@@ -50,6 +50,35 @@ class LMU:
         }
     },
 
+    def exec_crt(self,system_prompt,user_prompt,para):
+        """处理字符串输入的 create 模式
+        system_prompt: 字符串，系统提示词
+        user_prompt: 字符串，用户提示词
+        para: 参数字典
+        """
+        messages = []
+        messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+
+        response = self.client.chat.completions.create(
+            model=para.get("model", "gpt-4"),
+            messages=messages,
+            tools=[self.tools] if para.get("use_tool", False) else None,
+        )
+
+        choice = response.choices[0]
+        message = choice.message
+
+        result = message.content
+        return_calls = []
+
+        if message.tool_calls:
+            for tool_call in message.tool_calls:
+                if tool_call.function.name == "command":
+                    return_calls.append(f"exec_cmd {tool_call.function.arguments}")
+
+        return result, return_calls
+
     def exec(self,last_msgs,user_msg,para):
         messages=[]
         # last_msgs 格式：[system...][user/assistant/tool...], 最后一个必须是 assistant
@@ -168,7 +197,7 @@ class Core:
                 para=self.unwrap(para)
                 mode=command[4]
                 return_key=command[5]
-                result,return_calls=LMU.exec(system_prompt,user_prompt,para)
+                result,return_calls=LMU.exec_crt(system_prompt,user_prompt,para)
                 if result:
                     if mode=="a":
                         MEM[return_key].append(result) #寄存
@@ -180,9 +209,45 @@ class Core:
                     self.usr_tool_reg.append([])
                     this_command_context_id=len(self.last_msg_reg)
                     this_command_user_reg_id=len(self.usr_tool_reg)
-                    self.command_stack[-1]=f"exec ${this_command_context_id} ${this_command_user_reg_id} ${para} {mode} &{return_key}"
+                    self.command_stack[-1]=f"exec $last_msg_reg.{this_command_context_id} $user_tool_reg.{this_command_user_reg_id} ${para} {mode} &{return_key}"
                     self.command_stack.extend(return_calls[::-1])
                 continue
 
     def unwrap(self,value):
-        pass
+        value=[value[0],*value[1:].split(".")]
+        if value[1]=="last_msg_reg":
+            assert value[0]=="$"
+            return self.last_msg_reg[int(value[2])]
+        elif value[1]=="usr_tool_reg":
+            assert value[0]=="$"
+            return self.usr_tool_reg[int(value[2])]
+        else: 
+            return self._mem_unwrap(value)
+        
+    def _mem_unwrap(self,value):
+        if value[0]=="$":
+            temp=MEM
+            for i in range(len(value)-1):
+                temp=temp[value[i+1]]
+            if isinstance(temp,str):
+                if temp.startswith("$"):
+                    temp_value=[temp[0],*temp[1:].split(".")]
+                    temp=self._mem_unwrap(temp_value)
+            if not isinstance(temp,str):
+                if isinstance(temp,list):
+                    return temp[0] #期望约定：列表中第一个元素是列表元数据
+                if isinstance(temp,dict):
+                    return f"dict.keys:{temp.keys()}"
+        if value[0]=="&":
+            temp=MEM
+            for i in range(len(value)-1):
+                temp=temp[value[i+1]]
+            if isinstance(temp,str):
+                return temp
+            if not isinstance(temp,str):
+                if isinstance(temp,list):
+                    return temp[0]
+                if isinstance(temp,dict):
+                    return f"dict.keys:{temp.keys()}"
+                                    
+                
