@@ -4,35 +4,153 @@ from collections import defaultdict
 
 from openai import OpenAI
 
-class Msg:
-    role=""
-    def __init__(self,content):
-        self.content=content
+from avm_types import MetaList, MetaDict
+from exceptions import VMSyntaxError, VMMemoryError
+from messages import SystemMessage, UserMessage, Conversation, UserMessageBatch
 
-    def to_dict(self):
-        return {"role":self.role,"content":self.content}
 
-class UserMsg:
-    role="user"
-    def __init__(self,content):
-        super().__init__(content)
+class Instruction:
+    """指令基类"""
+    def execute(self, core: 'Core') -> None:
+        raise NotImplementedError
 
-class SystemMsg:
-    role="system"
-    def __init__(self,content):
-        super().__init__(content)
 
-class AssistantMsg:
-    role="assistant"
-    def __init__(self,content):
-        super().__init__(content)
+class CreateInstruction(Instruction):
+    """create 指令：发起新的对话"""
+    def __init__(self, system_ref: str, user_ref: str, para_ref: str, mode: str, return_key_ref: str):
+        self.system_ref = system_ref
+        self.user_ref = user_ref
+        self.para_ref = para_ref
+        self.mode = mode  # 'a' 或 'w'
+        self.return_key_ref = return_key_ref
 
+    def execute(self, core: 'Core') -> None:
+        system = core.unwrap(self.system_ref, for_llm=False)
+        user = core.unwrap(self.user_ref, for_llm=False)
+        para = core.unwrap(self.para_ref, for_llm=False)
+        result, return_calls = core.lmu.exec_crt(system, user, para)
+        if result:
+            key = core.unwrap(self.return_key_ref, for_llm=False)
+            if self.mode == 'a':
+                if not isinstance(core.MEM[key], (MetaList, list)):
+                    core.MEM[key] = MetaList()
+                core.MEM[key].append(result)
+            else:
+                core.MEM[key] = result
+        if return_calls:
+            # 创建类型化的 Conversation 和 UserMessageBatch
+            conversation = Conversation.from_any_list([(SYSTEM, system), (USER, user)])
+            user_batch = UserMessageBatch()  # 空的工具响应批量
+            # 寄存明确存储类型化对象
+            core.last_msg_reg.append(conversation)
+            core.usr_tool_reg.append(user_batch)
+            this_command_context_id = len(core.last_msg_reg)
+            this_command_user_reg_id = len(core.usr_tool_reg)
+            # 替换栈顶为 exec 指令
+            core.command_stack[-1] = f"exec $last_msg_reg.{this_command_context_id} $user_tool_reg.{this_command_user_reg_id} {self.para_ref} {self.mode} {self.return_key_ref}"
+            core.command_stack.extend(return_calls[::-1])
+        else:
+            # 没有 return_calls 才 pop
+            core.command_stack.pop()
+
+
+class ExecInstruction(Instruction):
+    """exec 指令：继续对话"""
+    def __init__(self, last_msg_ref: str, user_msg_ref: str, para_ref: str, mode: str, return_key_ref: str, call_id_ref: str):
+        self.last_msg_ref = last_msg_ref
+        self.user_msg_ref = user_msg_ref
+        self.para_ref = para_ref
+        self.mode = mode
+        self.return_key_ref = return_key_ref
+        self.call_id_ref = call_id_ref
+
+    def execute(self, core: 'Core') -> None:
+        # 解析索引（格式：$last_msg_reg.0 或 $MEM.key）
+        last_msg_idx = self._parse_index(self.last_msg_ref)
+        user_msg_idx = self._parse_index(self.user_msg_ref)
+
+        # 直接从寄存器获取类型化对象（不再需要转换）
+        conversation: Conversation = core.unwrap(self.last_msg_ref, for_llm=False)
+        user_batch: UserMessageBatch = core.unwrap(self.user_msg_ref, for_llm=False)
+        para = core.unwrap(self.para_ref, for_llm=False)
+
+        result, return_calls, updated_conversation = core.lmu.exec(conversation, user_batch, para)
+
+        # 只有有 result 时才 pop 和写入内存
+        if result:
+            core.command_stack.pop()
+            # pop 对应的寄存器（通过索引）
+            if last_msg_idx is not None and last_msg_idx < len(core.last_msg_reg):
+                core.last_msg_reg.pop(last_msg_idx)
+            if user_msg_idx is not None and user_msg_idx < len(core.usr_tool_reg):
+                core.usr_tool_reg.pop(user_msg_idx)
+            # 写入内存（存储更新后的 conversation）
+            if self.mode == 'a':
+                core.MEM[self.return_key_ref].append((result, self.call_id_ref))
+            else:
+                core.MEM[self.return_key_ref] = updated_conversation
+
+        # 有 return_calls 时压栈
+        if return_calls:
+            core.command_stack.extend(return_calls[::-1])
+
+    def _parse_index(self, ref: str):
+        """解析引用中的索引（如 $last_msg_reg.0 返回 0）"""
+        if ref.startswith('$'):
+            parts = ref[1:].split('.')
+            if len(parts) >= 2 and parts[0] in ('last_msg_reg', 'usr_tool_reg'):
+                try:
+                    return int(parts[1])
+                except ValueError:
+                    pass
+        return None
+
+
+class SetMetadataInstruction(Instruction):
+    """set_metadata 指令：设置元数据的元数据"""
+    def __init__(self, target_ref: str, metadata: str):
+        self.target_ref = target_ref
+        self.metadata = metadata
+
+    def execute(self, core: 'Core') -> None:
+        target = core.unwrap(self.target_ref, for_llm=False)
+        if isinstance(target, MetaList):
+            target.set_metadata(self.metadata)
+        elif isinstance(target, MetaDict):
+            target.set_metadata(self.metadata)
+        else:
+            raise VMMemoryError(f"set_metadata 目标必须是 MetaList 或 MetaDict，得到 {type(target)}")
+        core.command_stack.pop()
+
+
+def parse_instruction(raw: str) -> Instruction:
+    """解析指令字符串为指令对象"""
+    parts = raw.split()
+    if not parts:
+        raise VMSyntaxError("空指令")
+    op = parts[0]
+    if op == "create":
+        if len(parts) != 6:
+            raise VMSyntaxError(f"create 需要 6 个参数，得到 {len(parts)}")
+        return CreateInstruction(parts[1], parts[2], parts[3], parts[4], parts[5])
+    elif op == "exec":
+        if len(parts) != 7:
+            raise VMSyntaxError(f"exec 需要 7 个参数，得到 {len(parts)}")
+        return ExecInstruction(parts[1], parts[2], parts[3], parts[4], parts[5], parts[6])
+    elif op == "set_metadata":
+        if len(parts) < 3:
+            raise VMSyntaxError(f"set_metadata 至少需要 2 个参数，得到 {len(parts)}")
+        metadata = " ".join(parts[2:])
+        return SetMetadataInstruction(parts[1], metadata)
+    else:
+        raise VMSyntaxError(f"未知指令：{op}")
 
 class LMU:
+    """LLM 调用模块"""
 
     client: OpenAI
 
-    tools= {
+    tools = {
         "type": "function",
         "function": {
             "name": "command",
@@ -48,17 +166,51 @@ class LMU:
                 "required": ["command"]
             }
         }
-    },
+    }
 
-    def exec_crt(self,system_prompt,user_prompt,para):
+    def exec_crt(self, system_prompt: str, user_prompt: str, para: dict):
         """处理字符串输入的 create 模式
         system_prompt: 字符串，系统提示词
         user_prompt: 字符串，用户提示词
         para: 参数字典
         """
-        messages = []
-        messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": user_prompt})
+        messages = [
+            SystemMessage(content=system_prompt).to_dict(),
+            UserMessage(content=user_prompt).to_dict()
+        ]
+
+        response = self.client.chat.completions.create(
+            model=para.get("model", "gpt-4"),
+            messages=messages,
+            tools=[self.tools] if para.get("use_tool", False) else None,
+        )
+
+        choice = response.choices[0]
+        message = choice.message
+
+        result = message.content
+        return_calls = []
+
+        if message.tool_calls:
+            for tool_call in message.tool_calls:
+                if tool_call.function.name == "command":
+                    return_calls.append(f"{tool_call.function.arguments}")
+
+        return result, return_calls
+
+    def exec(self, conversation: Conversation, user_msg_batch: UserMessageBatch, para: dict):
+        """执行对话
+        conversation: 对话历史（已验证并封装）
+        user_msg_batch: 用户消息批量输入
+        para: 参数字典
+        """
+        # 使用 Conversation 类型处理消息转换
+        messages = conversation.to_api_messages()
+        messages.extend(user_msg_batch.to_tool_messages())
+
+        user_content = user_msg_batch.get_user_content()
+        if user_content:
+            messages.append({"role": "user", "content": user_content})
 
         response = self.client.chat.completions.create(
             model=para.get("model", "gpt-4"),
@@ -77,77 +229,14 @@ class LMU:
                 if tool_call.function.name == "command":
                     return_calls.append(f"exec_cmd {tool_call.function.arguments}")
 
-        return result, return_calls
+        # 更新对话历史
+        conversation.append_user_message(user_content)
+        conversation.append_assistant_message(result or "")
 
-    def exec(self,last_msgs,user_msg,para):
-        messages=[]
-        # last_msgs 格式：[system...][user/assistant/tool...], 最后一个必须是 assistant
-        # user_msg 是一个数组，包含 (content, tool_call_id) 元组和/或纯 content 字符串
-
-        # 检查并合并连续的 system 消息
-        if last_msgs:
-            # 检查最后一个消息是否为 assistant
-            if last_msgs[-1].get("role") != "assistant":
-                raise ValueError("last_msgs 的最后一个消息必须是 assistant")
-
-            # 合并前 n 个连续的 system 消息为一个
-            system_contents = []
-            i = 0
-            while i < len(last_msgs) and last_msgs[i].get("role") == "system":
-                system_contents.append(last_msgs[i].get("content", ""))
-                i += 1
-
-            if system_contents:
-                messages.append({"role": "system", "content": "\n\n".join(system_contents)})
-
-            # 剩余消息可以是 user/assistant/tool 混合，但 tool 必须跟在 assistant 后面
-            rest = last_msgs[i:]
-            messages.extend(rest)
-
-        # 处理 user_msg 数组，将 tool 角色消息插入到 assistant 消息后，user 消息前
-        tool_messages = []
-        user_contents = []
-        for item in user_msg:
-            if isinstance(item, tuple) and len(item) == 2:
-                content, tool_call_id = item
-                tool_messages.append({"role": "tool", "content": content, "tool_call_id": tool_call_id})
-            else:
-                user_contents.append(str(item))
-
-        # 将 tool 消息添加到 messages（在 assistant 消息后，user 消息前）
-        messages.extend(tool_messages)
-
-        # 添加最终的 user 消息
-        if user_contents:
-            messages.append({"role": "user", "content": "\n\n".join(user_contents)})
-
-        response = self.client.chat.completions.create(
-            model=para.get("model", "gpt-4"),
-            messages=messages,
-            tools=[self.tools] if para.get("use_tool", False) else None,
-        )
-
-        choice = response.choices[0]
-        message = choice.message
-
-        # 提取返回内容
-        result = message.content
-        return_calls = []
-
-        # 如果有工具调用，解析并添加到 return_calls
-        if message.tool_calls:
-            for tool_call in message.tool_calls:
-                if tool_call.function.name == "command":
-                    return_calls.append(f"exec_cmd {tool_call.function.arguments}")
-
-        # 将本次对话添加到 last_msgs 用于后续调用
-        last_msgs.append({"role": "user", "content": user_msg})
-        last_msgs.append({"role": "assistant", "content": result or ""})
-
-        return result, return_calls
+        return result, return_calls, conversation
 
     @staticmethod
-    def build_last_msg(last_msgs,result,return_calls):
+    def build_last_msg(last_msgs, _result, _return_calls):
         # 构建用于后续调用的消息历史
         return last_msgs
 
@@ -156,6 +245,7 @@ SYSTEM="system"
 USER="user"
 ASSISTANT="assistant"
 
+
 class Core:
     command_stack=[]
     last_msg_reg=[]
@@ -163,57 +253,14 @@ class Core:
 
     def run(self):
         while self.command_stack:
-            command=self.command_stack[-1]
-            command=command.split()
-            # 无前缀表示字面值，$表示变量，&表示地址
-            if command[0]=="exec": #exec $last_msg $user_msg $para a/w &return_key id
-                last_msg=command[1]
-                last_msg=self.unwrap(last_msg) #寄存
-                user_msg=command[2]
-                user_msg=self.unwrap(user_msg) #如果是来源于寄存器的，则应该清空对应寄存器
-                para=command[3]
-                para=self.unwrap(para)
-                mode=command[4]
-                return_key=command[5]
-                call_id=command[6]
-                result,return_calls=LMU.exec(last_msg,user_msg,para)
-                if result:
-                    self.command_stack.pop()
-                    self.last_msg_reg.pop(last_msg)
-                    self.usr_tool_reg.pop(user_msg)
-                    if mode=="a":
-                        MEM[return_key].append(result,call_id) #如果不是寄存，则忽略id
-                    if mode=="w":
-                        MEM[return_key]=result 
-                if return_calls:
-                    self.command_stack.extend(return_calls[::-1])
-                continue
-            if command[0]=="create": #create $system_prompt $user_prompt $para a/w &return_key
-                system_prompt=command[1]
-                system_prompt=self.unwrap(system_prompt) #寄存
-                user_prompt=command[2]
-                user_prompt=self.unwrap(user_prompt)
-                para=command[3]
-                para=self.unwrap(para)
-                mode=command[4]
-                return_key=command[5]
-                result,return_calls=LMU.exec_crt(system_prompt,user_prompt,para)
-                if result:
-                    if mode=="a":
-                        MEM[return_key].append(result) #寄存
-                    if mode=="w":
-                        MEM[return_key]=result #寄存
-                    self.command_stack.pop()
-                if return_calls:
-                    self.last_msg_reg.append([(SYSTEM,system_prompt),(USER,user_prompt)])
-                    self.usr_tool_reg.append([])
-                    this_command_context_id=len(self.last_msg_reg)
-                    this_command_user_reg_id=len(self.usr_tool_reg)
-                    self.command_stack[-1]=f"exec $last_msg_reg.{this_command_context_id} $user_tool_reg.{this_command_user_reg_id} ${para} {mode} &{return_key}"
-                    self.command_stack.extend(return_calls[::-1])
-                continue
+            raw = self.command_stack[-1]
+            instruction = parse_instruction(raw)
+            instruction.execute(self)
 
-    def unwrap(self,value):
+    def unwrap(self, value, for_llm=False):
+        """解引用值
+        for_llm: 如果为 True，对 MetaList/MetaDict 返回元数据字符串
+        """
         value=[value[0],*value[1:].split(".")]
         if value[1]=="last_msg_reg":
             assert value[0]=="$"
@@ -221,10 +268,13 @@ class Core:
         elif value[1]=="usr_tool_reg":
             assert value[0]=="$"
             return self.usr_tool_reg[int(value[2])]
-        else: 
-            return self._mem_unwrap(value)
-        
-    def _mem_unwrap(self,value):
+        else:
+            return self._mem_unwrap(value, for_llm=for_llm)
+
+    def _mem_unwrap(self, value, for_llm=False):
+        """从 MEM 中解引用值
+        for_llm: 如果为 True，对 MetaList/MetaDict 返回 to_llm_string()
+        """
         if value[0]=="$":
             temp=MEM
             for i in range(len(value)-1):
@@ -232,12 +282,18 @@ class Core:
             if isinstance(temp,str):
                 if temp.startswith("$"):
                     temp_value=[temp[0],*temp[1:].split(".")]
-                    temp=self._mem_unwrap(temp_value)
+                    temp=self._mem_unwrap(temp_value, for_llm=for_llm)
+            # 循环结束后再处理类型
             if not isinstance(temp,str):
+                if isinstance(temp, MetaList):
+                    return temp.to_llm_string() if for_llm else temp
+                if isinstance(temp, MetaDict):
+                    return temp.to_llm_string() if for_llm else temp
                 if isinstance(temp,list):
                     return temp[0] #期望约定：列表中第一个元素是列表元数据
                 if isinstance(temp,dict):
                     return f"dict.keys:{temp.keys()}"
+            return temp
         if value[0]=="&":
             temp=MEM
             for i in range(len(value)-1):
@@ -245,9 +301,11 @@ class Core:
             if isinstance(temp,str):
                 return temp
             if not isinstance(temp,str):
+                if isinstance(temp, MetaList):
+                    return temp.to_llm_string() if for_llm else temp
+                if isinstance(temp, MetaDict):
+                    return temp.to_llm_string() if for_llm else temp
                 if isinstance(temp,list):
                     return temp[0]
                 if isinstance(temp,dict):
                     return f"dict.keys:{temp.keys()}"
-                                    
-                
