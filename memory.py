@@ -30,7 +30,7 @@ class Memory:
     def setdefault(self, key: str, default: Any = None) -> Any:
         return self._data.setdefault(key, default)
 
-    def unwrap(self, value: list, for_llm: bool = False) -> Any:
+    def unwrap(self, value: list, for_llm: bool = True) -> Any:
         """
         解引用值
         :param value: 引用列表，如 ['$', 'key'] 或 ['&', 'key', 'subkey']
@@ -40,12 +40,12 @@ class Memory:
         if value[0] == "$":
             return self._unwrap_dollar(value[1:], for_llm=for_llm)
         elif value[0] == "&":
-            return self._unwrap_ampersand(value[1:])
+            return self._unwrap_ampersand(value[1:], for_llm=for_llm)
         else:
             # 无前缀，直接返回路径对应的值
             return self._get_by_path(value)
 
-    def _unwrap_dollar(self, path: list, for_llm: bool = False, seen: Optional[set] = None) -> Any:
+    def _unwrap_dollar(self, path: list, for_llm: bool, seen: Optional[set] = None) -> Any:
         """
         $ 引用：递归解引用
         """
@@ -67,7 +67,7 @@ class Memory:
         # 处理类型转换
         return self._convert_for_llm(temp, for_llm)
 
-    def _unwrap_ampersand(self, path: list) -> Any:
+    def _unwrap_ampersand(self, path: list, for_llm: bool) -> Any:
         """
         & 引用：一层解引用（不递归）
         """
@@ -78,7 +78,7 @@ class Memory:
             temp_value = [temp[0], *temp[1:].split(".")]
             temp = self._get_by_path(temp_value[1:])
 
-        return temp
+        return self._convert_for_llm(temp, for_llm)
 
     def _get_by_path(self, path: list) -> Any:
         """
@@ -124,6 +124,19 @@ class Memory:
                 temp[key] = {}
             temp = temp[key]
         temp[path[-1]] = value
+
+    def set(self, ref: str, value: Any) -> None:
+        """
+        根据引用设置值
+        :param ref: 引用字符串，如 '$MEM.key' 或 '$MEM.key.subkey'
+        :param value: 要设置的值
+        """
+        if not ref.startswith("$"):
+            raise ValueError(f"引用必须以 $ 开头：{ref}")
+
+        # 解析引用路径
+        parts = ref[1:].split(".")
+        self.set_by_path(parts, value)
 
     def to_dict(self) -> dict:
         """返回底层字典的副本"""

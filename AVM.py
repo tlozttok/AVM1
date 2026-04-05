@@ -1,5 +1,7 @@
 
 
+import enum
+
 from openai import OpenAI
 
 from avm_types import MetaList, MetaDict
@@ -7,40 +9,86 @@ from exceptions import VMSyntaxError, VMMemoryError
 from messages import SystemMessage, UserMessage, Conversation, UserMessageBatch
 from memory import Memory
 
+class CommandReturnType(enum):
+    """指令返回类型"""
+    EXIT=0
+    CONTINUE=1
+
+type CRT=CommandReturnType
 
 class Instruction:
     """指令基类"""
+    def __init__(self,call_id: str, utr_index: int, **kargs):
+        self.call_id = call_id
+        self.utr_index = utr_index
+        for k, v in kargs.items():
+            setattr(self, k, v)
+        
     def execute(self, core: 'Core') -> None:
         raise NotImplementedError
+class MemoryReadInstruction(Instruction):
+    """memory_read 指令：从内存中读取数据"""
+    call_id: str
+    utr_index: int
+    ref: str
+    def __init__(self, call_id: str, utr_index: int, ref: str, **kargs):
+        super().__init__(call_id, utr_index, ref=ref, **kargs)
+    
+    def execute(self, core: 'Core') -> None:
+        user_batch = core.usr_tool_reg[self.utr_index]
+        content=core.unwrap(self.ref, for_llm=True)
+        user_batch.add_user_message(content)
+        return CRT.EXIT
+
+class MemoryWriteInstruction(Instruction):
+    """memory_write 指令：写入内存"""
+    call_id: str
+    utr_index: int
+    ref: str
+    content: str
+    def __init__(self, call_id: str, utr_index: int, ref: str, content: str, **kargs):
+        super().__init__(call_id, utr_index, ref=ref, content=content, **kargs)
+        self.content = content
+    
+    def execute(self, core: 'Core') -> None:
+        user_batch = core.usr_tool_reg[self.utr_index]
+        try:
+            core.mem.set(self.ref, self.content)
+        except VMMemoryError as e:
+            user_batch.add_tool_response(f"Error: {e}", self.call_id)
+            return CRT.EXIT
+        user_batch.add_tool_response(f"Success set: {self.ref}", self.call_id)
+        return CRT.EXIT
+
+class MemoryMakeInstruction(Instruction):
+    """memory_make 指令：创建内存地址"""
+    call_id: str
+    utr_index: int
+    ...
 
 
 class CreateInstruction(Instruction):
     """create 指令：发起新的对话"""
-    def __init__(self, system_ref: str, user_ref: str, para_ref: str, mode: str, utr_index: str, call_id: str):
-        self.system_ref = system_ref
-        self.user_ref = user_ref
-        self.para_ref = para_ref
-        self.mode = mode  # 'a' 或 'w'
-        self.utr_index = int(utr_index)
-        self.call_id = call_id
+    call_id: str
+    utr_index: int
+    system_ref: str
+    user_ref: str
+    para_ref: str
 
-    def execute(self, core: 'Core') -> None:
-        system = core.unwrap(self.system_ref, for_llm=False)
-        user = core.unwrap(self.user_ref, for_llm=False)
+    def __init__(self, call_id: str, utr_index: int, system_ref: str, user_ref: str, para_ref: str, **kargs):
+        super().__init__(call_id, utr_index, system_ref=system_ref, user_ref=user_ref, para_ref=para_ref, **kargs)
+
+    def execute(self, core: 'Core') -> int:
+        system = core.unwrap(self.system_ref)
+        user = core.unwrap(self.user_ref)
         para = core.unwrap(self.para_ref, for_llm=False)
         result, return_calls, conversation = core.lmu.exec_crt(system, user, para, self.utr_index)
 
         # 处理 result：存入 usr_tool_reg[utr_index]
         if result:
             user_batch = core.usr_tool_reg[self.utr_index]
-            if self.mode == 'a':
-                # 追加工具响应
-                user_batch.add_tool_response(result, self.call_id)
-            else:
-                # 替换为新的 UserMessageBatch
-                new_batch = UserMessageBatch()
-                new_batch.add_tool_response(result, self.call_id)
-                core.usr_tool_reg[self.utr_index] = new_batch
+            # 追加工具响应
+            user_batch.add_tool_response(result, self.call_id)
 
         # 处理 return_calls
         if return_calls:
@@ -53,22 +101,24 @@ class CreateInstruction(Instruction):
             core.usr_tool_reg.append(UserMessageBatch())
 
             # 替换栈顶为 exec 指令
-            core.command_stack[-1] = f"exec $last_msg_reg.{last_msg_idx} $user_tool_reg.{user_msg_idx} {self.para_ref} {self.mode} {self.utr_index} {self.call_id}"
+            core.command_stack[-1] = f"exec $last_msg_reg.{last_msg_idx} $user_tool_reg.{user_msg_idx} {self.para_ref} {self.utr_index} {self.call_id}"
             core.command_stack.extend(return_calls[::-1])
+            return CRT.CONTINUE
         else:
             # 没有 return_calls 才 pop
-            core.command_stack.pop()
+            return CRT.EXIT
 
 
 class ExecInstruction(Instruction):
     """exec 指令：继续对话"""
-    def __init__(self, last_msg_ref: str, user_msg_ref: str, para_ref: str, mode: str, utr_index: str, call_id: str):
-        self.last_msg_ref = last_msg_ref
-        self.user_msg_ref = user_msg_ref
-        self.para_ref = para_ref
-        self.mode = mode
-        self.utr_index = int(utr_index)
-        self.call_id = call_id
+    call_id: str
+    utr_index: int
+    last_msg_ref: str
+    user_msg_ref: str
+    para_ref: str
+
+    def __init__(self, call_id: str, utr_index: int, last_msg_ref: str, user_msg_ref: str, para_ref: str, **kargs):
+        super().__init__(call_id, utr_index, last_msg_ref=last_msg_ref, user_msg_ref=user_msg_ref, para_ref=para_ref, **kargs)
 
     def execute(self, core: 'Core') -> None:
         # 解析索引（格式：$last_msg_reg.0 或 $MEM.key）
@@ -76,8 +126,8 @@ class ExecInstruction(Instruction):
         user_msg_idx = self._parse_index(self.user_msg_ref)
 
         # 直接从寄存器获取类型化对象
-        conversation: Conversation = core.unwrap(self.last_msg_ref, for_llm=False)
-        user_batch: UserMessageBatch = core.unwrap(self.user_msg_ref, for_llm=False)
+        conversation: Conversation = core.unwrap(self.last_msg_ref)
+        user_batch: UserMessageBatch = core.unwrap(self.user_msg_ref)
         para = core.unwrap(self.para_ref, for_llm=False)
 
         # 调用 LMU.exec，传入 utr_index 用于工具调用
@@ -86,26 +136,22 @@ class ExecInstruction(Instruction):
 
         # 处理 result
         if result:
-            # 弹出指令栈
-            core.command_stack.pop()
+            # 将 (result, call_id) 存入 usr_tool_reg[utr_index]
+            call_id = self.call_id
+            user_batch = core.usr_tool_reg[self.utr_index]
+            user_batch.add_tool_response(result, call_id)
+
+        # 处理 return_calls：不弹出当前指令，直接压栈
+        if return_calls:
+            core.command_stack.extend(return_calls[::-1])
+            return CRT.CONTINUE
+        else:
             # pop 对应的寄存器（通过索引）
             if last_msg_idx is not None and last_msg_idx < len(core.last_msg_reg):
                 core.last_msg_reg.pop(last_msg_idx)
             if user_msg_idx is not None and user_msg_idx < len(core.usr_tool_reg):
                 core.usr_tool_reg.pop(user_msg_idx)
-            # 将 (result, call_id) 存入 usr_tool_reg[utr_index]
-            call_id = self.call_id
-            user_batch = core.usr_tool_reg[self.utr_index]
-            if self.mode == 'a':
-                user_batch.add_tool_response(result, call_id)
-            else:
-                new_batch = UserMessageBatch()
-                new_batch.add_tool_response(result, call_id)
-                core.usr_tool_reg[self.utr_index] = new_batch
-
-        # 处理 return_calls：不弹出当前指令，直接压栈
-        if return_calls:
-            core.command_stack.extend(return_calls[::-1])
+            return CRT.EXIT
 
     def _parse_index(self, ref: str):
         """解析引用中的索引（如 $last_msg_reg.0 返回 0）"""
@@ -119,46 +165,11 @@ class ExecInstruction(Instruction):
         return None
 
 
-class SetMetadataInstruction(Instruction):
-    """set_metadata 指令：设置元数据"""
-    def __init__(self, target_ref: str, metadata: str):
-        self.target_ref = target_ref
-        self.metadata = metadata
-
-    def execute(self, core: 'Core') -> None:
-        target = core.unwrap(self.target_ref, for_llm=False)
-        if isinstance(target, MetaList):
-            target.set_metadata(self.metadata)
-        elif isinstance(target, MetaDict):
-            target.set_metadata(self.metadata)
-        else:
-            raise VMMemoryError(f"set_metadata 目标必须是 MetaList 或 MetaDict，得到 {type(target)}")
-        core.command_stack.pop()
 
 
 def parse_instruction(raw: str) -> Instruction:
     """解析指令字符串为指令对象"""
-    parts = raw.split()
-    if not parts:
-        raise VMSyntaxError("空指令")
-    op = parts[0]
-    if op == "create":
-        # create $system_ref $user_ref $para_ref mode utr_index call_id (6 个参数)
-        if len(parts) != 7:
-            raise VMSyntaxError(f"create 需要 6 个参数，得到 {len(parts)-1}")
-        return CreateInstruction(parts[1], parts[2], parts[3], parts[4], parts[5], parts[6])
-    elif op == "exec":
-        # exec $last_msg_ref $user_msg_ref $para_ref mode utr_index call_id_ref (6 个参数)
-        if len(parts) != 7:
-            raise VMSyntaxError(f"exec 需要 6 个参数，得到 {len(parts)-1}")
-        return ExecInstruction(parts[1], parts[2], parts[3], parts[4], parts[5], parts[6])
-    elif op == "set_metadata":
-        if len(parts) < 3:
-            raise VMSyntaxError(f"set_metadata 至少需要 2 个参数，得到 {len(parts)-1}")
-        metadata = " ".join(parts[2:])
-        return SetMetadataInstruction(parts[1], metadata)
-    else:
-        raise VMSyntaxError(f"未知指令：{op}")
+    pass
 
 
 class LMU:
@@ -179,12 +190,8 @@ class LMU:
                         "type": "string",
                         "description": "命令字符串",
                     },
-                    "call_id": {
-                        "type": "string",
-                        "description": "工具调用 ID",
-                    }
                 },
-                "required": ["command", "call_id"]
+                "required": ["command"]
             }
         }
     }
@@ -213,13 +220,9 @@ class LMU:
                         "type": "string",
                         "description": "模式：a(追加) 或 w(写入)",
                         "enum": ["a", "w"]
-                    },
-                    "call_id": {
-                        "type": "string",
-                        "description": "工具调用 ID",
                     }
                 },
-                "required": ["system_ref", "user_ref", "para_ref", "mode", "call_id"]
+                "required": ["system_ref", "user_ref", "para_ref", "mode"]
             }
         }
     }
@@ -255,13 +258,13 @@ class LMU:
                 if tool_call.function.name == "command":
                     args = tool_call.function.arguments
                     command = args.get("command", "")
-                    call_id = args.get("call_id", "")
+                    call_id = tool_call.id
                     # 将 call_id 追加到指令末尾
                     return_calls.append(f"{command} {call_id}")
                 elif tool_call.function.name == "create_cmd":
                     args = tool_call.function.arguments
                     # 构造 create 指令，自动注入 current_utr_index
-                    cmd = f"create {args['system_ref']} {args['user_ref']} {args['para_ref']} {args['mode']} {current_utr_index} {args['call_id']}"
+                    cmd = f"create {args['system_ref']} {args['user_ref']} {args['para_ref']} {args['mode']} {current_utr_index} {tool_call.id}"
                     return_calls.append(cmd)
 
         # 创建 Conversation 对象返回
@@ -305,11 +308,11 @@ class LMU:
                 if tool_call.function.name == "command":
                     args = tool_call.function.arguments
                     command = args.get("command", "")
-                    call_id = args.get("call_id", "")
+                    call_id = tool_call.id
                     return_calls.append(f"{command} {call_id}")
                 elif tool_call.function.name == "create_cmd":
                     args = tool_call.function.arguments
-                    cmd = f"create {args['system_ref']} {args['user_ref']} {args['para_ref']} {args['mode']} {current_utr_index} {args['call_id']}"
+                    cmd = f"create {args['system_ref']} {args['user_ref']} {args['para_ref']} {args['mode']} {current_utr_index} {tool_call.id}"
                     return_calls.append(cmd)
 
         # 更新对话历史
@@ -343,7 +346,7 @@ class Core:
             instruction = parse_instruction(raw)
             instruction.execute(self)
 
-    def unwrap(self, value, for_llm=False):
+    def unwrap(self, value, for_llm=True):
         """解引用值
         只处理 $last_msg_reg 和 $usr_tool_reg 的寄存器访问
         其他情况调用 self.mem.unwrap
