@@ -227,7 +227,7 @@ class LMU:
         if message.tool_calls:
             for tool_call in message.tool_calls:
                 if tool_call.function.name == "command":
-                    return_calls.append(f"exec_cmd {tool_call.function.arguments}")
+                    return_calls.append(f"{tool_call.function.arguments}")
 
         # 更新对话历史
         conversation.append_user_message(user_content)

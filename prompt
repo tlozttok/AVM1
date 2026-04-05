@@ -1,518 +1,90 @@
-# Agent 虚拟机完整设计报告（面向 AI 编码工具）
+1. MEM 类化
+将全局 MEM 改为 Memory 类，内部用字典存储。
 
-## 摘要
+实现 __getitem__、__setitem__、__contains__ 等魔术方法。
 
-本文档描述了一个用于运行 AI Agent 的虚拟机（VM）的设计与实现现状。该虚拟机不同于传统 Agent 框架：它不内置“工具调用”概念，而是通过通用指令集（`exec`, `create` 等）让 AI 直接控制执行流、内存和外部 I/O。报告包括：设计目标、核心架构、现有代码问题分析、类型系统计划、异常处理策略、指令数据结构设计，以及给 AI 编码工具的具体实现指引。
+将 Core._mem_unwrap 的逻辑移入 Memory.unwrap 方法，支持 $（递归解引用）和 &（一层解引用），以及 MetaList/MetaDict 的 to_llm_string() 转换。
 
----
+Core.unwrap 只处理 $last_msg_reg 和 $usr_tool_reg 的寄存器访问，其他情况调用 self.mem.unwrap。
 
-## 1. 设计目标
+2. 删除 return_key_ref，加入 utr_index 和 call_id
+CreateInstruction：
 
-- **Agent 作为信息处理器**：Agent 主要进行“语言运算”（思考），而非调用外部工具。外部交互通过内存映射 I/O（类似 CPU 的 PIO）完成。
-- **无特殊工具抽象**：没有内置的“工具调用”通道。AI 通过返回指令（`return_calls`）来控制虚拟机，所有外部能力表现为普通内存访问。
-- **利用预训练模型的自然输出**：复用 LLM 已有的结构化输出格式（如 `tool_calls`），将其解释为指令序列，而非传统工具调用。
-- **确定性内核 + AI 驱动**：虚拟机提供确定的指令执行环境，AI 生成指令序列（`return_calls`）来驱动自身循环。
-- **简洁的寄存器与内存模型**：`last_msg_reg` 存储对话历史（消息组），`usr_tool_reg` 存储临时消息/工具 ID，`MEM` 字典存储通用数据。
+参数改为 (system_ref, user_ref, para_ref, mode, utr_index, call_id)
 
----
+执行时调用 lmu.exec_crt（传入当前 utr_index，以便 create_cmd 工具使用）
 
-## 2. 核心架构
+如果有 result（非空）：
 
-### 2.1 虚拟机组件
-
-| 组件 | 职责 | 当前实现状态 |
-|------|------|--------------|
-| **指令栈 (`command_stack`)** | 存储待执行的指令（字符串或指令对象） | 已实现，但字符串解析脆弱 |
-| **寄存器** | `last_msg_reg`: 对话历史列表（每个元素是 `[(role, content), ...]`）<br>`usr_tool_reg`: 待处理消息/工具 ID 列表 | 部分实现，但 `usr_tool_reg` 未充分使用 |
-| **内存 (`MEM`)** | 字典，存储任意数据（字符串、列表、字典、设备对象） | 已实现，但类型标记缺失 |
-| **指令处理核心 (`Core.run`)** | 循环弹出栈顶指令，解析并执行 | 基本实现，但解析与执行耦合 |
-| **LLM 调用模块 (`LMU`)** | 与 OpenAI API 交互，返回文本和 `tool_calls` | 已实现，但硬编码了 `command` 工具 |
-| **内存访问器 (`unwrap` / `_mem_unwrap`)** | 解析 `$var` 和 `&addr` 引用，从内存/寄存器取值 | 存在缩进错误和逻辑不完整 |
+若 mode == 'a'：向 usr_tool_reg[utr_index] 追加 (result, call_id)（作为工具响应）
 
-### 2.2 执行模型
+若 mode == 'w'：替换 usr_tool_reg[utr_index] 为新的 UserMessageBatch 并添加该响应
 
-1. **启动**：外部压入一条 `create` 指令（例如 `create $system_prompt $first_user_msg $para a &conv_root`）。
-2. **`create` 执行**：
-   - 调用 `LMU.exec_crt` 获得初始回复和可能的 `return_calls`。
-   - 将 `(system_prompt, user_prompt)` 存入 `last_msg_reg`，空列表存入 `usr_tool_reg`。
-   - 动态生成 `exec` 指令替换栈顶，并将 `return_calls` 逆序压栈。
-3. **`exec` 执行**：
-   - 从寄存器读取对话历史和用户消息。
-   - 调用 `LMU.exec` 获得结果和新的 `return_calls`。
-   - 将结果写入 `MEM` 指定的 `return_key`，弹出当前指令，压入新的 `return_calls`。
-4. **循环**：`run` 方法持续执行栈顶指令，直到栈空。AI 通过 `return_calls` 不断生成新指令，实现自循环。
+如果有 return_calls：
 
-### 2.3 指令格式（当前字符串形式）
+先分配新的寄存器槽位：last_msg_idx = len(last_msg_reg)，user_msg_idx = len(usr_tool_reg)
 
-```
-create $system_prompt $user_prompt $para a/w &return_key
-exec $last_msg $user_msg $para a/w &return_key id
-```
+存入新创建的 Conversation（来自 lmu.exec_crt 的 result 和 return_calls 构建的？实际上 exec_crt 返回的 result 是文本，return_calls 是指令列表，需要根据这些构建一个新的 Conversation 对象？原代码中 exec_crt 没有返回 conversation，只返回 result 和 return_calls。但 create 指令的后续 exec 需要 Conversation。所以 LMU.exec_crt 也需要返回一个 Conversation 对象，包含 system 和 user 消息，以及 assistant 的回复（如果有）。
 
-- `$` 前缀表示从寄存器或内存中读取（如 `$last_msg_reg.0`）。
-- `&` 前缀表示地址（用于写入结果）。
-- `id` 用于关联工具调用 ID（OpenAI `tool_call_id`）。
+将栈顶替换为 exec $last_msg_reg.{last_msg_idx} $user_tool_reg.{user_msg_idx} {para_ref} {mode} {utr_index} {call_id}
 
----
+压入 return_calls（每个元素是完整的指令字符串）
 
-## 3. 现有代码问题分析
+如果没有 return_calls，则直接弹出当前指令。
 
-### 3.1 严重问题
+ExecInstruction：
 
-| 问题 | 位置 | 影响 | 修复方向 |
-|------|------|------|----------|
-| **`_mem_unwrap` 缩进错误** | `_mem_unwrap` 中的 `if not isinstance(temp,str):` 块在循环内部，导致路径遍历中途返回 | 无法完整解析多级路径，嵌套引用失效 | 将类型判断块移到循环外部 |
-| **`LMU.exec` 中修改传入的 `last_msgs`** | `last_msgs.append(...)` 直接修改外部列表 | 可能意外污染调用方数据，且历史无限增长 | 改为返回新列表或深拷贝 |
-| **`MEM[return_key].append(result, call_id)` 语法错误** | `append` 只接受一个参数 | 运行时会崩溃 | 应改为 `append((result, call_id))` 或使用字典 |
-| **`unwrap` 对寄存器引用解析后未清空** | 注释提到“清空对应寄存器”但未实现 | 寄存器值会重复使用，可能导致逻辑错误 | 在取值后设置 `None` 或删除条目 |
-| **`usr_tool_reg` 从未被写入** | `exec` 指令中未更新 `usr_tool_reg` | 工具调用 ID 无法追踪 | 需要在 `return_calls` 处理时同步更新 |
+参数改为 (last_msg_ref, user_msg_ref, para_ref, mode, utr_index, call_id_ref)
 
-### 3.2 设计缺陷
+执行时：
 
-| 缺陷 | 描述 | 建议改进 |
-|------|------|----------|
-| **指令字符串解析脆弱** | 使用 `split()` 分割，无法处理带空格的参数 | 引入结构化指令格式（如 JSON 或自定义类） |
-| **类型系统缺失** | 依赖隐式约定（列表第一个元素是元数据，字典返回 `dict.keys:`） | 增加类型标记或专用类 |
-| **异常处理混乱** | 没有统一异常类，到处 `assert` 或静默失败 | 定义异常层次，用装饰器分离处理逻辑 |
-| **历史无限增长** | `last_msgs` 每次 `exec` 都会追加新消息 | 增加截断策略（最大长度、摘要压缩） |
-| **LLM 调用硬编码** | `tools=[self.tools]` 固定为 `command` 工具 | 改为可配置，或完全移除工具依赖，使用内存映射 I/O |
+从 last_msg_ref 解引用得到 Conversation（这个对话是临时的，用完即弃）
 
-### 3.3 次要问题
+从 user_msg_ref 解引用得到 UserMessageBatch（包含当前要发送的工具响应）
 
-- **`LMU.exec_crt` 未处理 `return_calls` 的递归**：如果初始调用也返回工具调用，不会正确处理。
-- **`Core.run` 中 `self.command_stack.pop()` 后未处理栈空情况**：可能导致索引错误。
-- **`unwrap` 中的 `_mem_unwrap` 返回字符串表示（如 `"dict.keys:..."`），但调用方可能期望原始对象**：需要区分“给 LLM 看”和“内部操作”两种模式。
+调用 lmu.exec(conversation, user_batch, para, current_utr_index=utr_index)，返回 (result, return_calls, updated_conversation)（但 updated_conversation 不需要保存）
 
----
+如果有 result：
 
-## 4. 类型系统计划（虚拟机内部）
+弹出指令栈
 
-### 4.1 基本类型
+解引用 call_id_ref 得到 call_id 字符串
 
-- **字符串**：普通文本，用于 LLM 输入/输出。
-- **列表**：有序集合，存储任意类型。**对 LLM 暴露时只显示长度和索引**（不显示元素内容），除非显式调用内存管理指令。
-- **字典**：键值对，键为字符串。暴露时只显示键列表。
-- **设备对象**：代表外部 I/O（如用户输入），具有 `read()` 和 `write()` 方法，访问时可能阻塞。
-- **地址引用**：内部表示（如 `AddressRef` 类），不暴露给 LLM。
+将 (result, call_id) 存入 usr_tool_reg[utr_index]（追加或覆盖，根据 mode）
 
-### 4.2 类型标记与检查
+注意：user_msg_ref 和 last_msg_ref 对应的寄存器槽位是否需要清理？原代码会 pop 掉，但现在对话不需要保留，可以 pop 掉 last_msg_reg 和 usr_tool_reg 中对应的条目，以释放资源。但注意 utr_index 可能和这些索引不同，不能混淆。
 
-- 在 `MEM` 和寄存器中，定义 Python 类型存储数据。
-- 类型检查时机：**指令执行前**，在 `Instruction.execute` 方法内进行。例如 `list_append` 指令检查目标是否为 `list`。
-- 为 LLM 生成元数据时，使用专用函数 `to_metadata(value, depth=0)`，根据值类型返回字符串：
-  ```python
-  def to_metadata(value, for_llm=True):
-      if not for_llm:
-          return value  # 内部操作返回原始对象
-      if isinstance(value, list):
-          return f"list[{len(value)}]"
-      if isinstance(value, dict):
-          return f"dict({list(value.keys())})"
-      if isinstance(value, Device):
-          return "<device>"
-      return str(value)
-  ```
-
-### 4.3 设备对象示例
-
-```python
-class UserInputDevice:
-    def read(self):
-        return input("User: ")  # 阻塞等待
-    def write(self, value):
-        # 输出到控制台
-        print(f"AI: {value}")
-```
-
-挂载到 `MEM["/io/user"] = UserInputDevice()`。
-
----
-
-## 5. 异常处理策略
-
-### 5.1 异常分类
-
-| 类别 | 示例 | 处理方式 |
-|------|------|----------|
-| **语法错误** | 未知指令、参数数量错误 | 立即终止虚拟机，打印错误 |
-| **内存错误** | 键不存在、索引越界、循环引用 | 立即终止虚拟机，打印错误 |
-| **资源错误** | 栈溢出、LLM 调用超时 | 立即终止虚拟机，打印错误 |
-| **软件异常** | 对数字调用 `list_append` | 暂不处理，记录日志，让 LLM 自行修正 |
-
-### 5.2 异常类定义
-
-```python
-class VMError(Exception):
-    """所有虚拟机异常的基类"""
-    pass
-
-class VMSyntaxError(VMError):
-    pass
-
-class VMMemoryError(VMError):
-    pass
-
-class VMResourceError(VMError):
-    pass
-```
-
-### 5.3 与核心逻辑分离
-
-使用装饰器捕获异常，避免核心代码充满 try-except：
-
-```python
-def vm_exception_handler(func):
-    def wrapper(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except VMError as e:
-            logging.error(f"VM terminated: {e}")
-            sys.exit(1)
-    return wrapper
-```
-
-应用在 `Core.run` 和每个 `Instruction.execute` 上。
-
-### 5.4 错误信息规范
-
-- 包含错误类型、位置（指令、内存地址）、具体原因。
-- 示例：`VMMemoryError: Key 'user.name' not found in MEM`
-
----
-
-## 6. 指令数据结构设计
-
-### 6.1 指令基类
-
-```python
-class Instruction:
-    def execute(self, core: 'Core') -> None:
-        raise NotImplementedError
-```
-
-### 6.2 具体指令类
-
-#### `CreateInstruction`
-
-```python
-class CreateInstruction(Instruction):
-    def __init__(self, system_prompt_ref: str, user_prompt_ref: str,
-                 para_ref: str, mode: str, return_key_ref: str):
-        self.system_prompt_ref = system_prompt_ref
-        self.user_prompt_ref = user_prompt_ref
-        self.para_ref = para_ref
-        self.mode = mode          # 'a' or 'w'
-        self.return_key_ref = return_key_ref
-
-    def execute(self, core):
-        # 使用 core.unwrap 解析引用
-        system = core.unwrap(self.system_prompt_ref, for_llm=False)
-        user = core.unwrap(self.user_prompt_ref, for_llm=False)
-        para = core.unwrap(self.para_ref, for_llm=False)
-        result, return_calls = core.lmu.exec_crt(system, user, para)
-        # 写入 MEM
-        key = core.unwrap(self.return_key_ref, for_llm=False, as_address=True)
-        if self.mode == 'a':
-            core.MEM[key].append(result)
-        else:
-            core.MEM[key] = result
-        # 处理 return_calls 压栈等
-```
-
-#### `ExecInstruction`
-
-```python
-class ExecInstruction(Instruction):
-    def __init__(self, last_msg_ref, user_msg_ref, para_ref,
-                 mode, return_key_ref, call_id_ref):
-        # 类似
-```
-
-### 6.3 解析函数
-
-```python
-def parse_instruction(raw: str) -> Instruction:
-    parts = raw.split()
-    if not parts:
-        raise VMSyntaxError("Empty instruction")
-    op = parts[0]
-    if op == "create":
-        if len(parts) != 6:
-            raise VMSyntaxError(f"create expects 6 args, got {len(parts)}")
-        return CreateInstruction(parts[1], parts[2], parts[3], parts[4], parts[5])
-    elif op == "exec":
-        if len(parts) != 7:
-            raise VMSyntaxError(f"exec expects 7 args, got {len(parts)}")
-        return ExecInstruction(parts[1], parts[2], parts[3], parts[4], parts[5], parts[6])
-    else:
-        raise VMSyntaxError(f"Unknown instruction: {op}")
-```
-
----
-
-## 7. 现有代码重构步骤（给 AI 编码工具）
-
-### 7.1 立即修复的致命问题
-
-1. **修正 `_mem_unwrap` 缩进**：将 `if not isinstance(temp,str):` 块移到 `for` 循环外部。
-2. **修复 `MEM[return_key].append` 语法**：改为 `MEM[return_key].append((result, call_id))`。
-3. **移除 `LMU.exec` 中对传入 `last_msgs` 的直接修改**：改为返回新的历史列表，或使用深拷贝。
-
-### 7.2 逐步重构
-
-#### 阶段一：引入指令类（不改变现有执行逻辑）
-- 修改 `Core.run`：先用 `parse_instruction` 将字符串转为指令对象，再调用 `execute`。
-- 保持 `execute` 内部代码与原指令分支相同（过渡）。
-
-#### 阶段二：实现类型系统与元数据生成
-- 实现 `to_metadata(value, for_llm)` 函数。
-- 修改 `unwrap` 增加 `for_llm` 参数，在 `ExecInstruction` 中调用时设为 `True`。
-- 在 `_mem_unwrap` 中，如果最终值是 `list` 或 `dict` 且 `for_llm=True`，返回 `to_metadata` 结果；否则返回原始对象。
-
-#### 阶段三：异常处理
-- 定义异常类。
-- 用装饰器包裹 `Core.run` 和每个 `Instruction.execute`。
-- 在关键位置（如 `unwrap` 路径访问、`LMU` 调用）抛出具体异常。
-
-#### 阶段四：内存管理指令
-- 添加 `inspect_list $list_ref` 指令，返回详细内容。
-- 添加 `load_keys $dict_ref` 返回键列表。
-- 这些指令内部使用 `to_metadata` 但允许展示内容（通过参数控制）。
-
-#### 阶段五：设备 I/O 集成
-- 定义 `Device` 抽象类。
-- 在 `MEM` 中预置设备对象（如 `MEM["/io/user"]`）。
-- 修改 `_mem_unwrap`：当访问到 `Device` 对象时，如果是读操作（`for_llm=True`），调用 `read()` 并返回字符串；如果是写操作（通过 `dict_set`），调用 `write(value)`。
-
-### 7.3 测试计划
-
-- **单元测试**：每个指令类的 `execute` 方法单独测试，模拟 `Core` 和 `MEM`。
-- **集成测试**：用一组简单指令序列（如对话循环）验证完整流程。
-- **异常测试**：触发各种异常，确认虚拟机正确退出并打印错误。
-
----
-
-## 8. 给 AI 编码工具的实现指引
-
-### 8.1 代码生成优先级
-
-1. **修复缩进和语法错误**（最高优先级）。
-2. **实现 `parse_instruction` 和指令类**（不改变外部行为）。
-3. **实现 `to_metadata` 和修改 `unwrap`**。
-4. **添加异常类和装饰器**。
-5. **添加设备 I/O 示例**。
-
-### 8.2 编码风格建议
-
-- 使用类型注解（`from typing import List, Dict, Union`）。
-- 每个函数和类都有 docstring。
-- 异常信息使用 f-string 包含上下文。
-- 保持 `Core` 类尽量简单，复杂逻辑放在指令类或辅助函数中。
-
-### 8.3 已知难点提示
-
-- **`unwrap` 需要同时处理寄存器（`last_msg_reg`, `usr_tool_reg`）和内存（`MEM`）**。建议将寄存器也视为特殊的内存区域（例如 `MEM["_reg_last_msg"]`），简化实现。
-- **循环引用检测**：在 `_mem_unwrap` 中使用 `seen` 集合（递归深度限制）。
-- **历史截断**：在 `LMU.exec` 中，如果 `len(last_msgs) > MAX_HISTORY`，删除最早的消息（保留 system）。
-
----
-
-## 9. 附录：代码示例片段
-
-### 修正后的 `_mem_unwrap`（缩进修正版）
-
-```python
-def _mem_unwrap(self, value):
-    if value[0] == "$":
-        temp = MEM
-        for i in range(len(value)-1):
-            temp = temp[value[i+1]]
-        # 循环结束后再处理引用和类型
-        if isinstance(temp, str) and temp.startswith("$"):
-            temp_value = [temp[0], *temp[1:].split(".")]
-            temp = self._mem_unwrap(temp_value)
-        # 根据最终类型返回
-        if isinstance(temp, list):
-            return temp[0]  # 约定：第一个元素是元数据
-        if isinstance(temp, dict):
-            return f"dict.keys:{temp.keys()}"
-        return temp
-    if value[0] == "&":
-        # 类似逻辑，但返回地址对应的值
-        ...
-```
-
-### 指令类示例
-
-```python
-class CreateInstruction(Instruction):
-    def __init__(self, system_ref, user_ref, para_ref, mode, return_key_ref):
-        self.system_ref = system_ref
-        self.user_ref = user_ref
-        self.para_ref = para_ref
-        self.mode = mode
-        self.return_key_ref = return_key_ref
-
-    def execute(self, core):
-        system = core.unwrap(self.system_ref, for_llm=False)
-        user = core.unwrap(self.user_ref, for_llm=False)
-        para = core.unwrap(self.para_ref, for_llm=False)
-        result, return_calls = core.lmu.exec_crt(system, user, para)
-        key = core.unwrap(self.return_key_ref, for_llm=False, as_address=True)
-        if self.mode == 'a':
-            core.MEM.setdefault(key, []).append(result)
-        else:
-            core.MEM[key] = result
-        core.command_stack.pop()
-        if return_calls:
-            # 将 return_calls 逆序压栈
-            core.command_stack.extend(return_calls[::-1])
-            # 更新寄存器逻辑（原 create 中的特殊处理）
-            core.last_msg_reg.append([(SYSTEM, system), (USER, user)])
-            core.usr_tool_reg.append([])
-            # 生成新的 exec 指令并替换栈顶（原逻辑）
-            # ...
-```
-
----
-
-## 结束语
-
-本报告为 AI 编码工具提供了完整的虚拟机设计蓝图、现有问题清单以及具体的重构步骤。请按照优先级逐步实现，并在每阶段完成后进行测试。如有疑问，请根据本文档中的设计原则自行决策。
-
-你说得对，我之前的报告忽略了“自定义元数据”的需求。你希望列表和字典可以携带**用户可设置的字符串元数据**（例如 LLM 可以生成一个描述性的字符串来代替默认的 `"list[3]"`），并且在没有设置时回退到默认的元数据（仅显示结构信息）。这需要引入自定义数据类型来包装列表和字典。
-
-以下是对报告的**补充与修正**，专门针对类型系统中的元数据自定义部分。
-
----
-
-## 补充：自定义元数据类型（替代原生 list/dict）
-
-### 设计目标
-
-- 每个列表或字典在虚拟机内部可以关联一个**字符串元数据**。
-- 当 LLM 通过 `unwrap` 访问该数据时（`for_llm=True`），返回的是**元数据字符串**（如果存在），否则返回默认的结构描述字符串。
-- 元数据字符串由 LLM 通过专用指令（如 `set_metadata`）动态生成和修改。
-- 底层数据本身不受影响，仅改变对 LLM 的呈现方式。
-
-### 实现方案
-
-定义两个新类：`MetaList` 和 `MetaDict`，分别替代原生 `list` 和 `dict`。
-
-```python
-class MetaList:
-    def __init__(self, data=None, metadata=None):
-        self._data = data if data is not None else []
-        self._metadata = metadata   # 字符串，可为 None
-
-    def __getitem__(self, index):
-        return self._data[index]
-
-    def __setitem__(self, index, value):
-        self._data[index] = value
+如果有 return_calls：
 
-    def append(self, value):
-        self._data.append(value)
-
-    def get_metadata(self):
-        return self._metadata
-
-    def set_metadata(self, metadata: str):
-        self._metadata = metadata
-
-    def to_llm_string(self):
-        """返回给 LLM 的字符串表示"""
-        if self._metadata is not None:
-            return self._metadata
-        # 默认：只显示长度，不显示内容
-        return f"list(len={len(self._data)})"
-
-    # 其他必要方法（extend, pop, __len__ 等）根据需要实现
-```
-
-`MetaDict` 类似：
-
-```python
-class MetaDict:
-    def __init__(self, data=None, metadata=None):
-        self._data = data if data is not None else {}
-        self._metadata = metadata
-
-    def __getitem__(self, key):
-        return self._data[key]
-
-    def __setitem__(self, key, value):
-        self._data[key] = value
-
-    def keys(self):
-        return self._data.keys()
-
-    def get_metadata(self):
-        return self._metadata
-
-    def set_metadata(self, metadata: str):
-        self._metadata = metadata
-
-    def to_llm_string(self):
-        if self._metadata is not None:
-            return self._metadata
-        return f"dict(keys={list(self._data.keys())})"
-```
-
-### 内存模型的调整
-
-- `MEM` 字典中存储的值可以是 `MetaList`、`MetaDict`、普通字符串、设备对象等。
-- 创建指令时（如 `create`），生成的对话历史列表默认应为 `MetaList`，元数据为 `None`。
-
-### 对 `unwrap` 和 `_mem_unwrap` 的修改
-
-当 `for_llm=True` 时，如果解引用得到的值是 `MetaList` 或 `MetaDict`，调用其 `to_llm_string()` 方法返回字符串。如果是其他类型（如字符串、设备），按原有方式处理。
-
-```python
-# 在 _mem_unwrap 或 unwrap 的返回处
-if isinstance(value, (MetaList, MetaDict)) and for_llm:
-    return value.to_llm_string()
-else:
-    return value  # 内部操作直接返回对象
-```
-
-### 元数据设置指令
-
-需要新增指令供 LLM 调用，例如：
-
-```
-set_metadata $target_ref $metadata_string
-```
-
-其中 `$target_ref` 是一个引用（如 `$conv_list`），`$metadata_string` 是新的元数据字符串。执行时，从 `MEM` 中获取目标对象，调用其 `set_metadata` 方法。
-
-### 默认元数据的回退
-
-如果 LLM 从未设置元数据，则 `to_llm_string()` 返回默认的简短结构描述。这满足了“只展示数据结构，不展示内容”的要求。如果 LLM 希望展示内容，可以显式设置元数据为包含内容的字符串（例如 `"list: [hello, world]"`），或者通过专门的内存管理指令（如 `inspect_list`）获取详情。
-
-### 对现有代码的影响
-
-- 需要替换所有原本使用原生 `list`/`dict` 作为长期存储的地方（`MEM` 和寄存器）为 `MetaList`/`MetaDict`。
-- `last_msg_reg` 中的每个消息组应转换为 `MetaList`，其内部消息元组保持不变。
-- 工具调用返回的 `return_calls` 指令可能需要支持 `set_metadata`。
-
----
-
-## 更新后的类型系统总结（修正版）
-
-- **基本类型**：字符串、`MetaList`、`MetaDict`、设备对象、地址引用（内部）。
-- **元数据**：每个 `MetaList`/`MetaDict` 可附带一个可选的字符串元数据。对 LLM 展示时优先使用元数据，否则使用默认结构描述。
-- **类型检查**：指令执行时检查对象是否为 `MetaList`/`MetaDict` 实例（而不是原生类型）。
-- **指令扩展**：增加 `set_metadata` 和 `get_metadata` 指令。
-
----
-
-## 给 AI 编码工具的额外指引
-
-1. **实现 `MetaList` 和 `MetaDict` 类**，确保它们的行为与原生类型基本一致（支持索引、迭代、长度等），以便现有代码中的操作（如 `append`、`__getitem__`）能正常工作。
-2. **修改 `Core` 初始化**：所有新创建的列表/字典都使用 `MetaList`/`MetaDict`，包括 `last_msg_reg` 中的对话历史。
-3. **修改 `LMU.exec` 和 `LMU.exec_crt`**：它们接收的 `last_msgs` 可能是 `MetaList`，需要正确处理（例如转换为 OpenAI API 可接受的字典列表）。转换时，应提取内部的 `_data`。
-4. **添加新指令**：`set_metadata $ref $string`，并在 `Core.run` 中增加对应的解析和执行分支。
-5. **测试**：验证当元数据存在时，LLM 收到的是自定义字符串；当不存在时，收到默认结构描述；并且内部数据操作不受影响。
-
-此补充设计使你的虚拟机能够充分利用 LLM 生成描述性元数据的能力，同时保持数据隐私（默认不暴露内容）。你可以根据实际需要调整 `to_llm_string` 的默认格式。
+不弹出当前指令，直接压入 return_calls（这样当前 exec 会再次执行，使用新的 user_msg_ref 中的响应）
+
+3. 工具调用类型化，添加 create_cmd 工具
+LMU 修改：
+
+exec_crt 和 exec 方法增加参数 current_utr_index: int。
+
+定义两个工具：command 和 create_cmd。
+
+command：参数 {"command": str}，解析后直接取 command 字段值作为指令字符串加入 return_calls。
+
+create_cmd：参数 {"system_ref": str, "user_ref": str, "para_ref": str, "mode": str, "call_id": str}，构造指令字符串：
+
+text
+f"create {system_ref} {user_ref} {para_ref} {mode} {current_utr_index} {call_id}"
+加入 return_calls。
+
+工具调用设计：
+
+command 工具：参数包含 command（指令字符串）和 call_id（字符串）。
+LMU 解析后，生成指令字符串时，需要在原 command 字符串末尾追加 call_id（因为所有指令的最后一个参数都是 call_id）。例如，LLM 返回 {"command": "create $a $b $c w 5", "call_id": "call_123"}，则生成的指令为 "create $a $b $c w 5 call_123"。
+
+create_cmd 工具：参数包含 system_ref, user_ref, para_ref, mode, call_id（不需要 utr_index，由 VM 注入）。
+LMU 生成指令：f"create {system_ref} {user_ref} {para_ref} {mode} {current_utr_index} {call_id}"（注意 utr_index 是当前指令的父寄存器索引，由 VM 自动填入）。
+
+其他指令（如 set_metadata）：如果需要被工具调用，也可以通过 command 工具生成，并同样附加 call_id。指令解析器 parse_instruction 需要能解析出最后的 call_id 参数（对于 set_metadata 这种参数数量不固定的指令，约定 call_id 为最后一个参数，可以是任何字符串）。
+
+指令执行逻辑（所有指令统一）：
+
+执行后若有 result（非 None），则根据 mode 将 (result, self.call_id) 存入 core.usr_tool_reg[self.utr_index]。
+
+若有 return_calls，则压栈子指令（子指令的 utr_index 为当前指令的 utr_index，因为结果要返回到同一个父寄存器）。
