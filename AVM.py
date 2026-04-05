@@ -62,13 +62,13 @@ class CreateInstruction(Instruction):
 
 class ExecInstruction(Instruction):
     """exec 指令：继续对话"""
-    def __init__(self, last_msg_ref: str, user_msg_ref: str, para_ref: str, mode: str, utr_index: str, call_id_ref: str):
+    def __init__(self, last_msg_ref: str, user_msg_ref: str, para_ref: str, mode: str, utr_index: str, call_id: str):
         self.last_msg_ref = last_msg_ref
         self.user_msg_ref = user_msg_ref
         self.para_ref = para_ref
         self.mode = mode
         self.utr_index = int(utr_index)
-        self.call_id_ref = call_id_ref
+        self.call_id = call_id
 
     def execute(self, core: 'Core') -> None:
         # 解析索引（格式：$last_msg_reg.0 或 $MEM.key）
@@ -82,6 +82,7 @@ class ExecInstruction(Instruction):
 
         # 调用 LMU.exec，传入 utr_index 用于工具调用
         result, return_calls, _ = core.lmu.exec(conversation, user_batch, para, self.utr_index)
+        user_batch.clear()
 
         # 处理 result
         if result:
@@ -93,7 +94,7 @@ class ExecInstruction(Instruction):
             if user_msg_idx is not None and user_msg_idx < len(core.usr_tool_reg):
                 core.usr_tool_reg.pop(user_msg_idx)
             # 将 (result, call_id) 存入 usr_tool_reg[utr_index]
-            call_id = core.unwrap(self.call_id_ref, for_llm=False)
+            call_id = self.call_id
             user_batch = core.usr_tool_reg[self.utr_index]
             if self.mode == 'a':
                 user_batch.add_tool_response(result, call_id)
@@ -119,7 +120,7 @@ class ExecInstruction(Instruction):
 
 
 class SetMetadataInstruction(Instruction):
-    """set_metadata 指令：设置元数据的元数据"""
+    """set_metadata 指令：设置元数据"""
     def __init__(self, target_ref: str, metadata: str):
         self.target_ref = target_ref
         self.metadata = metadata

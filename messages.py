@@ -209,6 +209,11 @@ class UserMessageBatch:
         """添加用户内容"""
         self.user_contents.append(str(content))
 
+    def clear(self) -> None:
+        """清空所有内容"""
+        self.tool_responses.clear()
+        self.user_contents.clear()
+
     @classmethod
     def from_any_list(cls, items: List[Union[Tuple[str, str], str]]) -> 'UserMessageBatch':
         """从任意输入列表创建 UserMessageBatch"""
