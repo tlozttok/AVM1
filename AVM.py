@@ -24,8 +24,9 @@ class Instruction:
         for k, v in kargs.items():
             setattr(self, k, v)
         
-    def execute(self, core: 'Core') -> None:
+    def execute(self, core: 'Core') -> CRT:
         raise NotImplementedError
+    
 class MemoryReadInstruction(Instruction):
     """memory_read 指令：从内存中读取数据"""
     call_id: str
@@ -34,7 +35,7 @@ class MemoryReadInstruction(Instruction):
     def __init__(self, call_id: str, utr_index: int, ref: str, **kargs):
         super().__init__(call_id, utr_index, ref=ref, **kargs)
     
-    def execute(self, core: 'Core') -> None:
+    def execute(self, core: 'Core') -> CRT:
         user_batch = core.usr_tool_reg[self.utr_index]
         content=core.unwrap(self.ref, for_llm=True)
         user_batch.add_user_message(content)
@@ -50,14 +51,14 @@ class MemoryWriteInstruction(Instruction):
         super().__init__(call_id, utr_index, ref=ref, content=content, **kargs)
         self.content = content
     
-    def execute(self, core: 'Core') -> None:
+    def execute(self, core: 'Core') -> CRT:
         user_batch = core.usr_tool_reg[self.utr_index]
         try:
             core.mem.set(self.ref, self.content)
+            user_batch.add_tool_response(f"Success set: {self.ref}", self.call_id)
         except VMMemoryError as e:
             user_batch.add_tool_response(f"Error: {e}", self.call_id)
             return CRT.EXIT
-        user_batch.add_tool_response(f"Success set: {self.ref}", self.call_id)
         return CRT.EXIT
 
 class MemoryMakeInstruction(Instruction):
@@ -134,7 +135,7 @@ class ExecInstruction(Instruction):
     def __init__(self, call_id: str, utr_index: int, last_msg_ref: str, user_msg_ref: str, para_ref: str, **kargs):
         super().__init__(call_id, utr_index, last_msg_ref=last_msg_ref, user_msg_ref=user_msg_ref, para_ref=para_ref, **kargs)
 
-    def execute(self, core: 'Core') -> None:
+    def execute(self, core: 'Core') -> CRT:
         # 解析索引（格式：$last_msg_reg.0 或 $MEM.key）
         last_msg_idx = self._parse_index(self.last_msg_ref)
         user_msg_idx = self._parse_index(self.user_msg_ref)
@@ -358,7 +359,11 @@ class Core:
         while self.command_stack:
             raw = self.command_stack[-1]
             instruction = parse_instruction(raw)
-            instruction.execute(self)
+            return_type=instruction.execute(self)
+            if return_type == CRT.EXIT:
+                self.command_stack.pop()
+            elif return_type == CRT.CONTINUE:
+                continue
 
     def unwrap(self, value, for_llm=True):
         """解引用值
