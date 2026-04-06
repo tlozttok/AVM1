@@ -1,6 +1,7 @@
 """AVM 内存系统定义"""
 from typing import Any, Optional
 from avm_types import MetaList, MetaDict
+from exceptions import VMMemoryError
 
 
 class Memory:
@@ -137,6 +138,73 @@ class Memory:
         # 解析引用路径
         parts = ref[1:].split(".")
         self.set_by_path(parts, value)
+
+    def make(self, ref: str, key: str, mem_type: str) -> None:
+        """
+        在指定路径创建新的内存地址
+        :param ref: 引用字符串，如 '$MEM.key' 或 '$MEM.key.subkey'
+        :param key: 新地址的名字
+        :param mem_type: 类型，'str' | 'dict' | 'list'
+        """
+        if not ref.startswith("$"):
+            raise VMMemoryError(f"引用必须以 $ 开头：{ref}")
+
+        if mem_type not in ('str', 'dict', 'list'):
+            raise VMMemoryError(f"不支持的类型：{mem_type}，必须是 'str', 'dict', 'list' 之一")
+
+        # 解析引用路径
+        parts = ref[1:].split(".")
+
+        # 获取父路径和当前值
+        parent_path = parts[:-1] if len(parts) > 1 else []
+        current_path = parts
+
+        # 获取 ref 对应的值
+        if parent_path:
+            parent = self._get_by_path(parent_path)
+        else:
+            parent = self._data
+
+        # 检查 ref 是否存在
+        if current_path:
+            try:
+                current = self._get_by_path(current_path)
+            except (KeyError, TypeError):
+                raise VMMemoryError(f"路径不存在：{ref}")
+        else:
+            current = parent
+
+        # 如果 ref 是空路径（即 $MEM），则直接在 _data 上操作
+        if not current_path:
+            current = self._data
+
+        # 检查类型
+        if isinstance(current, str):
+            raise VMMemoryError(f"不能在字符串类型的路径下创建新键：{ref}")
+        elif isinstance(current, list):
+            # 期望第二个值是索引数字
+            if not key.isdigit():
+                raise VMMemoryError(f"列表类型的路径下，key 必须是数字索引：{key}")
+            index = int(key)
+            if index < 0 or index >= len(current):
+                raise VMMemoryError(f"索引越界：{index}，列表长度：{len(current)}")
+            # 在列表指定索引位置创建新值
+            if mem_type == 'str':
+                current[index] = ""
+            elif mem_type == 'dict':
+                current[index] = {}
+            elif mem_type == 'list':
+                current[index] = []
+        elif isinstance(current, dict):
+            # 在字典中创建新键
+            if mem_type == 'str':
+                current[key] = ""
+            elif mem_type == 'dict':
+                current[key] = {}
+            elif mem_type == 'list':
+                current[key] = []
+        else:
+            raise VMMemoryError(f"不支持在类型 {type(current).__name__} 下创建新键")
 
     def to_dict(self) -> dict:
         """返回底层字典的副本"""

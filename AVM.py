@@ -64,7 +64,21 @@ class MemoryMakeInstruction(Instruction):
     """memory_make 指令：创建内存地址"""
     call_id: str
     utr_index: int
-    ...
+    ref: str
+    key: str
+    mem_type: str
+
+    def __init__(self, call_id: str, utr_index: int, ref: str, key: str, mem_type: str, **kargs):
+        super().__init__(call_id, utr_index, ref=ref, key=key, mem_type=mem_type, **kargs)
+
+    def execute(self, core: 'Core') -> CRT:
+        user_batch = core.usr_tool_reg[self.utr_index]
+        try:
+            core.mem.make(self.ref, self.key, self.mem_type)
+            user_batch.add_tool_response(f"Success created {self.mem_type} at {self.ref}.{self.key}", self.call_id)
+        except VMMemoryError as e:
+            user_batch.add_tool_response(f"Error: {e}", self.call_id)
+        return CRT.EXIT
 
 
 class CreateInstruction(Instruction):
