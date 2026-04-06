@@ -2,6 +2,7 @@
 from typing import Any, Optional
 from avm_types import MetaList, MetaDict
 from exceptions import VMMemoryError
+from memory_device import MemoryDevice, StringDevice
 
 
 class Memory:
@@ -12,6 +13,7 @@ class Memory:
 
     def __init__(self):
         self._data: dict = {}
+        self._devices: dict = {}  # 存储已挂载的设备，key 为路径字符串
 
     def __getitem__(self, key: str) -> Any:
         return self._data[key]
@@ -86,6 +88,10 @@ class Memory:
         根据路径获取值
         :param path: 路径列表，如 ['key', 'subkey']
         """
+        # 首先检查是否是设备路径
+        if self.is_device_path(path):
+            return self.get_device(path)
+
         temp = self._data
         for key in path:
             temp = temp[key]
@@ -97,6 +103,10 @@ class Memory:
         """
         if not for_llm:
             return value
+
+        # 检查是否是设备
+        if isinstance(value, MemoryDevice):
+            return value.to_llm_string()
 
         if isinstance(value, MetaList):
             return value.to_llm_string()
@@ -115,10 +125,24 @@ class Memory:
         根据路径设置值
         :param path: 路径列表，如 ['key', 'subkey']
         """
-        if len(path) == 1:
-            self._data[path[0]] = value
+        # 检查是否是设备路径
+        if self.is_device_path(path):
+            device = self.get_device(path)
+            if isinstance(device, StringDevice):
+                device.set_value(value)
+            else:
+                raise VMMemoryError(f"设备 {type(device).__name__} 不支持直接写入")
             return
 
+        # 检查最后一个节点是否是设备路径（完整路径）
+        full_path_str = ".".join(path)
+        if full_path_str in self._devices:
+            device = self._devices[full_path_str]
+            if isinstance(device, StringDevice):
+                device.set_value(value)
+                return
+
+        # 普通路径处理
         temp = self._data
         for key in path[:-1]:
             if key not in temp:
@@ -135,9 +159,42 @@ class Memory:
         if not ref.startswith("$"):
             raise ValueError(f"引用必须以 $ 开头：{ref}")
 
-        # 解析引用路径
-        parts = ref[1:].split(".")
+        # 解析引用路径 - 移除 $MEM 前缀
+        parts = ref[1:].split(".")  # 例如：["$MEM", "user_output"] -> ["MEM", "user_output"]
+        if parts[0] == "MEM":
+            parts = parts[1:]  # 移除 MEM 前缀，得到 ["user_output"]
+
         self.set_by_path(parts, value)
+
+    def mount(self, path: str, device: MemoryDevice) -> None:
+        """
+        挂载设备到指定路径
+        :param path: 路径字符串，如 'sys.log'（不包含 $MEM 前缀）
+        :param device: 要挂载的设备
+        """
+        if not isinstance(device, MemoryDevice):
+            raise VMMemoryError(f"必须挂载 MemoryDevice 类型的设备， got {type(device).__name__}")
+
+        self._devices[path] = device
+
+    def unmount(self, path: str) -> None:
+        """
+        从指定路径卸载设备
+        :param path: 路径字符串
+        """
+        if path not in self._devices:
+            raise VMMemoryError(f"路径 {path} 没有挂载设备")
+        del self._devices[path]
+
+    def is_device_path(self, path: list) -> bool:
+        """检查路径是否对应设备"""
+        path_str = ".".join(path)
+        return path_str in self._devices
+
+    def get_device(self, path: list) -> Optional[MemoryDevice]:
+        """获取路径对应的设备"""
+        path_str = ".".join(path)
+        return self._devices.get(path_str)
 
     def make(self, ref: str, key: str, mem_type: str) -> None:
         """

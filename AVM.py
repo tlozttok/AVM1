@@ -1,6 +1,6 @@
 
 
-import enum
+from enum import Enum
 
 from openai import OpenAI
 
@@ -9,12 +9,12 @@ from exceptions import VMSyntaxError, VMMemoryError
 from messages import SystemMessage, UserMessage, Conversation, UserMessageBatch
 from memory import Memory
 
-class CommandReturnType(enum):
+class CommandReturnType(Enum):
     """指令返回类型"""
-    EXIT=0
-    CONTINUE=1
+    EXIT = 0
+    CONTINUE = 1
 
-type CRT=CommandReturnType
+CRT = CommandReturnType
 
 class Instruction:
     """指令基类"""
@@ -100,7 +100,7 @@ class CreateInstruction(Instruction):
         result, return_calls, conversation = core.lmu.exec_crt(system, user, para, self.utr_index)
 
         # 处理 result：存入 usr_tool_reg[utr_index]
-        if result:
+        if result and self.utr_index!=-1:
             user_batch = core.usr_tool_reg[self.utr_index]
             # 追加工具响应
             user_batch.add_tool_response(result, self.call_id)
@@ -117,6 +117,8 @@ class CreateInstruction(Instruction):
 
             # 替换栈顶为 exec 指令
             core.command_stack[-1] = f"exec $last_msg_reg.{last_msg_idx} $user_tool_reg.{user_msg_idx} {self.para_ref} {self.utr_index} {self.call_id}"
+            for i in range(len(return_calls)):
+                return_calls[i] = return_calls[i].replace("$current_utr_index", str(user_msg_idx))
             core.command_stack.extend(return_calls[::-1])
             return CRT.CONTINUE
         else:
@@ -146,7 +148,7 @@ class ExecInstruction(Instruction):
         para = core.unwrap(self.para_ref, for_llm=False)
 
         # 调用 LMU.exec，传入 utr_index 用于工具调用
-        result, return_calls, _ = core.lmu.exec(conversation, user_batch, para, self.utr_index)
+        result, return_calls, _ = core.lmu.exec(conversation, user_batch, para, self.user_msg_ref)
         user_batch.clear()
 
         # 处理 result
@@ -244,7 +246,7 @@ class LMU:
 
     tools = [command_tool, create_cmd_tool]
 
-    def exec_crt(self, system_prompt: str, user_prompt: str, para: dict, current_utr_index: int = 0):
+    def exec_crt(self, system_prompt: str, user_prompt: str, para: dict):
         """处理字符串输入的 create 模式
         system_prompt: 字符串，系统提示词
         user_prompt: 字符串，用户提示词
@@ -278,8 +280,7 @@ class LMU:
                     return_calls.append(f"{command} {call_id}")
                 elif tool_call.function.name == "create_cmd":
                     args = tool_call.function.arguments
-                    # 构造 create 指令，自动注入 current_utr_index
-                    cmd = f"create {args['system_ref']} {args['user_ref']} {args['para_ref']} {args['mode']} {current_utr_index} {tool_call.id}"
+                    cmd = f"create {args['system_ref']} {args['user_ref']} {args['para_ref']} {args['mode']} $current_utr_index {tool_call.id}"
                     return_calls.append(cmd)
 
         # 创建 Conversation 对象返回
