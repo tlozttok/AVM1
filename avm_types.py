@@ -52,6 +52,9 @@ class MetaDict:
 
     def keys(self):
         return self._data.keys()
+    
+    def get(self, key, default=None):
+        return self._data.get(key, default)
 
     def values(self):
         return self._data.values()
@@ -70,6 +73,9 @@ class MetaDict:
         if self._metadata is not None:
             return self._metadata
         return f"dict[keys={list(self._data.keys())}]"
+
+    def  to_dict(self):
+        return self._data.copy()
 
     def __repr__(self):
         return f"MetaDict(data={self._data}, metadata={self._metadata})"

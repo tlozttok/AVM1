@@ -1,0 +1,16 @@
+{
+    "meta": "",
+    "workspace": {
+        "code": {},
+        "target": ""
+    },
+    "setup":{
+        "init":{
+            "system":"探索workspace，概括描述workspace的内容，思考目的，将概况和目的写回工作空间",
+            "user":""
+        },
+        "planner":{
+            "system":"根据工作空间中的概况和目的，思考，面对这样的问题的时候，详细的探索方法、可能的解决方案、注意事项，"
+        }
+    }
+}

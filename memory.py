@@ -3,6 +3,9 @@ from typing import Any, Optional
 from avm_types import MetaList, MetaDict
 from exceptions import VMMemoryError
 from memory_device import MemoryDevice, StringDevice
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class Memory:
@@ -40,10 +43,18 @@ class Memory:
         :param for_llm: 如果为 True，对 MetaList/MetaDict 返回 to_llm_string()
         :return: 解引用后的值
         """
+        logger.debug("[unwrap] value=%s for_llm=%s", value, for_llm)
         if value[0] == "$":
-            return self._unwrap_dollar(value[1:], for_llm=for_llm)
+            path = value[1:]
+            # 移除 MEM 前缀（$MEM.key -> $key）
+            if path and path[0] == "MEM":
+                path = path[1:]
+            return self._unwrap_dollar(path, for_llm=for_llm)
         elif value[0] == "&":
-            return self._unwrap_ampersand(value[1:], for_llm=for_llm)
+            path = value[1:]
+            if path and path[0] == "MEM":
+                path = path[1:]
+            return self._unwrap_ampersand(path, for_llm=for_llm)
         else:
             # 无前缀，直接返回路径对应的值
             return self._get_by_path(value)
@@ -65,22 +76,20 @@ class Memory:
                 return temp
             seen.add(temp)
             temp_value = [temp[0], *temp[1:].split(".")]
-            return self._unwrap_dollar(temp_value[1:], for_llm=for_llm, seen=seen)
+            next_path = temp_value[1:]
+            # 移除 MEM 前缀
+            if next_path and next_path[0] == "MEM":
+                next_path = next_path[1:]
+            return self._unwrap_dollar(next_path, for_llm=for_llm, seen=seen)
 
         # 处理类型转换
         return self._convert_for_llm(temp, for_llm)
 
     def _unwrap_ampersand(self, path: list, for_llm: bool) -> Any:
         """
-        & 引用：一层解引用（不递归）
+        & 引用：直接返回路径对应的原始值，不做额外解引用
         """
         temp = self._get_by_path(path)
-
-        # 如果是字符串且以 $ 开头，只解一层
-        if isinstance(temp, str) and temp.startswith("$"):
-            temp_value = [temp[0], *temp[1:].split(".")]
-            temp = self._get_by_path(temp_value[1:])
-
         return self._convert_for_llm(temp, for_llm)
 
     def _get_by_path(self, path: list) -> Any:
@@ -125,6 +134,7 @@ class Memory:
         根据路径设置值
         :param path: 路径列表，如 ['key', 'subkey']
         """
+        logger.debug("[set_by_path] path=%s value=%r", path, value)
         # 检查是否是设备路径
         if self.is_device_path(path):
             device = self.get_device(path)
@@ -156,6 +166,7 @@ class Memory:
         :param ref: 引用字符串，如 '$MEM.key' 或 '$MEM.key.subkey'
         :param value: 要设置的值
         """
+        logger.info("[mem.set] ref=%s", ref)
         if not ref.startswith("$"):
             raise ValueError(f"引用必须以 $ 开头：{ref}")
 
@@ -172,6 +183,7 @@ class Memory:
         :param path: 路径字符串，如 'sys.log'（不包含 $MEM 前缀）
         :param device: 要挂载的设备
         """
+        logger.info("[mem.mount] path=%s device=%s", path, type(device).__name__)
         if not isinstance(device, MemoryDevice):
             raise VMMemoryError(f"必须挂载 MemoryDevice 类型的设备， got {type(device).__name__}")
 
@@ -182,6 +194,7 @@ class Memory:
         从指定路径卸载设备
         :param path: 路径字符串
         """
+        logger.info("[mem.unmount] path=%s", path)
         if path not in self._devices:
             raise VMMemoryError(f"路径 {path} 没有挂载设备")
         del self._devices[path]
@@ -203,6 +216,7 @@ class Memory:
         :param key: 新地址的名字
         :param mem_type: 类型，'str' | 'dict' | 'list'
         """
+        logger.info("[mem.make] ref=%s key=%s type=%s", ref, key, mem_type)
         if not ref.startswith("$"):
             raise VMMemoryError(f"引用必须以 $ 开头：{ref}")
 
@@ -211,6 +225,9 @@ class Memory:
 
         # 解析引用路径
         parts = ref[1:].split(".")
+        # 移除 MEM 前缀
+        if parts and parts[0] == "MEM":
+            parts = parts[1:]
 
         # 获取父路径和当前值
         parent_path = parts[:-1] if len(parts) > 1 else []

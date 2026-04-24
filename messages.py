@@ -2,6 +2,9 @@
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple, Union
 from enum import Enum
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class Role(str, Enum):
@@ -94,6 +97,7 @@ class ConversationMessage:
     """对话中的单条消息（内部表示）"""
     role: str
     content: str
+    tool_calls: Optional[List[dict]] = None
 
     @classmethod
     def from_any(cls, msg: MessageInput) -> 'ConversationMessage':
@@ -101,14 +105,21 @@ class ConversationMessage:
         if isinstance(msg, Message):
             return cls(role=msg.role, content=msg.content)
         elif isinstance(msg, dict):
-            return cls(role=msg.get("role", ""), content=msg.get("content", ""))
+            return cls(
+                role=msg.get("role", ""),
+                content=msg.get("content", ""),
+                tool_calls=msg.get("tool_calls")
+            )
         elif isinstance(msg, (list, tuple)):
             return cls(role=str(msg[0]), content=str(msg[1]))
         else:
             raise TypeError(f"不支持的消息类型：{type(msg)}")
 
     def to_dict(self) -> dict:
-        return {"role": self.role, "content": self.content}
+        result = {"role": self.role, "content": self.content}
+        if self.tool_calls:
+            result["tool_calls"] = self.tool_calls
+        return result
 
 
 @dataclass
@@ -177,15 +188,17 @@ class Conversation:
         """
         self.validate(require_last_assistant=False)
         merged = self.merge_system_messages()
-        return [msg.to_dict() for msg in merged]
+        result = [msg.to_dict() for msg in merged]
+        logger.debug("[Conversation.to_api_messages] count=%d", len(result))
+        return result
 
     def append_user_message(self, content: str) -> None:
         """添加用户消息"""
         self.messages.append(ConversationMessage(role=Role.USER.value, content=content))
 
-    def append_assistant_message(self, content: str) -> None:
+    def append_assistant_message(self, content: str, tool_calls: Optional[List[dict]] = None) -> None:
         """添加助手消息"""
-        self.messages.append(ConversationMessage(role=Role.ASSISTANT.value, content=content))
+        self.messages.append(ConversationMessage(role=Role.ASSISTANT.value, content=content, tool_calls=tool_calls))
 
     def get_last_messages(self, count: int = 1) -> List[ConversationMessage]:
         """获取最后 n 条消息"""
@@ -203,6 +216,7 @@ class UserMessageBatch:
 
     def add_tool_response(self, content: str, tool_call_id: str) -> None:
         """添加工具响应"""
+        logger.debug("[UserMessageBatch.add_tool_response] id=%s content=%r", tool_call_id, content)
         self.tool_responses.append(ToolCallResponse(content=content, tool_call_id=tool_call_id))
 
     def add_user_content(self, content: str) -> None:

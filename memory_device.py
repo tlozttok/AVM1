@@ -1,5 +1,8 @@
 """AVM 内存设备：可挂载到内存路径的虚拟设备"""
 from typing import Any, Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryDevice:
@@ -24,9 +27,11 @@ class StringDevice(MemoryDevice):
         return "str"
 
     def get_value(self) -> str:
+        logger.debug("[StringDevice.get_value] -> %r", self._value)
         return self._value
 
     def set_value(self, value: str) -> None:
+        logger.debug("[StringDevice.set_value] %r", value)
         self._value = value
 
     def to_llm_string(self) -> str:
