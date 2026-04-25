@@ -92,7 +92,7 @@ def init_memory(mem: Memory) -> None:
     mem["system_prompt"] = system_prompt
 
     # 3. 系统提示词
-    user_prompt = """现在开始循环。"""
+    user_prompt = """现在开始循环。先读取input，再写入output，成功后再次读取input！！"""
     mem["user_prompt"] = user_prompt
 
     # 4. 用户输入内容模板

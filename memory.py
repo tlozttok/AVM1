@@ -19,21 +19,36 @@ class Memory:
         self._devices: dict = {}  # 存储已挂载的设备，key 为路径字符串
 
     def __getitem__(self, key: str) -> Any:
+        if key in self._devices:
+            return self._devices[key]
         return self._data[key]
 
     def __setitem__(self, key: str, value: Any) -> None:
+        if key in self._devices:
+            device = self._devices[key]
+            if hasattr(device, 'set_value'):
+                device.set_value(value)
+            else:
+                raise VMMemoryError(f"设备 {type(device).__name__} 不支持直接写入")
+            return
         self._data[key] = value
 
     def __contains__(self, key: str) -> bool:
-        return key in self._data
+        return key in self._devices or key in self._data
 
     def __delitem__(self, key: str) -> None:
+        if key in self._devices:
+            raise VMMemoryError(f"不能删除已挂载的设备：{key}，请先卸载")
         del self._data[key]
 
     def get(self, key: str, default: Any = None) -> Any:
+        if key in self._devices:
+            return self._devices[key]
         return self._data.get(key, default)
 
     def setdefault(self, key: str, default: Any = None) -> Any:
+        if key in self._devices:
+            return self._devices[key]
         return self._data.setdefault(key, default)
 
     def unwrap(self, value: list, for_llm: bool = True) -> Any:
@@ -138,25 +153,24 @@ class Memory:
         # 检查是否是设备路径
         if self.is_device_path(path):
             device = self.get_device(path)
-            if isinstance(device, StringDevice):
+            if hasattr(device, 'set_value'):
                 device.set_value(value)
             else:
                 raise VMMemoryError(f"设备 {type(device).__name__} 不支持直接写入")
             return
 
-        # 检查最后一个节点是否是设备路径（完整路径）
-        full_path_str = ".".join(path)
-        if full_path_str in self._devices:
-            device = self._devices[full_path_str]
-            if isinstance(device, StringDevice):
-                device.set_value(value)
-                return
-
         # 普通路径处理
         temp = self._data
         for key in path[:-1]:
-            if key not in temp:
-                temp[key] = {}
+            try:
+                exists = key in temp
+            except (TypeError, KeyError):
+                exists = False
+            if not exists:
+                try:
+                    temp[key] = {}
+                except TypeError:
+                    raise VMMemoryError(f"无法在 {type(temp).__name__} 类型下创建子路径")
             temp = temp[key]
         temp[path[-1]] = value
 

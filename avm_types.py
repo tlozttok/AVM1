@@ -22,6 +22,9 @@ class MetaList:
     def set_metadata(self, metadata: str):
         self._metadata = metadata
 
+    def __contains__(self, key):
+        return key in self._data
+
     def to_llm_string(self):
         """返回给 LLM 的字符串表示"""
         if self._metadata is not None:
@@ -67,6 +70,9 @@ class MetaDict:
 
     def set_metadata(self, metadata: str):
         self._metadata = metadata
+
+    def __contains__(self, key):
+        return key in self._data
 
     def to_llm_string(self):
         """返回给 LLM 的字符串表示"""

@@ -32,6 +32,9 @@ class StringDevice(MemoryDevice):
 
     def set_value(self, value: str) -> None:
         logger.debug("[StringDevice.set_value] %r", value)
+        if not isinstance(value, str):
+            from exceptions import VMMemoryError
+            raise VMMemoryError(f"StringDevice 只接受 str，got {type(value).__name__}")
         self._value = value
 
     def to_llm_string(self) -> str:
@@ -68,6 +71,16 @@ class MetaListDevice(MemoryDevice):
 
     def set_metadata(self, metadata: str) -> None:
         self._metadata = metadata
+
+    def set_value(self, value: list) -> None:
+        """整体替换内部数据（用于 Memory.set_by_path 的设备写入）"""
+        from exceptions import VMMemoryError
+        if not isinstance(value, list):
+            raise VMMemoryError(f"MetaListDevice 只接受 list，got {type(value).__name__}")
+        self._data = value
+
+    def __contains__(self, value) -> bool:
+        return value in self._data
 
     def to_llm_string(self) -> str:
         if self._metadata is not None:
@@ -117,6 +130,16 @@ class MetaDictDevice(MemoryDevice):
 
     def set_metadata(self, metadata: str) -> None:
         self._metadata = metadata
+
+    def set_value(self, value: dict) -> None:
+        """整体替换内部数据（用于 Memory.set_by_path 的设备写入）"""
+        from exceptions import VMMemoryError
+        if not isinstance(value, dict):
+            raise VMMemoryError(f"MetaDictDevice 只接受 dict，got {type(value).__name__}")
+        self._data = value
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
 
     def to_llm_string(self) -> str:
         if self._metadata is not None:

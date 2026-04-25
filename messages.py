@@ -98,6 +98,7 @@ class ConversationMessage:
     role: str
     content: str
     tool_calls: Optional[List[dict]] = None
+    tool_call_id: str = ""
 
     @classmethod
     def from_any(cls, msg: MessageInput) -> 'ConversationMessage':
@@ -108,7 +109,8 @@ class ConversationMessage:
             return cls(
                 role=msg.get("role", ""),
                 content=msg.get("content", ""),
-                tool_calls=msg.get("tool_calls")
+                tool_calls=msg.get("tool_calls"),
+                tool_call_id=msg.get("tool_call_id", "")
             )
         elif isinstance(msg, (list, tuple)):
             return cls(role=str(msg[0]), content=str(msg[1]))
@@ -119,6 +121,8 @@ class ConversationMessage:
         result = {"role": self.role, "content": self.content}
         if self.tool_calls:
             result["tool_calls"] = self.tool_calls
+        if self.tool_call_id:
+            result["tool_call_id"] = self.tool_call_id
         return result
 
 
@@ -199,6 +203,14 @@ class Conversation:
     def append_assistant_message(self, content: str, tool_calls: Optional[List[dict]] = None) -> None:
         """添加助手消息"""
         self.messages.append(ConversationMessage(role=Role.ASSISTANT.value, content=content, tool_calls=tool_calls))
+
+    def append_tool_message(self, content: str, tool_call_id: str) -> None:
+        """添加工具响应消息"""
+        self.messages.append(ConversationMessage(
+            role=Role.TOOL.value,
+            content=content,
+            tool_call_id=tool_call_id
+        ))
 
     def get_last_messages(self, count: int = 1) -> List[ConversationMessage]:
         """获取最后 n 条消息"""

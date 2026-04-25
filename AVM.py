@@ -430,11 +430,16 @@ class LMU:
         ]
         logger.debug("[LMU.exec_crt] messages=%s", messages)
         
+        extra_para=para.to_dict()
+        extra_para.pop("use_tool", None)
+        extra_para.pop("model", None)
+        
         response = self.client.chat.completions.create(
             model=para.get("model", "gpt-4"),
             messages=messages,
             tools=self.tools,
             tool_choice=para.get("use_tool"),
+            **extra_para
         )
 
         choice = response.choices[0]
@@ -442,7 +447,7 @@ class LMU:
 
         result = message.content
         return_calls = []
-        logger.debug("[LMU.exec_crt] response content=%r tool_calls=%s", result, bool(message.tool_calls))
+        logger.debug("[LMU.exec] response content=%r tool_calls=%s", result, bool(message.tool_calls))
 
         if message.tool_calls:
             for tool_call in message.tool_calls:
@@ -542,7 +547,8 @@ class LMU:
         response = self.client.chat.completions.create(
             model=para.get("model", "gpt-4"),
             messages=messages,
-            tools=self.tools if para.get("use_tool", None) else None,
+            tools=self.tools,
+            tool_choice=para.get("use_tool"),
             **extra_para
         )
 
@@ -551,7 +557,7 @@ class LMU:
 
         result = message.content
         return_calls = []
-        logger.debug("[LMU.exec_crt] response content=%r tool_calls=%s", result, bool(message.tool_calls))
+        logger.debug("[LMU.exec] response content=%r tool_calls=%s", result, bool(message.tool_calls))
 
         if message.tool_calls:
             for tool_call in message.tool_calls:
@@ -606,8 +612,15 @@ class LMU:
                         }
                     })
 
-        # 更新对话历史，assistant 消息必须保留 tool_calls
-        conversation.append_user_message(user_content or "")
+        # 更新对话历史：tool 响应 -> user 输入(如有) -> assistant 回复
+        # 必须先把 tool 响应保存到 conversation，否则下次 exec 时 conversation
+        # 中缺少 tool 消息，API 会报 "tool_calls 没有对应的 tool 响应"
+        for resp in user_msg_batch.tool_responses:
+            conversation.append_tool_message(resp.content, resp.tool_call_id)
+
+        if user_content:
+            conversation.append_user_message(user_content)
+
         tc_list = None
         if message.tool_calls:
             tc_list = [
