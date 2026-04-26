@@ -8,10 +8,20 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _wrap_value(value: Any) -> Any:
+    """将普通 dict/list 自动包装为 MetaDict/MetaList"""
+    if isinstance(value, dict) and not isinstance(value, MetaDict):
+        return MetaDict(data=value)
+    if isinstance(value, list) and not isinstance(value, MetaList):
+        return MetaList(data=value)
+    return value
+
+
 class Memory:
     """
     内存类
     封装内存访问逻辑，支持 $（递归解引用）和 &（一层解引用）
+    注意：MEM 中只存储 MetaDict/MetaList/str，不会出现普通 dict/list
     """
 
     def __init__(self):
@@ -31,7 +41,7 @@ class Memory:
             else:
                 raise VMMemoryError(f"设备 {type(device).__name__} 不支持直接写入")
             return
-        self._data[key] = value
+        self._data[key] = _wrap_value(value)
 
     def __contains__(self, key: str) -> bool:
         return key in self._devices or key in self._data
@@ -136,11 +146,6 @@ class Memory:
             return value.to_llm_string()
         elif isinstance(value, MetaDict):
             return value.to_llm_string()
-        elif isinstance(value, list):
-            # 约定：列表中第一个元素是元数据
-            return value[0] if value else ""
-        elif isinstance(value, dict):
-            return f"dict.keys:{value.keys()}"
         else:
             return value
 
@@ -148,6 +153,8 @@ class Memory:
         """
         根据路径设置值
         :param path: 路径列表，如 ['key', 'subkey']
+        特殊规则：如果 path 终点的现有值是 MetaList/MetaDict，
+        则写入被解释为修改其元数据，而不是替换整个对象。
         """
         logger.debug("[set_by_path] path=%s value=%r", path, value)
         # 检查是否是设备路径
@@ -168,11 +175,21 @@ class Memory:
                 exists = False
             if not exists:
                 try:
-                    temp[key] = {}
+                    temp[key] = MetaDict(data={})
                 except TypeError:
                     raise VMMemoryError(f"无法在 {type(temp).__name__} 类型下创建子路径")
             temp = temp[key]
-        temp[path[-1]] = value
+
+        last_key = path[-1]
+        # 如果终点已存在且是 MetaList/MetaDict，写入即修改元数据
+        if last_key in temp:
+            existing = temp[last_key]
+            if isinstance(existing, (MetaList, MetaDict)):
+                existing.set_metadata(value)
+                logger.info("[set_by_path] set metadata for %s = %r", ".".join(path), value)
+                return
+
+        temp[last_key] = _wrap_value(value)
 
     def set(self, ref: str, value: Any) -> None:
         """
@@ -269,7 +286,7 @@ class Memory:
         # 检查类型
         if isinstance(current, str):
             raise VMMemoryError(f"不能在字符串类型的路径下创建新键：{ref}")
-        elif isinstance(current, list):
+        elif isinstance(current, (list, MetaList)):
             # 期望第二个值是索引数字
             if not key.isdigit():
                 raise VMMemoryError(f"列表类型的路径下，key 必须是数字索引：{key}")
@@ -280,17 +297,17 @@ class Memory:
             if mem_type == 'str':
                 current[index] = ""
             elif mem_type == 'dict':
-                current[index] = {}
+                current[index] = MetaDict(data={})
             elif mem_type == 'list':
-                current[index] = []
-        elif isinstance(current, dict):
+                current[index] = MetaList(data=[])
+        elif isinstance(current, (dict, MetaDict)):
             # 在字典中创建新键
             if mem_type == 'str':
                 current[key] = ""
             elif mem_type == 'dict':
-                current[key] = {}
+                current[key] = MetaDict(data={})
             elif mem_type == 'list':
-                current[key] = []
+                current[key] = MetaList(data=[])
         else:
             raise VMMemoryError(f"不支持在类型 {type(current).__name__} 下创建新键")
 

@@ -37,6 +37,13 @@ class MetaList:
     def __iter__(self):
         return iter(self._data)
 
+    def __eq__(self, other):
+        if isinstance(other, MetaList):
+            return self._data == other._data
+        if isinstance(other, list):
+            return self._data == other
+        return NotImplemented
+
     def __repr__(self):
         return f"MetaList(data={self._data}, metadata={self._metadata})"
 
@@ -80,8 +87,15 @@ class MetaDict:
             return self._metadata
         return f"dict[keys={list(self._data.keys())}]"
 
-    def  to_dict(self):
+    def to_dict(self):
         return self._data.copy()
+
+    def __eq__(self, other):
+        if isinstance(other, MetaDict):
+            return self._data == other._data
+        if isinstance(other, dict):
+            return self._data == other
+        return NotImplemented
 
     def __repr__(self):
         return f"MetaDict(data={self._data}, metadata={self._metadata})"

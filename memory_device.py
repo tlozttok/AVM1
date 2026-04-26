@@ -97,6 +97,117 @@ class MetaListDevice(MemoryDevice):
         return f"MetaListDevice(data={self._data}, metadata={self._metadata})"
 
 
+class InputsListDevice(MetaListDevice):
+    """伪列表用户输入设备
+    挂载到 $MEM.inputs，模拟一个不断增长的输入列表。
+    - 读取 $MEM.inputs 时返回列表元数据
+    - 读取 $MEM.inputs.-1 时阻塞请求用户输入，追加到列表后返回
+    - 读取其他索引时，像正常列表一样返回已有元素
+    """
+
+    def __init__(self, data=None, metadata=None):
+        super().__init__(data=data, metadata=metadata)
+        self._pending_input = False
+
+    def _parse_index(self, index):
+        if isinstance(index, str):
+            try:
+                return int(index)
+            except ValueError:
+                from exceptions import VMMemoryError
+                raise VMMemoryError(f"InputsListDevice 索引必须是整数，got {index!r}")
+        return index
+
+    def __getitem__(self, index):
+        index = self._parse_index(index)
+        if index == -1:
+            # 伪列表语义：读最后一个元素 = 请求新用户输入
+            self._pending_input = True
+            try:
+                print("\n[用户输入请求] 请输入：", end="", flush=True)
+                user_input = input()
+            except EOFError:
+                user_input = ""
+            finally:
+                self._pending_input = False
+            self._data.append(user_input)
+            logger.info("[InputsListDevice] received input: %r", user_input)
+            return user_input
+        # 正常列表访问
+        return self._data[index]
+
+    def __setitem__(self, index, value):
+        from exceptions import VMMemoryError
+        raise VMMemoryError("InputsListDevice 是只读的，不允许写入")
+
+    def set_value(self, value):
+        from exceptions import VMMemoryError
+        raise VMMemoryError("InputsListDevice 是只读的，不允许写入")
+
+    def to_llm_string(self) -> str:
+        if self._pending_input:
+            return "[等待用户输入...]"
+        if self._metadata is not None:
+            return self._metadata
+        if not self._data:
+            return "inputs[list_len=0]"
+        recent = self._data[-3:]
+        return f"inputs[list_len={len(self._data)}, recent={recent!r}]"
+
+
+class OutputsListDevice(MetaListDevice):
+    """伪列表用户输出设备
+    挂载到 $MEM.outputs，模拟一个输出列表。
+    - 读取 $MEM.outputs 时返回列表元数据
+    - 写入 $MEM.outputs.-1 时以追加方式写入，并打印到屏幕
+    - 读取其他索引时，像正常列表一样返回已有元素
+    - 不可通过索引修改已有元素，只支持追加（通过 -1 写入）
+    """
+
+    def _parse_index(self, index):
+        if isinstance(index, str):
+            try:
+                return int(index)
+            except ValueError:
+                from exceptions import VMMemoryError
+                raise VMMemoryError(f"OutputsListDevice 索引必须是整数，got {index!r}")
+        return index
+
+    def __getitem__(self, index):
+        index = self._parse_index(index)
+        return self._data[index]
+
+    def __setitem__(self, index, value):
+        index = self._parse_index(index)
+        if index == -1:
+            self.append(value)
+        else:
+            from exceptions import VMMemoryError
+            raise VMMemoryError("OutputsListDevice 只支持追加写入（索引 -1），不允许修改已有元素")
+
+    def append(self, value):
+        if not isinstance(value, str):
+            from exceptions import VMMemoryError
+            raise VMMemoryError(f"OutputsListDevice 只接受 str，got {type(value).__name__}")
+        self._data.append(value)
+        print(f"\n[Agent 输出] {value}")
+
+    def set_value(self, value):
+        """支持直接写入单个字符串（追加）或列表（替换）"""
+        if isinstance(value, list):
+            self._data = [str(v) for v in value]
+        elif isinstance(value, str):
+            self.append(value)
+        else:
+            from exceptions import VMMemoryError
+            raise VMMemoryError(f"OutputsListDevice 只接受 str 或 list，got {type(value).__name__}")
+
+    def to_llm_string(self) -> str:
+        if self._metadata is not None:
+            return self._metadata
+        return f"outputs[list_len={len(self._data)}, items={self._data!r}]"
+
+
 class MetaDictDevice(MemoryDevice):
     """假装是 MetaDict 的设备"""
 
