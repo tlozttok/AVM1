@@ -83,9 +83,7 @@ class MetaListDevice(MemoryDevice):
         return value in self._data
 
     def to_llm_string(self) -> str:
-        if self._metadata is not None:
-            return self._metadata
-        return f"list[len={len(self._data)}]"
+        return f"list[len={len(self._data)},metadata={self._metadata!r}]"
 
     def __len__(self) -> int:
         return len(self._data)
@@ -147,12 +145,10 @@ class InputsListDevice(MetaListDevice):
     def to_llm_string(self) -> str:
         if self._pending_input:
             return "[等待用户输入...]"
-        if self._metadata is not None:
-            return self._metadata
         if not self._data:
-            return "inputs[list_len=0]"
+            return f"inputs[list_len=0,metadata={self._metadata!r}]"
         recent = self._data[-3:]
-        return f"inputs[list_len={len(self._data)}, recent={recent!r}]"
+        return f"inputs[list_len={len(self._data)}, recent={recent!r},metadata={self._metadata!r}]"
 
 
 class OutputsListDevice(MetaListDevice):
@@ -203,9 +199,7 @@ class OutputsListDevice(MetaListDevice):
             raise VMMemoryError(f"OutputsListDevice 只接受 str 或 list，got {type(value).__name__}")
 
     def to_llm_string(self) -> str:
-        if self._metadata is not None:
-            return self._metadata
-        return f"outputs[list_len={len(self._data)}, items={self._data!r}]"
+        return f"outputs[list_len={len(self._data)}, items={self._data!r},metadata={self._metadata!r}]"
 
 
 class MetaDictDevice(MemoryDevice):
@@ -253,9 +247,7 @@ class MetaDictDevice(MemoryDevice):
         return key in self._data
 
     def to_llm_string(self) -> str:
-        if self._metadata is not None:
-            return self._metadata
-        return f"dict[keys={list(self._data.keys())}]"
+        return f"dict[keys={list(self._data.keys())},metadata={self._metadata!r}]"
 
     def __repr__(self) -> str:
         return f"MetaDictDevice(data={self._data}, metadata={self._metadata})"

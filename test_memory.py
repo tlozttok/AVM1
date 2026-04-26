@@ -80,13 +80,13 @@ class TestMemoryUnwrap:
         mem = Memory()
         mem["d"] = MetaDict(data={"k": "v"})
         result = mem.unwrap(["$", "d"], for_llm=True)
-        assert result == "dict[keys=['k']]"
+        assert result == "dict[keys=['k'],metadata=None]"
 
     def test_unwrap_metalist(self):
         mem = Memory()
         mem["l"] = MetaList(data=[1, 2, 3])
         result = mem.unwrap(["$", "l"], for_llm=True)
-        assert result == "list[len=3]"
+        assert result == "list[len=3,metadata=None]"
 
 
 class TestMemoryDevice:

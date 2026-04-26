@@ -25,7 +25,7 @@ class Memory:
     """
 
     def __init__(self):
-        self._data: dict = {}
+        self._data = MetaDict(data={})
         self._devices: dict = {}  # 存储已挂载的设备，key 为路径字符串
 
     def __getitem__(self, key: str) -> Any:
@@ -126,6 +126,16 @@ class Memory:
         if self.is_device_path(path):
             return self.get_device(path)
 
+        # 检查路径前缀是否命中设备：如 inputs.-1 中 inputs 是设备
+        for i in range(len(path) - 1, 0, -1):
+            prefix = path[:i]
+            if self.is_device_path(prefix):
+                device = self.get_device(prefix)
+                current = device
+                for key in path[i:]:
+                    current = current[key]
+                return current
+
         temp = self._data
         for key in path:
             temp = temp[key]
@@ -165,6 +175,19 @@ class Memory:
             else:
                 raise VMMemoryError(f"设备 {type(device).__name__} 不支持直接写入")
             return
+
+        # 检查路径前缀是否命中设备：如 outputs.-1 中 outputs 是设备
+        for i in range(len(path) - 1, 0, -1):
+            prefix = path[:i]
+            if self.is_device_path(prefix):
+                device = self.get_device(prefix)
+                current = device
+                for key in path[i:-1]:
+                    current = current[key]
+                last_key = path[-1]
+                current[last_key] = value
+                logger.info("[set_by_path] device write: %s[%s] = %r", prefix, last_key, value)
+                return
 
         # 普通路径处理
         temp = self._data

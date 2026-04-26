@@ -27,9 +27,7 @@ class MetaList:
 
     def to_llm_string(self):
         """返回给 LLM 的字符串表示"""
-        if self._metadata is not None:
-            return self._metadata
-        return f"list[len={len(self._data)}]"
+        return f"list[len={len(self._data)},metadata={self._metadata!r}]"
 
     def __len__(self):
         return len(self._data)
@@ -60,6 +58,15 @@ class MetaDict:
     def __setitem__(self, key, value):
         self._data[key] = value
 
+    def __delitem__(self, key):
+        del self._data[key]
+
+    def setdefault(self, key, default=None):
+        return self._data.setdefault(key, default)
+
+    def copy(self):
+        return MetaDict(data=self._data.copy(), metadata=self._metadata)
+
     def keys(self):
         return self._data.keys()
     
@@ -83,9 +90,7 @@ class MetaDict:
 
     def to_llm_string(self):
         """返回给 LLM 的字符串表示"""
-        if self._metadata is not None:
-            return self._metadata
-        return f"dict[keys={list(self._data.keys())}]"
+        return f"dict[keys={list(self._data.keys())},metadata={self._metadata!r}]"
 
     def to_dict(self):
         return self._data.copy()

@@ -116,11 +116,6 @@ class CreateInstruction(Instruction):
         result, return_calls, conversation = core.lmu.exec_crt(system, user, para)
         logger.debug("[create] result=%r return_calls=%s", result, len(return_calls))
 
-        # 处理 result：存入 usr_tool_reg[utr_index]
-        if result and self.utr_index != -1:
-            user_batch = core.usr_tool_reg[self.utr_index]
-            user_batch.add_tool_response(result, self.call_id)
-
         # 处理 return_calls
         if return_calls:
             logger.info("[create] return_calls=%d", len(return_calls))
@@ -146,6 +141,9 @@ class CreateInstruction(Instruction):
                     core.command_stack.append(instr)
             return CRT.CONTINUE
         else:
+            if result and self.utr_index != -1:
+                user_batch = core.usr_tool_reg[self.utr_index]
+                user_batch.add_tool_response(result, self.call_id)
             return CRT.EXIT
 
 
@@ -176,11 +174,6 @@ class ExecInstruction(Instruction):
         logger.debug("[exec] result=%r return_calls=%d", result, len(return_calls))
         user_batch.clear()
 
-        # 处理 result
-        if result and self.utr_index != -1:
-            parent_batch = core.usr_tool_reg[self.utr_index]
-            parent_batch.add_tool_response(result, self.call_id)
-
         # 处理 return_calls：不弹出当前指令，直接压栈
         if return_calls:
             logger.info("[exec] pushing %d sub-instructions", len(return_calls))
@@ -190,6 +183,9 @@ class ExecInstruction(Instruction):
                     core.command_stack.append(instr)
             return CRT.CONTINUE
         else:
+            if result and self.utr_index != -1:
+                parent_batch = core.usr_tool_reg[self.utr_index]
+                parent_batch.add_tool_response(result, self.call_id)
             # pop 对应的寄存器
             if user_msg_idx is not None and user_msg_idx < len(core.usr_tool_reg):
                 core.usr_tool_reg.pop(user_msg_idx)
@@ -327,11 +323,11 @@ class LMU:
                 "properties": {
                     "system_ref": {
                         "type": "string",
-                        "description": "系统提示词引用（如 $MEM.sys）",
+                        "description": "系统提示词引用（如 $MEM.sys），也可以是字面值（不以$或&开头）",
                     },
                     "user_ref": {
                         "type": "string",
-                        "description": "用户消息引用（如 $MEM.usr）",
+                        "description": "用户消息引用（如 $MEM.usr），也可以是字面值（不以$或&开头）",
                     },
                     "para_ref": {
                         "type": "string",
@@ -643,7 +639,6 @@ SYSTEM = "system"
 USER = "user"
 ASSISTANT = "assistant"
 
-
 class Core:
     def __init__(self):
         self.command_stack = []
@@ -651,6 +646,7 @@ class Core:
         self.usr_tool_reg = []  # 存储 UserMessageBatch 对象
         self.mem = Memory()
         self.lmu = LMU()
+        self.debug = False
 
 
 
@@ -662,6 +658,8 @@ class Core:
                 instruction = parse_instruction(instruction)
             logger.debug("[Core.run] executing %s(call_id=%s)", type(instruction).__name__, getattr(instruction, 'call_id', 'N/A'))
             return_type = instruction.execute(self)
+            if self.debug:
+                input("[核心循环] Press Enter to continue...")
             if return_type == CRT.EXIT:
                 self.command_stack.pop()
                 logger.debug("[Core.run] EXIT, stack_size=%d", len(self.command_stack))
