@@ -51,9 +51,12 @@ class MemoryReadInstruction(Instruction):
             content = core.unwrap(self.ref, for_llm=True)
             logger.debug("[memory_read] content=%r", content)
             user_batch.add_tool_response(content, self.call_id)
-        except VMMemoryError as e:
+        except (VMMemoryError, KeyError, IndexError, TypeError, ValueError) as e:
             logger.error("[memory_read] error: %s", e)
             user_batch.add_tool_response(f"Error: {e}", self.call_id)
+        except Exception as e:
+            logger.exception("[memory_read] unexpected error")
+            user_batch.add_tool_response(f"Internal Error: {type(e).__name__}: {e}", self.call_id)
         logger.info("[memory_read] done call_id=%s", self.call_id)
         return CRT.EXIT
 
@@ -714,7 +717,9 @@ class Core:
                         data = conn.recv(4096).decode("utf-8").strip()
                         if data:
                             result = self.mem.query_path(data)
-                            conn.sendall(result.encode("utf-8"))
+                            payload = result.encode("utf-8")
+                            header = format(len(payload), "08x").encode()
+                            conn.sendall(header + payload)
                     except Exception:
                         pass
             sock.close()
@@ -754,7 +759,10 @@ class Core:
         """解引用值
         只处理 $last_msg_reg 和 $usr_tool_reg 的寄存器访问
         其他情况调用 self.mem.unwrap
+        不以 $ 开头则视为字面值直接返回
         """
+        if not value.startswith("$"):
+            return value
         value = [value[0], *value[1:].split(".")]
         if value[1] == "last_msg_reg":
             assert value[0] == "$"

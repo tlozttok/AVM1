@@ -127,27 +127,48 @@ class Memory:
 
     def _get_by_path(self, path: list) -> Any:
         """
-        根据路径获取值
+        根据路径获取值，访问前先检查地址存在性
         :param path: 路径列表，如 ['key', 'subkey']
         """
-        # 首先检查是否是设备路径
+        if not path:
+            return self._data
+
+        # 精确设备路径匹配
         if self.is_device_path(path):
             return self.get_device(path)
 
-        # 检查路径前缀是否命中设备：如 inputs.-1 中 inputs 是设备
+        # 设备路径前缀匹配：如 inputs.-1 中 inputs 是设备
         for i in range(len(path) - 1, 0, -1):
             prefix = path[:i]
             if self.is_device_path(prefix):
                 device = self.get_device(prefix)
                 current = device
-                for key in path[i:]:
+                for j, key in enumerate(path[i:], start=i):
+                    self._check_access(current, key, path)
                     current = current[key]
                 return current
 
-        temp = self._data
-        for key in path:
-            temp = temp[key]
-        return temp
+        # 普通路径：从 _data 根开始逐级检查后访问
+        current = self._data
+        for i, key in enumerate(path):
+            self._check_access(current, key, path)
+            current = current[key]
+        return current
+
+    @staticmethod
+    def _check_access(current, key: str, path: list):
+        """检查 key 是否可访问，不可则抛出 VMMemoryError"""
+        partial = ".".join(str(k) for k in path)
+        if isinstance(current, (dict, MetaDict)):
+            if key not in current:
+                raise VMMemoryError(f"键 {key!r} 不存在 (路径: {partial})")
+        elif isinstance(current, (list, MetaList)):
+            try:
+                idx = int(key)
+            except ValueError:
+                raise VMMemoryError(f"列表索引必须是数字，got {key!r} (路径: {partial})")
+            if idx < -len(current) or idx >= len(current):
+                raise VMMemoryError(f"索引越界：{idx}，列表长度：{len(current)} (路径: {partial})")
 
     def _convert_for_llm(self, value: Any, for_llm: bool) -> Any:
         """
@@ -383,6 +404,10 @@ class Memory:
             return value.to_llm_string()
         if isinstance(value, MetaList):
             return value.to_llm_string()
+        if isinstance(value, str):
+            if len(value) > 200:
+                return repr(value[:200] + "...")
+            return repr(value)
         return repr(value)
 
     def dump_tree(self, max_str_len: int = 80, max_items: int = 20) -> str:

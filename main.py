@@ -32,17 +32,46 @@ def load_config(path: str = "config.json") -> dict:
 
 
 def setup_logging(level: str = "INFO", log_file: str | None = None) -> None:
-    """配置日志系统"""
-    handlers = [logging.StreamHandler(sys.stderr)]
-    if log_file:
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    """配置日志系统 — 控制台带颜色，文件无颜色"""
 
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    class _ColoredFormatter(logging.Formatter):
+        _COLORS = {
+            "DEBUG":    "\033[90m",      # 灰色
+            "INFO":     "\033[32m",      # 绿色
+            "WARNING":  "\033[33m",      # 黄色
+            "ERROR":    "\033[31m",      # 红色
+            "CRITICAL": "\033[1;31m",    # 加粗红
+        }
+        _NAME_COLOR = "\033[36m"         # 青色 (logger name)
+        _RESET = "\033[0m"
+
+        def format(self, record):
+            lvl = record.levelname
+            color = self._COLORS.get(lvl, "")
+            record.levelname = f"{color}{lvl:8}{self._RESET}"
+            record.name = f"{self._NAME_COLOR}{record.name}{self._RESET}"
+            return super().format(record)
+
+    console_fmt = _ColoredFormatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
-        handlers=handlers,
     )
+    file_fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(console_fmt)
+    root.addHandler(sh)
+
+    if log_file:
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setFormatter(file_fmt)
+        root.addHandler(fh)
 
 
 def _json_to_meta(value):

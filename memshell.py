@@ -3,11 +3,21 @@ import socket
 import sys
 
 HELP = """命令:
-  <path>    查询路径，如 $MEM.calc.result1 或 $MEM.inputs
+  <path>    查询路径，如 $MEM.calc.result1 或直接 system
   /h, /help 帮助
   /t, /tree 显示完整树
   /q, /quit 退出
 """
+
+
+def _recv_full(sock, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("server closed")
+        buf += chunk
+    return buf
 
 
 def main():
@@ -47,15 +57,22 @@ def main():
             line = "$MEM"
 
         try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(sock_path)
             sock.sendall(line.encode("utf-8"))
-            resp = sock.recv(8192).decode("utf-8")
+
+            header = _recv_full(sock, 8)
+            length = int(header.decode(), 16)
+            resp = _recv_full(sock, length).decode("utf-8")
+
             print(resp)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionError):
             print("连接断开")
             break
+        finally:
+            sock.close()
         print()
 
-    sock.close()
     print("退出")
 
 
