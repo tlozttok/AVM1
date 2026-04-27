@@ -9,11 +9,19 @@ logger = logging.getLogger(__name__)
 
 
 def _wrap_value(value: Any) -> Any:
-    """将普通 dict/list 自动包装为 MetaDict/MetaList"""
-    if isinstance(value, dict) and not isinstance(value, MetaDict):
-        return MetaDict(data=value)
-    if isinstance(value, list) and not isinstance(value, MetaList):
-        return MetaList(data=value)
+    """将普通 dict/list 递归包装为 MetaDict/MetaList。已包装的也递归检查内部数据。"""
+    if isinstance(value, MetaDict):
+        for k, v in list(value.items()):
+            value[k] = _wrap_value(v)
+        return value
+    if isinstance(value, MetaList):
+        for i in range(len(value)):
+            value[i] = _wrap_value(value[i])
+        return value
+    if isinstance(value, dict):
+        return MetaDict(data={k: _wrap_value(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return MetaList(data=[_wrap_value(v) for v in value])
     return value
 
 
@@ -156,6 +164,10 @@ class Memory:
             return value.to_llm_string()
         elif isinstance(value, MetaDict):
             return value.to_llm_string()
+        elif isinstance(value, dict):
+            raise VMMemoryError(f"MEM 中不应存在普通 dict，请检查写入路径。keys={list(value.keys())[:5]}")
+        elif isinstance(value, list):
+            raise VMMemoryError(f"MEM 中不应存在普通 list，请检查写入路径。len={len(value)}")
         else:
             return value
 
@@ -333,6 +345,112 @@ class Memory:
                 current[key] = MetaList(data=[])
         else:
             raise VMMemoryError(f"不支持在类型 {type(current).__name__} 下创建新键")
+
+    def query_path(self, ref: str) -> str:
+        """类似 memory_read，但不触发设备副作用（不阻塞等待用户输入等）"""
+        if ref.startswith("$"):
+            parts = ref[1:].split(".")
+            if parts and parts[0] == "MEM":
+                parts = parts[1:]
+        else:
+            parts = ref.split(".")
+
+        if not parts:
+            return self._data.to_llm_string()
+
+        value = self._data
+        for i, key in enumerate(parts):
+            current_prefix = parts[: i + 1]
+            if self.is_device_path(current_prefix):
+                device = self.get_device(current_prefix)
+                return f"[{type(device).__name__}] {device.to_llm_string()}"
+
+            if isinstance(value, (MetaDict, dict)):
+                if key not in value:
+                    return f"Error: key {key!r} not found (keys: {list(value.keys())[:10]})"
+                value = value[key]
+            elif isinstance(value, (MetaList, list)):
+                try:
+                    value = value[int(key)]
+                except (ValueError, IndexError) as e:
+                    return f"Error: {e}"
+            else:
+                return repr(value)
+
+        if isinstance(value, MemoryDevice):
+            return f"[{type(value).__name__}] {value.to_llm_string()}"
+        if isinstance(value, MetaDict):
+            return value.to_llm_string()
+        if isinstance(value, MetaList):
+            return value.to_llm_string()
+        return repr(value)
+
+    def dump_tree(self, max_str_len: int = 80, max_items: int = 20) -> str:
+        """将整个内存树格式化为可读字符串，用于实时监控"""
+
+        def _render(value, indent: str, prefix: str, depth: int) -> list:
+            lines = []
+            if depth > 8:
+                lines.append(f"{indent}{prefix}<max depth>")
+                return lines
+
+            if isinstance(value, MemoryDevice):
+                name = type(value).__name__
+                summary = value.to_llm_string()
+                lines.append(f"{indent}{prefix}[dev:{name}] {summary}")
+                return lines
+
+            if isinstance(value, MetaDict):
+                meta = value.get_metadata()
+                keys = list(value.keys())
+                header = f"dict[keys={keys[:max_items]}{'...' if len(keys) > max_items else ''}"
+                if meta:
+                    header += f", meta={meta!r}"
+                header += "]"
+                lines.append(f"{indent}{prefix}{header}")
+                child_indent = indent + "  "
+                for k in keys[:max_items]:
+                    try:
+                        lines.extend(_render(value[k], child_indent, f".{k}  ", depth + 1))
+                    except Exception as e:
+                        lines.append(f"{child_indent}.{k}  <error: {e}>")
+                return lines
+
+            if isinstance(value, MetaList):
+                meta = value.get_metadata()
+                header = f"list[len={len(value)}"
+                if meta:
+                    header += f", meta={meta!r}"
+                header += "]"
+                lines.append(f"{indent}{prefix}{header}")
+                child_indent = indent + "  "
+                limit = min(len(value), max_items)
+                for i in range(limit):
+                    try:
+                        lines.extend(_render(value[i], child_indent, f"[{i}]  ", depth + 1))
+                    except Exception as e:
+                        lines.append(f"{child_indent}[{i}]  <error: {e}>")
+                if len(value) > max_items:
+                    lines.append(f"{child_indent}... ({len(value) - max_items} more)")
+                return lines
+
+            if isinstance(value, str):
+                if len(value) > max_str_len:
+                    value = value[:max_str_len] + "..."
+                lines.append(f"{indent}{prefix}str: {value!r}")
+                return lines
+
+            lines.append(f"{indent}{prefix}{type(value).__name__}: {value!r}")
+            return lines
+
+        root_lines = _render(self._data, "", "$MEM  ", 0)
+        # 追加设备列表
+        if self._devices:
+            root_lines.append("")
+            root_lines.append("--- mounted devices ---")
+            for path, dev in self._devices.items():
+                root_lines.append(f"  {path}  [{type(dev).__name__}]  {dev.to_llm_string()}")
+        return "\n".join(root_lines)
 
     def to_dict(self) -> dict:
         """返回底层字典的副本"""

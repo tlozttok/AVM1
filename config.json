@@ -1,6 +1,6 @@
 {
   "log_level": "DEBUG",
-  "log_file": null,
-  "debug": true,
+  "log_file": "log/log.txt",
+  "debug": false,
   "prompt": "program/deepseek_simplified.json"
 }

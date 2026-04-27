@@ -29,6 +29,18 @@ class MetaList:
         """返回给 LLM 的字符串表示"""
         return f"list[len={len(self._data)},metadata={self._metadata!r}]"
 
+    def to_list(self):
+        """递归转换为普通 list（用于 API 参数等需要纯 JSON 结构的场景）"""
+        result = []
+        for v in self._data:
+            if isinstance(v, MetaDict):
+                result.append(v.to_dict())
+            elif isinstance(v, MetaList):
+                result.append(v.to_list())
+            else:
+                result.append(v)
+        return result
+
     def __len__(self):
         return len(self._data)
 
@@ -93,7 +105,16 @@ class MetaDict:
         return f"dict[keys={list(self._data.keys())},metadata={self._metadata!r}]"
 
     def to_dict(self):
-        return self._data.copy()
+        """递归转换为普通 dict（用于 API 参数等需要纯 JSON 结构的场景）"""
+        result = {}
+        for k, v in self._data.items():
+            if isinstance(v, MetaDict):
+                result[k] = v.to_dict()
+            elif isinstance(v, MetaList):
+                result[k] = v.to_list()
+            else:
+                result[k] = v
+        return result
 
     def __eq__(self, other):
         if isinstance(other, MetaDict):

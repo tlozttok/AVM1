@@ -1,6 +1,7 @@
 """AVM 主程序入口"""
 import json
 import logging
+import os
 import sys
 from memory import Memory
 from memory_device import InputsListDevice, OutputsListDevice
@@ -81,7 +82,7 @@ def init_memory(mem: Memory, prompt_path: str) -> None:
         "model": "deepseek-v4-flash",
         "extra_body": {"thinking": {"type": "disabled"}},
         "use_tool": "auto"
-    })
+    },metadata="默认模型调用参数,最好就用这个")
     mem["model_params"] = model_params
 
     # 3. 挂载伪列表输入/输出设备
@@ -109,6 +110,12 @@ def main():
     # 创建 Core 实例
     core = Core()
     core.debug = config.get("debug", False)
+
+    # 内存实时监控（通过环境变量 AVM_MEMDUMP 指定输出文件路径）
+    mem_dump_file = os.environ.get("AVM_MEMDUMP")
+    mem_sock_path = os.environ.get("AVM_MEMSOCK")
+    if mem_dump_file:
+        core.start_memory_monitor(mem_dump_file, socket_path=mem_sock_path)
 
     # 初始化内存
     init_memory(core.mem, prompt_path=config["prompt"])

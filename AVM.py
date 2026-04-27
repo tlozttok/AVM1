@@ -6,6 +6,10 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import json
 import logging
+import os
+import socket
+import threading
+import time
 
 from avm_types import MetaList, MetaDict
 from exceptions import VMSyntaxError, VMMemoryError
@@ -43,9 +47,13 @@ class MemoryReadInstruction(Instruction):
     def execute(self, core: 'Core') -> CRT:
         logger.info("[memory_read] call_id=%s ref=%s", self.call_id, self.ref)
         user_batch = core.usr_tool_reg[self.utr_index]
-        content = core.unwrap(self.ref, for_llm=True)
-        logger.debug("[memory_read] content=%r", content)
-        user_batch.add_tool_response(content, self.call_id)
+        try:
+            content = core.unwrap(self.ref, for_llm=True)
+            logger.debug("[memory_read] content=%r", content)
+            user_batch.add_tool_response(content, self.call_id)
+        except VMMemoryError as e:
+            logger.error("[memory_read] error: %s", e)
+            user_batch.add_tool_response(f"Error: {e}", self.call_id)
         logger.info("[memory_read] done call_id=%s", self.call_id)
         return CRT.EXIT
 
@@ -331,7 +339,7 @@ class LMU:
                     },
                     "para_ref": {
                         "type": "string",
-                        "description": "参数引用（如 $MEM.para）",
+                        "description": "调用模型时候的参数的引用（如 $MEM.para），请从内存中寻找格式正确的",
                     },
                     "mode": {
                         "type": "string",
@@ -413,6 +421,19 @@ class LMU:
 
     tools = [command_tool, create_cmd_tool, memory_read_tool, memory_write_tool, memory_make_tool]
 
+    # OpenAI API 允许作为 kwargs 传入的参数白名单
+    _API_PARAM_KEYS = {
+        "temperature", "max_tokens", "top_p", "frequency_penalty",
+        "presence_penalty", "stop", "stream", "extra_body",
+        "seed", "logit_bias", "logprobs", "top_logprobs",
+        "n", "response_format", "timeout",
+    }
+
+    def _filter_api_params(self, para: dict) -> dict:
+        """只保留 OpenAI API 支持的参数，过滤掉业务数据"""
+        return {k: v for k, v in para.items() if k in self._API_PARAM_KEYS}
+
+
     def exec_crt(self, system_prompt: str, user_prompt: str, para: dict):
         """处理字符串输入的 create 模式
         system_prompt: 字符串，系统提示词
@@ -425,16 +446,15 @@ class LMU:
             UserMessage(content=user_prompt).to_dict()
         ]
         logger.debug("[LMU.exec_crt] messages=%s", messages)
-        
-        extra_para=para.to_dict()
-        extra_para.pop("use_tool", None)
-        extra_para.pop("model", None)
-        
+
+        extra_para = self._filter_api_params(para.to_dict())
+        use_tool = para.get("use_tool")
+
         response = self.client.chat.completions.create(
             model=para.get("model", "gpt-4"),
             messages=messages,
             tools=self.tools,
-            tool_choice=para.get("use_tool"),
+            tool_choice=use_tool,
             **extra_para
         )
 
@@ -536,15 +556,14 @@ class LMU:
         if user_content:
             messages.append({"role": "user", "content": user_content})
 
-        extra_para=para.to_dict()
-        extra_para.pop("use_tool", None)
-        extra_para.pop("model", None)
-        
+        extra_para = self._filter_api_params(para.to_dict())
+        use_tool = para.get("use_tool")
+
         response = self.client.chat.completions.create(
             model=para.get("model", "gpt-4"),
             messages=messages,
             tools=self.tools,
-            tool_choice=para.get("use_tool"),
+            tool_choice=use_tool,
             **extra_para
         )
 
@@ -647,6 +666,64 @@ class Core:
         self.mem = Memory()
         self.lmu = LMU()
         self.debug = False
+        self._monitor_thread = None
+        self._monitor_running = False
+
+    def start_memory_monitor(self, output_file: str, interval: float = 0.3,
+                             socket_path: str | None = None):
+        """启动后台线程，定期将内存树写入文件，可选开启 Unix socket 交互查询"""
+        self._monitor_running = True
+
+        def _monitor_loop():
+            while self._monitor_running:
+                try:
+                    dump = self.mem.dump_tree()
+                    with open(output_file, "w", encoding="utf-8") as f:
+                        f.write(dump)
+                except Exception:
+                    pass
+                time.sleep(interval)
+
+        self._monitor_thread = threading.Thread(target=_monitor_loop, daemon=True)
+        self._monitor_thread.start()
+        logger.info("[Core] memory monitor started, output=%s interval=%s", output_file, interval)
+
+        if socket_path:
+            self._start_mem_socket_server(socket_path)
+
+    def _start_mem_socket_server(self, socket_path: str):
+        """在独立线程中启动 Unix socket server，接受路径查询返回结果"""
+
+        def _server():
+            if os.path.exists(socket_path):
+                os.unlink(socket_path)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.bind(socket_path)
+            sock.listen(1)
+            sock.settimeout(0.5)
+            logger.info("[Core] memory socket server listening on %s", socket_path)
+            while self._monitor_running:
+                try:
+                    conn, _ = sock.accept()
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+                with conn:
+                    try:
+                        data = conn.recv(4096).decode("utf-8").strip()
+                        if data:
+                            result = self.mem.query_path(data)
+                            conn.sendall(result.encode("utf-8"))
+                    except Exception:
+                        pass
+            sock.close()
+            try:
+                os.unlink(socket_path)
+            except OSError:
+                pass
+
+        threading.Thread(target=_server, daemon=True).start()
 
 
 

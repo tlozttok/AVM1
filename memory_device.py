@@ -58,7 +58,11 @@ class MetaListDevice(MemoryDevice):
         return "MetaList"
 
     def __getitem__(self, index: int) -> Any:
-        return self._data[index]
+        try:
+            return self._data[index]
+        except IndexError:
+            from exceptions import VMMemoryError
+            raise VMMemoryError(f"索引越界：{index}，列表长度：{len(self._data)}") from None
 
     def __setitem__(self, index: int, value: Any) -> None:
         self._data[index] = value
@@ -132,7 +136,7 @@ class InputsListDevice(MetaListDevice):
             logger.info("[InputsListDevice] received input: %r", user_input)
             return user_input
         # 正常列表访问
-        return self._data[index]
+        return super().__getitem__(index)
 
     def __setitem__(self, index, value):
         from exceptions import VMMemoryError
@@ -171,7 +175,7 @@ class OutputsListDevice(MetaListDevice):
 
     def __getitem__(self, index):
         index = self._parse_index(index)
-        return self._data[index]
+        return super().__getitem__(index)
 
     def __setitem__(self, index, value):
         index = self._parse_index(index)
