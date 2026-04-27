@@ -1,8 +1,8 @@
 """AVM 内存系统定义"""
 from typing import Any, Optional
-from avm_types import MetaList, MetaDict
-from exceptions import VMMemoryError
-from memory_device import MemoryDevice, StringDevice
+from .types import MetaList, MetaDict
+from .exceptions import VMMemoryError
+from .memory_device import MemoryDevice, StringDevice
 import logging
 
 logger = logging.getLogger(__name__)

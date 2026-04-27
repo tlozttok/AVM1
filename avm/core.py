@@ -11,10 +11,10 @@ import socket
 import threading
 import time
 
-from avm_types import MetaList, MetaDict
-from exceptions import VMSyntaxError, VMMemoryError
-from messages import SystemMessage, UserMessage, Conversation, UserMessageBatch
-from memory import Memory
+from .types import MetaList, MetaDict
+from .exceptions import VMSyntaxError, VMMemoryError
+from .messages import SystemMessage, UserMessage, Conversation, UserMessageBatch
+from .memory import Memory
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +220,7 @@ def parse_instruction(raw: str) -> Instruction:
     """解析指令字符串为指令对象
     统一格式: <cmd_type> <call_id> <utr_index> <...args>
     """
-    from exceptions import VMSyntaxError
+    from .exceptions import VMSyntaxError
     logger.debug("[parse_instruction] raw=%r", raw)
     parts = raw.strip().split()
     if not parts:

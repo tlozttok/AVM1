@@ -1,10 +1,10 @@
 """memory 模块单元测试"""
 
 import pytest
-from memory import Memory
-from memory_device import StringDevice, MetaListDevice, MetaDictDevice
-from exceptions import VMMemoryError
-from avm_types import MetaDict, MetaList
+from avm.memory import Memory
+from avm.memory_device import StringDevice, MetaListDevice, MetaDictDevice
+from avm.exceptions import VMMemoryError
+from avm.types import MetaDict, MetaList
 
 
 class TestMemoryBasic:

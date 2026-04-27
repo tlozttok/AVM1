@@ -1,7 +1,7 @@
 """messages 模块单元测试"""
 
 import pytest
-from messages import (
+from avm.messages import (
     Role, ToolCall, ToolCallResponse,
     Message, SystemMessage, UserMessage, AssistantMessage, ToolMessage,
     ConversationMessage, Conversation, UserMessageBatch,

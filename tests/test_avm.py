@@ -9,16 +9,16 @@
 """
 
 import pytest
-from AVM import (
+from avm.core import (
     Core, parse_instruction, LMU,
     CreateInstruction, ExecInstruction,
     MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction,
     CRT,
 )
-from memory import Memory
-from messages import Conversation, UserMessageBatch
-from exceptions import VMSyntaxError, VMMemoryError
-from memory_device import StringDevice
+from avm.memory import Memory
+from avm.messages import Conversation, UserMessageBatch
+from avm.exceptions import VMSyntaxError, VMMemoryError
+from avm.memory_device import StringDevice
 
 
 # ---------------------------------------------------------------------------

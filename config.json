@@ -2,5 +2,5 @@
   "log_level": "DEBUG",
   "log_file": "log/log.txt",
   "debug": false,
-  "prompt": "program/deepseek_simplified.json"
+  "prompt": "programs/deepseek_simplified.json"
 }

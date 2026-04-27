@@ -1,2 +1,5 @@
 __pycache__/
 .env
+log/*.txt
+log/*.log
+log/*.tmp

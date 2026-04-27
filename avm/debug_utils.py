@@ -10,8 +10,8 @@
 
 import json
 from typing import List, Dict, Any, Optional
-from AVM import Core, parse_instruction, CRT
-from memory_device import MemoryDevice
+from .core import Core
+from .memory_device import MemoryDevice
 
 
 class DebugTracer:

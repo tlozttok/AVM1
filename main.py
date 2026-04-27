@@ -3,10 +3,10 @@ import json
 import logging
 import os
 import sys
-from memory import Memory
-from memory_device import InputsListDevice, OutputsListDevice
-from avm_types import MetaDict, MetaList
-from AVM import Core
+from avm.memory import Memory
+from avm.memory_device import InputsListDevice, OutputsListDevice
+from avm.types import MetaDict, MetaList
+from avm.core import Core
 
 logger = logging.getLogger(__name__)
 

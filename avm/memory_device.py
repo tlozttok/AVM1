@@ -33,7 +33,7 @@ class StringDevice(MemoryDevice):
     def set_value(self, value: str) -> None:
         logger.debug("[StringDevice.set_value] %r", value)
         if not isinstance(value, str):
-            from exceptions import VMMemoryError
+            from .exceptions import VMMemoryError
             raise VMMemoryError(f"StringDevice 只接受 str，got {type(value).__name__}")
         self._value = value
 
@@ -61,7 +61,7 @@ class MetaListDevice(MemoryDevice):
         try:
             return self._data[index]
         except IndexError:
-            from exceptions import VMMemoryError
+            from .exceptions import VMMemoryError
             raise VMMemoryError(f"索引越界：{index}，列表长度：{len(self._data)}") from None
 
     def __setitem__(self, index: int, value: Any) -> None:
@@ -78,7 +78,7 @@ class MetaListDevice(MemoryDevice):
 
     def set_value(self, value: list) -> None:
         """整体替换内部数据（用于 Memory.set_by_path 的设备写入）"""
-        from exceptions import VMMemoryError
+        from .exceptions import VMMemoryError
         if not isinstance(value, list):
             raise VMMemoryError(f"MetaListDevice 只接受 list，got {type(value).__name__}")
         self._data = value
@@ -116,7 +116,7 @@ class InputsListDevice(MetaListDevice):
             try:
                 return int(index)
             except ValueError:
-                from exceptions import VMMemoryError
+                from .exceptions import VMMemoryError
                 raise VMMemoryError(f"InputsListDevice 索引必须是整数，got {index!r}")
         return index
 
@@ -139,11 +139,11 @@ class InputsListDevice(MetaListDevice):
         return super().__getitem__(index)
 
     def __setitem__(self, index, value):
-        from exceptions import VMMemoryError
+        from .exceptions import VMMemoryError
         raise VMMemoryError("InputsListDevice 是只读的，不允许写入")
 
     def set_value(self, value):
-        from exceptions import VMMemoryError
+        from .exceptions import VMMemoryError
         raise VMMemoryError("InputsListDevice 是只读的，不允许写入")
 
     def to_llm_string(self) -> str:
@@ -169,7 +169,7 @@ class OutputsListDevice(MetaListDevice):
             try:
                 return int(index)
             except ValueError:
-                from exceptions import VMMemoryError
+                from .exceptions import VMMemoryError
                 raise VMMemoryError(f"OutputsListDevice 索引必须是整数，got {index!r}")
         return index
 
@@ -182,12 +182,12 @@ class OutputsListDevice(MetaListDevice):
         if index == -1:
             self.append(value)
         else:
-            from exceptions import VMMemoryError
+            from .exceptions import VMMemoryError
             raise VMMemoryError("OutputsListDevice 只支持追加写入（索引 -1），不允许修改已有元素")
 
     def append(self, value):
         if not isinstance(value, str):
-            from exceptions import VMMemoryError
+            from .exceptions import VMMemoryError
             raise VMMemoryError(f"OutputsListDevice 只接受 str，got {type(value).__name__}")
         self._data.append(value)
         print(f"\n[Agent 输出] {value}")
@@ -199,7 +199,7 @@ class OutputsListDevice(MetaListDevice):
         elif isinstance(value, str):
             self.append(value)
         else:
-            from exceptions import VMMemoryError
+            from .exceptions import VMMemoryError
             raise VMMemoryError(f"OutputsListDevice 只接受 str 或 list，got {type(value).__name__}")
 
     def to_llm_string(self) -> str:
@@ -242,7 +242,7 @@ class MetaDictDevice(MemoryDevice):
 
     def set_value(self, value: dict) -> None:
         """整体替换内部数据（用于 Memory.set_by_path 的设备写入）"""
-        from exceptions import VMMemoryError
+        from .exceptions import VMMemoryError
         if not isinstance(value, dict):
             raise VMMemoryError(f"MetaDictDevice 只接受 dict，got {type(value).__name__}")
         self._data = value
