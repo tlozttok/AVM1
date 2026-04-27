@@ -32,7 +32,7 @@ def load_config(path: str = "config.json") -> dict:
 
 def setup_logging(level: str = "INFO", log_file: str | None = None) -> None:
     """配置日志系统"""
-    handlers = [logging.StreamHandler(sys.stdout)]
+    handlers = [logging.StreamHandler(sys.stderr)]
     if log_file:
         handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
 

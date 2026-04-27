@@ -659,7 +659,12 @@ class Core:
             logger.debug("[Core.run] executing %s(call_id=%s)", type(instruction).__name__, getattr(instruction, 'call_id', 'N/A'))
             return_type = instruction.execute(self)
             if self.debug:
-                input("[核心循环] Press Enter to continue...")
+                debug_event = getattr(self, '_debug_event', None)
+                if debug_event is not None:
+                    debug_event.clear()
+                    debug_event.wait()
+                else:
+                    input("[核心循环] Press Enter to continue...")
             if return_type == CRT.EXIT:
                 self.command_stack.pop()
                 logger.debug("[Core.run] EXIT, stack_size=%d", len(self.command_stack))
