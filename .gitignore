@@ -3,3 +3,4 @@ __pycache__/
 log/*.txt
 log/*.log
 log/*.tmp
+data/*.json

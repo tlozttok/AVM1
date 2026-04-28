@@ -1,6 +1,9 @@
 {
   "log_level": "DEBUG",
-  "log_file": "log/log.txt",
+  "log_file": null,
   "debug": false,
-  "prompt": "programs/deepseek_simplified.json"
+  "prompt": "programs/deepseek_simplified.json",
+  "uuid": "dev-001",
+  "restart": false,
+  "persist_level": "medium"
 }

@@ -1,7 +1,7 @@
 """AVM 内存系统定义"""
 from typing import Any, Optional
 from .types import MetaList, MetaDict
-from .exceptions import VMMemoryError
+from .exceptions import VMMemoryError, MemoryKeyNotFoundError, MemoryIndexOutOfRangeError, MemoryTypeError
 from .memory_device import MemoryDevice, StringDevice
 import logging
 
@@ -157,22 +157,26 @@ class Memory:
 
     @staticmethod
     def _check_access(current, key: str, path: list):
-        """检查 key 是否可访问，不可则抛出 VMMemoryError"""
+        """检查 key 是否可访问，不可则抛出对应的内存子类异常"""
+        from .memory_device import MemoryDevice
+
+        if isinstance(current, MemoryDevice):
+            return
         partial = ".".join(str(k) for k in path)
         if isinstance(current, str):
-            raise VMMemoryError(f"无法访问子路径：{partial} 的父节点已是字符串，没有子节点")
+            raise MemoryTypeError(f"字符串没有子节点：{partial}")
         if isinstance(current, (dict, MetaDict)):
             if key not in current:
-                raise VMMemoryError(f"键 {key!r} 不存在 (路径: {partial})")
+                raise MemoryKeyNotFoundError(f"键 {key!r} 不存在：{partial}（可用 memory_make 创建）")
         elif isinstance(current, (list, MetaList)):
             try:
                 idx = int(key)
             except ValueError:
-                raise VMMemoryError(f"列表索引必须是数字，got {key!r} (路径: {partial})")
+                raise MemoryTypeError(f"列表索引必须是数字，got {key!r}：{partial}")
             if idx < -len(current) or idx >= len(current):
-                raise VMMemoryError(f"索引越界：{idx}，列表长度：{len(current)} (路径: {partial})")
+                raise MemoryIndexOutOfRangeError(f"索引越界：{idx}，列表长度：{len(current)}：{partial}")
         else:
-            raise VMMemoryError(f"无法访问子路径：父节点是 {type(current).__name__} 类型 (路径: {partial})")
+            raise MemoryTypeError(f"无法访问子路径：父节点是 {type(current).__name__} 类型：{partial}")
 
     def _convert_for_llm(self, value: Any, for_llm: bool) -> Any:
         """
@@ -244,12 +248,14 @@ class Memory:
         # 如果前缀路径落到了叶子节点（字符串等），无法继续索引
         if isinstance(temp, str):
             prefix_path = ".".join(str(k) for k in path[:-1])
-            raise VMMemoryError(
-                f"无法访问：{prefix_path} 是字符串，没有子节点 (尝试写入 .{last_key})")
+            raise MemoryTypeError(
+                f"无法写入：{prefix_path} 是字符串，没有子节点 (.{last_key})"
+            )
         if not isinstance(temp, (dict, MetaDict, list, MetaList)):
             prefix_path = ".".join(str(k) for k in path[:-1])
-            raise VMMemoryError(
-                f"无法访问：{prefix_path} 是 {type(temp).__name__} 类型，不支持子路径")
+            raise MemoryTypeError(
+                f"无法写入：{prefix_path} 是 {type(temp).__name__} 类型，不支持子路径"
+            )
 
         # 如果终点已存在且是 MetaList/MetaDict，写入即修改元数据
         if last_key in temp:
@@ -494,3 +500,59 @@ class Memory:
     def to_dict(self) -> dict:
         """返回底层字典的副本"""
         return self._data.copy()
+
+    def save(self, filepath: str) -> None:
+        """将内存数据持久化到 JSON 文件（仅 _data，不含设备）"""
+        import json
+
+        def _serialize(value):
+            if isinstance(value, MetaDict):
+                return {
+                    "__type": "MetaDict",
+                    "meta": value.get_metadata(),
+                    "data": {k: _serialize(v) for k, v in value.items()},
+                }
+            if isinstance(value, MetaList):
+                return {
+                    "__type": "MetaList",
+                    "meta": value.get_metadata(),
+                    "data": [_serialize(v) for v in value],
+                }
+            if isinstance(value, str):
+                return value
+            return str(value)
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(_serialize(self._data), f, ensure_ascii=False, indent=2)
+        logger.info("[mem.save] persisted to %s", filepath)
+
+    @classmethod
+    def load(cls, filepath: str) -> "Memory":
+        """从 JSON 文件加载内存数据并返回 Memory 实例"""
+        import json, os
+        from .types import MetaList, MetaDict
+
+        mem = cls()
+        if not os.path.isfile(filepath):
+            logger.warning("[mem.load] file not found: %s", filepath)
+            return mem
+
+        with open(filepath, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        def _deserialize(value):
+            if isinstance(value, dict) and value.get("__type") == "MetaDict":
+                return MetaDict(
+                    data={k: _deserialize(v) for k, v in value["data"].items()},
+                    metadata=value.get("meta"),
+                )
+            if isinstance(value, dict) and value.get("__type") == "MetaList":
+                return MetaList(
+                    data=[_deserialize(v) for v in value["data"]],
+                    metadata=value.get("meta"),
+                )
+            return value
+
+        mem._data = _deserialize(raw)
+        logger.info("[mem.load] loaded from %s", filepath)
+        return mem

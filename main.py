@@ -146,8 +146,40 @@ def main():
     if mem_dump_file:
         core.start_memory_monitor(mem_dump_file, socket_path=mem_sock_path)
 
-    # 初始化内存
-    init_memory(core.mem, prompt_path=config["prompt"])
+    # 持久化配置
+    user_uuid = config.get("uuid", "dev-001")
+    persist_level = config.get("persist_level", "off")
+    persist_path = os.path.join(os.path.dirname(__file__), "data", f"avm_{user_uuid}.json")
+
+    restart = config.get("restart", False)
+    if not restart:
+        os.makedirs(os.path.dirname(persist_path), exist_ok=True)
+        if os.path.isfile(persist_path):
+            core.mem = Memory.load(persist_path)
+            print(f"[系统] 已从 {persist_path} 加载持久化内存")
+        else:
+            print("[系统] 无持久化文件，从零开始")
+
+    core.persist_path = persist_path
+    core.persist_level = persist_level
+
+    # 初始化内存（首次启动）或补充缺失项
+    prompt_path = config["prompt"]
+    mem = core.mem
+    if not restart or not os.path.isfile(persist_path):
+        init_memory(mem, prompt_path)
+    else:
+        # 确保设备挂载和必要参数存在
+        if "inputs" not in mem:
+            mem.mount("inputs", InputsListDevice(data=[], metadata="用户输入列表"))
+        if "outputs" not in mem:
+            mem.mount("outputs", OutputsListDevice(data=[], metadata="对用户的输出列表"))
+        if "model_params" not in mem or not isinstance(mem.get("model_params"), MetaDict):
+            mem["model_params"] = MetaDict(data={
+                "model": "deepseek-v4-flash",
+                "extra_body": {"thinking": {"type": "disabled"}},
+                "use_tool": "auto",
+            })
 
     # 设置初始命令栈
     core.command_stack.append("create 0 -1 $MEM.system $MEM.user $MEM.model_params")

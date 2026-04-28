@@ -4,7 +4,8 @@ from .core import Core, LMU, CRT, parse_instruction, \
     MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction
 from .memory import Memory
 from .types import MetaDict, MetaList
-from .exceptions import VMSyntaxError, VMMemoryError, VMResourceError, vm_exception_handler
+from .exceptions import VMSyntaxError, VMMemoryError, VMResourceError, vm_exception_handler, \
+    MemoryKeyNotFoundError, MemoryIndexOutOfRangeError, MemoryTypeError, MemoryCircularReferenceError
 from .memory_device import MemoryDevice, StringDevice, MetaListDevice, MetaDictDevice, \
     InputsListDevice, OutputsListDevice
 from .messages import Conversation, UserMessageBatch, \

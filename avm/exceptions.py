@@ -12,7 +12,31 @@ class VMSyntaxError(VMError):
 
 
 class VMMemoryError(VMError):
-    """内存错误：键不存在、索引越界、类型错误等"""
+    """内存访问基础错误"""
+    pass
+
+
+class MemoryKeyNotFoundError(VMMemoryError):
+    """键不存在 — LLM 可以用 memory_make 创建"""
+    pass
+
+
+class MemoryIndexOutOfRangeError(VMMemoryError):
+    """列表索引越界 — LLM 可以换索引重试"""
+    pass
+
+
+class MemoryTypeError(VMMemoryError):
+    """
+    类型不匹配 — 在字符串下找子节点、对列表用非数字索引等。
+    此路不通，LLM 应换条路。
+    将来可细分为：MemoryStringSubAccessError, MemoryListNonIntIndexError 等。
+    """
+    pass
+
+
+class MemoryCircularReferenceError(VMMemoryError):
+    """$ 解引用成环"""
     pass
 
 

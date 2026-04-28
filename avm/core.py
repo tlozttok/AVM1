@@ -150,6 +150,12 @@ class CreateInstruction(Instruction):
                 instr = _make_instruction(rc, user_msg_idx)
                 if instr is not None:
                     core.command_stack.append(instr)
+                else:
+                    batch = core.usr_tool_reg[user_msg_idx]
+                    batch.add_tool_response(
+                        f"Error: unsupported command '{rc.get('cmd_type', '?')}'",
+                        rc.get("call_id", ""),
+                    )
             return CRT.CONTINUE
         else:
             if result and self.utr_index != -1:
@@ -192,6 +198,12 @@ class ExecInstruction(Instruction):
                 instr = _make_instruction(rc, user_msg_idx)
                 if instr is not None:
                     core.command_stack.append(instr)
+                else:
+                    batch = core.usr_tool_reg[user_msg_idx]
+                    batch.add_tool_response(
+                        f"Error: unsupported command '{rc.get('cmd_type', '?')}'",
+                        rc.get("call_id", ""),
+                    )
             return CRT.CONTINUE
         else:
             if result and self.utr_index != -1:
@@ -734,12 +746,24 @@ class Core:
 
     def run(self):
         logger.info("[Core.run] start, stack_size=%d", len(self.command_stack))
+        persist_path = getattr(self, 'persist_path', None)
+        persist_level = getattr(self, 'persist_level', 'off')
+        if persist_path and persist_level != 'off':
+            logger.info("[Core.run] persistence enabled, level=%s path=%s", persist_level, persist_path)
         while self.command_stack:
             instruction = self.command_stack[-1]
             if isinstance(instruction, str):
                 instruction = parse_instruction(instruction)
             logger.debug("[Core.run] executing %s(call_id=%s)", type(instruction).__name__, getattr(instruction, 'call_id', 'N/A'))
+
+            is_mem_op = isinstance(instruction, (MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction))
+            # 高级持久化：每条指令前
+            if persist_path and persist_level == "high":
+                self.mem.save(persist_path)
             return_type = instruction.execute(self)
+            # 中级持久化：内存操作后
+            if persist_path and persist_level == "medium" and is_mem_op:
+                self.mem.save(persist_path)
             if self.debug:
                 debug_event = getattr(self, '_debug_event', None)
                 if debug_event is not None:

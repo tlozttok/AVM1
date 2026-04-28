@@ -33,8 +33,8 @@ class StringDevice(MemoryDevice):
     def set_value(self, value: str) -> None:
         logger.debug("[StringDevice.set_value] %r", value)
         if not isinstance(value, str):
-            from .exceptions import VMMemoryError
-            raise VMMemoryError(f"StringDevice 只接受 str，got {type(value).__name__}")
+            from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
+            raise MemoryTypeError(f"StringDevice 只接受 str，got {type(value).__name__}")
         self._value = value
 
     def to_llm_string(self) -> str:
@@ -61,8 +61,8 @@ class MetaListDevice(MemoryDevice):
         try:
             return self._data[index]
         except IndexError:
-            from .exceptions import VMMemoryError
-            raise VMMemoryError(f"索引越界：{index}，列表长度：{len(self._data)}") from None
+            from .exceptions import MemoryIndexOutOfRangeError
+            raise MemoryIndexOutOfRangeError(f"索引越界：{index}，列表长度：{len(self._data)}") from None
 
     def __setitem__(self, index: int, value: Any) -> None:
         self._data[index] = value
@@ -78,9 +78,9 @@ class MetaListDevice(MemoryDevice):
 
     def set_value(self, value: list) -> None:
         """整体替换内部数据（用于 Memory.set_by_path 的设备写入）"""
-        from .exceptions import VMMemoryError
+        from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
         if not isinstance(value, list):
-            raise VMMemoryError(f"MetaListDevice 只接受 list，got {type(value).__name__}")
+            raise MemoryTypeError(f"MetaListDevice 只接受 list，got {type(value).__name__}")
         self._data = value
 
     def __contains__(self, value) -> bool:
@@ -116,8 +116,8 @@ class InputsListDevice(MetaListDevice):
             try:
                 return int(index)
             except ValueError:
-                from .exceptions import VMMemoryError
-                raise VMMemoryError(f"InputsListDevice 索引必须是整数，got {index!r}")
+                from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
+                raise MemoryTypeError(f"InputsListDevice 索引必须是整数，got {index!r}")
         return index
 
     def __getitem__(self, index):
@@ -139,12 +139,12 @@ class InputsListDevice(MetaListDevice):
         return super().__getitem__(index)
 
     def __setitem__(self, index, value):
-        from .exceptions import VMMemoryError
-        raise VMMemoryError("InputsListDevice 是只读的，不允许写入")
+        from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
+        raise MemoryTypeError("InputsListDevice 是只读的，不允许写入")
 
     def set_value(self, value):
-        from .exceptions import VMMemoryError
-        raise VMMemoryError("InputsListDevice 是只读的，不允许写入")
+        from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
+        raise MemoryTypeError("InputsListDevice 是只读的，不允许写入")
 
     def to_llm_string(self) -> str:
         if self._pending_input:
@@ -169,8 +169,8 @@ class OutputsListDevice(MetaListDevice):
             try:
                 return int(index)
             except ValueError:
-                from .exceptions import VMMemoryError
-                raise VMMemoryError(f"OutputsListDevice 索引必须是整数，got {index!r}")
+                from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
+                raise MemoryTypeError(f"OutputsListDevice 索引必须是整数，got {index!r}")
         return index
 
     def __getitem__(self, index):
@@ -182,13 +182,13 @@ class OutputsListDevice(MetaListDevice):
         if index == -1:
             self.append(value)
         else:
-            from .exceptions import VMMemoryError
-            raise VMMemoryError("OutputsListDevice 只支持追加写入（索引 -1），不允许修改已有元素")
+            from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
+            raise MemoryTypeError("OutputsListDevice 只支持追加写入（索引 -1），不允许修改已有元素")
 
     def append(self, value):
         if not isinstance(value, str):
-            from .exceptions import VMMemoryError
-            raise VMMemoryError(f"OutputsListDevice 只接受 str，got {type(value).__name__}")
+            from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
+            raise MemoryTypeError(f"OutputsListDevice 只接受 str，got {type(value).__name__}")
         self._data.append(value)
         print(f"\n[Agent 输出] {value}")
 
@@ -199,8 +199,8 @@ class OutputsListDevice(MetaListDevice):
         elif isinstance(value, str):
             self.append(value)
         else:
-            from .exceptions import VMMemoryError
-            raise VMMemoryError(f"OutputsListDevice 只接受 str 或 list，got {type(value).__name__}")
+            from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
+            raise MemoryTypeError(f"OutputsListDevice 只接受 str 或 list，got {type(value).__name__}")
 
     def to_llm_string(self) -> str:
         return f"outputs[list_len={len(self._data)}, items={self._data!r},metadata={self._metadata!r}]"
@@ -242,9 +242,9 @@ class MetaDictDevice(MemoryDevice):
 
     def set_value(self, value: dict) -> None:
         """整体替换内部数据（用于 Memory.set_by_path 的设备写入）"""
-        from .exceptions import VMMemoryError
+        from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
         if not isinstance(value, dict):
-            raise VMMemoryError(f"MetaDictDevice 只接受 dict，got {type(value).__name__}")
+            raise MemoryTypeError(f"MetaDictDevice 只接受 dict，got {type(value).__name__}")
         self._data = value
 
     def __contains__(self, key: str) -> bool:
