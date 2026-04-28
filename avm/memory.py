@@ -159,6 +159,8 @@ class Memory:
     def _check_access(current, key: str, path: list):
         """检查 key 是否可访问，不可则抛出 VMMemoryError"""
         partial = ".".join(str(k) for k in path)
+        if isinstance(current, str):
+            raise VMMemoryError(f"无法访问子路径：{partial} 的父节点已是字符串，没有子节点")
         if isinstance(current, (dict, MetaDict)):
             if key not in current:
                 raise VMMemoryError(f"键 {key!r} 不存在 (路径: {partial})")
@@ -169,6 +171,8 @@ class Memory:
                 raise VMMemoryError(f"列表索引必须是数字，got {key!r} (路径: {partial})")
             if idx < -len(current) or idx >= len(current):
                 raise VMMemoryError(f"索引越界：{idx}，列表长度：{len(current)} (路径: {partial})")
+        else:
+            raise VMMemoryError(f"无法访问子路径：父节点是 {type(current).__name__} 类型 (路径: {partial})")
 
     def _convert_for_llm(self, value: Any, for_llm: bool) -> Any:
         """
@@ -237,6 +241,16 @@ class Memory:
             temp = temp[key]
 
         last_key = path[-1]
+        # 如果前缀路径落到了叶子节点（字符串等），无法继续索引
+        if isinstance(temp, str):
+            prefix_path = ".".join(str(k) for k in path[:-1])
+            raise VMMemoryError(
+                f"无法访问：{prefix_path} 是字符串，没有子节点 (尝试写入 .{last_key})")
+        if not isinstance(temp, (dict, MetaDict, list, MetaList)):
+            prefix_path = ".".join(str(k) for k in path[:-1])
+            raise VMMemoryError(
+                f"无法访问：{prefix_path} 是 {type(temp).__name__} 类型，不支持子路径")
+
         # 如果终点已存在且是 MetaList/MetaDict，写入即修改元数据
         if last_key in temp:
             existing = temp[last_key]

@@ -21,18 +21,18 @@ echo "log:  $LOGFILE"
 echo "mem:  $MEMFILE"
 echo "sock: $MEMSOCK"
 
-# 左侧上 pane: 对话终端
+# 左侧: 对话终端 (独占)
 tmux new-session -d -s avm \
     -n chat "cd '$PROJECT_DIR' && AVM_MEMDUMP='$MEMFILE' AVM_MEMSOCK='$MEMSOCK' python main.py 2>'$LOGFILE'; echo; echo '=== 会话结束 ==='; read -p '按 Enter 关闭...'"
 
-# 右侧 pane: 日志 tail
+# 右侧上: 日志 tail
 tmux split-window -h -t avm \
     "echo '=== 日志 (实时) ==='; echo; tail --retry -f '$LOGFILE' 2>/dev/null; read -p '按 Enter 关闭...'"
 
-# 左侧下 pane: 交互式内存检查器
-tmux select-pane -t avm:0.0
-tmux split-window -v -t avm:0.0 \
+# 右侧下: 交互式内存检查器
+tmux split-window -v -t avm:0.1 \
     "while [ ! -S '$MEMSOCK' ]; do sleep 0.3; done; python '$PROJECT_DIR/memshell.py' '$MEMSOCK'; read -p '按 Enter 关闭...'"
 
+# 焦点回到对话窗
 tmux select-pane -t avm:0.0
 tmux attach-session -t avm
