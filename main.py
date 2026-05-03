@@ -15,7 +15,7 @@ DEFAULT_CONFIG = {
     "log_level": "INFO",
     "log_file": None,
     "debug": False,
-    "prompt": "program/deepseek_simplified.json",
+    "prompt": "programs/deepseek_simplified.json",
 }
 
 
@@ -86,8 +86,8 @@ def _json_to_meta(value):
     - 其他: 原样返回
     """
     if isinstance(value, dict):
-        metadata = value.pop("meta", None) if "meta" in value else None
-        data = {k: _json_to_meta(v) for k, v in value.items()}
+        metadata = value.get("meta")
+        data = {k: _json_to_meta(v) for k, v in value.items() if k != "meta"}
         return MetaDict(data=data, metadata=metadata)
     elif isinstance(value, list):
         data = [_json_to_meta(v) for v in value]
