@@ -120,9 +120,19 @@ class CreateInstruction(Instruction):
 
     def execute(self, core: 'Core') -> CRT:
         logger.info("[create] call_id=%s utr=%s", self.call_id, self.utr_index)
-        system = core.unwrap(self.system_ref)
-        user = core.unwrap(self.user_ref)
-        para = core.unwrap(self.para_ref, for_llm=False)
+        try:
+            system = core.unwrap(self.system_ref)
+            user = core.unwrap(self.user_ref)
+            para = core.unwrap(self.para_ref, for_llm=False)
+        except VMMemoryError as e:
+            logger.error("[create] error: %s", e)
+            if self.utr_index != -1:
+                core.usr_tool_reg[self.utr_index].add_tool_response(
+                    f"[参数错误] {e}。请检查 create 指令的 memory 引用是否正确。"
+                    f"确认引用路径是否存在，必要时先用 memory_make 创建。",
+                    self.call_id
+                )
+            return CRT.EXIT
         logger.debug("[create] system_ref=%s user_ref=%s para=%s", self.system_ref, self.user_ref, para)
         result, return_calls, conversation = core.lmu.exec_crt(system, user, para)
         logger.debug("[create] result=%r return_calls=%s", result, len(return_calls))
@@ -130,6 +140,13 @@ class CreateInstruction(Instruction):
         # 处理 return_calls
         if return_calls:
             logger.info("[create] return_calls=%d", len(return_calls))
+            # --- monitor: 检测到 tool_calls ---
+            core._notify("tool_calls_detected", {
+                "source": "create",
+                "call_id": self.call_id,
+                "utr_index": self.utr_index,
+                "tool_calls": return_calls,
+            })
             # 分配新的寄存器槽位
             last_msg_idx = len(core.last_msg_reg)
             user_msg_idx = len(core.usr_tool_reg)
@@ -137,6 +154,13 @@ class CreateInstruction(Instruction):
             # 存入 Conversation
             core.last_msg_reg.append(conversation)
             core.usr_tool_reg.append(UserMessageBatch())
+
+            # --- monitor: conversation 被创建 ---
+            core._notify("conversation_created", {
+                "call_id": self.call_id,
+                "last_msg_idx": last_msg_idx,
+                "messages": [m.to_dict() for m in conversation.messages],
+            })
 
             # 替换栈顶为 exec 指令
             core.command_stack[-1] = ExecInstruction(
@@ -152,15 +176,24 @@ class CreateInstruction(Instruction):
                     core.command_stack.append(instr)
                 else:
                     batch = core.usr_tool_reg[user_msg_idx]
-                    batch.add_tool_response(
-                        f"Error: unsupported command '{rc.get('cmd_type', '?')}'",
-                        rc.get("call_id", ""),
-                    )
+                    args = rc.get("args", {})
+                    detail = args.get("error", "")
+                    name = args.get("name", rc.get("cmd_type", "?"))
+                    msg = f"Error: {name} 执行失败"
+                    if detail:
+                        msg += f" — {detail}"
+                    batch.add_tool_response(msg, rc.get("call_id", ""))
             return CRT.CONTINUE
         else:
             if result and self.utr_index != -1:
                 user_batch = core.usr_tool_reg[self.utr_index]
                 user_batch.add_tool_response(result, self.call_id)
+            # --- monitor: conversation 完成（无子调用）---
+            if conversation is not None:
+                core._notify("conversation_completed", {
+                    "call_id": self.call_id,
+                    "messages": [m.to_dict() for m in conversation.messages],
+                })
             return CRT.EXIT
 
 
@@ -181,10 +214,20 @@ class ExecInstruction(Instruction):
         last_msg_idx = self._parse_index(self.last_msg_ref)
         user_msg_idx = self._parse_index(self.user_msg_ref)
 
-        # 直接从寄存器获取类型化对象
-        conversation: Conversation = core.unwrap(self.last_msg_ref)
-        user_batch: UserMessageBatch = core.unwrap(self.user_msg_ref)
-        para = core.unwrap(self.para_ref, for_llm=False)
+        try:
+            # 直接从寄存器获取类型化对象
+            conversation: Conversation = core.unwrap(self.last_msg_ref)
+            user_batch: UserMessageBatch = core.unwrap(self.user_msg_ref)
+            para = core.unwrap(self.para_ref, for_llm=False)
+        except VMMemoryError as e:
+            logger.error("[exec] error: %s", e)
+            if self.utr_index != -1:
+                core.usr_tool_reg[self.utr_index].add_tool_response(
+                    f"[参数错误] {e}。请检查 exec 指令的 memory 引用是否正确。"
+                    f"确认引用路径是否存在，必要时先用 memory_make 创建。",
+                    self.call_id
+                )
+            return CRT.EXIT
 
         # 调用 LMU.exec
         result, return_calls, _ = core.lmu.exec(conversation, user_batch, para)
@@ -194,21 +237,40 @@ class ExecInstruction(Instruction):
         # 处理 return_calls：不弹出当前指令，直接压栈
         if return_calls:
             logger.info("[exec] pushing %d sub-instructions", len(return_calls))
+            # --- monitor: 检测到 tool_calls ---
+            core._notify("tool_calls_detected", {
+                "source": "exec",
+                "call_id": self.call_id,
+                "utr_index": self.utr_index,
+                "last_msg_ref": self.last_msg_ref,
+                "user_msg_ref": self.user_msg_ref,
+                "tool_calls": return_calls,
+            })
             for rc in reversed(return_calls):
                 instr = _make_instruction(rc, user_msg_idx)
                 if instr is not None:
                     core.command_stack.append(instr)
                 else:
                     batch = core.usr_tool_reg[user_msg_idx]
-                    batch.add_tool_response(
-                        f"Error: unsupported command '{rc.get('cmd_type', '?')}'",
-                        rc.get("call_id", ""),
-                    )
+                    args = rc.get("args", {})
+                    detail = args.get("error", "")
+                    name = args.get("name", rc.get("cmd_type", "?"))
+                    msg = f"Error: {name} 执行失败"
+                    if detail:
+                        msg += f" — {detail}"
+                    batch.add_tool_response(msg, rc.get("call_id", ""))
             return CRT.CONTINUE
         else:
             if result and self.utr_index != -1:
                 parent_batch = core.usr_tool_reg[self.utr_index]
                 parent_batch.add_tool_response(result, self.call_id)
+            # --- monitor: conversation 最终更新（即将关闭）---
+            core._notify("conversation_updated", {
+                "call_id": self.call_id,
+                "last_msg_idx": last_msg_idx,
+                "messages": [m.to_dict() for m in conversation.messages],
+                "closed": True,
+            })
             # pop 对应的寄存器
             if user_msg_idx is not None and user_msg_idx < len(core.usr_tool_reg):
                 core.usr_tool_reg.pop(user_msg_idx)
@@ -298,7 +360,8 @@ def _make_instruction(rc: dict, utr_index: int) -> Instruction:
     elif cmd_type == "memory_make":
         return MemoryMakeInstruction(call_id, utr_index, args.get("ref", ""), args.get("key", ""), args.get("mem_type", ""))
     elif cmd_type == "command":
-        # placeholder: command 工具尚未设计
+        return None
+    elif cmd_type == "json_error":
         return None
     else:
         return None
@@ -449,6 +512,20 @@ class LMU:
         return {k: v for k, v in para.items() if k in self._API_PARAM_KEYS}
 
 
+    def _parse_tool_args(self, tool_call, return_calls: list):
+        """安全解析 tool call 的 arguments JSON，失败时生成错误 return_call"""
+        call_id = tool_call.id
+        try:
+            return json.loads(tool_call.function.arguments)
+        except json.JSONDecodeError as e:
+            logger.error("[LMU] JSON decode error for %s (%s): %s", tool_call.function.name, call_id, e)
+            return_calls.append({
+                "call_id": call_id,
+                "cmd_type": "json_error",
+                "args": {"error": str(e), "name": tool_call.function.name},
+            })
+            return None
+
     def exec_crt(self, system_prompt: str, user_prompt: str, para: dict):
         """处理字符串输入的 create 模式
         system_prompt: 字符串，系统提示词
@@ -460,7 +537,9 @@ class LMU:
             SystemMessage(content=system_prompt).to_dict(),
             UserMessage(content=user_prompt).to_dict()
         ]
-        logger.debug("[LMU.exec_crt] messages=%s", messages)
+        logger.debug("[LMU.exec_crt] model=%s, msg_count=%d system_preview=%r user_preview=%r",
+            para.get("model"), 2,
+            system_prompt[:100], user_prompt[:100])
 
         extra_para = self._filter_api_params(para.to_dict())
         use_tool = para.get("use_tool")
@@ -478,62 +557,43 @@ class LMU:
 
         result = message.content
         return_calls = []
-        logger.debug("[LMU.exec] response content=%r tool_calls=%s", result, bool(message.tool_calls))
+        logger.debug("[LMU.exec] response content=%r tool_calls=%s", result[:200] if result else result, bool(message.tool_calls))
 
         if message.tool_calls:
             for tool_call in message.tool_calls:
                 call_id = tool_call.id
-                if tool_call.function.name == "command":
-                    args = json.loads(tool_call.function.arguments)
+                name = tool_call.function.name
+                if name == "command":
+                    args = self._parse_tool_args(tool_call, return_calls)
+                    if args is None: continue
                     command = args.get("command", "")
-                    return_calls.append({
-                        "call_id": call_id,
-                        "cmd_type": "command",
-                        "raw": command
-                    })
-                elif tool_call.function.name == "create_cmd":
-                    args = json.loads(tool_call.function.arguments)
-                    return_calls.append({
-                        "call_id": call_id,
-                        "cmd_type": "create",
-                        "args": {
-                            "system_ref": args.get("system_ref", ""),
-                            "user_ref": args.get("user_ref", ""),
-                            "para_ref": args.get("para_ref", "")
-                        }
-                    })
-                elif tool_call.function.name == "memory_read":
-                    args = json.loads(tool_call.function.arguments)
-                    return_calls.append({
-                        "call_id": call_id,
-                        "cmd_type": "memory_read",
-                        "args": {
-                            "ref": args.get("ref", "")
-                        }
-                    })
-                elif tool_call.function.name == "memory_write":
-                    args = json.loads(tool_call.function.arguments)
-                    return_calls.append({
-                        "call_id": call_id,
-                        "cmd_type": "memory_write",
-                        "args": {
-                            "ref": args.get("ref", ""),
-                            "content": args.get("content", "")
-                        }
-                    })
-                elif tool_call.function.name == "memory_make":
-                    args = json.loads(tool_call.function.arguments)
-                    return_calls.append({
-                        "call_id": call_id,
-                        "cmd_type": "memory_make",
-                        "args": {
-                            "ref": args.get("ref", ""),
-                            "key": args.get("key", ""),
-                            "mem_type": args.get("mem_type", "")
-                        }
-                    })
+                    return_calls.append({"call_id": call_id, "cmd_type": "command", "raw": command})
+                elif name == "create_cmd":
+                    args = self._parse_tool_args(tool_call, return_calls)
+                    if args is None: continue
+                    return_calls.append({"call_id": call_id, "cmd_type": "create", "args": {
+                        "system_ref": args.get("system_ref", ""),
+                        "user_ref": args.get("user_ref", ""),
+                        "para_ref": args.get("para_ref", "")
+                    }})
+                elif name == "memory_read":
+                    args = self._parse_tool_args(tool_call, return_calls)
+                    if args is None: continue
+                    return_calls.append({"call_id": call_id, "cmd_type": "memory_read", "args": {"ref": args.get("ref", "")}})
+                elif name == "memory_write":
+                    args = self._parse_tool_args(tool_call, return_calls)
+                    if args is None: continue
+                    return_calls.append({"call_id": call_id, "cmd_type": "memory_write", "args": {
+                        "ref": args.get("ref", ""), "content": args.get("content", "")
+                    }})
+                elif name == "memory_make":
+                    args = self._parse_tool_args(tool_call, return_calls)
+                    if args is None: continue
+                    return_calls.append({"call_id": call_id, "cmd_type": "memory_make", "args": {
+                        "ref": args.get("ref", ""), "key": args.get("key", ""), "mem_type": args.get("mem_type", "")
+                    }})
 
-        # 创建 Conversation 对象返回，assistant 消息必须保留 tool_calls
+        # 创建 Conversation 对象返回，assistant 消息必须保留 tool_calls (exec_crt)
         assistant_msg = {"role": ASSISTANT, "content": result or ""}
         if message.tool_calls:
             assistant_msg["tool_calls"] = [
@@ -587,60 +647,41 @@ class LMU:
 
         result = message.content
         return_calls = []
-        logger.debug("[LMU.exec] response content=%r tool_calls=%s", result, bool(message.tool_calls))
+        logger.debug("[LMU.exec] response content=%r tool_calls=%s", result[:200] if result else result, bool(message.tool_calls))
 
         if message.tool_calls:
             for tool_call in message.tool_calls:
                 call_id = tool_call.id
-                if tool_call.function.name == "command":
-                    args = json.loads(tool_call.function.arguments)
+                name = tool_call.function.name
+                if name == "command":
+                    args = self._parse_tool_args(tool_call, return_calls)
+                    if args is None: continue
                     command = args.get("command", "")
-                    return_calls.append({
-                        "call_id": call_id,
-                        "cmd_type": "command",
-                        "raw": command
-                    })
-                elif tool_call.function.name == "create_cmd":
-                    args = json.loads(tool_call.function.arguments)
-                    return_calls.append({
-                        "call_id": call_id,
-                        "cmd_type": "create",
-                        "args": {
-                            "system_ref": args.get("system_ref", ""),
-                            "user_ref": args.get("user_ref", ""),
-                            "para_ref": args.get("para_ref", "")
-                        }
-                    })
-                elif tool_call.function.name == "memory_read":
-                    args = json.loads(tool_call.function.arguments)
-                    return_calls.append({
-                        "call_id": call_id,
-                        "cmd_type": "memory_read",
-                        "args": {
-                            "ref": args.get("ref", "")
-                        }
-                    })
-                elif tool_call.function.name == "memory_write":
-                    args = json.loads(tool_call.function.arguments)
-                    return_calls.append({
-                        "call_id": call_id,
-                        "cmd_type": "memory_write",
-                        "args": {
-                            "ref": args.get("ref", ""),
-                            "content": args.get("content", "")
-                        }
-                    })
-                elif tool_call.function.name == "memory_make":
-                    args = json.loads(tool_call.function.arguments)
-                    return_calls.append({
-                        "call_id": call_id,
-                        "cmd_type": "memory_make",
-                        "args": {
-                            "ref": args.get("ref", ""),
-                            "key": args.get("key", ""),
-                            "mem_type": args.get("mem_type", "")
-                        }
-                    })
+                    return_calls.append({"call_id": call_id, "cmd_type": "command", "raw": command})
+                elif name == "create_cmd":
+                    args = self._parse_tool_args(tool_call, return_calls)
+                    if args is None: continue
+                    return_calls.append({"call_id": call_id, "cmd_type": "create", "args": {
+                        "system_ref": args.get("system_ref", ""),
+                        "user_ref": args.get("user_ref", ""),
+                        "para_ref": args.get("para_ref", "")
+                    }})
+                elif name == "memory_read":
+                    args = self._parse_tool_args(tool_call, return_calls)
+                    if args is None: continue
+                    return_calls.append({"call_id": call_id, "cmd_type": "memory_read", "args": {"ref": args.get("ref", "")}})
+                elif name == "memory_write":
+                    args = self._parse_tool_args(tool_call, return_calls)
+                    if args is None: continue
+                    return_calls.append({"call_id": call_id, "cmd_type": "memory_write", "args": {
+                        "ref": args.get("ref", ""), "content": args.get("content", "")
+                    }})
+                elif name == "memory_make":
+                    args = self._parse_tool_args(tool_call, return_calls)
+                    if args is None: continue
+                    return_calls.append({"call_id": call_id, "cmd_type": "memory_make", "args": {
+                        "ref": args.get("ref", ""), "key": args.get("key", ""), "mem_type": args.get("mem_type", "")
+                    }})
 
         # 更新对话历史：tool 响应 -> user 输入(如有) -> assistant 回复
         # 必须先把 tool 响应保存到 conversation，否则下次 exec 时 conversation
@@ -683,6 +724,9 @@ class Core:
         self.debug = False
         self._monitor_thread = None
         self._monitor_running = False
+        # -- 状态观察器（供 web monitor 等外部模块订阅运行时状态）--
+        self._state_observers: list = []
+        self._observer_lock = threading.Lock()
 
     def start_memory_monitor(self, output_file: str, interval: float = 0.3,
                              socket_path: str | None = None):
@@ -742,7 +786,63 @@ class Core:
 
         threading.Thread(target=_server, daemon=True).start()
 
+    # ------------------------------------------------------------------
+    # 状态观察器（供外部实时监控使用）
+    # ------------------------------------------------------------------
 
+    def add_state_observer(self, fn):
+        """注册状态观察回调。fn 签名: (event_type: str, payload: dict) -> None"""
+        with self._observer_lock:
+            if fn not in self._state_observers:
+                self._state_observers.append(fn)
+
+    def remove_state_observer(self, fn):
+        """注销状态观察回调"""
+        with self._observer_lock:
+            if fn in self._state_observers:
+                self._state_observers.remove(fn)
+
+    def _notify(self, event_type: str, payload: dict):
+        """通知所有观察者（在 Core.run 线程中调用，观察者需自行保证线程安全）"""
+        with self._observer_lock:
+            observers = list(self._state_observers)
+        for fn in observers:
+            try:
+                fn(event_type, payload)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _instruction_to_dict(instr) -> dict:
+        """将指令对象序列化为可 JSON 的字典"""
+        base = {
+            "type": type(instr).__name__.replace("Instruction", "").lower(),
+            "call_id": getattr(instr, "call_id", ""),
+            "utr_index": getattr(instr, "utr_index", -1),
+        }
+        if isinstance(instr, CreateInstruction):
+            base.update({
+                "system_ref": getattr(instr, "system_ref", ""),
+                "user_ref": getattr(instr, "user_ref", ""),
+                "para_ref": getattr(instr, "para_ref", ""),
+            })
+        elif isinstance(instr, ExecInstruction):
+            base.update({
+                "last_msg_ref": getattr(instr, "last_msg_ref", ""),
+                "user_msg_ref": getattr(instr, "user_msg_ref", ""),
+                "para_ref": getattr(instr, "para_ref", ""),
+            })
+        elif isinstance(instr, MemoryReadInstruction):
+            base.update({"ref": getattr(instr, "ref", "")})
+        elif isinstance(instr, MemoryWriteInstruction):
+            base.update({"ref": getattr(instr, "ref", ""), "content": getattr(instr, "content", "")})
+        elif isinstance(instr, MemoryMakeInstruction):
+            base.update({
+                "ref": getattr(instr, "ref", ""),
+                "key": getattr(instr, "key", ""),
+                "mem_type": getattr(instr, "mem_type", ""),
+            })
+        return base
 
     def run(self):
         logger.info("[Core.run] start, stack_size=%d", len(self.command_stack))
@@ -760,7 +860,20 @@ class Core:
             # 高级持久化：每条指令前
             if persist_path and persist_level == "high":
                 self.mem.save(persist_path)
+
+            # --- monitor: 指令执行前 ---
+            self._notify("instruction_start", {
+                "instruction": self._instruction_to_dict(instruction),
+            })
+
             return_type = instruction.execute(self)
+
+            # --- monitor: 指令执行后 ---
+            self._notify("instruction_end", {
+                "instruction": self._instruction_to_dict(instruction),
+                "return_type": return_type.name,
+            })
+
             # 中级持久化：内存操作后
             if persist_path and persist_level == "medium" and is_mem_op:
                 self.mem.save(persist_path)
@@ -778,6 +891,7 @@ class Core:
                 logger.debug("[Core.run] CONTINUE, stack_size=%d", len(self.command_stack))
                 continue
         logger.info("[Core.run] end")
+        self._notify("run_finished", {})
 
     def unwrap(self, value, for_llm=True):
         """解引用值

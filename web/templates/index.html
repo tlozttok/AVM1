@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AVM Chat</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box }
+body { font:14px/1.5 system-ui,sans-serif; background:#1a1a2e; color:#e0e0e0; height:100vh; display:flex; flex-direction:column }
+header { background:#16213e; padding:10px 20px; font-size:16px; font-weight:bold; border-bottom:1px solid #0f3460; display:flex; justify-content:space-between; align-items:center }
+header .dot { width:8px; height:8px; border-radius:50%; background:#4caf50; display:inline-block; margin-right:8px }
+.status { font-size:12px; color:#888 }
+#messages { flex:1; overflow-y:auto; padding:15px; display:flex; flex-direction:column; gap:8px }
+.msg { max-width:85%; padding:10px 14px; border-radius:12px; white-space:pre-wrap; word-break:break-word }
+.user { align-self:flex-end; background:#0f3460; border-bottom-right-radius:4px }
+.agent { align-self:flex-start; background:#16213e; border-bottom-left-radius:4px; color:#b0c4de }
+#input-area { display:flex; padding:10px; border-top:1px solid #0f3460; background:#16213e }
+#input-area input { flex:1; padding:10px; border:none; border-radius:8px; background:#1a1a2e; color:#e0e0e0; outline:none; font-size:14px }
+#input-area button { margin-left:8px; padding:10px 20px; border:none; border-radius:8px; background:#0f3460; color:#e0e0e0; cursor:pointer; font-size:14px }
+#input-area button:hover { background:#1a4a8a }
+</style>
+</head>
+<body>
+<header>
+  <span><span class="dot"></span>AVM Chat</span>
+  <span class="status" id="status">已连接</span>
+</header>
+<div id="messages"></div>
+<div id="input-area">
+  <input id="input" type="text" placeholder="输入消息..." autofocus />
+  <button onclick="send()">发送</button>
+</div>
+
+<script>
+const msgs = document.getElementById('messages');
+const status = document.getElementById('status');
+
+// SSE
+const es = new EventSource('/stream');
+es.onopen = () => status.textContent = '已连接';
+es.onerror = () => status.textContent = '断开';
+es.onmessage = e => {
+    const d = JSON.parse(e.data);
+    append(d.text, 'agent');
+};
+
+function append(text, role) {
+    const div = document.createElement('div');
+    div.className = 'msg ' + role;
+    div.textContent = text;
+    msgs.appendChild(div);
+    msgs.scrollTop = msgs.scrollHeight;
+}
+
+async function send() {
+    const inp = document.getElementById('input');
+    const text = inp.value.trim();
+    if (!text) return;
+    append(text, 'user');
+    inp.value = '';
+    await fetch('/input', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text}) });
+}
+
+document.getElementById('input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') send();
+});
+</script>
+</body>
+</html>

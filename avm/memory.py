@@ -208,6 +208,15 @@ class Memory:
         则写入被解释为修改其元数据，而不是替换整个对象。
         """
         logger.debug("[set_by_path] path=%s value=%r", path, value)
+        if not path:
+            if isinstance(self._data, MetaDict):
+                self._data.set_metadata(str(value))
+                logger.info("[set_by_path] set metadata for root")
+                return
+            self._data = _wrap_value(value)
+            logger.info("[set_by_path] set root value = %r", value)
+            return
+
         # 检查是否是设备路径
         if self.is_device_path(path):
             device = self.get_device(path)
@@ -256,6 +265,17 @@ class Memory:
             raise MemoryTypeError(
                 f"无法写入：{prefix_path} 是 {type(temp).__name__} 类型，不支持子路径"
             )
+
+        # 列表目标：将 key 转为整数索引
+        if isinstance(temp, (list, MetaList)):
+            try:
+                idx = int(last_key)
+            except ValueError:
+                raise MemoryTypeError(f"列表索引必须是数字：{last_key}")
+            if idx < -len(temp) or idx >= len(temp):
+                raise MemoryIndexOutOfRangeError(f"索引越界：{idx}，列表长度：{len(temp)}")
+            temp[idx] = _wrap_value(value)
+            return
 
         # 如果终点已存在且是 MetaList/MetaDict，写入即修改元数据
         if last_key in temp:

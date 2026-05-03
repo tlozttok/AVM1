@@ -7,6 +7,7 @@ from avm.memory import Memory
 from avm.memory_device import InputsListDevice, OutputsListDevice
 from avm.types import MetaDict, MetaList
 from avm.core import Core
+import readline
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,10 @@ def setup_logging(level: str = "INFO", log_file: str | None = None) -> None:
 
     root = logging.getLogger()
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    # 抑制第三方库的请求体 dump（openai / httpx / httpcore）
+    for noisy in ("openai", "httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     sh = logging.StreamHandler(sys.stderr)
     sh.setFormatter(console_fmt)

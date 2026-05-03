@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AVM Monitor</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box }
+body { font:13px/1.5 system-ui,sans-serif; background:#0a0a14; color:#c8c8d8; height:100vh; display:flex; flex-direction:column }
+header { background:#121225; padding:8px 16px; font-size:15px; font-weight:bold; border-bottom:1px solid #22223e; display:flex; justify-content:space-between; align-items:center; flex-shrink:0 }
+header .dot { width:8px; height:8px; border-radius:50%; background:#4caf50; display:inline-block; margin-right:8px }
+header .dot.disconnected { background:#f44336 }
+.status { font-size:12px; color:#888 }
+#main { flex:1; display:flex; overflow:hidden }
+.panel { border-right:1px solid #22223e; display:flex; flex-direction:column; overflow:hidden }
+.panel:last-child { border-right:none }
+.panel-header { background:#151528; padding:8px 12px; font-size:13px; font-weight:bold; color:#9090b8; border-bottom:1px solid #22223e; flex-shrink:0; display:flex; justify-content:space-between; align-items:center }
+.panel-body { flex:1; overflow-y:auto; padding:8px }
+
+/* 左栏 — 堆栈 */
+#panel-stack { width:22% }
+.stack-card { background:#151528; border:1px solid #22223e; border-radius:6px; padding:8px 10px; margin-bottom:6px; font-size:12px; transition: all .2s }
+.stack-card.top { border-color:#4a7fd9; background:#152035; box-shadow:0 0 8px rgba(74,127,217,.15) }
+.stack-card .type { font-weight:bold; color:#7eb8ff; text-transform:uppercase; font-size:11px }
+.stack-card.top .type { color:#4a7fd9 }
+.stack-card .meta { color:#888; margin-top:3px }
+.stack-card .meta span { margin-right:8px }
+.stack-empty { color:#555; text-align:center; padding:20px; font-style:italic }
+
+/* 右栏 — 纵向流程图 */
+#panel-flow { width:78%; position:relative }
+#flow-svg { width:100%; height:100%; min-height:400px }
+.flow-node-rect { cursor:pointer; transition: opacity .2s }
+.flow-node-rect:hover { opacity:.9 }
+.flow-node-circle { cursor:pointer }
+.flow-label { font-size:12px; fill:#c8c8d8; pointer-events:none }
+.flow-label-small { font-size:10px; fill:#888; pointer-events:none }
+.flow-line { fill:none; stroke-width:2 }
+.flow-arrow { fill:none; stroke-width:2; marker-end:url(#arrowhead) }
+.flow-return { fill:none; stroke-width:2; stroke-dasharray:4,3; marker-end:url(#arrowhead-return) }
+.tooltip { position:absolute; background:rgba(15,15,30,.95); border:1px solid #4a4a6a; border-radius:6px; padding:8px 12px; font-size:12px; color:#c8c8d8; pointer-events:none; opacity:0; transition:opacity .15s; max-width:300px; z-index:100 }
+.tooltip.visible { opacity:1 }
+</style>
+</head>
+<body>
+<header>
+  <span><span class="dot" id="conn-dot"></span>AVM Monitor</span>
+  <span class="status" id="status">已连接</span>
+</header>
+<div id="main">
+  <div class="panel" id="panel-stack">
+    <div class="panel-header">📚 指令堆栈</div>
+    <div class="panel-body" id="stack-body"></div>
+  </div>
+  <div class="panel" id="panel-flow">
+    <div class="panel-header">🌲 执行流图</div>
+    <div class="panel-body" id="flow-body" style="padding:0;overflow:auto">
+      <svg id="flow-svg">
+        <defs>
+          <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#4a7fd9"/>
+          </marker>
+          <marker id="arrowhead-return" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#4caf50"/>
+          </marker>
+        </defs>
+      </svg>
+    </div>
+  </div>
+</div>
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+const statusEl = document.getElementById('status');
+const dotEl = document.getElementById('conn-dot');
+const stackBody = document.getElementById('stack-body');
+const flowSvg = document.getElementById('flow-svg');
+const tooltip = document.getElementById('tooltip');
+
+let lastData = null;
+
+// SSE
+const es = new EventSource('/monitor/stream');
+es.onopen = () => { statusEl.textContent = '已连接'; dotEl.classList.remove('disconnected'); };
+es.onerror = () => { statusEl.textContent = '断开'; dotEl.classList.add('disconnected'); };
+es.onmessage = e => {
+    const data = JSON.parse(e.data);
+    lastData = data;
+    renderStack(data.command_stack);
+    renderFlow(data.flow || []);
+};
+
+// ---------- 堆栈面板 ----------
+function renderStack(stack) {
+    if (!stack || stack.length === 0) {
+        stackBody.innerHTML = '<div class="stack-empty">命令栈为空</div>';
+        return;
+    }
+    stackBody.innerHTML = stack.map((instr, i) => {
+        const isTop = i === stack.length - 1;
+        const typeClass = 'type-' + instr.type;
+        let detail = '';
+        if (instr.type === 'create') detail = `${instr.system_ref||''} → ${instr.user_ref||''}`;
+        else if (instr.type === 'exec') detail = `${instr.last_msg_ref||''}`;
+        else if (instr.type === 'memory_read') detail = instr.ref || '';
+        else if (instr.type === 'memory_write') detail = `${instr.ref||''} = ${(instr.content||'').slice(0,30)}`;
+        else if (instr.type === 'memory_make') detail = `${instr.ref||''}.${instr.key||''} [${instr.mem_type||''}]`;
+        else detail = instr.raw || '';
+        return `
+        <div class="stack-card ${isTop?'top':''}">
+            <div class="type ${typeClass}">${instr.type} <span style="color:#666;font-weight:normal">#${instr.call_id}</span></div>
+            <div class="meta">
+                <span>utr=${instr.utr_index ?? instr.utr ?? -1}</span>
+                ${detail ? `<span style="color:#aaa">${detail}</span>` : ''}
+            </div>
+        </div>`;
+    }).join('');
+    stackBody.scrollTop = stackBody.scrollHeight;
+}
+
+// ---------- 纵向流程图 ----------
+const NODE_W = 110;
+const NODE_H = 36;
+const GAP_X = 180;
+const GAP_Y = 70;
+const MARGIN_X = 60;
+const MARGIN_Y = 40;
+
+const COLORS = {
+    start:    { fill: '#1a2a4a', stroke: '#4a7fd9', text: '#7eb8ff' },
+    llm_call: { fill: '#2a1a4a', stroke: '#a080ff', text: '#c8a8ff' },
+    subdialog:{ fill: '#3a2010', stroke: '#ffaa55', text: '#ffcc88' },
+    tool_call:{ fill: '#0a2a0a', stroke: '#4caf50', text: '#7fdf7f' },
+    input:    { fill: '#0a1a2a', stroke: '#4a9fd9', text: '#7fc8ff' },
+    step:     { fill: '#1a1a2a', stroke: '#666',    text: '#aaa' },
+    running:  { fill: '#2a2a00', stroke: '#ffcc00', text: '#ffcc00' },
+};
+
+function renderFlow(flow) {
+    if (!flow || flow.length === 0) {
+        flowSvg.innerHTML = '<defs><marker id="arrowhead" ...>...</marker><marker id="arrowhead-return" ...>...</marker></defs>';
+        return;
+    }
+
+    // 计算尺寸
+    const maxDepth = Math.max(...flow.map(n => n.depth), 0);
+    const width = MARGIN_X * 2 + maxDepth * GAP_X + NODE_W + 40;
+    const height = MARGIN_Y * 2 + flow.length * GAP_Y;
+    flowSvg.setAttribute('width', width);
+    flowSvg.setAttribute('height', height);
+    flowSvg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+
+    // 保留 defs
+    const defs = flowSvg.querySelector('defs');
+    flowSvg.innerHTML = '';
+    if (defs) flowSvg.appendChild(defs);
+    else {
+        flowSvg.innerHTML = `
+        <defs>
+          <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#4a7fd9"/>
+          </marker>
+          <marker id="arrowhead-return" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#4caf50"/>
+          </marker>
+        </defs>`;
+    }
+
+    // 计算节点坐标
+    flow.forEach((node, i) => {
+        node._x = MARGIN_X + node.depth * GAP_X;
+        node._y = MARGIN_Y + i * GAP_Y;
+    });
+
+    // 画连线
+    for (let i = 0; i < flow.length - 1; i++) {
+        const a = flow[i];
+        const b = flow[i + 1];
+        drawConnection(a, b);
+    }
+
+    // 画节点
+    flow.forEach(node => {
+        drawNode(node);
+    });
+}
+
+function drawConnection(a, b) {
+    const ax = a._x + NODE_W / 2;
+    const ay = a._y + NODE_H / 2;
+    const bx = b._x + NODE_W / 2;
+    const by = b._y + NODE_H / 2;
+
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+
+    if (a.depth === b.depth) {
+        // 同深度：垂直线
+        path.setAttribute('d', `M${ax},${a._y + NODE_H} L${bx},${b._y}`);
+        path.setAttribute('class', 'flow-line');
+        path.setAttribute('stroke', '#3a3a5a');
+    } else if (a.depth < b.depth) {
+        // 进入子对话：水平向右 + 垂直向下
+        path.setAttribute('d', `M${a._x + NODE_W},${ay} L${b._x},${ay} L${b._x},${b._y}`);
+        path.setAttribute('class', 'flow-line');
+        path.setAttribute('stroke', '#ffaa55');
+    } else {
+        // 离开子对话：垂直向下 + 水平向左 + 返回箭头
+        const midY = (a._y + NODE_H + b._y) / 2;
+        path.setAttribute('d', `M${ax},${a._y + NODE_H} L${ax},${midY} L${bx},${midY} L${bx},${b._y}`);
+        path.setAttribute('class', 'flow-return');
+        path.setAttribute('stroke', '#4caf50');
+        // 在水平段画箭头
+        const arrow = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        arrow.setAttribute('d', `M${ax},${midY} L${bx + 5},${midY}`);
+        arrow.setAttribute('class', 'flow-return');
+        arrow.setAttribute('stroke', '#4caf50');
+        arrow.setAttribute('marker-end', 'url(#arrowhead-return)');
+        flowSvg.appendChild(arrow);
+    }
+    flowSvg.appendChild(path);
+}
+
+function drawNode(node) {
+    const x = node._x;
+    const y = node._y;
+    const colors = COLORS[node.type] || COLORS.step;
+    const isRunning = node.status === 'running';
+    const fill = isRunning ? COLORS.running.fill : colors.fill;
+    const stroke = isRunning ? COLORS.running.stroke : colors.stroke;
+
+    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    g.setAttribute('class', 'flow-node-rect');
+    g.onmouseover = (e) => showTooltip(e, node);
+    g.onmouseout = hideTooltip;
+
+    if (node.type === 'start' || node.type === 'subdialog') {
+        // 方框
+        const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        rect.setAttribute('x', x);
+        rect.setAttribute('y', y);
+        rect.setAttribute('width', NODE_W);
+        rect.setAttribute('height', NODE_H);
+        rect.setAttribute('rx', 6);
+        rect.setAttribute('fill', fill);
+        rect.setAttribute('stroke', stroke);
+        rect.setAttribute('stroke-width', isRunning ? 2.5 : 1.5);
+        g.appendChild(rect);
+    } else {
+        // 圆角矩形（胶囊形）
+        const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        rect.setAttribute('x', x);
+        rect.setAttribute('y', y);
+        rect.setAttribute('width', NODE_W);
+        rect.setAttribute('height', NODE_H);
+        rect.setAttribute('rx', NODE_H / 2);
+        rect.setAttribute('fill', fill);
+        rect.setAttribute('stroke', stroke);
+        rect.setAttribute('stroke-width', isRunning ? 2.5 : 1.5);
+        g.appendChild(rect);
+    }
+
+    // 标签
+    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    text.setAttribute('x', x + NODE_W / 2);
+    text.setAttribute('y', y + NODE_H / 2 + 4);
+    text.setAttribute('text-anchor', 'middle');
+    text.setAttribute('class', 'flow-label');
+    text.setAttribute('fill', colors.text);
+    text.textContent = truncate(node.label, 12);
+    g.appendChild(text);
+
+    // 状态点
+    if (isRunning) {
+        const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        dot.setAttribute('cx', x + NODE_W - 8);
+        dot.setAttribute('cy', y + 8);
+        dot.setAttribute('r', 3);
+        dot.setAttribute('fill', '#ffcc00');
+        g.appendChild(dot);
+    }
+
+    flowSvg.appendChild(g);
+}
+
+function truncate(text, max) {
+    return text && text.length > max ? text.slice(0, max - 1) + '…' : (text || '');
+}
+
+function showTooltip(event, node) {
+    const lines = [`<strong>${node.label}</strong>`];
+    lines.push(`类型: ${node.type}`);
+    lines.push(`状态: ${node.status}`);
+    if (node.detail) lines.push(`详情: ${node.detail}`);
+    if (node.return_type) lines.push(`返回: ${node.return_type}`);
+    if (node.started_at) {
+        const dur = node.finished_at ? ((node.finished_at - node.started_at) * 1000).toFixed(0) + 'ms' : '进行中';
+        lines.push(`耗时: ${dur}`);
+    }
+    tooltip.innerHTML = lines.join('<br>');
+    tooltip.classList.add('visible');
+    tooltip.style.left = (event.clientX + 12) + 'px';
+    tooltip.style.top = (event.clientY + 12) + 'px';
+}
+
+function hideTooltip() {
+    tooltip.classList.remove('visible');
+}
+
+window.addEventListener('resize', () => {
+    if (lastData) renderFlow(lastData.flow || []);
+});
+</script>
+</body>
+</html>
