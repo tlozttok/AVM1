@@ -187,7 +187,7 @@ def main():
             })
 
     # 设置初始命令栈
-    core.command_stack.append("create 0 -1 $MEM.system $MEM.user $MEM.model_params")
+    core.command_stack.append("create 0 -1 $MEM.system $MEM.user $MEM.model_params")#-1是怎么回事
     core.run()
 
 
