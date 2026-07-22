@@ -1,50 +1,41 @@
-"""messages 模块单元测试"""
+"""types 模块单元测试"""
 
 import pytest
-from avm.messages import (
-    Role, ToolCall, ToolCallResponse,
-    Message, SystemMessage, UserMessage, AssistantMessage, ToolMessage,
-    ConversationMessage, Conversation, UserMessageBatch,
+from avm.types import (
+    Role, Message,
+    SystemMessage, UserMessage, AssistantMessage, ToolMessage,
+    message_to_api_dict,
+    Conversation, UserMessageBatch,
 )
 
 
-class TestConversationMessage:
-    def test_from_any_dict(self):
-        msg = ConversationMessage.from_any({"role": "user", "content": "hello"})
-        assert msg.role == "user"
-        assert msg.content == "hello"
-        assert msg.tool_calls is None
+class TestMessageToApiDict:
+    def test_system_message(self):
+        d = message_to_api_dict(SystemMessage(content="sys"))
+        assert d == {"role": "system", "content": "sys"}
 
-    def test_from_any_dict_with_tool_calls(self):
+    def test_user_message(self):
+        d = message_to_api_dict(UserMessage(content="hi"))
+        assert d == {"role": "user", "content": "hi"}
+
+    def test_assistant_no_tool_calls(self):
+        d = message_to_api_dict(AssistantMessage(content="ok"))
+        assert d == {"role": "assistant", "content": "ok"}
+
+    def test_assistant_with_tool_calls(self):
         tc = [{"id": "1", "type": "function", "function": {"name": "read"}}]
-        msg = ConversationMessage.from_any({"role": "assistant", "content": "", "tool_calls": tc})
-        assert msg.tool_calls == tc
-
-    def test_from_any_tuple(self):
-        msg = ConversationMessage.from_any(("system", "sys"))
-        assert msg.role == "system"
-        assert msg.content == "sys"
-
-    def test_from_any_message_object(self):
-        msg = ConversationMessage.from_any(UserMessage(content="hi"))
-        assert msg.role == "user"
-        assert msg.content == "hi"
-
-    def test_to_dict_basic(self):
-        msg = ConversationMessage(role="user", content="hi")
-        assert msg.to_dict() == {"role": "user", "content": "hi"}
-
-    def test_to_dict_with_tool_calls(self):
-        tc = [{"id": "1", "type": "function", "function": {"name": "read"}}]
-        msg = ConversationMessage(role="assistant", content="ok", tool_calls=tc)
-        d = msg.to_dict()
+        d = message_to_api_dict(AssistantMessage(content="", tool_calls=tc))
         assert d["role"] == "assistant"
-        assert d["content"] == "ok"
+        assert d["content"] == ""
         assert d["tool_calls"] == tc
+
+    def test_tool_message(self):
+        d = message_to_api_dict(ToolMessage(content="result", tool_call_id="tc1"))
+        assert d == {"role": "tool", "content": "result", "tool_call_id": "tc1"}
 
 
 class TestConversation:
-    def test_from_any_list(self):
+    def test_from_any_list_tuples(self):
         conv = Conversation.from_any_list([
             ("system", "sys"),
             ("user", "usr"),
@@ -53,7 +44,7 @@ class TestConversation:
         assert conv.messages[0].role == "system"
         assert conv.messages[1].role == "user"
 
-    def test_from_any_list_with_tool_calls(self):
+    def test_from_any_list_dict_with_tool_calls(self):
         tc = [{"id": "1", "type": "function", "function": {"name": "read"}}]
         conv = Conversation.from_any_list([
             {"role": "assistant", "content": "", "tool_calls": tc},
@@ -67,7 +58,7 @@ class TestConversation:
 
     def test_validate_empty_ok(self):
         conv = Conversation()
-        conv.validate(require_last_assistant=False)  # 不抛异常
+        conv.validate(require_last_assistant=False)
 
     def test_validate_last_not_assistant_raises(self):
         conv = Conversation.from_any_list([("system", "sys"), ("user", "usr")])
@@ -167,18 +158,3 @@ class TestUserMessageBatch:
         assert len(batch.tool_responses) == 2
         assert batch.tool_responses[0].content == "r1"
         assert batch.user_contents == ["u1"]
-
-
-class TestAssistantMessage:
-    def test_to_dict_no_tool_calls(self):
-        msg = AssistantMessage(content="hi")
-        assert msg.to_dict() == {"role": "assistant", "content": "hi"}
-
-    def test_to_dict_with_tool_calls(self):
-        msg = AssistantMessage(
-            content="",
-            tool_calls=[ToolCall(id="1", type="function", name="read", arguments={"ref": "x"})]
-        )
-        d = msg.to_dict()
-        assert "tool_calls" in d
-        assert d["tool_calls"][0]["id"] == "1"

@@ -177,11 +177,15 @@ class ToolMessage(Message):
     """工具响应消息"""
     role: str = "tool"
     tool_call_id: str = ""
-    
-    def __init__(self,content,tool_call_id):
-        super().__init__(content)
-        self.tool_call_id = tool_call_id
 
+
+def message_to_api_dict(msg: Message) -> dict:
+    d: dict = {"role": msg.role, "content": msg.content}
+    if isinstance(msg, AssistantMessage) and msg.tool_calls:
+        d["tool_calls"] = msg.tool_calls
+    if isinstance(msg, ToolMessage):
+        d["tool_call_id"] = msg.tool_call_id
+    return d
 
 
 @dataclass
@@ -242,7 +246,7 @@ class Conversation:
         """
         self.validate(require_last_assistant=False)
         merged = self.merge_system_messages()
-        result = [msg.to_dict() for msg in merged]
+        result = [message_to_api_dict(msg) for msg in merged]
         logger.debug("[Conversation.to_api_messages] count=%d", len(result))
         return result
 
@@ -265,6 +269,30 @@ class Conversation:
     def get_last_messages(self, count: int = 1) -> List[Message]:
         """获取最后 n 条消息"""
         return self.messages[-count:] if self.messages else []
+
+    @classmethod
+    def from_any_list(cls, items: list) -> 'Conversation':
+        conv = cls()
+        for item in items:
+            if isinstance(item, (tuple, list)) and len(item) == 2:
+                role, content = item
+                conv.messages.append(cls._msg_for(role, content, {}))
+            elif isinstance(item, dict):
+                conv.messages.append(cls._msg_for(
+                    item.get("role", ""), item.get("content", ""), item))
+        return conv
+
+    @staticmethod
+    def _msg_for(role: str, content: str, extra: dict) -> Message:
+        if role == "system":
+            return SystemMessage(content=content)
+        if role == "user":
+            return UserMessage(content=content)
+        if role == "assistant":
+            return AssistantMessage(content=content, tool_calls=extra.get("tool_calls"))
+        if role == "tool":
+            return ToolMessage(content=content, tool_call_id=extra.get("tool_call_id", ""))
+        return SystemMessage(content=content)
 
 
 @dataclass
@@ -315,19 +343,16 @@ class UserMessageBatch:
 
 
 __all__ = [
+    'MetaList',
+    'MetaDict',
     'Role',
     'ToolCall',
-    'ToolCallResponse',
     'Message',
     'SystemMessage',
     'UserMessage',
     'AssistantMessage',
     'ToolMessage',
-    'ConversationMessage',
+    'message_to_api_dict',
     'Conversation',
     'UserMessageBatch',
-    'MessageDict',
-    'MessageTuple',
-    'MessageInput',
-    'MessageHistory',
 ]

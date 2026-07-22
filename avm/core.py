@@ -13,7 +13,7 @@ import time
 
 from .types import MetaList, MetaDict
 from .exceptions import VMSyntaxError, VMMemoryError
-from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch
+from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, message_to_api_dict
 from .memory import Memory
 
 logger = logging.getLogger(__name__)
@@ -159,7 +159,7 @@ class CreateInstruction(Instruction):
             core._notify("conversation_created", {
                 "call_id": self.call_id,
                 "last_msg_idx": last_msg_idx,
-                "messages": [m.to_dict() for m in conversation.messages],
+                "messages": [message_to_api_dict(m) for m in conversation.messages],
             })
 
             # 替换栈顶为 exec 指令
@@ -192,7 +192,7 @@ class CreateInstruction(Instruction):
             if conversation is not None:
                 core._notify("conversation_completed", {
                     "call_id": self.call_id,
-                    "messages": [m.to_dict() for m in conversation.messages],
+                    "messages": [message_to_api_dict(m) for m in conversation.messages],
                 })
             return CRT.EXIT
 
@@ -268,7 +268,7 @@ class ExecInstruction(Instruction):
             core._notify("conversation_updated", {
                 "call_id": self.call_id,
                 "last_msg_idx": last_msg_idx,
-                "messages": [m.to_dict() for m in conversation.messages],
+                "messages": [message_to_api_dict(m) for m in conversation.messages],
                 "closed": True,
             })
             # pop 对应的寄存器
@@ -534,8 +534,8 @@ class LMU:
         """
         logger.info("[LMU.exec_crt] model=%s use_tool=%s", para.get("model"), para.get("use_tool"))
         messages = [
-            SystemMessage(content=system_prompt).to_dict(),
-            UserMessage(content=user_prompt).to_dict()
+            message_to_api_dict(SystemMessage(content=system_prompt)),
+            message_to_api_dict(UserMessage(content=user_prompt))
         ]
         logger.debug("[LMU.exec_crt] model=%s, msg_count=%d system_preview=%r user_preview=%r",
             para.get("model"), 2,

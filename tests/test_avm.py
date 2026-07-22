@@ -16,7 +16,7 @@ from avm.core import (
     CRT,
 )
 from avm.memory import Memory
-from avm.messages import Conversation, UserMessageBatch
+from avm.types import Conversation, UserMessageBatch
 from avm.exceptions import VMSyntaxError, VMMemoryError
 from avm.memory_device import StringDevice
 
