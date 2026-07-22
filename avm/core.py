@@ -13,7 +13,7 @@ import time
 
 from .types import MetaList, MetaDict
 from .exceptions import VMSyntaxError, VMMemoryError
-from .messages import SystemMessage, UserMessage, Conversation, UserMessageBatch
+from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch
 from .memory import Memory
 
 logger = logging.getLogger(__name__)
