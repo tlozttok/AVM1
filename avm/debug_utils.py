@@ -75,7 +75,7 @@ class DebugTracer:
         if b_lm != a_lm:
             lines.append(f"[last_msg_reg] {len(b_lm)} -> {len(a_lm)} conversations")
 
-        # usr_tool_reg 变化
+        # usr_tool_reg 变化（现在从 last_msg_reg 的 user_batch 获取）
         b_ut = before["usr_tool_reg"]
         a_ut = after["usr_tool_reg"]
         if b_ut != a_ut:
@@ -122,10 +122,8 @@ class DebugTracer:
             lines.append(f"  {cmd} {marker}")
         lines.append(f"last_msg_reg ({len(self.core.last_msg_reg)}):")
         for i, conv in enumerate(self.core.last_msg_reg):
-            lines.append(f"  [{i}] {len(conv.messages)} messages")
-        lines.append(f"usr_tool_reg ({len(self.core.usr_tool_reg)}):")
-        for i, batch in enumerate(self.core.usr_tool_reg):
-            lines.append(f"  [{i}] {len(batch.tool_responses)} tool_responses, {len(batch.user_contents)} user_contents")
+            b = conv.user_batch
+            lines.append(f"  [{i}] {len(conv.messages)} msgs, {len(b.tool_responses)} tool_resp, {len(b.user_contents)} user_content")
         lines.append(f"mem top-level keys: {list(self.core.mem._data.keys())}")
         lines.append(f"mounted devices: {list(self.core.mem._devices.keys())}")
         return "\n".join(lines)
@@ -139,7 +137,7 @@ class DebugTracer:
             "label": label,
             "command_stack": list(self.core.command_stack),
             "last_msg_reg": [self._conv_summary(c) for c in self.core.last_msg_reg],
-            "usr_tool_reg": [self._batch_summary(b) for b in self.core.usr_tool_reg],
+            "usr_tool_reg": [self._batch_summary(c.user_batch) for c in self.core.last_msg_reg],
             "mem_keys": set(self.core.mem._data.keys()),
             "mem_devices": list(self.core.mem._devices.keys()),
         })
@@ -165,10 +163,8 @@ def inspect_core(core: Core, title: str = "CORE INSPECT") -> str:
     lines.append(f"last_msg_reg   : {len(core.last_msg_reg)} conversation(s)")
     for i, c in enumerate(core.last_msg_reg):
         msgs = [(m.role, m.content[:40]) for m in c.messages]
-        lines.append(f"  [{i}] {msgs}")
-    lines.append(f"usr_tool_reg   : {len(core.usr_tool_reg)} batch(es)")
-    for i, b in enumerate(core.usr_tool_reg):
-        lines.append(f"  [{i}] tools={b.tool_responses}, users={b.user_contents}")
+        b = c.user_batch
+        lines.append(f"  [{i}] msgs={msgs}, tools={b.tool_responses}, users={b.user_contents}")
     lines.append(f"mem top keys   : {list(core.mem._data.keys())}")
     lines.append(f"devices        : {list(core.mem._devices.keys())}")
     lines.append("=" * 60)

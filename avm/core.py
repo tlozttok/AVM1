@@ -46,7 +46,7 @@ class MemoryReadInstruction(Instruction):
     
     def execute(self, core: 'Core') -> CRT:
         logger.info("[memory_read] call_id=%s ref=%s", self.call_id, self.ref)
-        user_batch = core.usr_tool_reg[self.utr_index]
+        user_batch = core.last_msg_reg[self.utr_index].user_batch
         try:
             content = core.unwrap(self.ref, for_llm=True)
             logger.debug("[memory_read] content=%r", content)
@@ -72,7 +72,7 @@ class MemoryWriteInstruction(Instruction):
     
     def execute(self, core: 'Core') -> CRT:
         logger.info("[memory_write] call_id=%s ref=%s", self.call_id, self.ref)
-        user_batch = core.usr_tool_reg[self.utr_index]
+        user_batch = core.last_msg_reg[self.utr_index].user_batch
         try:
             core.mem.set(self.ref, self.content)
             user_batch.add_tool_response(f"Success set: {self.ref}", self.call_id)
@@ -96,7 +96,7 @@ class MemoryMakeInstruction(Instruction):
 
     def execute(self, core: 'Core') -> CRT:
         logger.info("[memory_make] call_id=%s ref=%s key=%s type=%s", self.call_id, self.ref, self.key, self.mem_type)
-        user_batch = core.usr_tool_reg[self.utr_index]
+        user_batch = core.last_msg_reg[self.utr_index].user_batch
         try:
             core.mem.make(self.ref, self.key, self.mem_type)
             user_batch.add_tool_response(f"Success created {self.mem_type} at {self.ref}.{self.key}", self.call_id)
@@ -127,7 +127,7 @@ class CreateInstruction(Instruction):
         except VMMemoryError as e:
             logger.error("[create] error: %s", e)
             if self.utr_index != -1:
-                core.usr_tool_reg[self.utr_index].add_tool_response(
+                core.last_msg_reg[self.utr_index].user_batch.add_tool_response(
                     f"[参数错误] {e}。请检查 create 指令的 memory 引用是否正确。"
                     f"确认引用路径是否存在，必要时先用 memory_make 创建。",
                     self.call_id
@@ -149,11 +149,9 @@ class CreateInstruction(Instruction):
             })
             # 分配新的寄存器槽位
             last_msg_idx = len(core.last_msg_reg)
-            user_msg_idx = len(core.usr_tool_reg)
 
-            # 存入 Conversation
+            # 存入 Conversation（含内嵌的 UserMessageBatch）
             core.last_msg_reg.append(conversation)
-            core.usr_tool_reg.append(UserMessageBatch())
 
             # --- monitor: conversation 被创建 ---
             core._notify("conversation_created", {
@@ -166,16 +164,16 @@ class CreateInstruction(Instruction):
             core.command_stack[-1] = ExecInstruction(
                 self.call_id, self.utr_index,
                 f"$last_msg_reg.{last_msg_idx}",
-                f"$usr_tool_reg.{user_msg_idx}",
+                f"$usr_tool_reg.{last_msg_idx}",
                 self.para_ref
             )
             # 压入子指令（反序）
             for rc in reversed(return_calls):
-                instr = _make_instruction(rc, user_msg_idx)
+                instr = _make_instruction(rc, last_msg_idx)
                 if instr is not None:
                     core.command_stack.append(instr)
                 else:
-                    batch = core.usr_tool_reg[user_msg_idx]
+                    batch = conversation.user_batch
                     args = rc.get("args", {})
                     detail = args.get("error", "")
                     name = args.get("name", rc.get("cmd_type", "?"))
@@ -186,8 +184,7 @@ class CreateInstruction(Instruction):
             return CRT.CONTINUE
         else:
             if result and self.utr_index != -1:
-                user_batch = core.usr_tool_reg[self.utr_index]
-                user_batch.add_tool_response(result, self.call_id)
+                core.last_msg_reg[self.utr_index].user_batch.add_tool_response(result, self.call_id)
             # --- monitor: conversation 完成（无子调用）---
             if conversation is not None:
                 core._notify("conversation_completed", {
@@ -217,12 +214,11 @@ class ExecInstruction(Instruction):
         try:
             # 直接从寄存器获取类型化对象
             conversation: Conversation = core.unwrap(self.last_msg_ref)
-            user_batch: UserMessageBatch = core.unwrap(self.user_msg_ref)
             para = core.unwrap(self.para_ref, for_llm=False)
         except VMMemoryError as e:
             logger.error("[exec] error: %s", e)
             if self.utr_index != -1:
-                core.usr_tool_reg[self.utr_index].add_tool_response(
+                core.last_msg_reg[self.utr_index].user_batch.add_tool_response(
                     f"[参数错误] {e}。请检查 exec 指令的 memory 引用是否正确。"
                     f"确认引用路径是否存在，必要时先用 memory_make 创建。",
                     self.call_id
@@ -230,9 +226,9 @@ class ExecInstruction(Instruction):
             return CRT.EXIT
 
         # 调用 LMU.exec
-        result, return_calls, _ = core.lmu.exec(conversation, user_batch, para)
+        result, return_calls, _ = core.lmu.exec(conversation, para)
         logger.debug("[exec] result=%r return_calls=%d", result, len(return_calls))
-        user_batch.clear()
+        conversation.user_batch.clear()
 
         # 处理 return_calls：不弹出当前指令，直接压栈
         if return_calls:
@@ -247,23 +243,21 @@ class ExecInstruction(Instruction):
                 "tool_calls": return_calls,
             })
             for rc in reversed(return_calls):
-                instr = _make_instruction(rc, user_msg_idx)
+                instr = _make_instruction(rc, last_msg_idx)
                 if instr is not None:
                     core.command_stack.append(instr)
                 else:
-                    batch = core.usr_tool_reg[user_msg_idx]
                     args = rc.get("args", {})
                     detail = args.get("error", "")
                     name = args.get("name", rc.get("cmd_type", "?"))
                     msg = f"Error: {name} 执行失败"
                     if detail:
                         msg += f" — {detail}"
-                    batch.add_tool_response(msg, rc.get("call_id", ""))
+                    conversation.user_batch.add_tool_response(msg, rc.get("call_id", ""))
             return CRT.CONTINUE
         else:
             if result and self.utr_index != -1:
-                parent_batch = core.usr_tool_reg[self.utr_index]
-                parent_batch.add_tool_response(result, self.call_id)
+                core.last_msg_reg[self.utr_index].user_batch.add_tool_response(result, self.call_id)
             # --- monitor: conversation 最终更新（即将关闭）---
             core._notify("conversation_updated", {
                 "call_id": self.call_id,
@@ -271,9 +265,7 @@ class ExecInstruction(Instruction):
                 "messages": [message_to_api_dict(m) for m in conversation.messages],
                 "closed": True,
             })
-            # pop 对应的寄存器
-            if user_msg_idx is not None and user_msg_idx < len(core.usr_tool_reg):
-                core.usr_tool_reg.pop(user_msg_idx)
+            # pop 寄存器
             if last_msg_idx is not None and last_msg_idx < len(core.last_msg_reg):
                 core.last_msg_reg.pop(last_msg_idx)
             logger.info("[exec] done call_id=%s", self.call_id)
@@ -615,19 +607,18 @@ class LMU:
 
         return result, return_calls, conversation
 
-    def exec(self, conversation: Conversation, user_msg_batch: UserMessageBatch, para: MetaDict):
+    def exec(self, conversation: Conversation, para: MetaDict):
         """执行对话
-        conversation: 对话历史（已验证并封装）
-        user_msg_batch: 用户消息批量输入
+        conversation: 对话历史（含内嵌的 user_batch）
         para: 参数字典
         """
         logger.info("[LMU.exec] model=%s use_tool=%s", para.get("model"), para.get("use_tool", False))
         # 使用 Conversation 类型处理消息转换
         messages = conversation.to_api_messages()
-        messages.extend(user_msg_batch.to_tool_messages())
+        messages.extend(conversation.user_batch.to_tool_messages())
         logger.debug("[LMU.exec] messages_count=%d", len(messages))
 
-        user_content = user_msg_batch.get_user_content()
+        user_content = conversation.user_batch.get_user_content()
         if user_content:
             messages.append({"role": "user", "content": user_content})
 
@@ -686,7 +677,7 @@ class LMU:
         # 更新对话历史：tool 响应 -> user 输入(如有) -> assistant 回复
         # 必须先把 tool 响应保存到 conversation，否则下次 exec 时 conversation
         # 中缺少 tool 消息，API 会报 "tool_calls 没有对应的 tool 响应"
-        for resp in user_msg_batch.tool_responses:
+        for resp in conversation.user_batch.tool_responses:
             conversation.append_tool_message(resp.content, resp.tool_call_id)
 
         if user_content:
@@ -717,8 +708,7 @@ ASSISTANT = "assistant"
 class Core:
     def __init__(self):
         self.command_stack = []
-        self.last_msg_reg = []  # 存储 Conversation 对象
-        self.usr_tool_reg = []  # 存储 UserMessageBatch 对象
+        self.last_msg_reg = []  # 存储 Conversation 对象（含内嵌 UserMessageBatch）
         self.mem = Memory()
         self.lmu = LMU()
         self.debug = False
@@ -907,6 +897,6 @@ class Core:
             return self.last_msg_reg[int(value[2])]
         elif value[1] == "usr_tool_reg":
             assert value[0] == "$"
-            return self.usr_tool_reg[int(value[2])]
+            return self.last_msg_reg[int(value[2])].user_batch
         else:
             return self.mem.unwrap(value, for_llm=for_llm)

@@ -53,8 +53,8 @@ class MockLMU:
     def exec_crt(self, system_prompt, user_prompt, para):
         return self._next("exec_crt", system_prompt, user_prompt, para)
 
-    def exec(self, conversation, user_msg_batch, para):
-        return self._next("exec", conversation, user_msg_batch, para)
+    def exec(self, conversation, para):
+        return self._next("exec", conversation, para)
 
 
 # ---------------------------------------------------------------------------
@@ -199,18 +199,16 @@ class TestCoreState:
         core = make_core()
         assert core.command_stack == []
         assert core.last_msg_reg == []
-        assert core.usr_tool_reg == []
+        assert core.last_msg_reg == []
         assert isinstance(core.mem, Memory)
 
     def test_unwrap_register(self):
         core = make_core()
         conv = Conversation.from_any_list([("system", "sys"), ("user", "usr")])
-        batch = UserMessageBatch()
         core.last_msg_reg.append(conv)
-        core.usr_tool_reg.append(batch)
 
         assert core.unwrap("$last_msg_reg.0") is conv
-        assert core.unwrap("$usr_tool_reg.0") is batch
+        assert core.unwrap("$usr_tool_reg.0") is conv.user_batch
 
     def test_unwrap_mem(self):
         core = make_core()
@@ -226,13 +224,14 @@ class TestInstructionExecution:
     def test_memory_read(self):
         core = make_core()
         core.mem["input"] = "user_says_hi"
-        core.usr_tool_reg.append(UserMessageBatch())
+        conv = Conversation()
+        core.last_msg_reg.append(conv)
 
         instr = MemoryReadInstruction("cid", 0, "$MEM.input")
         rt = instr.execute(core)
 
         assert rt == CRT.EXIT
-        batch = core.usr_tool_reg[0]
+        batch = core.last_msg_reg[0].user_batch
         assert len(batch.tool_responses) == 1
         assert batch.tool_responses[0].content == "user_says_hi"
         assert batch.tool_responses[0].tool_call_id == "cid"
@@ -240,7 +239,8 @@ class TestInstructionExecution:
     def test_memory_write(self):
         core = make_core()
         core.mem["out"] = ""
-        core.usr_tool_reg.append(UserMessageBatch())
+        conv = Conversation()
+        core.last_msg_reg.append(conv)
 
         instr = MemoryWriteInstruction("cid", 0, "$MEM.out", "hello")
         rt = instr.execute(core)
@@ -248,7 +248,7 @@ class TestInstructionExecution:
         assert rt == CRT.EXIT
         assert core.mem["out"] == "hello"
         # 工具响应也写入了 batch
-        assert len(core.usr_tool_reg[0].tool_responses) == 1
+        assert len(core.last_msg_reg[0].user_batch.tool_responses) == 1
 
     def test_create_no_tool_calls(self):
         """create 指令，LLM 无工具调用 -> EXIT，结果写回父 batch"""
@@ -256,15 +256,16 @@ class TestInstructionExecution:
         core.mem["sys"] = "system_prompt"
         core.mem["usr"] = "user_prompt"
         core.mem["para"] = {"model": "test"}
-        core.usr_tool_reg.append(UserMessageBatch())
+        conv = Conversation()
+        core.last_msg_reg.append(conv)
 
         core.command_stack.append("create cid_1 0 $MEM.sys $MEM.usr $MEM.para")
         core.run()
 
         assert len(core.command_stack) == 0
-        assert len(core.usr_tool_reg) == 1
-        assert core.usr_tool_reg[0].tool_responses[0].content == "hello"
-        assert core.usr_tool_reg[0].tool_responses[0].tool_call_id == "cid_1"
+        assert len(core.last_msg_reg) == 1
+        assert core.last_msg_reg[0].user_batch.tool_responses[0].content == "hello"
+        assert core.last_msg_reg[0].user_batch.tool_responses[0].tool_call_id == "cid_1"
 
     def test_create_with_tool_calls(self):
         """create 指令，LLM 返回一个工具调用 -> CONTINUE，栈顶替换为 exec + 子指令"""
@@ -280,7 +281,8 @@ class TestInstructionExecution:
         core.mem["usr"] = "u"
         core.mem["para"] = {"model": "test", "use_tool": True}
         core.mem["input"] = "hello"
-        core.usr_tool_reg.append(UserMessageBatch())
+        conv = Conversation()
+        core.last_msg_reg.append(conv)
 
         core.command_stack.append("create cid_1 0 $MEM.sys $MEM.usr $MEM.para")
         core.run()
@@ -303,7 +305,8 @@ class TestInstructionExecution:
         core.mem["usr"] = "u"
         core.mem["para"] = {"model": "test", "use_tool": True}
         core.mem["input"] = "hello"
-        core.usr_tool_reg.append(UserMessageBatch())
+        conv = Conversation()
+        core.last_msg_reg.append(conv)
 
         core.command_stack.append("create cid_1 0 $MEM.sys $MEM.usr $MEM.para")
         core.run()
@@ -319,9 +322,9 @@ class TestInstructionExecution:
 
         assert len(core.command_stack) == 0
         assert len(core.last_msg_reg) == 0
-        assert len(core.usr_tool_reg) == 1  # 只剩父 batch
+        assert len(core.last_msg_reg) == 1  # 只剩父 batch
         # exec 的 result 写回父 batch
-        assert core.usr_tool_reg[0].tool_responses[-1].content == "final_answer"
+        assert core.last_msg_reg[0].user_batch.tool_responses[-1].content == "final_answer"
 
     def test_nested_create(self):
         """exec 中 LLM 触发 create_cmd -> 产生新的 create 指令"""
@@ -337,7 +340,8 @@ class TestInstructionExecution:
         core.mem["sys2"] = "s2"
         core.mem["usr2"] = "u2"
         core.mem["para2"] = {"model": "test2"}
-        core.usr_tool_reg.append(UserMessageBatch())
+        conv = Conversation()
+        core.last_msg_reg.append(conv)
 
         core.command_stack.append("create cid_1 0 $MEM.sys $MEM.usr $MEM.para")
         core.run()
@@ -349,7 +353,7 @@ class TestInstructionExecution:
         assert core.lmu.call_index == 3
         assert len(core.command_stack) == 0
         # 第二层对话的寄存器已被弹出，只剩父 batch
-        assert len(core.usr_tool_reg) == 1
+        assert len(core.last_msg_reg) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -375,16 +379,17 @@ class TestIntegration:
         core.mem["usr"] = "user"
         core.mem["para"] = {"model": "test", "use_tool": True}
         core.mem["data"] = {"input": "raw_data"}
-        core.usr_tool_reg.append(UserMessageBatch())
+        conv = Conversation()
+        core.last_msg_reg.append(conv)
 
         core.command_stack.append("create root 0 $MEM.sys $MEM.usr $MEM.para")
         core.run()
 
         assert len(core.command_stack) == 0
         assert len(core.last_msg_reg) == 0
-        assert len(core.usr_tool_reg) == 1
+        assert len(core.last_msg_reg) == 1
         # 最终 result 回到父 batch
-        assert core.usr_tool_reg[0].tool_responses[-1].content == "processed"
+        assert core.last_msg_reg[0].user_batch.tool_responses[-1].content == "processed"
 
     def test_multi_tool_calls_order(self):
         """验证多个工具调用的压栈顺序（反序）"""
@@ -402,7 +407,8 @@ class TestIntegration:
         core.mem["para"] = {"model": "test", "use_tool": True}
         core.mem["a"] = ""
         core.mem["b"] = ""
-        core.usr_tool_reg.append(UserMessageBatch())
+        conv = Conversation()
+        core.last_msg_reg.append(conv)
 
         core.command_stack.append("create root 0 $MEM.s $MEM.u $MEM.para")
         core.run()
@@ -468,26 +474,28 @@ class TestMemoryMakeExecution:
     def test_memory_make_execute_dict(self):
         core = make_core()
         core.mem["data"] = {}
-        core.usr_tool_reg.append(UserMessageBatch())
+        conv = Conversation()
+        core.last_msg_reg.append(conv)
 
         instr = MemoryMakeInstruction("cid", 0, "$MEM.data", "new_key", "dict")
         rt = instr.execute(core)
 
         assert rt == CRT.EXIT
         assert core.mem["data"]["new_key"] == {}
-        assert len(core.usr_tool_reg[0].tool_responses) == 1
-        assert "Success created dict" in core.usr_tool_reg[0].tool_responses[0].content
+        assert len(core.last_msg_reg[0].user_batch.tool_responses) == 1
+        assert "Success created dict" in core.last_msg_reg[0].user_batch.tool_responses[0].content
 
     def test_memory_make_execute_error(self):
         core = make_core()
         core.mem["data"] = "string"
-        core.usr_tool_reg.append(UserMessageBatch())
+        conv = Conversation()
+        core.last_msg_reg.append(conv)
 
         instr = MemoryMakeInstruction("cid", 0, "$MEM.data", "key", "dict")
         rt = instr.execute(core)
 
         assert rt == CRT.EXIT
-        assert "Error" in core.usr_tool_reg[0].tool_responses[0].content
+        assert "Error" in core.last_msg_reg[0].user_batch.tool_responses[0].content
 
 
 # ---------------------------------------------------------------------------
@@ -503,8 +511,10 @@ class TestExecInstructionDirect:
         ])
         core.mem["para"] = {"model": "test"}
         core.last_msg_reg.append(conv)
-        core.usr_tool_reg.append(UserMessageBatch())   # idx 0: exec 使用的
-        core.usr_tool_reg.append(UserMessageBatch())   # idx 1: 父 batch
+        conv = Conversation()
+        core.last_msg_reg.append(conv)   # idx 0: exec 使用的
+        conv = Conversation()
+        core.last_msg_reg.append(conv)   # idx 1: 父 batch
 
         instr = ExecInstruction("cid", 1, "$last_msg_reg.0", "$usr_tool_reg.0", "$MEM.para")
         core.command_stack.append(instr)
@@ -512,9 +522,9 @@ class TestExecInstructionDirect:
 
         # EXIT 后弹出寄存器
         assert len(core.last_msg_reg) == 0
-        assert len(core.usr_tool_reg) == 1  # 只剩父 batch
-        assert core.usr_tool_reg[0].tool_responses[0].content == "result"
-        assert core.usr_tool_reg[0].tool_responses[0].tool_call_id == "cid"
+        assert len(core.last_msg_reg) == 1  # 只剩父 batch
+        assert core.last_msg_reg[0].user_batch.tool_responses[0].content == "result"
+        assert core.last_msg_reg[0].user_batch.tool_responses[0].tool_call_id == "cid"
 
     def test_exec_continue_with_tool_calls(self):
         """ExecInstruction CONTINUE，压入子指令，之后继续执行"""
@@ -526,8 +536,10 @@ class TestExecInstructionDirect:
         core.mem["x"] = "val"
         core.mem["para"] = {"model": "test"}
         core.last_msg_reg.append(conv)
-        core.usr_tool_reg.append(UserMessageBatch())   # idx 0: exec 使用的
-        core.usr_tool_reg.append(UserMessageBatch())   # idx 1: 父 batch
+        conv = Conversation()
+        core.last_msg_reg.append(conv)   # idx 0: exec 使用的
+        conv = Conversation()
+        core.last_msg_reg.append(conv)   # idx 1: 父 batch
 
         instr = ExecInstruction("cid", 1, "$last_msg_reg.0", "$usr_tool_reg.0", "$MEM.para")
         core.command_stack.append(instr)
@@ -535,9 +547,9 @@ class TestExecInstructionDirect:
 
         assert len(core.command_stack) == 0
         assert len(core.last_msg_reg) == 0
-        assert len(core.usr_tool_reg) == 1
+        assert len(core.last_msg_reg) == 1
         # memory_read 的结果 + exec 的 result
-        assert core.usr_tool_reg[0].tool_responses[-1].content == "done"
+        assert core.last_msg_reg[0].user_batch.tool_responses[-1].content == "done"
 
     def test_exec_with_user_content(self):
         """ExecInstruction 消费 user_msg_batch 中的 user_content"""
@@ -547,16 +559,17 @@ class TestExecInstructionDirect:
         ])
         core.mem["para"] = {"model": "test"}
         core.last_msg_reg.append(conv)
-        batch = UserMessageBatch()
-        batch.add_user_content("additional input")
-        core.usr_tool_reg.append(batch)
-        core.usr_tool_reg.append(UserMessageBatch())  # 父 batch
+        exec_conv = Conversation()
+        exec_conv.user_batch.add_user_content("additional input")
+        core.last_msg_reg.append(exec_conv)
+        conv = Conversation()
+        core.last_msg_reg.append(conv)  # 父 batch
 
         instr = ExecInstruction("cid", 1, "$last_msg_reg.0", "$usr_tool_reg.0", "$MEM.para")
         core.command_stack.append(instr)
         core.run()
 
-        assert core.usr_tool_reg[0].tool_responses[0].content == "got_it"
+        assert core.last_msg_reg[0].user_batch.tool_responses[0].content == "got_it"
 
 
 # ---------------------------------------------------------------------------
@@ -573,13 +586,14 @@ class TestCoreRun:
         core.mem["sys"] = "s"
         core.mem["usr"] = "u"
         core.mem["para"] = {"model": "test"}
-        core.usr_tool_reg.append(UserMessageBatch())
+        conv = Conversation()
+        core.last_msg_reg.append(conv)
 
         core.command_stack.append("create cid 0 $MEM.sys $MEM.usr $MEM.para")
         core.run()
 
         assert len(core.command_stack) == 0
-        assert core.usr_tool_reg[0].tool_responses[0].content == "hello"
+        assert core.last_msg_reg[0].user_batch.tool_responses[0].content == "hello"
 
 
 # ---------------------------------------------------------------------------

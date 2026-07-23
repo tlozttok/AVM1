@@ -192,9 +192,10 @@ def message_to_api_dict(msg: Message) -> dict:
 class Conversation:
     """
     对话历史封装
-    负责消息的验证、合并和转换
+    负责消息的验证、合并和转换，内嵌用户消息批次
     """
     messages: List[Message] = field(default_factory=list)
+    user_batch: 'UserMessageBatch' = field(default_factory=lambda: UserMessageBatch())
 
     def validate(self, require_last_assistant: bool = True) -> None:
         """
