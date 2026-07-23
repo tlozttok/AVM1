@@ -29,11 +29,11 @@ CRT = CommandReturnType
 class Instruction:
     """指令基类"""
     call_id: str
-    utr_index: int
+    caller_id: int
 
-    def __init__(self,call_id: str, utr_index: int, **kargs):
+    def __init__(self,call_id: str, caller_id: int, **kargs):
         self.call_id = call_id
-        self.utr_index = utr_index
+        self.caller_id = caller_id
         for k, v in kargs.items():
             setattr(self, k, v)
         
@@ -43,14 +43,14 @@ class Instruction:
 class MemoryReadInstruction(Instruction):
     """memory_read 指令：从内存中读取数据"""
     call_id: str
-    utr_index: int
+    caller_id: int
     ref: str
-    def __init__(self, call_id: str, utr_index: int, ref: str, **kargs):
-        super().__init__(call_id, utr_index, ref=ref, **kargs)
+    def __init__(self, call_id: str, caller_id: int, ref: str, **kargs):
+        super().__init__(call_id, caller_id, ref=ref, **kargs)
     
     def execute(self, core: 'Core') -> CRT:
         logger.info("[memory_read] call_id=%s ref=%s", self.call_id, self.ref)
-        user_batch = core.last_msg_reg[self.utr_index].user_batch
+        user_batch = core._conv_by_cid[self.caller_id].user_batch
         try:
             content = core.unwrap(self.ref, for_llm=True)
             logger.debug("[memory_read] content=%r", content)
@@ -67,16 +67,16 @@ class MemoryReadInstruction(Instruction):
 class MemoryWriteInstruction(Instruction): 
     """memory_write 指令：写入内存"""
     call_id: str
-    utr_index: int
+    caller_id: int
     ref: str
     content: str
-    def __init__(self, call_id: str, utr_index: int, ref: str, content: str, **kargs):
-        super().__init__(call_id, utr_index, ref=ref, content=content, **kargs)
+    def __init__(self, call_id: str, caller_id: int, ref: str, content: str, **kargs):
+        super().__init__(call_id, caller_id, ref=ref, content=content, **kargs)
         self.content = content
     
     def execute(self, core: 'Core') -> CRT:
         logger.info("[memory_write] call_id=%s ref=%s", self.call_id, self.ref)
-        user_batch = core.last_msg_reg[self.utr_index].user_batch
+        user_batch = core._conv_by_cid[self.caller_id].user_batch
         try:
             core.mem.set(self.ref, self.content)
             user_batch.add_tool_response(f"Success set: {self.ref}", self.call_id)
@@ -90,17 +90,17 @@ class MemoryWriteInstruction(Instruction):
 class MemoryMakeInstruction(Instruction):
     """memory_make 指令：创建内存地址"""
     call_id: str
-    utr_index: int
+    caller_id: int
     ref: str
     key: str
     mem_type: str
 
-    def __init__(self, call_id: str, utr_index: int, ref: str, key: str, mem_type: str, **kargs):
-        super().__init__(call_id, utr_index, ref=ref, key=key, mem_type=mem_type, **kargs)
+    def __init__(self, call_id: str, caller_id: int, ref: str, key: str, mem_type: str, **kargs):
+        super().__init__(call_id, caller_id, ref=ref, key=key, mem_type=mem_type, **kargs)
 
     def execute(self, core: 'Core') -> CRT:
         logger.info("[memory_make] call_id=%s ref=%s key=%s type=%s", self.call_id, self.ref, self.key, self.mem_type)
-        user_batch = core.last_msg_reg[self.utr_index].user_batch
+        user_batch = core._conv_by_cid[self.caller_id].user_batch
         try:
             core.mem.make(self.ref, self.key, self.mem_type)
             user_batch.add_tool_response(f"Success created {self.mem_type} at {self.ref}.{self.key}", self.call_id)
@@ -114,32 +114,38 @@ class MemoryMakeInstruction(Instruction):
 class CreateInstruction(Instruction):
     """create 指令：发起新的对话"""
     call_id: str
-    utr_index: int
     system_ref: str
     user_ref: str
     para_ref: str
 
-    def __init__(self, call_id: str, utr_index: int, system_ref: str, user_ref: str, para_ref: str, **kargs):
-        super().__init__(call_id, utr_index, system_ref=system_ref, user_ref=user_ref, para_ref=para_ref, **kargs)
+    def __init__(self, call_id: str, system_ref: str, user_ref: str, para_ref: str, **kargs):
+        super().__init__(call_id, system_ref=system_ref, user_ref=user_ref, para_ref=para_ref, **kargs)
 
     def execute(self, core: 'Core') -> CRT:
-        logger.info("[create] call_id=%s utr=%s", self.call_id, self.utr_index)
+        logger.info("[create] call_id=%s caller=%s", self.call_id, self.caller_id)
         try:
             system = core.unwrap(self.system_ref)
             user = core.unwrap(self.user_ref)
             para = core.unwrap(self.para_ref, for_llm=False)
         except VMMemoryError as e:
             logger.error("[create] error: %s", e)
-            if self.utr_index != -1:
-                core.last_msg_reg[self.utr_index].user_batch.add_tool_response(
+            if self.caller_id != -1:
+                core._conv_by_cid[self.caller_id].user_batch.add_tool_response(
                     f"[参数错误] {e}。请检查 create 指令的 memory 引用是否正确。"
                     f"确认引用路径是否存在，必要时先用 memory_make 创建。",
                     self.call_id
                 )
             return CRT.EXIT
         logger.debug("[create] system_ref=%s user_ref=%s para=%s", self.system_ref, self.user_ref, para)
-        result, return_calls, conversation = core.lmu.exec_crt(system, user, para)
-        logger.debug("[create] result=%r return_calls=%s", result, len(return_calls))
+        result, return_calls, messages_list = core.lmu.exec_crt(system, user, para)
+        conversation = Conversation(
+            messages=messages_list,
+            cid=0,  # 由 core._register 覆盖
+            is_sub=(self.caller_id != -1),
+            parent=core._conv_by_cid[self.caller_id] if self.caller_id != -1 else None,
+        )
+        core._register(conversation)
+        logger.debug("[create] result=%r return_calls=%s cid=%s", result, len(return_calls), conversation.cid)
 
         # 处理 return_calls
         if return_calls:
@@ -148,7 +154,7 @@ class CreateInstruction(Instruction):
             core._notify("tool_calls_detected", {
                 "source": "create",
                 "call_id": self.call_id,
-                "utr_index": self.utr_index,
+                "caller_id": self.caller_id,
                 "tool_calls": return_calls,
             })
             # 分配新的寄存器槽位
@@ -166,14 +172,14 @@ class CreateInstruction(Instruction):
 
             # 替换栈顶为 exec 指令
             core.command_stack[-1] = ExecInstruction(
-                self.call_id, self.utr_index,
+                self.call_id, self.caller_id,
                 f"$last_msg_reg.{last_msg_idx}",
                 f"$usr_tool_reg.{last_msg_idx}",
                 self.para_ref
             )
             # 压入子指令（反序）
             for rc in reversed(return_calls):
-                instr = _make_instruction(rc, last_msg_idx)
+                instr = _make_instruction(rc, conversation.cid)
                 if instr is not None:
                     core.command_stack.append(instr)
                 else:
@@ -187,8 +193,8 @@ class CreateInstruction(Instruction):
                     batch.add_tool_response(msg, rc.get("call_id", ""))
             return CRT.CONTINUE
         else:
-            if result and self.utr_index != -1:
-                core.last_msg_reg[self.utr_index].user_batch.add_tool_response(result, self.call_id)
+            if result and self.caller_id != -1:
+                core._conv_by_cid[self.caller_id].user_batch.add_tool_response(result, self.call_id)
             # --- monitor: conversation 完成（无子调用）---
             if conversation is not None:
                 core._notify("conversation_completed", {
@@ -201,19 +207,18 @@ class CreateInstruction(Instruction):
 class ExecInstruction(Instruction):
     """exec 指令：继续对话"""
     call_id: str
-    utr_index: int
+    caller_id: int
     last_msg_ref: str
     user_msg_ref: str
     para_ref: str
 
-    def __init__(self, call_id: str, utr_index: int, last_msg_ref: str, user_msg_ref: str, para_ref: str, **kargs):
-        super().__init__(call_id, utr_index, last_msg_ref=last_msg_ref, user_msg_ref=user_msg_ref, para_ref=para_ref, **kargs)
+    def __init__(self, call_id: str, caller_id: int, last_msg_ref: str, user_msg_ref: str, para_ref: str, **kargs):
+        super().__init__(call_id, caller_id, last_msg_ref=last_msg_ref, user_msg_ref=user_msg_ref, para_ref=para_ref, **kargs)
 
     def execute(self, core: 'Core') -> CRT:
-        logger.info("[exec] call_id=%s utr=%s", self.call_id, self.utr_index)
+        logger.info("[exec] call_id=%s caller=%s", self.call_id, self.caller_id)
         # 解析索引（格式：$last_msg_reg.0 或 $MEM.key）
         last_msg_idx = self._parse_index(self.last_msg_ref)
-        user_msg_idx = self._parse_index(self.user_msg_ref)
 
         try:
             # 直接从寄存器获取类型化对象
@@ -221,8 +226,8 @@ class ExecInstruction(Instruction):
             para = core.unwrap(self.para_ref, for_llm=False)
         except VMMemoryError as e:
             logger.error("[exec] error: %s", e)
-            if self.utr_index != -1:
-                core.last_msg_reg[self.utr_index].user_batch.add_tool_response(
+            if self.caller_id != -1:
+                core._conv_by_cid[self.caller_id].user_batch.add_tool_response(
                     f"[参数错误] {e}。请检查 exec 指令的 memory 引用是否正确。"
                     f"确认引用路径是否存在，必要时先用 memory_make 创建。",
                     self.call_id
@@ -241,13 +246,13 @@ class ExecInstruction(Instruction):
             core._notify("tool_calls_detected", {
                 "source": "exec",
                 "call_id": self.call_id,
-                "utr_index": self.utr_index,
+                "caller_id": self.caller_id,
                 "last_msg_ref": self.last_msg_ref,
                 "user_msg_ref": self.user_msg_ref,
                 "tool_calls": return_calls,
             })
             for rc in reversed(return_calls):
-                instr = _make_instruction(rc, last_msg_idx)
+                instr = _make_instruction(rc, conversation.cid)
                 if instr is not None:
                     core.command_stack.append(instr)
                 else:
@@ -260,8 +265,8 @@ class ExecInstruction(Instruction):
                     conversation.user_batch.add_tool_response(msg, rc.get("call_id", ""))
             return CRT.CONTINUE
         else:
-            if result and self.utr_index != -1:
-                core.last_msg_reg[self.utr_index].user_batch.add_tool_response(result, self.call_id)
+            if result and self.caller_id != -1:
+                core._conv_by_cid[self.caller_id].user_batch.add_tool_response(result, self.call_id)
             # --- monitor: conversation 最终更新（即将关闭）---
             core._notify("conversation_updated", {
                 "call_id": self.call_id,
@@ -291,7 +296,7 @@ class ExecInstruction(Instruction):
 
 def parse_instruction(raw: str) -> Instruction:
     """解析指令字符串为指令对象
-    统一格式: <cmd_type> <call_id> <utr_index> <...args>
+    统一格式: <cmd_type> <call_id> <caller_id> <...args>
     """
     from .exceptions import VMSyntaxError
     logger.debug("[parse_instruction] raw=%r", raw)
@@ -301,40 +306,40 @@ def parse_instruction(raw: str) -> Instruction:
     
     cmd_type = parts[0]
     call_id = parts[1] if len(parts) > 1 else ""
-    utr_index = int(parts[2]) if len(parts) > 2 else -1
+    caller_id = int(parts[2]) if len(parts) > 2 else -1
     
     if cmd_type == "create":
         system_ref = parts[3] if len(parts) > 3 else ""
         user_ref = parts[4] if len(parts) > 4 else ""
         para_ref = parts[5] if len(parts) > 5 else ""
-        return CreateInstruction(call_id, utr_index, system_ref, user_ref, para_ref)
+        return CreateInstruction(call_id, caller_id, system_ref, user_ref, para_ref)
     
     elif cmd_type == "exec":
         last_msg_ref = parts[3] if len(parts) > 3 else ""
         user_msg_ref = parts[4] if len(parts) > 4 else ""
         para_ref = parts[5] if len(parts) > 5 else ""
-        return ExecInstruction(call_id, utr_index, last_msg_ref, user_msg_ref, para_ref)
+        return ExecInstruction(call_id, caller_id, last_msg_ref, user_msg_ref, para_ref)
     
     elif cmd_type == "memory_read":
         ref = parts[3] if len(parts) > 3 else ""
-        return MemoryReadInstruction(call_id, utr_index, ref)
+        return MemoryReadInstruction(call_id, caller_id, ref)
     
     elif cmd_type == "memory_write":
         ref = parts[3] if len(parts) > 3 else ""
         content = parts[4] if len(parts) > 4 else ""
-        return MemoryWriteInstruction(call_id, utr_index, ref, content)
+        return MemoryWriteInstruction(call_id, caller_id, ref, content)
     
     elif cmd_type == "memory_make":
         ref = parts[3] if len(parts) > 3 else ""
         key = parts[4] if len(parts) > 4 else ""
         mem_type = parts[5] if len(parts) > 5 else ""
-        return MemoryMakeInstruction(call_id, utr_index, ref, key, mem_type)
+        return MemoryMakeInstruction(call_id, caller_id, ref, key, mem_type)
     
     else:
         raise VMSyntaxError(f"未知指令类型：{cmd_type}")
 
 
-def _make_instruction(rc: dict, utr_index: int) -> Instruction:
+def _make_instruction(rc: dict, caller_id: int) -> Instruction:
     """根据 LMU 返回的半成品对象构造完整指令
     rc 格式: {"call_id": str, "cmd_type": str, "args": dict}
     """
@@ -344,17 +349,17 @@ def _make_instruction(rc: dict, utr_index: int) -> Instruction:
     
     if cmd_type == "create":
         return CreateInstruction(
-            call_id, utr_index,
+            call_id, caller_id,
             args.get("system_ref", ""),
             args.get("user_ref", ""),
             args.get("para_ref", "")
         )
     elif cmd_type == "memory_read":
-        return MemoryReadInstruction(call_id, utr_index, args.get("ref", ""))
+        return MemoryReadInstruction(call_id, caller_id, args.get("ref", ""))
     elif cmd_type == "memory_write":
-        return MemoryWriteInstruction(call_id, utr_index, args.get("ref", ""), args.get("content", ""))
+        return MemoryWriteInstruction(call_id, caller_id, args.get("ref", ""), args.get("content", ""))
     elif cmd_type == "memory_make":
-        return MemoryMakeInstruction(call_id, utr_index, args.get("ref", ""), args.get("key", ""), args.get("mem_type", ""))
+        return MemoryMakeInstruction(call_id, caller_id, args.get("ref", ""), args.get("key", ""), args.get("mem_type", ""))
     elif cmd_type == "command":
         return None
     elif cmd_type == "json_error":
@@ -526,15 +531,14 @@ class LMU:
 
     def exec_crt(self, system_prompt: str, user_prompt: str, para: dict):
         """处理字符串输入的 create 模式
-        system_prompt: 字符串，系统提示词
-        user_prompt: 字符串，用户提示词
-        para: 参数字典
+        返回 (result, return_calls, messages_list)
         """
         logger.info("[LMU.exec_crt] model=%s use_tool=%s", para.get("model"), para.get("use_tool"))
-        messages = [
-            message_to_api_dict(SystemMessage(content=system_prompt)),
-            message_to_api_dict(UserMessage(content=user_prompt))
+        messages_list: list = [
+            SystemMessage(content=system_prompt),
+            UserMessage(content=user_prompt),
         ]
+        messages = [message_to_api_dict(m) for m in messages_list]
         logger.debug("[LMU.exec_crt] model=%s, msg_count=%d system_preview=%r user_preview=%r",
             para.get("model"), 2,
             system_prompt[:100], user_prompt[:100])
@@ -591,10 +595,9 @@ class LMU:
                         "ref": args.get("ref", ""), "key": args.get("key", ""), "mem_type": args.get("mem_type", "")
                     }})
 
-        # 创建 Conversation 对象返回，assistant 消息必须保留 tool_calls (exec_crt)
-        assistant_msg = {"role": ASSISTANT, "content": result or ""}
+        tc_list = None
         if message.tool_calls:
-            assistant_msg["tool_calls"] = [
+            tc_list = [
                 {
                     "id": tc.id,
                     "type": tc.type,
@@ -605,13 +608,9 @@ class LMU:
                 }
                 for tc in message.tool_calls
             ]
-        conversation = Conversation.from_any_list([
-            (SYSTEM, system_prompt),
-            (USER, user_prompt),
-            assistant_msg
-        ])
+        messages_list.append(AssistantMessage(content=result or "", tool_calls=tc_list))
 
-        return result, return_calls, conversation
+        return result, return_calls, messages_list
 
     def exec(self, conversation: Conversation, para: MetaDict):
         """执行对话
@@ -713,8 +712,10 @@ ASSISTANT = "assistant"
 
 class Core:
     def __init__(self):
-        self.command_stack: List[Instruction] = []
-        self.last_msg_reg: List[Conversation] = []  # Conversation 对象（含内嵌 UserMessageBatch）
+        self.command_stack: list = []
+        self.last_msg_reg: list = []  # Conversation 对象（含内嵌 UserMessageBatch）
+        self._conv_by_cid: Dict[int, Conversation] = {}
+        self._next_cid: int = 0
         self.mem: Memory = Memory()
         self.lmu: LMU = LMU()
         self.debug: bool = False
@@ -722,6 +723,12 @@ class Core:
         self._monitor_running: bool = False
         self._state_observers: List[Callable] = []
         self._observer_lock: threading.Lock = threading.Lock()
+
+    def _register(self, conv: Conversation) -> Conversation:
+        conv.cid = self._next_cid
+        self._conv_by_cid[conv.cid] = conv
+        self._next_cid += 1
+        return conv
 
     def start_memory_monitor(self, output_file: str, interval: float = 0.3,
                              socket_path: str | None = None):
@@ -813,7 +820,7 @@ class Core:
         base = {
             "type": type(instr).__name__.replace("Instruction", "").lower(),
             "call_id": getattr(instr, "call_id", ""),
-            "utr_index": getattr(instr, "utr_index", -1),
+            "caller_id": getattr(instr, "caller_id", -1),
         }
         if isinstance(instr, CreateInstruction):
             base.update({

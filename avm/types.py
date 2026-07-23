@@ -200,11 +200,17 @@ class Conversation:
     is_sub:bool
     parent: Optional['Conversation'] = None
     is_root: bool = False
+    metadata: Dict[str, str]
     
-    
-    def __init__(self, messages: List[Message] = None):
+    def __init__(self, messages: List[Message] = None, cid: int = 0, is_sub:bool=False, parent: Optional['Conversation'] = None, is_root: bool = False, metadata: Dict[str, str] = None):
         self.messages = messages or []
         self.user_batch = UserMessageBatch()
+        self.cid = cid
+        self.is_sub = is_sub
+        self.parent = parent
+        self.is_root = is_root
+        self.metadata = metadata or {}
+        self.validate()
     
     
 
@@ -284,15 +290,15 @@ class Conversation:
 
     @classmethod
     def from_any_list(cls, items: list) -> 'Conversation':
-        conv = cls()
+        msgs = []
         for item in items:
             if isinstance(item, (tuple, list)) and len(item) == 2:
                 role, content = item
-                conv.messages.append(cls._msg_for(role, content, {}))
+                msgs.append(cls._msg_for(role, content, {}))
             elif isinstance(item, dict):
-                conv.messages.append(cls._msg_for(
+                msgs.append(cls._msg_for(
                     item.get("role", ""), item.get("content", ""), item))
-        return conv
+        return cls(messages=msgs)
 
     @staticmethod
     def _msg_for(role: str, content: str, extra: dict) -> Message:

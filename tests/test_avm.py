@@ -16,7 +16,7 @@ from avm.core import (
     CRT,
 )
 from avm.memory import Memory
-from avm.types import Conversation, UserMessageBatch
+from avm.types import Conversation, UserMessageBatch, SystemMessage, UserMessage, AssistantMessage
 from avm.exceptions import VMSyntaxError, VMMemoryError
 from avm.memory_device import StringDevice
 
@@ -51,7 +51,14 @@ class MockLMU:
         return resp
 
     def exec_crt(self, system_prompt, user_prompt, para):
-        return self._next("exec_crt", system_prompt, user_prompt, para)
+        result, return_calls, conv_or_msgs = self._next("exec_crt", system_prompt, user_prompt, para)
+        if not isinstance(conv_or_msgs, list):
+            conv_or_msgs = [
+                SystemMessage(content=system_prompt),
+                UserMessage(content=user_prompt),
+                AssistantMessage(content=result or ""),
+            ]
+        return result, return_calls, conv_or_msgs
 
     def exec(self, conversation, para):
         return self._next("exec", conversation, para)
@@ -78,7 +85,7 @@ class TestParseInstruction:
         instr = parse_instruction("create cid_1 0 $MEM.sys $MEM.usr $MEM.para")
         assert isinstance(instr, CreateInstruction)
         assert instr.call_id == "cid_1"
-        assert instr.utr_index == 0
+        assert instr.caller_id == 0
         assert instr.system_ref == "$MEM.sys"
         assert instr.user_ref == "$MEM.usr"
         assert instr.para_ref == "$MEM.para"
@@ -87,7 +94,7 @@ class TestParseInstruction:
         instr = parse_instruction("exec cid_1 0 $last_msg_reg.0 $usr_tool_reg.0 $MEM.para")
         assert isinstance(instr, ExecInstruction)
         assert instr.call_id == "cid_1"
-        assert instr.utr_index == 0
+        assert instr.caller_id == 0
         assert instr.last_msg_ref == "$last_msg_reg.0"
         assert instr.user_msg_ref == "$usr_tool_reg.0"
         assert instr.para_ref == "$MEM.para"
@@ -206,6 +213,7 @@ class TestCoreState:
         core = make_core()
         conv = Conversation.from_any_list([("system", "sys"), ("user", "usr")])
         core.last_msg_reg.append(conv)
+        core._register(conv)
 
         assert core.unwrap("$last_msg_reg.0") is conv
         assert core.unwrap("$usr_tool_reg.0") is conv.user_batch
@@ -224,8 +232,9 @@ class TestInstructionExecution:
     def test_memory_read(self):
         core = make_core()
         core.mem["input"] = "user_says_hi"
-        conv = Conversation()
+        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
         core.last_msg_reg.append(conv)
+        core._register(conv)
 
         instr = MemoryReadInstruction("cid", 0, "$MEM.input")
         rt = instr.execute(core)
@@ -239,8 +248,9 @@ class TestInstructionExecution:
     def test_memory_write(self):
         core = make_core()
         core.mem["out"] = ""
-        conv = Conversation()
+        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
         core.last_msg_reg.append(conv)
+        core._register(conv)
 
         instr = MemoryWriteInstruction("cid", 0, "$MEM.out", "hello")
         rt = instr.execute(core)
@@ -256,8 +266,9 @@ class TestInstructionExecution:
         core.mem["sys"] = "system_prompt"
         core.mem["usr"] = "user_prompt"
         core.mem["para"] = {"model": "test"}
-        conv = Conversation()
+        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
         core.last_msg_reg.append(conv)
+        core._register(conv)
 
         core.command_stack.append("create cid_1 0 $MEM.sys $MEM.usr $MEM.para")
         core.run()
@@ -281,8 +292,9 @@ class TestInstructionExecution:
         core.mem["usr"] = "u"
         core.mem["para"] = {"model": "test", "use_tool": True}
         core.mem["input"] = "hello"
-        conv = Conversation()
+        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
         core.last_msg_reg.append(conv)
+        core._register(conv)
 
         core.command_stack.append("create cid_1 0 $MEM.sys $MEM.usr $MEM.para")
         core.run()
@@ -305,8 +317,9 @@ class TestInstructionExecution:
         core.mem["usr"] = "u"
         core.mem["para"] = {"model": "test", "use_tool": True}
         core.mem["input"] = "hello"
-        conv = Conversation()
+        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
         core.last_msg_reg.append(conv)
+        core._register(conv)
 
         core.command_stack.append("create cid_1 0 $MEM.sys $MEM.usr $MEM.para")
         core.run()
@@ -340,8 +353,9 @@ class TestInstructionExecution:
         core.mem["sys2"] = "s2"
         core.mem["usr2"] = "u2"
         core.mem["para2"] = {"model": "test2"}
-        conv = Conversation()
+        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
         core.last_msg_reg.append(conv)
+        core._register(conv)
 
         core.command_stack.append("create cid_1 0 $MEM.sys $MEM.usr $MEM.para")
         core.run()
@@ -379,8 +393,9 @@ class TestIntegration:
         core.mem["usr"] = "user"
         core.mem["para"] = {"model": "test", "use_tool": True}
         core.mem["data"] = {"input": "raw_data"}
-        conv = Conversation()
+        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
         core.last_msg_reg.append(conv)
+        core._register(conv)
 
         core.command_stack.append("create root 0 $MEM.sys $MEM.usr $MEM.para")
         core.run()
@@ -407,8 +422,9 @@ class TestIntegration:
         core.mem["para"] = {"model": "test", "use_tool": True}
         core.mem["a"] = ""
         core.mem["b"] = ""
-        conv = Conversation()
+        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
         core.last_msg_reg.append(conv)
+        core._register(conv)
 
         core.command_stack.append("create root 0 $MEM.s $MEM.u $MEM.para")
         core.run()
@@ -461,9 +477,9 @@ class TestParseInstructionEdgeCases:
         assert isinstance(instr, MemoryWriteInstruction)
         assert instr.content == ""
 
-    def test_utr_index_defaults_to_minus_one(self):
+    def test_caller_id_defaults_to_minus_one(self):
         instr = parse_instruction("memory_read cid")
-        assert instr.utr_index == -1
+        assert instr.caller_id == -1
 
 
 # ---------------------------------------------------------------------------
@@ -474,8 +490,9 @@ class TestMemoryMakeExecution:
     def test_memory_make_execute_dict(self):
         core = make_core()
         core.mem["data"] = {}
-        conv = Conversation()
+        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
         core.last_msg_reg.append(conv)
+        core._register(conv)
 
         instr = MemoryMakeInstruction("cid", 0, "$MEM.data", "new_key", "dict")
         rt = instr.execute(core)
@@ -488,8 +505,9 @@ class TestMemoryMakeExecution:
     def test_memory_make_execute_error(self):
         core = make_core()
         core.mem["data"] = "string"
-        conv = Conversation()
+        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
         core.last_msg_reg.append(conv)
+        core._register(conv)
 
         instr = MemoryMakeInstruction("cid", 0, "$MEM.data", "key", "dict")
         rt = instr.execute(core)
@@ -511,10 +529,13 @@ class TestExecInstructionDirect:
         ])
         core.mem["para"] = {"model": "test"}
         core.last_msg_reg.append(conv)
-        conv = Conversation()
-        core.last_msg_reg.append(conv)   # idx 0: exec 使用的
-        conv = Conversation()
-        core.last_msg_reg.append(conv)   # idx 1: 父 batch
+        core._register(conv)
+        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
+        core.last_msg_reg.append(conv)
+        core._register(conv)   # idx 0: exec 使用的
+        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
+        core.last_msg_reg.append(conv)
+        core._register(conv)   # idx 1: 父 batch
 
         instr = ExecInstruction("cid", 1, "$last_msg_reg.0", "$usr_tool_reg.0", "$MEM.para")
         core.command_stack.append(instr)
@@ -536,10 +557,13 @@ class TestExecInstructionDirect:
         core.mem["x"] = "val"
         core.mem["para"] = {"model": "test"}
         core.last_msg_reg.append(conv)
-        conv = Conversation()
-        core.last_msg_reg.append(conv)   # idx 0: exec 使用的
-        conv = Conversation()
-        core.last_msg_reg.append(conv)   # idx 1: 父 batch
+        core._register(conv)
+        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
+        core.last_msg_reg.append(conv)
+        core._register(conv)   # idx 0: exec 使用的
+        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
+        core.last_msg_reg.append(conv)
+        core._register(conv)   # idx 1: 父 batch
 
         instr = ExecInstruction("cid", 1, "$last_msg_reg.0", "$usr_tool_reg.0", "$MEM.para")
         core.command_stack.append(instr)
@@ -559,11 +583,14 @@ class TestExecInstructionDirect:
         ])
         core.mem["para"] = {"model": "test"}
         core.last_msg_reg.append(conv)
+        core._register(conv)
         exec_conv = Conversation()
         exec_conv.user_batch.add_user_content("additional input")
         core.last_msg_reg.append(exec_conv)
-        conv = Conversation()
-        core.last_msg_reg.append(conv)  # 父 batch
+        core._register(exec_conv)
+        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
+        core.last_msg_reg.append(conv)
+        core._register(conv)  # 父 batch
 
         instr = ExecInstruction("cid", 1, "$last_msg_reg.0", "$usr_tool_reg.0", "$MEM.para")
         core.command_stack.append(instr)
@@ -586,8 +613,9 @@ class TestCoreRun:
         core.mem["sys"] = "s"
         core.mem["usr"] = "u"
         core.mem["para"] = {"model": "test"}
-        conv = Conversation()
+        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
         core.last_msg_reg.append(conv)
+        core._register(conv)
 
         core.command_stack.append("create cid 0 $MEM.sys $MEM.usr $MEM.para")
         core.run()
