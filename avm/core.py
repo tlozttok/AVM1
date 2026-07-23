@@ -150,31 +150,23 @@ class CreateInstruction(Instruction):
         # 处理 return_calls
         if return_calls:
             logger.info("[create] return_calls=%d", len(return_calls))
-            # --- monitor: 检测到 tool_calls ---
             core._notify("tool_calls_detected", {
                 "source": "create",
                 "call_id": self.call_id,
                 "caller_id": self.caller_id,
                 "tool_calls": return_calls,
             })
-            # 分配新的寄存器槽位
-            last_msg_idx = len(core.last_msg_reg)
 
-            # 存入 Conversation（含内嵌的 UserMessageBatch）
-            core.last_msg_reg.append(conversation)
-
-            # --- monitor: conversation 被创建 ---
             core._notify("conversation_created", {
                 "call_id": self.call_id,
-                "last_msg_idx": last_msg_idx,
+                "cid": conversation.cid,
                 "messages": [message_to_api_dict(m) for m in conversation.messages],
             })
 
-            # 替换栈顶为 exec 指令
             core.command_stack[-1] = ExecInstruction(
                 self.call_id, self.caller_id,
-                f"$last_msg_reg.{last_msg_idx}",
-                f"$usr_tool_reg.{last_msg_idx}",
+                f"$conv.{conversation.cid}",
+                f"$batch.{conversation.cid}",
                 self.para_ref
             )
             # 压入子指令（反序）
@@ -208,21 +200,18 @@ class ExecInstruction(Instruction):
     """exec 指令：继续对话"""
     call_id: str
     caller_id: int
-    last_msg_ref: str
-    user_msg_ref: str
+    conv_ref: str
+    batch_ref: str
     para_ref: str
 
-    def __init__(self, call_id: str, caller_id: int, last_msg_ref: str, user_msg_ref: str, para_ref: str, **kargs):
-        super().__init__(call_id, caller_id, last_msg_ref=last_msg_ref, user_msg_ref=user_msg_ref, para_ref=para_ref, **kargs)
+    def __init__(self, call_id: str, caller_id: int, conv_ref: str, batch_ref: str, para_ref: str, **kargs):
+        super().__init__(call_id, caller_id, conv_ref=conv_ref, batch_ref=batch_ref, para_ref=para_ref, **kargs)
 
     def execute(self, core: 'Core') -> CRT:
         logger.info("[exec] call_id=%s caller=%s", self.call_id, self.caller_id)
-        # 解析索引（格式：$last_msg_reg.0 或 $MEM.key）
-        last_msg_idx = self._parse_index(self.last_msg_ref)
 
         try:
-            # 直接从寄存器获取类型化对象
-            conversation: Conversation = core.unwrap(self.last_msg_ref)
+            conversation: Conversation = core.unwrap(self.conv_ref)
             para = core.unwrap(self.para_ref, for_llm=False)
         except VMMemoryError as e:
             logger.error("[exec] error: %s", e)
@@ -239,16 +228,13 @@ class ExecInstruction(Instruction):
         logger.debug("[exec] result=%r return_calls=%d", result, len(return_calls))
         conversation.user_batch.clear()
 
-        # 处理 return_calls：不弹出当前指令，直接压栈
         if return_calls:
             logger.info("[exec] pushing %d sub-instructions", len(return_calls))
-            # --- monitor: 检测到 tool_calls ---
             core._notify("tool_calls_detected", {
                 "source": "exec",
                 "call_id": self.call_id,
                 "caller_id": self.caller_id,
-                "last_msg_ref": self.last_msg_ref,
-                "user_msg_ref": self.user_msg_ref,
+                "cid": conversation.cid,
                 "tool_calls": return_calls,
             })
             for rc in reversed(return_calls):
@@ -267,31 +253,14 @@ class ExecInstruction(Instruction):
         else:
             if result and self.caller_id != -1:
                 core._conv_by_cid[self.caller_id].user_batch.add_tool_response(result, self.call_id)
-            # --- monitor: conversation 最终更新（即将关闭）---
             core._notify("conversation_updated", {
                 "call_id": self.call_id,
-                "last_msg_idx": last_msg_idx,
+                "cid": conversation.cid,
                 "messages": [message_to_api_dict(m) for m in conversation.messages],
                 "closed": True,
             })
-            # pop 寄存器
-            if last_msg_idx is not None and last_msg_idx < len(core.last_msg_reg):
-                core.last_msg_reg.pop(last_msg_idx)
-            logger.info("[exec] done call_id=%s", self.call_id)
+            logger.info("[exec] done call_id=%s cid=%s", self.call_id, conversation.cid)
             return CRT.EXIT
-
-    def _parse_index(self, ref: str):
-        """解析引用中的索引（如 $last_msg_reg.0 返回 0）"""
-        if ref.startswith('$'):
-            parts = ref[1:].split('.')
-            if len(parts) >= 2 and parts[0] in ('last_msg_reg', 'usr_tool_reg'):
-                try:
-                    return int(parts[1])
-                except ValueError:
-                    pass
-        return None
-
-
 
 
 def parse_instruction(raw: str) -> Instruction:
@@ -315,10 +284,10 @@ def parse_instruction(raw: str) -> Instruction:
         return CreateInstruction(call_id, caller_id, system_ref, user_ref, para_ref)
     
     elif cmd_type == "exec":
-        last_msg_ref = parts[3] if len(parts) > 3 else ""
-        user_msg_ref = parts[4] if len(parts) > 4 else ""
+        conv_ref = parts[3] if len(parts) > 3 else ""
+        batch_ref = parts[4] if len(parts) > 4 else ""
         para_ref = parts[5] if len(parts) > 5 else ""
-        return ExecInstruction(call_id, caller_id, last_msg_ref, user_msg_ref, para_ref)
+        return ExecInstruction(call_id, caller_id, conv_ref, batch_ref, para_ref)
     
     elif cmd_type == "memory_read":
         ref = parts[3] if len(parts) > 3 else ""
@@ -713,8 +682,9 @@ ASSISTANT = "assistant"
 class Core:
     def __init__(self):
         self.command_stack: list = []
-        self.last_msg_reg: list = []  # Conversation 对象（含内嵌 UserMessageBatch）
         self._conv_by_cid: Dict[int, Conversation] = {}
+        self._ready_covn:List[int]=[]
+        self._dormant_convs: List[int] = []
         self._next_cid: int = 0
         self.mem: Memory = Memory()
         self.lmu: LMU = LMU()
@@ -729,6 +699,14 @@ class Core:
         self._conv_by_cid[conv.cid] = conv
         self._next_cid += 1
         return conv
+    
+    def _unregister(self, cid: int) -> None:
+        if cid in self._conv_by_cid:
+            del self._conv_by_cid[cid]
+    
+    def get_conversation(self, cid: int) -> Optional[Conversation]:
+        return self._conv_by_cid.get(cid)
+
 
     def start_memory_monitor(self, output_file: str, interval: float = 0.3,
                              socket_path: str | None = None):
@@ -830,8 +808,8 @@ class Core:
             })
         elif isinstance(instr, ExecInstruction):
             base.update({
-                "last_msg_ref": getattr(instr, "last_msg_ref", ""),
-                "user_msg_ref": getattr(instr, "user_msg_ref", ""),
+                "conv_ref": getattr(instr, "conv_ref", ""),
+                "batch_ref": getattr(instr, "batch_ref", ""),
                 "para_ref": getattr(instr, "para_ref", ""),
             })
         elif isinstance(instr, MemoryReadInstruction):
@@ -897,18 +875,19 @@ class Core:
 
     def unwrap(self, value, for_llm=True):
         """解引用值
-        只处理 $last_msg_reg 和 $usr_tool_reg 的寄存器访问
-        其他情况调用 self.mem.unwrap
-        不以 $ 开头则视为字面值直接返回
+        $conv.{cid} → Conversation 对象
+        $batch.{cid} → Conversation 的 user_batch
+        其他以 $ 开头走 self.mem.unwrap
+        不以 $ 开头视为字面值
         """
         if not value.startswith("$"):
             return value
         value = [value[0], *value[1:].split(".")]
-        if value[1] == "last_msg_reg":
+        if value[1] == "conv":
             assert value[0] == "$"
-            return self.last_msg_reg[int(value[2])]
-        elif value[1] == "usr_tool_reg":
+            return self._conv_by_cid[int(value[2])]
+        elif value[1] == "batch":
             assert value[0] == "$"
-            return self.last_msg_reg[int(value[2])].user_batch
+            return self._conv_by_cid[int(value[2])].user_batch
         else:
             return self.mem.unwrap(value, for_llm=for_llm)

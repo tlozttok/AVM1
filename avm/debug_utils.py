@@ -69,24 +69,11 @@ class DebugTracer:
                 lines.append(f"  OLD top: {b_stack[-1]}")
                 lines.append(f"  NEW top: {a_stack[-1] if a_stack else '(empty)'}")
 
-        # last_msg_reg 变化
-        b_lm = before["last_msg_reg"]
-        a_lm = after["last_msg_reg"]
+        # conversations 变化
+        b_lm = before["conversations"]
+        a_lm = after["conversations"]
         if b_lm != a_lm:
-            lines.append(f"[last_msg_reg] {len(b_lm)} -> {len(a_lm)} conversations")
-
-        # usr_tool_reg 变化（现在从 last_msg_reg 的 user_batch 获取）
-        b_ut = before["usr_tool_reg"]
-        a_ut = after["usr_tool_reg"]
-        if b_ut != a_ut:
-            lines.append(f"[usr_tool_reg] {len(b_ut)} -> {len(a_ut)} batches")
-            for i, (old, new) in enumerate(zip(b_ut, a_ut)):
-                if old != new:
-                    lines.append(f"  batch[{i}] changed")
-            if len(a_ut) > len(b_ut):
-                lines.append(f"  batch[{len(b_ut)}..{len(a_ut)-1}] added")
-            if len(b_ut) > len(a_ut):
-                lines.append(f"  batch[{len(a_ut)}..{len(b_ut)-1}] removed")
+            lines.append(f"[conversations] {len(b_lm)} -> {len(a_lm)}")
 
         # mem 变化（仅顶层 key 数量）
         b_mem = before["mem_keys"]
@@ -120,10 +107,10 @@ class DebugTracer:
         for i, cmd in enumerate(reversed(self.core.command_stack)):
             marker = "<<< TOP" if i == 0 else ""
             lines.append(f"  {cmd} {marker}")
-        lines.append(f"last_msg_reg ({len(self.core.last_msg_reg)}):")
-        for i, conv in enumerate(self.core.last_msg_reg):
+        lines.append(f"conversations ({len(self.core._conv_by_cid)}):")
+        for cid, conv in self.core._conv_by_cid.items():
             b = conv.user_batch
-            lines.append(f"  [{i}] {len(conv.messages)} msgs, {len(b.tool_responses)} tool_resp, {len(b.user_contents)} user_content")
+            lines.append(f"  [{cid}] {len(conv.messages)} msgs, {len(b.tool_responses)} tool_resp, {len(b.user_contents)} user_content")
         lines.append(f"mem top-level keys: {list(self.core.mem._data.keys())}")
         lines.append(f"mounted devices: {list(self.core.mem._devices.keys())}")
         return "\n".join(lines)
@@ -136,8 +123,7 @@ class DebugTracer:
         self.history.append({
             "label": label,
             "command_stack": list(self.core.command_stack),
-            "last_msg_reg": [self._conv_summary(c) for c in self.core.last_msg_reg],
-            "usr_tool_reg": [self._batch_summary(c.user_batch) for c in self.core.last_msg_reg],
+            "conversations": {cid: self._conv_summary(c) for cid, c in self.core._conv_by_cid.items()},
             "mem_keys": set(self.core.mem._data.keys()),
             "mem_devices": list(self.core.mem._devices.keys()),
         })
@@ -160,8 +146,8 @@ def inspect_core(core: Core, title: str = "CORE INSPECT") -> str:
     """一次性打印 Core 的当前完整状态。"""
     lines = [f"\n{'='*60}", f"  {title}", f"{'='*60}"]
     lines.append(f"command_stack  : {core.command_stack}")
-    lines.append(f"last_msg_reg   : {len(core.last_msg_reg)} conversation(s)")
-    for i, c in enumerate(core.last_msg_reg):
+    lines.append(f"conversations  : {len(core._conv_by_cid)}")
+    for cid, c in core._conv_by_cid.items():
         msgs = [(m.role, m.content[:40]) for m in c.messages]
         b = c.user_batch
         lines.append(f"  [{i}] msgs={msgs}, tools={b.tool_responses}, users={b.user_contents}")
