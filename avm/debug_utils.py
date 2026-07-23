@@ -21,9 +21,9 @@ class DebugTracer:
     """
 
     def __init__(self, core: Core):
-        self.core = core
+        self.core: Core = core
         self.history: List[Dict[str, Any]] = []
-        self._step_count = 0
+        self._step_count: int = 0
 
     # ------------------------------------------------------------------
     # 核心 API

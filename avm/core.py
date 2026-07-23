@@ -1,6 +1,7 @@
 
 
 from enum import Enum
+from typing import Optional, List, Dict, Any, Callable
 
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -27,6 +28,9 @@ CRT = CommandReturnType
 
 class Instruction:
     """指令基类"""
+    call_id: str
+    utr_index: int
+
     def __init__(self,call_id: str, utr_index: int, **kargs):
         self.call_id = call_id
         self.utr_index = utr_index
@@ -60,7 +64,7 @@ class MemoryReadInstruction(Instruction):
         logger.info("[memory_read] done call_id=%s", self.call_id)
         return CRT.EXIT
 
-class MemoryWriteInstruction(Instruction):
+class MemoryWriteInstruction(Instruction): 
     """memory_write 指令：写入内存"""
     call_id: str
     utr_index: int
@@ -362,6 +366,8 @@ def _make_instruction(rc: dict, utr_index: int) -> Instruction:
 class LMU:
     """LLM 调用模块"""
 
+    _client: Optional[OpenAI] = None
+
     def __init__(self):
         self._client = None
 
@@ -373,7 +379,7 @@ class LMU:
         return self._client
 
     # 两个工具定义
-    command_tool = {
+    command_tool: dict = {
         "type": "function",
         "function": {
             "name": "command",
@@ -391,7 +397,7 @@ class LMU:
         }
     }
 
-    create_cmd_tool = {
+    create_cmd_tool: dict = {
         "type": "function",
         "function": {
             "name": "create_cmd",
@@ -422,7 +428,7 @@ class LMU:
         }
     }
 
-    memory_read_tool = {
+    memory_read_tool: dict = {
         "type": "function",
         "function": {
             "name": "memory_read",
@@ -440,7 +446,7 @@ class LMU:
         }
     }
 
-    memory_write_tool = {
+    memory_write_tool: dict = {
         "type": "function",
         "function": {
             "name": "memory_write",
@@ -462,7 +468,7 @@ class LMU:
         }
     }
 
-    memory_make_tool = {
+    memory_make_tool: dict = {
         "type": "function",
         "function": {
             "name": "memory_make",
@@ -489,10 +495,10 @@ class LMU:
         }
     }
 
-    tools = [command_tool, create_cmd_tool, memory_read_tool, memory_write_tool, memory_make_tool]
+    tools: list = [command_tool, create_cmd_tool, memory_read_tool, memory_write_tool, memory_make_tool]
 
     # OpenAI API 允许作为 kwargs 传入的参数白名单
-    _API_PARAM_KEYS = {
+    _API_PARAM_KEYS: set = {
         "temperature", "max_tokens", "top_p", "frequency_penalty",
         "presence_penalty", "stop", "stream", "extra_body",
         "seed", "logit_bias", "logprobs", "top_logprobs",
@@ -707,16 +713,15 @@ ASSISTANT = "assistant"
 
 class Core:
     def __init__(self):
-        self.command_stack = []
-        self.last_msg_reg = []  # 存储 Conversation 对象（含内嵌 UserMessageBatch）
-        self.mem = Memory()
-        self.lmu = LMU()
-        self.debug = False
-        self._monitor_thread = None
-        self._monitor_running = False
-        # -- 状态观察器（供 web monitor 等外部模块订阅运行时状态）--
-        self._state_observers: list = []
-        self._observer_lock = threading.Lock()
+        self.command_stack: List[Instruction] = []
+        self.last_msg_reg: List[Conversation] = []  # Conversation 对象（含内嵌 UserMessageBatch）
+        self.mem: Memory = Memory()
+        self.lmu: LMU = LMU()
+        self.debug: bool = False
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._monitor_running: bool = False
+        self._state_observers: List[Callable] = []
+        self._observer_lock: threading.Lock = threading.Lock()
 
     def start_memory_monitor(self, output_file: str, interval: float = 0.3,
                              socket_path: str | None = None):

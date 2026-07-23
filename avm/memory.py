@@ -33,7 +33,7 @@ class Memory:
     """
 
     def __init__(self):
-        self._data = MetaDict(data={})
+        self._data: MetaDict = MetaDict(data={})
         self._devices: dict = {}  # 存储已挂载的设备，key 为路径字符串
 
     def __getitem__(self, key: str) -> Any:

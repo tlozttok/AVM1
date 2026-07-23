@@ -1,5 +1,5 @@
 """AVM 内存设备：可挂载到内存路径的虚拟设备"""
-from typing import Any, Optional
+from typing import Any, Optional, List
 import logging
 
 logger = logging.getLogger(__name__)
@@ -21,7 +21,7 @@ class StringDevice(MemoryDevice):
     """假装是字符串的设备"""
 
     def __init__(self, value: str = ""):
-        self._value = value
+        self._value: str = value
 
     def pretend_as_type(self) -> str:
         return "str"
@@ -51,8 +51,8 @@ class MetaListDevice(MemoryDevice):
     """假装是 MetaList 的设备"""
 
     def __init__(self, data=None, metadata=None):
-        self._data = data if data is not None else []
-        self._metadata = metadata
+        self._data: list = data if data is not None else []
+        self._metadata: Optional[str] = metadata
 
     def pretend_as_type(self) -> str:
         return "MetaList"
@@ -132,7 +132,7 @@ class InputsListDevice(MetaListDevice):
                 user_input = ""
             finally:
                 self._pending_input = False
-            self._data.append(user_input)
+                self._data.append(user_input)
             logger.info("[InputsListDevice] received input: %r", user_input)
             return user_input
         # 正常列表访问
@@ -210,8 +210,8 @@ class MetaDictDevice(MemoryDevice):
     """假装是 MetaDict 的设备"""
 
     def __init__(self, data=None, metadata=None):
-        self._data = data if data is not None else {}
-        self._metadata = metadata
+        self._data: dict = data if data is not None else {}
+        self._metadata: Optional[str] = metadata
 
     def pretend_as_type(self) -> str:
         return "MetaDict"

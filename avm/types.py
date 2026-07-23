@@ -4,8 +4,8 @@
 class MetaList:
     """带元数据的列表，对 LLM 可展示自定义描述字符串"""
     def __init__(self, data=None, metadata=None):
-        self._data = data if data is not None else []
-        self._metadata = metadata
+        self._data: list = data if data is not None else []
+        self._metadata: Optional[str] = metadata
 
     def __getitem__(self, index):
         return self._data[index]
@@ -61,8 +61,8 @@ class MetaList:
 class MetaDict:
     """带元数据的字典，对 LLM 可展示自定义描述字符串"""
     def __init__(self, data=None, metadata=None):
-        self._data = data if data is not None else {}
-        self._metadata = metadata
+        self._data: dict = data if data is not None else {}
+        self._metadata: Optional[str] = metadata
 
     def __getitem__(self, key):
         return self._data[key]
@@ -188,14 +188,25 @@ def message_to_api_dict(msg: Message) -> dict:
     return d
 
 
-@dataclass
+
 class Conversation:
     """
     对话历史封装
     负责消息的验证、合并和转换，内嵌用户消息批次
     """
-    messages: List[Message] = field(default_factory=list)
-    user_batch: 'UserMessageBatch' = field(default_factory=lambda: UserMessageBatch())
+    messages: List[Message]
+    user_batch: 'UserMessageBatch'
+    cid: int
+    is_sub:bool
+    parent: Optional['Conversation'] = None
+    is_root: bool = False
+    
+    
+    def __init__(self, messages: List[Message] = None):
+        self.messages = messages or []
+        self.user_batch = UserMessageBatch()
+    
+    
 
     def validate(self, require_last_assistant: bool = True) -> None:
         """
