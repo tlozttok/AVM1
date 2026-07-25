@@ -1,6 +1,6 @@
 """AVM — Agent Virtual Machine"""
-from .core import Core, LMU, CRT, parse_instruction, \
-    CreateInstruction, ExecInstruction, \
+from .core import Core, LMU, \
+    Instruction, CreateInstruction, CreateSubInstruction, \
     MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction
 from .memory import Memory
 from .types import MetaDict, MetaList, Conversation, UserMessageBatch, \

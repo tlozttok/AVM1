@@ -125,7 +125,9 @@ async def lifespan(app: FastAPI):
     core.mem.mount("inputs", web_input)
     core.mem.mount("outputs", WebOutputDevice(output_queues, data=[], metadata="对用户的输出列表"))
 
-    core.command_stack.append("create 0 -1 $MEM.system $MEM.user $MEM.model_params")
+    system = core.unwrap("$MEM.system")
+    user = core.unwrap("$MEM.user")
+    core.start(system, user, "$MEM.model_params")
 
     # 启动监控状态收集器
     global monitor_state

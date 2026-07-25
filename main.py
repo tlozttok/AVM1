@@ -186,8 +186,10 @@ def main():
                 "use_tool": "auto",
             })
 
-    # 设置初始命令栈
-    core.command_stack.append("create 0 -1 $MEM.system $MEM.user $MEM.model_params")#-1是怎么回事
+    # 启动根对话
+    system = core.unwrap("$MEM.system")
+    user = core.unwrap("$MEM.user")
+    core.start(system, user, "$MEM.model_params")
     core.run()
 
 

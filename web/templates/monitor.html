@@ -86,36 +86,22 @@ es.onerror = () => { statusEl.textContent = '断开'; dotEl.classList.add('disco
 es.onmessage = e => {
     const data = JSON.parse(e.data);
     lastData = data;
-    renderStack(data.command_stack);
+    renderScheduling(data.scheduling);
     renderFlow(data.flow || []);
 };
 
-// ---------- 堆栈面板 ----------
-function renderStack(stack) {
-    if (!stack || stack.length === 0) {
-        stackBody.innerHTML = '<div class="stack-empty">命令栈为空</div>';
+// ---------- 调度面板 ----------
+function renderScheduling(sched) {
+    if (!sched) {
+        stackBody.innerHTML = '<div class="stack-empty">无调度数据</div>';
         return;
     }
-    stackBody.innerHTML = stack.map((instr, i) => {
-        const isTop = i === stack.length - 1;
-        const typeClass = 'type-' + instr.type;
-        let detail = '';
-        if (instr.type === 'create') detail = `${instr.system_ref||''} → ${instr.user_ref||''}`;
-        else if (instr.type === 'exec') detail = `${instr.last_msg_ref||''}`;
-        else if (instr.type === 'memory_read') detail = instr.ref || '';
-        else if (instr.type === 'memory_write') detail = `${instr.ref||''} = ${(instr.content||'').slice(0,30)}`;
-        else if (instr.type === 'memory_make') detail = `${instr.ref||''}.${instr.key||''} [${instr.mem_type||''}]`;
-        else detail = instr.raw || '';
-        return `
-        <div class="stack-card ${isTop?'top':''}">
-            <div class="type ${typeClass}">${instr.type} <span style="color:#666;font-weight:normal">#${instr.call_id}</span></div>
-            <div class="meta">
-                <span>utr=${instr.utr_index ?? instr.utr ?? -1}</span>
-                ${detail ? `<span style="color:#aaa">${detail}</span>` : ''}
-            </div>
-        </div>`;
-    }).join('');
-    stackBody.scrollTop = stackBody.scrollHeight;
+    let html = '';
+    html += `<div class="stack-card"><b>活跃:</b> ${sched.active_cid ?? '无'}</div>`;
+    html += `<div class="stack-card"><b>就绪:</b> [${(sched.ready_cids||[]).join(', ')}]</div>`;
+    html += `<div class="stack-card"><b>休眠:</b> [${(sched.dormant_cids||[]).join(', ')}]</div>`;
+    html += `<div class="stack-card"><b>总数:</b> ${sched.total_convs??0}</div>`;
+    stackBody.innerHTML = html;
 }
 
 // ---------- 纵向流程图 ----------

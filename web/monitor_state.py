@@ -204,25 +204,15 @@ class MonitorState:
 
         return {
             "timestamp": time.time(),
-            "command_stack": self._build_command_stack(),
+            "scheduling": self._build_scheduling_state(),
             "flow": flow,
             "running": {k: v for k, v in self._active_steps.items()},
         }
 
-    def _build_command_stack(self) -> list[dict]:
-        stack = []
-        for idx, instr in enumerate(self.core.command_stack):
-            if isinstance(instr, str):
-                parts = instr.strip().split()
-                d = {
-                    "idx": idx,
-                    "type": parts[0] if parts else "unknown",
-                    "call_id": parts[1] if len(parts) > 1 else "",
-                    "utr": int(parts[2]) if len(parts) > 2 else -1,
-                    "raw": instr,
-                }
-            else:
-                d = self.core._instruction_to_dict(instr)
-                d["idx"] = idx
-            stack.append(d)
-        return stack
+    def _build_scheduling_state(self) -> dict:
+        return {
+            "active_cid": self.core._active_cid,
+            "ready_cids": list(self.core._ready_cids),
+            "dormant_cids": list(self.core._dormant_cids),
+            "total_convs": len(self.core._conv_by_cid),
+        }
