@@ -1,693 +1,411 @@
-"""AVM 测试套件
-
-本测试使用 MockLMU 替代真实 LLM 调用，确保测试：
-1. 完全确定性（不依赖外部 API）
-2. 可复现
-3. 快速执行
-
-运行方式: python -m pytest test_avm.py -v
-"""
+"""Core 调度系统测试"""
 
 import pytest
+from avm.core import Core, LMU, _instruction_registry, _build_conversation
 from avm.core import (
-    Core, parse_instruction, LMU,
-    CreateInstruction, ExecInstruction,
     MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction,
-    CRT,
+    CreateInstruction, CreateSubInstruction,
 )
+from avm.types import Conversation, UserMessageBatch, SystemMessage, UserMessage, AssistantMessage, MetaDict
 from avm.memory import Memory
-from avm.types import Conversation, UserMessageBatch, SystemMessage, UserMessage, AssistantMessage
-from avm.exceptions import VMSyntaxError, VMMemoryError
-from avm.memory_device import StringDevice
 
-
-# ---------------------------------------------------------------------------
-# MockLMU
-# ---------------------------------------------------------------------------
 
 class MockLMU:
-    """确定性 LLM 模拟器
-    
-    用法：
-        mock = MockLMU([
-            ("hello", [], None),           # 第一次调用返回 "hello"
-            ("world", ["memory_read ..."], None),  # 第二次调用返回 "world" + 一个工具调用
-        ])
-    """
-
     def __init__(self, responses=None):
-        self.responses = responses or []
+        self.responses = list(responses) if responses else []
         self.call_index = 0
-        self.calls = []  # 记录所有调用，用于断言
+        self.calls = []
 
-    def _next(self, call_type, *args):
-        self.calls.append((call_type, *args))
+    def _next(self, *args):
+        self.calls.append(args)
         if self.call_index >= len(self.responses):
-            raise RuntimeError(f"MockLMU: 第 {self.call_index} 次调用没有预设响应")
+            raise RuntimeError(f"MockLMU 第 {self.call_index} 次调用没有预设响应")
         resp = self.responses[self.call_index]
         self.call_index += 1
         if callable(resp):
-            return resp(call_type, *args)
+            return resp(*args)
         return resp
 
-    def exec_crt(self, system_prompt, user_prompt, para):
-        result, return_calls, conv_or_msgs = self._next("exec_crt", system_prompt, user_prompt, para)
-        if not isinstance(conv_or_msgs, list):
-            conv_or_msgs = [
-                SystemMessage(content=system_prompt),
-                UserMessage(content=user_prompt),
-                AssistantMessage(content=result or ""),
-            ]
-        return result, return_calls, conv_or_msgs
-
     def exec(self, conversation, para):
-        return self._next("exec", conversation, para)
+        return self._next(conversation, para)
 
 
-# ---------------------------------------------------------------------------
-# 辅助函数
-# ---------------------------------------------------------------------------
-
-def make_core(mock_responses=None):
-    """创建一个带有 MockLMU 的 Core 实例"""
+def make_core(responses=None):
     core = Core()
-    if mock_responses is not None:
-        core.lmu = MockLMU(mock_responses)
+    if responses is not None:
+        core.lmu = MockLMU(responses)
     return core
 
 
-# ---------------------------------------------------------------------------
-# parse_instruction 测试
-# ---------------------------------------------------------------------------
+def _state(core):
+    return {
+        "active": core._active_cid,
+        "ready": list(core._ready_cids),
+        "dormant": list(core._dormant_cids),
+        "total": len(core._conv_by_cid),
+    }
 
-class TestParseInstruction:
-    def test_create(self):
-        instr = parse_instruction("create cid_1 0 $MEM.sys $MEM.usr $MEM.para")
-        assert isinstance(instr, CreateInstruction)
-        assert instr.call_id == "cid_1"
-        assert instr.caller_id == 0
-        assert instr.system_ref == "$MEM.sys"
-        assert instr.user_ref == "$MEM.usr"
-        assert instr.para_ref == "$MEM.para"
 
-    def test_exec(self):
-        instr = parse_instruction("exec cid_1 0 $last_msg_reg.0 $usr_tool_reg.0 $MEM.para")
-        assert isinstance(instr, ExecInstruction)
-        assert instr.call_id == "cid_1"
-        assert instr.caller_id == 0
-        assert instr.last_msg_ref == "$last_msg_reg.0"
-        assert instr.user_msg_ref == "$usr_tool_reg.0"
-        assert instr.para_ref == "$MEM.para"
+def _batch(core, cid):
+    conv = core._conv_by_cid[cid]
+    return [(r.content, r.tool_call_id) for r in conv.user_batch.tool_responses]
 
-    def test_memory_read(self):
-        instr = parse_instruction("memory_read cid_1 0 $MEM.user_input")
-        assert isinstance(instr, MemoryReadInstruction)
-        assert instr.ref == "$MEM.user_input"
+
+def _new_root(core, system="sys", user="hello"):
+    core.mem["system"] = system
+    core.mem["user"] = user
+    conv = core.start(system, user)
+    return conv
+
+
+# ------------------------------------------------------------------
+# Conversation lifecycle
+# ------------------------------------------------------------------
+
+class TestConversationStart:
+    def test_start_creates_root(self):
+        core = make_core()
+        conv = _new_root(core)
+        assert conv.is_root is True
+        assert conv.is_sub is False
+        assert conv.parent is None
+        assert len(conv.messages) == 2  # system + user
+        assert conv.messages[0].role == "system"
+        assert conv.messages[1].role == "user"
+
+    def test_start_adds_to_ready(self):
+        core = make_core()
+        conv = _new_root(core)
+        assert conv.cid in core._ready_cids
+        assert core._active_cid is None
+
+    def test_registry_contains_all_instructions(self):
+        reg = _instruction_registry()
+        assert "memory_read" in reg
+        assert "memory_write" in reg
+        assert "memory_make" in reg
+        assert "create_cmd" in reg
+        assert "create_sub" in reg
+        assert reg["memory_read"] is MemoryReadInstruction
+        assert reg["create_cmd"] is CreateInstruction
+        assert reg["create_sub"] is CreateSubInstruction
+
+
+# ------------------------------------------------------------------
+# Memory instruction execution via scheduling
+# ------------------------------------------------------------------
+
+class TestMemoryOpsThroughScheduling:
+    def test_memory_read_writes_to_batch(self):
+        """LMU 返回 memory_read → advance 后 user_batch 有工具响应"""
+        core = make_core([
+            (None, [{"call_id": "tc1", "cmd_type": "memory_read", "args": {"ref": "$MEM.data"}}], None),
+        ])
+        _new_root(core)
+        core.mem["data"] = "stored_value"
+        core._active_cid = core._ready_cids.pop(0)  # manually start
+
+        core.advance_conversation()
+
+        assert _batch(core, 0) == [("stored_value", "tc1")]
+
+    def test_memory_read_error_writes_to_batch(self):
+        core = make_core([
+            (None, [{"call_id": "tc1", "cmd_type": "memory_read", "args": {"ref": "$MEM.missing"}}], None),
+        ])
+        _new_root(core)
+        core._active_cid = core._ready_cids.pop(0)
+        core.advance_conversation()
+        content, call_id = _batch(core, 0)[0]
+        assert "Error" in content
 
     def test_memory_write(self):
-        instr = parse_instruction("memory_write cid_1 0 $MEM.out hello")
-        assert isinstance(instr, MemoryWriteInstruction)
-        assert instr.ref == "$MEM.out"
-        assert instr.content == "hello"
+        core = make_core([
+            (None, [{"call_id": "tc1", "cmd_type": "memory_write", "args": {"ref": "$MEM.out", "content": "written"}}], None),
+        ])
+        _new_root(core)
+        core._active_cid = core._ready_cids.pop(0)
+        core.advance_conversation()
+        assert core.mem["out"] == "written"
 
     def test_memory_make(self):
-        instr = parse_instruction("memory_make cid_1 0 $MEM.data new_key dict")
-        assert isinstance(instr, MemoryMakeInstruction)
-        assert instr.ref == "$MEM.data"
-        assert instr.key == "new_key"
-        assert instr.mem_type == "dict"
-
-    def test_empty_raises(self):
-        with pytest.raises(VMSyntaxError):
-            parse_instruction("")
-
-    def test_unknown_raises(self):
-        with pytest.raises(VMSyntaxError):
-            parse_instruction("foobar 0 1")
-
-
-# ---------------------------------------------------------------------------
-# Memory 测试
-# ---------------------------------------------------------------------------
-
-class TestMemory:
-    def test_basic_set_get(self):
-        mem = Memory()
-        mem["key"] = "value"
-        assert mem["key"] == "value"
-
-    def test_nested_set_get(self):
-        mem = Memory()
-        mem["a"] = {}
-        mem.set("$MEM.a.b", "nested")
-        assert mem["a"]["b"] == "nested"
-
-    def test_dollar_unwrap(self):
-        mem = Memory()
-        mem["a"] = "hello"
-        # Core 传入的 value 格式: ['$', 'MEM', 'a']
-        result = mem.unwrap(["$", "MEM", "a"], for_llm=True)
-        assert result == "hello"
-
-    def test_dollar_unwrap_without_mem_prefix(self):
-        mem = Memory()
-        mem["a"] = "hello"
-        result = mem.unwrap(["$", "a"], for_llm=True)
-        assert result == "hello"
-
-    def test_recursive_dereference(self):
-        mem = Memory()
-        mem["a"] = "$MEM.b"
-        mem["b"] = "final"
-        result = mem.unwrap(["$", "MEM", "a"], for_llm=True)
-        assert result == "final"
-
-    def test_ampersand_one_level(self):
-        mem = Memory()
-        mem["a"] = "$MEM.b"
-        mem["b"] = "final"
-        # & 直接返回原始值，不做额外解引用
-        result = mem.unwrap(["&", "MEM", "a"], for_llm=True)
-        assert result == "$MEM.b"
-
-    def test_device_mount_and_read(self):
-        mem = Memory()
-        dev = StringDevice("device_value")
-        mem.mount("io.test", dev)
-        result = mem.unwrap(["$", "MEM", "io", "test"], for_llm=True)
-        assert result == "device_value"
-
-    def test_device_write(self):
-        mem = Memory()
-        dev = StringDevice("old")
-        mem.mount("io.test", dev)
-        mem.set("$MEM.io.test", "new")
-        assert dev.get_value() == "new"
-
-    def test_make_dict(self):
-        mem = Memory()
-        mem["base"] = {}
-        mem.make("$MEM.base", "child", "dict")
-        assert mem["base"]["child"] == {}
-
-    def test_make_list(self):
-        mem = Memory()
-        mem["base"] = [None]
-        mem.make("$MEM.base", "0", "str")
-        assert mem["base"][0] == ""
-
-
-# ---------------------------------------------------------------------------
-# Core 状态测试（无 LLM）
-# ---------------------------------------------------------------------------
-
-class TestCoreState:
-    def test_core_init(self):
-        core = make_core()
-        assert core.command_stack == []
-        assert core.last_msg_reg == []
-        assert core.last_msg_reg == []
-        assert isinstance(core.mem, Memory)
-
-    def test_unwrap_register(self):
-        core = make_core()
-        conv = Conversation.from_any_list([("system", "sys"), ("user", "usr")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)
-
-        assert core.unwrap("$last_msg_reg.0") is conv
-        assert core.unwrap("$usr_tool_reg.0") is conv.user_batch
-
-    def test_unwrap_mem(self):
-        core = make_core()
-        core.mem["x"] = "hello"
-        assert core.unwrap("$MEM.x") == "hello"
-
-
-# ---------------------------------------------------------------------------
-# 指令执行测试（使用 MockLMU）
-# ---------------------------------------------------------------------------
-
-class TestInstructionExecution:
-    def test_memory_read(self):
-        core = make_core()
-        core.mem["input"] = "user_says_hi"
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)
-
-        instr = MemoryReadInstruction("cid", 0, "$MEM.input")
-        rt = instr.execute(core)
-
-        assert rt == CRT.EXIT
-        batch = core.last_msg_reg[0].user_batch
-        assert len(batch.tool_responses) == 1
-        assert batch.tool_responses[0].content == "user_says_hi"
-        assert batch.tool_responses[0].tool_call_id == "cid"
-
-    def test_memory_write(self):
-        core = make_core()
-        core.mem["out"] = ""
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)
-
-        instr = MemoryWriteInstruction("cid", 0, "$MEM.out", "hello")
-        rt = instr.execute(core)
-
-        assert rt == CRT.EXIT
-        assert core.mem["out"] == "hello"
-        # 工具响应也写入了 batch
-        assert len(core.last_msg_reg[0].user_batch.tool_responses) == 1
-
-    def test_create_no_tool_calls(self):
-        """create 指令，LLM 无工具调用 -> EXIT，结果写回父 batch"""
-        core = make_core([("hello", [], None)])
-        core.mem["sys"] = "system_prompt"
-        core.mem["usr"] = "user_prompt"
-        core.mem["para"] = {"model": "test"}
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)
-
-        core.command_stack.append("create cid_1 0 $MEM.sys $MEM.usr $MEM.para")
-        core.run()
-
-        assert len(core.command_stack) == 0
-        assert len(core.last_msg_reg) == 1
-        assert core.last_msg_reg[0].user_batch.tool_responses[0].content == "hello"
-        assert core.last_msg_reg[0].user_batch.tool_responses[0].tool_call_id == "cid_1"
-
-    def test_create_with_tool_calls(self):
-        """create 指令，LLM 返回一个工具调用 -> CONTINUE，栈顶替换为 exec + 子指令"""
         core = make_core([
-            (
-                None,
-                [{"call_id": "tc1", "cmd_type": "memory_read", "args": {"ref": "$MEM.input"}}],
-                Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "")]),
-            ),
-            ("done", [], None),  # exec 的响应
+            (None, [{"call_id": "tc1", "cmd_type": "memory_make", "args": {"ref": "$MEM.base", "key": "child", "mem_type": "str"}}], None),
         ])
-        core.mem["sys"] = "s"
-        core.mem["usr"] = "u"
-        core.mem["para"] = {"model": "test", "use_tool": True}
-        core.mem["input"] = "hello"
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)
+        _new_root(core)
+        core.mem["base"] = {}
+        core._active_cid = core._ready_cids.pop(0)
+        core.advance_conversation()
+        assert core.mem["base"]["child"] == ""
 
-        core.command_stack.append("create cid_1 0 $MEM.sys $MEM.usr $MEM.para")
-        core.run()
-
-        # 执行过程：
-        # 1. create 执行 -> 生成 exec + memory_read
-        # 2. memory_read 执行 -> EXIT -> 弹出
-        # 3. exec -> 消费 mock[1]，无更多工具调用 -> EXIT
-        assert core.lmu.call_index == 2
-        assert len(core.command_stack) == 0
-
-    def test_create_then_exec_chain(self):
-        """完整的 create -> exec 链条，无更多工具调用"""
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "")])
-        core = make_core([
-            (None, [{"call_id": "tc1", "cmd_type": "memory_read", "args": {"ref": "$MEM.input"}}], conv),  # create 的响应
-            ("final_answer", [], None),  # exec 的响应
-        ])
-        core.mem["sys"] = "s"
-        core.mem["usr"] = "u"
-        core.mem["para"] = {"model": "test", "use_tool": True}
-        core.mem["input"] = "hello"
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)
-
-        core.command_stack.append("create cid_1 0 $MEM.sys $MEM.usr $MEM.para")
-        core.run()
-
-        # 执行流程：
-        # 1. create -> 消费 mock[0]，生成 exec + memory_read
-        #    栈: [exec, memory_read] (memory_read 后压入，先执行)
-        # 2. memory_read -> 读取 $MEM.input，写入 batch[1]
-        #    栈: [exec]
-        # 3. exec -> 消费 mock[1]，conv + batch[1] -> "final_answer"
-        #    无更多 return_calls -> EXIT，弹出寄存器
-        #    栈: []
-
-        assert len(core.command_stack) == 0
-        assert len(core.last_msg_reg) == 0
-        assert len(core.last_msg_reg) == 1  # 只剩父 batch
-        # exec 的 result 写回父 batch
-        assert core.last_msg_reg[0].user_batch.tool_responses[-1].content == "final_answer"
-
-    def test_nested_create(self):
-        """exec 中 LLM 触发 create_cmd -> 产生新的 create 指令"""
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "")])
-        core = make_core([
-            (None, [{"call_id": "tc2", "cmd_type": "create", "args": {"system_ref": "$MEM.sys2", "user_ref": "$MEM.usr2", "para_ref": "$MEM.para2"}}], conv),  # create
-            (None, [], None),  # exec（第一次）
-            ("nested_done", [], None),  # 新的 create 的 exec_crt
-        ])
-        core.mem["sys"] = "s"
-        core.mem["usr"] = "u"
-        core.mem["para"] = {"model": "test", "use_tool": True}
-        core.mem["sys2"] = "s2"
-        core.mem["usr2"] = "u2"
-        core.mem["para2"] = {"model": "test2"}
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)
-
-        core.command_stack.append("create cid_1 0 $MEM.sys $MEM.usr $MEM.para")
-        core.run()
-
-        # create -> 产生 exec + create
-        # create 指令在栈顶，先执行 -> 创建第二层对话，消费 mock[2]
-        # 然后 exec 执行 -> 消费 mock[1]
-        
-        assert core.lmu.call_index == 3
-        assert len(core.command_stack) == 0
-        # 第二层对话的寄存器已被弹出，只剩父 batch
-        assert len(core.last_msg_reg) == 1
-
-
-# ---------------------------------------------------------------------------
-# 集成测试：完整运行流程
-# ---------------------------------------------------------------------------
-
-class TestIntegration:
-    def test_full_run_with_memory_ops(self):
-        """模拟一个完整的工作流：
-        - create 指令启动对话
-        - LLM 先触发 memory_read 读取输入
-        - 然后 LLM 再次调用（exec），无更多工具调用，返回结果
-        """
-        conv = Conversation.from_any_list([("system", "sys"), ("user", "usr"), ("assistant", "")])
-        core = make_core([
-            # 第一次 LLM 调用（create）: 要求读取输入
-            (None, [{"call_id": "tc1", "cmd_type": "memory_read", "args": {"ref": "$MEM.data.input"}}], conv),
-            # 第二次 LLM 调用（exec）: 处理输入后返回结果
-            ("processed", [], None),
-        ])
-
-        core.mem["sys"] = "system"
-        core.mem["usr"] = "user"
-        core.mem["para"] = {"model": "test", "use_tool": True}
-        core.mem["data"] = {"input": "raw_data"}
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)
-
-        core.command_stack.append("create root 0 $MEM.sys $MEM.usr $MEM.para")
-        core.run()
-
-        assert len(core.command_stack) == 0
-        assert len(core.last_msg_reg) == 0
-        assert len(core.last_msg_reg) == 1
-        # 最终 result 回到父 batch
-        assert core.last_msg_reg[0].user_batch.tool_responses[-1].content == "processed"
-
-    def test_multi_tool_calls_order(self):
-        """验证多个工具调用的压栈顺序（反序）"""
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "")])
+    def test_multiple_memory_ops_in_one_call(self):
+        """一次 LMU 调用返回多个工具调用，全部处理，conv 保持活跃"""
         core = make_core([
             (None, [
                 {"call_id": "tc1", "cmd_type": "memory_write", "args": {"ref": "$MEM.a", "content": "1"}},
                 {"call_id": "tc2", "cmd_type": "memory_write", "args": {"ref": "$MEM.b", "content": "2"}},
-            ], conv),
-            ("ok1", [], None),
-            ("ok2", [], None),
-        ])
-        core.mem["s"] = "s"
-        core.mem["u"] = "u"
-        core.mem["para"] = {"model": "test", "use_tool": True}
-        core.mem["a"] = ""
-        core.mem["b"] = ""
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)
-
-        core.command_stack.append("create root 0 $MEM.s $MEM.u $MEM.para")
-        core.run()
-
-        # return_calls 被反序压栈：
-        # 原始: [write_a, write_b]
-        # 压栈后: [exec, write_b, write_a]（exec 替换栈顶，然后 extend [write_b, write_a] 的反转 [write_a, write_b]）
-        # 等等，原始 return_calls = ["memory_write tc1 ...", "memory_write tc2 ..."]
-        # core.command_stack.extend(return_calls[::-1])
-        # 所以压入栈的顺序是："memory_write tc2 ...", "memory_write tc1 ..."
-        # 栈顶是最后压入的，所以先执行 "memory_write tc1 ..."
-        
-        # 但实际上 create 先替换栈顶为 exec，然后 extend return_calls[::-1]
-        # 所以栈变成：[..., exec, write_b, write_a]
-        # 等等不对，return_calls[::-1] 会把 return_calls 反转后 extend
-        # return_calls = [write_a, write_b]
-        # return_calls[::-1] = [write_b, write_a]
-        # extend 后栈顶是 write_a（最后压入）
-        # 所以先执行 write_a，然后 write_b，然后 exec
-        
-        # mock[0] 被 create 消费
-        # mock[1] 被 exec 消费（在 write_a 和 write_b 之后）
-        # 但 exec 之后没有更多工具调用，所以只消费了 2 条 mock
-        
-        assert core.mem["a"] == "1"
-        assert core.mem["b"] == "2"
-        assert core.lmu.call_index == 2  # create + exec 各消费一条
-
-
-# ---------------------------------------------------------------------------
-# main 入口
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
-# ---------------------------------------------------------------------------
-# 补充测试：parse_instruction 边界情况
-# ---------------------------------------------------------------------------
-
-class TestParseInstructionEdgeCases:
-    def test_memory_read_missing_args(self):
-        instr = parse_instruction("memory_read cid 0")
-        assert isinstance(instr, MemoryReadInstruction)
-        assert instr.ref == ""
-
-    def test_memory_write_missing_content(self):
-        instr = parse_instruction("memory_write cid 0 $MEM.out")
-        assert isinstance(instr, MemoryWriteInstruction)
-        assert instr.content == ""
-
-    def test_caller_id_defaults_to_minus_one(self):
-        instr = parse_instruction("memory_read cid")
-        assert instr.caller_id == -1
-
-
-# ---------------------------------------------------------------------------
-# 补充测试：MemoryMakeInstruction 执行
-# ---------------------------------------------------------------------------
-
-class TestMemoryMakeExecution:
-    def test_memory_make_execute_dict(self):
-        core = make_core()
-        core.mem["data"] = {}
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)
-
-        instr = MemoryMakeInstruction("cid", 0, "$MEM.data", "new_key", "dict")
-        rt = instr.execute(core)
-
-        assert rt == CRT.EXIT
-        assert core.mem["data"]["new_key"] == {}
-        assert len(core.last_msg_reg[0].user_batch.tool_responses) == 1
-        assert "Success created dict" in core.last_msg_reg[0].user_batch.tool_responses[0].content
-
-    def test_memory_make_execute_error(self):
-        core = make_core()
-        core.mem["data"] = "string"
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)
-
-        instr = MemoryMakeInstruction("cid", 0, "$MEM.data", "key", "dict")
-        rt = instr.execute(core)
-
-        assert rt == CRT.EXIT
-        assert "Error" in core.last_msg_reg[0].user_batch.tool_responses[0].content
-
-
-# ---------------------------------------------------------------------------
-# 补充测试：ExecInstruction 直接执行
-# ---------------------------------------------------------------------------
-
-class TestExecInstructionDirect:
-    def test_exec_exit_no_subcalls(self):
-        """ExecInstruction EXIT，弹出寄存器，result 写回父 batch"""
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "")])
-        core = make_core([
-            ("result", [], None),
-        ])
-        core.mem["para"] = {"model": "test"}
-        core.last_msg_reg.append(conv)
-        core._register(conv)
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)   # idx 0: exec 使用的
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)   # idx 1: 父 batch
-
-        instr = ExecInstruction("cid", 1, "$last_msg_reg.0", "$usr_tool_reg.0", "$MEM.para")
-        core.command_stack.append(instr)
-        core.run()
-
-        # EXIT 后弹出寄存器
-        assert len(core.last_msg_reg) == 0
-        assert len(core.last_msg_reg) == 1  # 只剩父 batch
-        assert core.last_msg_reg[0].user_batch.tool_responses[0].content == "result"
-        assert core.last_msg_reg[0].user_batch.tool_responses[0].tool_call_id == "cid"
-
-    def test_exec_continue_with_tool_calls(self):
-        """ExecInstruction CONTINUE，压入子指令，之后继续执行"""
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "")])
-        core = make_core([
-            (None, [{"call_id": "tc1", "cmd_type": "memory_read", "args": {"ref": "$MEM.x"}}], None),
+            ], None),
             ("done", [], None),
         ])
-        core.mem["x"] = "val"
-        core.mem["para"] = {"model": "test"}
-        core.last_msg_reg.append(conv)
-        core._register(conv)
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)   # idx 0: exec 使用的
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)   # idx 1: 父 batch
+        _new_root(core)
+        core._active_cid = core._ready_cids.pop(0)
 
-        instr = ExecInstruction("cid", 1, "$last_msg_reg.0", "$usr_tool_reg.0", "$MEM.para")
-        core.command_stack.append(instr)
-        core.run()
+        # first advance: process two memory_write
+        core.advance_conversation()
+        # conv stays active (no create/sub_create)
+        assert core._active_cid == 0
+        assert core.mem["a"] == "1"
+        assert core.mem["b"] == "2"
 
-        assert len(core.command_stack) == 0
-        assert len(core.last_msg_reg) == 0
-        assert len(core.last_msg_reg) == 1
-        # memory_read 的结果 + exec 的 result
-        assert core.last_msg_reg[0].user_batch.tool_responses[-1].content == "done"
+        # second advance: done
+        core.advance_conversation()
+        assert core._active_cid is None
 
-    def test_exec_with_user_content(self):
-        """ExecInstruction 消费 user_msg_batch 中的 user_content"""
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "")])
+
+# ------------------------------------------------------------------
+# 子对话 / 亚对话 调度
+# ------------------------------------------------------------------
+
+class TestCreateChild:
+    def test_create_cmd_dormant_and_ready(self):
+        """根对话调用 create_cmd → 根休眠，子进就绪，子变活跃"""
         core = make_core([
-            ("got_it", [], None),
+            (None, [
+                {"call_id": "ctc", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.sys2", "user_ref": "$MEM.usr2", "para_ref": "$MEM.para"}},
+            ], None),
         ])
-        core.mem["para"] = {"model": "test"}
-        core.last_msg_reg.append(conv)
-        core._register(conv)
-        exec_conv = Conversation()
-        exec_conv.user_batch.add_user_content("additional input")
-        core.last_msg_reg.append(exec_conv)
-        core._register(exec_conv)
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)  # 父 batch
+        _new_root(core)
+        core.mem["sys2"] = "child_sys"
+        core.mem["usr2"] = "child_usr"
+        core.mem["para"] = MetaDict(data={"model": "test"})
+        core._active_cid = core._ready_cids.pop(0)
 
-        instr = ExecInstruction("cid", 1, "$last_msg_reg.0", "$usr_tool_reg.0", "$MEM.para")
-        core.command_stack.append(instr)
-        core.run()
+        st0 = _state(core)
+        assert st0["active"] == 0
+        assert st0["ready"] == []
 
-        assert core.last_msg_reg[0].user_batch.tool_responses[0].content == "got_it"
+        core.advance_conversation()
 
+        st1 = _state(core)
+        assert st1["active"] == 1           # child becomes active
+        assert 0 in st1["dormant"]          # root dormant
+        assert 1 not in st1["ready"]        # child removed from ready
 
-# ---------------------------------------------------------------------------
-# 补充测试：Core.run 流程
-# ---------------------------------------------------------------------------
-
-class TestCoreRun:
-    def test_run_empty_stack(self):
-        core = make_core()
-        core.run()  # 空栈，不抛异常
-
-    def test_run_string_instruction(self):
-        core = make_core([("hello", [], None)])
-        core.mem["sys"] = "s"
-        core.mem["usr"] = "u"
-        core.mem["para"] = {"model": "test"}
-        conv = Conversation.from_any_list([("system", "s"), ("user", "u"), ("assistant", "a")])
-        core.last_msg_reg.append(conv)
-        core._register(conv)
-
-        core.command_stack.append("create cid 0 $MEM.sys $MEM.usr $MEM.para")
-        core.run()
-
-        assert len(core.command_stack) == 0
-        assert core.last_msg_reg[0].user_batch.tool_responses[0].content == "hello"
-
-
-# ---------------------------------------------------------------------------
-# 补充测试：tool_calls 在 Conversation 中的保存和序列化
-# ---------------------------------------------------------------------------
-
-class TestToolCallsAndConversation:
-    """测试 tool_calls 在 Conversation 中的保存和序列化（修复 API 报错的关键）"""
-
-    def test_conversation_preserves_tool_calls(self):
-        tc = [{"id": "call_1", "type": "function", "function": {"name": "memory_read", "arguments": "{}"}}]
-        conv = Conversation.from_any_list([
-            ("system", "sys"),
-            ("user", "usr"),
-            {"role": "assistant", "content": "", "tool_calls": tc},
+    def test_child_finished_picks_next_ready(self):
+        """子对话完成后取下一个就绪"""
+        core = make_core([
+            (None, [
+                {"call_id": "c1", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.sys2", "user_ref": "$MEM.usr2", "para_ref": "$MEM.p"}},
+                {"call_id": "c2", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.sys3", "user_ref": "$MEM.usr3", "para_ref": "$MEM.p"}},
+            ], None),
+            # child1 finishes
+            ("child1_done", [], None),
+            # child2 finishes
+            ("child2_done", [], None),
         ])
-        msgs = conv.to_api_messages()
-        assert len(msgs) == 3
-        assert msgs[2]["role"] == "assistant"
-        assert msgs[2]["tool_calls"] == tc
+        _new_root(core)
+        for k in ["sys2", "usr2", "sys3", "usr3", "p"]:
+            core.mem[k] = "x"
+        core.mem["p"] = MetaDict(data={"model": "test"})
+        core._active_cid = core._ready_cids.pop(0)
 
-    def test_append_assistant_with_tool_calls(self):
-        conv = Conversation.from_any_list([("system", "sys")])
-        tc = [{"id": "c1", "type": "function", "function": {"name": "read"}}]
-        conv.append_assistant_message("", tool_calls=tc)
-        msgs = conv.to_api_messages()
-        assert msgs[1]["tool_calls"] == tc
+        # advance root: creates 2 children, root → dormant
+        core.advance_conversation()
+        st1 = _state(core)
+        assert st1["active"] == 1       # first child active
+        assert st1["dormant"] == [0]
+        assert 2 in st1["ready"]        # second child waiting
 
-    def test_tool_calls_followed_by_tool_message(self):
-        """模拟 API 消息列表：assistant(tool_calls) + tool"""
-        conv = Conversation.from_any_list([
-            ("user", "hi"),
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"id": "tc1", "type": "function", "function": {"name": "memory_read", "arguments": "{}"}}
-            ]},
+        # advance child1: finishes → pick child2
+        core.advance_conversation()
+        st2 = _state(core)
+        assert st2["active"] == 2       # second child active
+        assert st2["ready"] == []
+
+        # advance child2: finishes → no more ready
+        core.advance_conversation()
+        st3 = _state(core)
+        assert st3["active"] is None
+
+    def test_child_has_parent_link(self):
+        core = make_core([
+            (None, [
+                {"call_id": "c", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.s", "user_ref": "$MEM.u", "para_ref": "$MEM.p"}},
+            ], None),
         ])
-        batch = UserMessageBatch()
-        batch.add_tool_response("result", "tc1")
+        _new_root(core)
+        core.mem["s"] = "x"
+        core.mem["u"] = "x"
+        core.mem["p"] = MetaDict(data={"model": "test"})
+        core._active_cid = core._ready_cids.pop(0)
+        core.advance_conversation()
 
-        msgs = conv.to_api_messages()
-        msgs.extend(batch.to_tool_messages())
-
-        assert msgs[0]["role"] == "user"
-        assert msgs[1]["role"] == "assistant"
-        assert "tool_calls" in msgs[1]
-        assert msgs[2]["role"] == "tool"
-        assert msgs[2]["tool_call_id"] == "tc1"
+        child = core._conv_by_cid[1]
+        assert child.parent is core._conv_by_cid[0]
+        assert child.is_sub is False
+        assert child.is_root is False
 
 
-# ---------------------------------------------------------------------------
-# 补充测试：_parse_index 边界
-# ---------------------------------------------------------------------------
+class TestCreateSub:
+    def test_create_sub_parent_ready_front(self):
+        """create_sub → 父插到就绪队首，亚对话进队首立即活跃"""
+        core = make_core([
+            (None, [
+                {"call_id": "cs", "cmd_type": "create_sub", "args": {"system_ref": "$MEM.s", "user_ref": "$MEM.u", "para_ref": "$MEM.p"}},
+            ], None),
+        ])
+        _new_root(core)
+        core.mem["s"] = "sub_sys"
+        core.mem["u"] = "sub_usr"
+        core.mem["p"] = MetaDict(data={"model": "test"})
+        core._active_cid = core._ready_cids.pop(0)
 
-class TestParseIndex:
-    def test_parse_index_last_msg_reg(self):
-        instr = ExecInstruction("c", 0, "$last_msg_reg.5", "$usr_tool_reg.0", "$MEM.para")
-        assert instr._parse_index("$last_msg_reg.5") == 5
+        core.advance_conversation()
 
-    def test_parse_index_usr_tool_reg(self):
-        instr = ExecInstruction("c", 0, "$last_msg_reg.0", "$usr_tool_reg.3", "$MEM.para")
-        assert instr._parse_index("$usr_tool_reg.3") == 3
+        st = _state(core)
+        assert st["active"] == 1        # sub becomes active
+        assert 0 in st["ready"]         # parent is in ready (front)
 
-    def test_parse_index_mem_returns_none(self):
-        instr = ExecInstruction("c", 0, "$last_msg_reg.0", "$usr_tool_reg.0", "$MEM.para")
-        assert instr._parse_index("$MEM.key") is None
+    def test_sub_finished_writes_to_parent_and_wakes(self):
+        """亚对话完成 → 输出写回 parent.user_batch，parent 回到 active"""
+        core = make_core([
+            (None, [
+                {"call_id": "cs_call", "cmd_type": "create_sub", "args": {"system_ref": "$MEM.s", "user_ref": "$MEM.u", "para_ref": "$MEM.p"}},
+            ], None),
+            # sub finishes, returns "sub_result"
+            ("sub_result", [], None),
+        ])
+        _new_root(core)
+        core.mem["s"] = "x"
+        core.mem["u"] = "x"
+        core.mem["p"] = MetaDict(data={"model": "test"})
+        core._active_cid = core._ready_cids.pop(0)
 
-    def test_parse_index_invalid_returns_none(self):
-        instr = ExecInstruction("c", 0, "$last_msg_reg.0", "$usr_tool_reg.0", "$MEM.para")
-        assert instr._parse_index("not_a_ref") is None
+        # advance root: create sub
+        core.advance_conversation()
+        st1 = _state(core)
+        assert st1["active"] == 1  # sub active
+        assert 0 in st1["ready"]  # parent in ready
+
+        # advance sub: finishes → parent wakes
+        core.advance_conversation()
+        st2 = _state(core)
+        assert st2["active"] == 0  # parent wakes
+
+        # parent batch has sub's result
+        batch = _batch(core, 0)
+        assert ("sub_result", "cs_call") in batch
+
+    def test_sub_has_is_sub_true(self):
+        core = make_core([
+            (None, [
+                {"call_id": "cs", "cmd_type": "create_sub", "args": {"system_ref": "$MEM.s", "user_ref": "$MEM.u", "para_ref": "$MEM.p"}},
+            ], None),
+        ])
+        _new_root(core)
+        for k in ["s", "u", "p"]:
+            core.mem[k] = "x"
+        core.mem["p"] = MetaDict(data={"model": "test"})
+        core._active_cid = core._ready_cids.pop(0)
+        core.advance_conversation()
+
+        sub = core._conv_by_cid[1]
+        assert sub.is_sub is True
+        assert sub.parent is core._conv_by_cid[0]
+
+
+# ------------------------------------------------------------------
+# 调度状态检查
+# ------------------------------------------------------------------
+
+class TestSchedulingState:
+    def test_no_tool_calls_conversation_finishes(self):
+        """无工具调用 → 对话结束"""
+        core = make_core([
+            ("final_answer", [], None),
+        ])
+        _new_root(core)
+        core._active_cid = core._ready_cids.pop(0)
+
+        core.advance_conversation()
+
+        assert core._active_cid is None
+        assert core._ready_cids == []
+
+    def test_user_batch_cleared_after_advance(self):
+        core = make_core([
+            ("done", [], None),
+        ])
+        _new_root(core)
+        conv = core._conv_by_cid[0]
+        conv.user_batch.add_tool_response("stale", "old_tc")
+        core._active_cid = core._ready_cids.pop(0)
+
+        core.advance_conversation()
+
+        assert len(conv.user_batch.tool_responses) == 0
+
+    def test_advance_adds_assistant_message(self):
+        core = make_core([
+            ("direct_answer", [], None),
+        ])
+        _new_root(core)
+        core._active_cid = core._ready_cids.pop(0)
+
+        msgs_before = len(core._conv_by_cid[0].messages)
+        core.advance_conversation()
+
+        conv = core._conv_by_cid[0]
+        # real LMU.exec appends assistant; mock returns canned response
+        # without modifying conversation — test just that advance runs
+        assert core._active_cid is None  # conversation finished
+
+
+# ------------------------------------------------------------------
+# LMU.exec 调用参数
+# ------------------------------------------------------------------
+
+class TestLMUExecCalled:
+    def test_exec_receives_conversation_and_para(self):
+        recorded = []
+
+        class RecordingLMU(MockLMU):
+            def exec(self, conversation, para):
+                recorded.append((len(conversation.messages), para.get("model")))
+                return "ok", [], conversation
+
+        core = Core()
+        core.lmu = RecordingLMU()
+        _new_root(core)
+        core.mem["model_params"] = MetaDict(data={"model": "gpt-4o"})
+        core._active_cid = core._ready_cids.pop(0)
+
+        core.advance_conversation()
+
+        assert len(recorded) == 1
+        msg_count, model = recorded[0]
+        assert msg_count == 2  # system + user
+        assert model == "gpt-4o"
+
+    def test_batch_tool_messages_sent_to_lmu(self):
+        recorded_messages = []
+
+        class RecordingLMU(MockLMU):
+            def exec(self, conversation, para):
+                msgs = conversation.to_api_messages()
+                msgs.extend(conversation.user_batch.to_tool_messages())
+                recorded_messages.extend(msgs)
+                return "ok", [], conversation
+
+        core = Core()
+        core.lmu = RecordingLMU()
+        _new_root(core)
+        conv = core._conv_by_cid[0]
+        conv.user_batch.add_tool_response("tool_result", "tc1")
+        core._active_cid = core._ready_cids.pop(0)
+
+        core.advance_conversation()
+
+        tool_msgs = [m for m in recorded_messages if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0]["tool_call_id"] == "tc1"

@@ -9,12 +9,15 @@ class MemoryDevice:
     """设备基类"""
 
     def pretend_as_type(self) -> str:
-        """返回设备假装类型：'str' | 'MetaList' | 'MetaDict'"""
         raise NotImplementedError
 
     def to_llm_string(self) -> str:
-        """返回给 LLM 的字符串表示"""
         raise NotImplementedError
+
+    def resolve_path(self, path: list) -> Any:
+        """设备子路径解析。默认不支持子路径。覆盖以实现符号链接等。"""
+        from .exceptions import VMMemoryError
+        raise VMMemoryError(f"{type(self).__name__} 不支持子路径访问")
 
 
 class StringDevice(MemoryDevice):
@@ -138,6 +141,12 @@ class InputsListDevice(MetaListDevice):
         # 正常列表访问
         return super().__getitem__(index)
 
+    def resolve_path(self, path: list) -> Any:
+        if len(path) == 1:
+            return self.__getitem__(path[0])
+        from .exceptions import VMMemoryError
+        raise VMMemoryError(f"InputsListDevice 不支持多级子路径")
+
     def __setitem__(self, index, value):
         from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
         raise MemoryTypeError("InputsListDevice 是只读的，不允许写入")
@@ -204,6 +213,12 @@ class OutputsListDevice(MetaListDevice):
 
     def to_llm_string(self) -> str:
         return f"outputs[list_len={len(self._data)}, items={self._data!r},metadata={self._metadata!r}]"
+
+    def resolve_path(self, path: list) -> Any:
+        if len(path) == 1:
+            return self.__getitem__(path[0])
+        from .exceptions import VMMemoryError
+        raise VMMemoryError(f"OutputsListDevice 不支持多级子路径")
 
 
 class MetaDictDevice(MemoryDevice):

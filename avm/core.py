@@ -144,7 +144,6 @@ class CreateInstruction(Instruction):
         child = _build_conversation(core, self.system_ref, self.user_ref, self.para_ref, parent=conv, is_sub=False)
         child.metadata["call_id"] = self.call_id
         core._ready_cids.append(child.cid)
-        core._dormant_cids.append(conv.cid)
 
 
 class CreateSubInstruction(Instruction):
@@ -342,6 +341,7 @@ class Core:
                 self._active_cid = parent.cid
         else:
             self._active_cid = None
+            self._pick_next_active()
 
     def _pick_next_active(self):
         if self._ready_cids:

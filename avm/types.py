@@ -210,7 +210,7 @@ class Conversation:
         self.parent = parent
         self.is_root = is_root
         self.metadata = metadata or {}
-        self.validate()
+        self.validate(require_last_assistant=False)
     
     
 

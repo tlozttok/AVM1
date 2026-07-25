@@ -72,88 +72,53 @@ class Memory:
     def unwrap(self, value: list, for_llm: bool = True) -> Any:
         """
         解引用值
-        :param value: 引用列表，如 ['$', 'key'] 或 ['&', 'key', 'subkey']
-        :param for_llm: 如果为 True，对 MetaList/MetaDict 返回 to_llm_string()
-        :return: 解引用后的值
+        :param value: 路径列表，如 ['$', 'MEM', 'key'] 或 ['$', 'device', 'subpath']
         """
         logger.debug("[unwrap] value=%s for_llm=%s", value, for_llm)
-        if value[0] == "$":
+        if value[0] in ("$", "&"):
             path = value[1:]
-            # 移除 MEM 前缀（$MEM.key -> $key）
-            if path and path[0] == "MEM":
-                path = path[1:]
-            return self._unwrap_dollar(path, for_llm=for_llm)
-        elif value[0] == "&":
-            path = value[1:]
-            if path and path[0] == "MEM":
-                path = path[1:]
-            return self._unwrap_ampersand(path, for_llm=for_llm)
         else:
-            # 无前缀，直接返回路径对应的值
-            return self._get_by_path(value)
+            path = value
+        return self.resolve_path(path, for_llm=for_llm)
 
-    def _unwrap_dollar(self, path: list, for_llm: bool, seen: Optional[set] = None) -> Any:
-        """
-        $ 引用：递归解引用
-        """
-        if seen is None:
-            seen = set()
-
-        # 获取路径对应的值
-        temp = self._get_by_path(path)
-
-        # 检查是否是字符串且以 $ 开头（需要递归解引用）
-        if isinstance(temp, str) and temp.startswith("$"):
-            # 防止循环引用
-            if temp in seen:
-                return temp
-            seen.add(temp)
-            temp_value = [temp[0], *temp[1:].split(".")]
-            next_path = temp_value[1:]
-            # 移除 MEM 前缀
-            if next_path and next_path[0] == "MEM":
-                next_path = next_path[1:]
-            return self._unwrap_dollar(next_path, for_llm=for_llm, seen=seen)
-
-        # 处理类型转换
-        return self._convert_for_llm(temp, for_llm)
-
-    def _unwrap_ampersand(self, path: list, for_llm: bool) -> Any:
-        """
-        & 引用：直接返回路径对应的原始值，不做额外解引用
-        """
-        temp = self._get_by_path(path)
-        return self._convert_for_llm(temp, for_llm)
-
-    def _get_by_path(self, path: list) -> Any:
-        """
-        根据路径获取值，访问前先检查地址存在性
-        :param path: 路径列表，如 ['key', 'subkey']
-        """
+    def resolve_path(self, path: list, for_llm: bool = False) -> Any:
         if not path:
-            return self._data
+            return self._convert_for_llm(self._data, for_llm)
 
-        # 精确设备路径匹配
-        if self.is_device_path(path):
-            return self.get_device(path)
+        # 不以 MEM 开头 — 必须先命中设备
+        if path[0] != "MEM":
+            for i in range(len(path)):
+                prefix_str = ".".join(path[:i + 1])
+                if prefix_str in self._devices:
+                    device = self._devices[prefix_str]
+                    remaining = path[i + 1:]
+                    result = device.resolve_path(remaining) if remaining else device
+                    return self._convert_for_llm(result, for_llm)
+            raise VMMemoryError(f"未知路径前缀：{path[0]}，只允许 MEM 或已挂载设备")
 
-        # 设备路径前缀匹配：如 inputs.-1 中 inputs 是设备
-        for i in range(len(path) - 1, 0, -1):
-            prefix = path[:i]
-            if self.is_device_path(prefix):
-                device = self.get_device(prefix)
-                current = device
-                for j, key in enumerate(path[i:], start=i):
-                    self._check_access(current, key, path)
-                    current = current[key]
-                return current
+        # MEM 路径：先检查设备命中，再走数据
+        path = path[1:]  # strip MEM
+        if not path:
+            return self._convert_for_llm(self._data, for_llm)
 
-        # 普通路径：从 _data 根开始逐级检查后访问
+        return self._resolve_mem_path(path, for_llm=for_llm)
+
+    def _resolve_mem_path(self, path: list, for_llm: bool) -> Any:
+        # 检查路径任意前缀是否命中设备
+        for i in range(len(path)):
+            prefix_str = ".".join(path[:i + 1])
+            if prefix_str in self._devices:
+                device = self._devices[prefix_str]
+                remaining = path[i + 1:]
+                result = device.resolve_path(remaining) if remaining else device
+                return self._convert_for_llm(result, for_llm)
+
+        # 普通数据访问
         current = self._data
-        for i, key in enumerate(path):
+        for key in path:
             self._check_access(current, key, path)
             current = current[key]
-        return current
+        return self._convert_for_llm(current, for_llm)
 
     @staticmethod
     def _check_access(current, key: str, path: list):
@@ -350,46 +315,23 @@ class Memory:
         if mem_type not in ('str', 'dict', 'list'):
             raise VMMemoryError(f"不支持的类型：{mem_type}，必须是 'str', 'dict', 'list' 之一")
 
-        # 解析引用路径
         parts = ref[1:].split(".")
-        # 移除 MEM 前缀
-        if parts and parts[0] == "MEM":
-            parts = parts[1:]
 
-        # 获取父路径和当前值
-        parent_path = parts[:-1] if len(parts) > 1 else []
-        current_path = parts
-
-        # 获取 ref 对应的值
-        if parent_path:
-            parent = self._get_by_path(parent_path)
-        else:
-            parent = self._data
-
-        # 检查 ref 是否存在
-        if current_path:
-            try:
-                current = self._get_by_path(current_path)
-            except (KeyError, TypeError):
-                raise VMMemoryError(f"路径不存在：{ref}")
-        else:
-            current = parent
-
-        # 如果 ref 是空路径（即 $MEM），则直接在 _data 上操作
-        if not current_path:
-            current = self._data
+        # 获取 ref 指向的值
+        try:
+            current = self.resolve_path(parts, for_llm=False)
+        except (VMMemoryError, MemoryKeyNotFoundError, KeyError, TypeError):
+            raise VMMemoryError(f"路径不存在：{ref}")
 
         # 检查类型
         if isinstance(current, str):
             raise VMMemoryError(f"不能在字符串类型的路径下创建新键：{ref}")
         elif isinstance(current, (list, MetaList)):
-            # 期望第二个值是索引数字
             if not key.isdigit():
                 raise VMMemoryError(f"列表类型的路径下，key 必须是数字索引：{key}")
             index = int(key)
             if index < 0 or index >= len(current):
                 raise VMMemoryError(f"索引越界：{index}，列表长度：{len(current)}")
-            # 在列表指定索引位置创建新值
             if mem_type == 'str':
                 current[index] = ""
             elif mem_type == 'dict':
@@ -397,7 +339,6 @@ class Memory:
             elif mem_type == 'list':
                 current[index] = MetaList(data=[])
         elif isinstance(current, (dict, MetaDict)):
-            # 在字典中创建新键
             if mem_type == 'str':
                 current[key] = ""
             elif mem_type == 'dict':

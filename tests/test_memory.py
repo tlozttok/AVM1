@@ -1,25 +1,25 @@
-"""memory 模块单元测试"""
+"""内存系统测试"""
 
 import pytest
-from avm.memory import Memory
-from avm.memory_device import StringDevice, MetaListDevice, MetaDictDevice
-from avm.exceptions import VMMemoryError
+from avm.memory import Memory, _wrap_value
+from avm.memory_device import StringDevice, MetaListDevice, MetaDictDevice, InputsListDevice, OutputsListDevice, MemoryDevice
 from avm.types import MetaDict, MetaList
+from avm.exceptions import VMMemoryError, MemoryKeyNotFoundError, MemoryIndexOutOfRangeError, MemoryTypeError
 
 
 class TestMemoryBasic:
-    def test_set_get(self):
+    def test_set_and_get(self):
         mem = Memory()
-        mem["key"] = "value"
-        assert mem["key"] == "value"
+        mem["k"] = "v"
+        assert mem["k"] == "v"
 
-    def test_contains(self):
+    def test_in_operator(self):
         mem = Memory()
         mem["a"] = 1
         assert "a" in mem
         assert "b" not in mem
 
-    def test_delitem(self):
+    def test_del_item(self):
         mem = Memory()
         mem["a"] = 1
         del mem["a"]
@@ -29,81 +29,140 @@ class TestMemoryBasic:
         mem = Memory()
         assert mem.get("x", "default") == "default"
 
-    def test_setdefault(self):
+    def test_setdefault_creates(self):
         mem = Memory()
         mem.setdefault("x", "v")
         assert mem["x"] == "v"
 
-
-class TestMemoryNested:
-    def test_nested_set_get(self):
+    def test_setdefault_no_overwrite(self):
         mem = Memory()
-        mem["a"] = {}
-        mem.set("$MEM.a.b", "nested")
-        assert mem["a"]["b"] == "nested"
+        mem["x"] = "original"
+        mem.setdefault("x", "new")
+        assert mem["x"] == "original"
 
-    def test_set_creates_intermediate_dicts(self):
+    def test_cannot_delete_device(self):
         mem = Memory()
-        mem.set("$MEM.a.b.c", "deep")
-        assert mem["a"]["b"]["c"] == "deep"
+        mem.mount("dev", StringDevice("val"))
+        with pytest.raises(VMMemoryError):
+            del mem["dev"]
 
 
-class TestMemoryUnwrap:
-    def test_dollar_unwrap(self):
+class TestWrapValue:
+    def test_dict_wrapped(self):
+        result = _wrap_value({"a": {"b": "c"}})
+        assert isinstance(result, MetaDict)
+        assert isinstance(result["a"], MetaDict)
+
+    def test_list_wrapped(self):
+        result = _wrap_value([1, 2])
+        assert isinstance(result, MetaList)
+
+    def test_nested_structures(self):
+        result = _wrap_value({"lst": [{"k": "v"}]})
+        assert isinstance(result, MetaDict)
+        assert isinstance(result["lst"], MetaList)
+        assert isinstance(result["lst"][0], MetaDict)
+
+    def test_string_unchanged(self):
+        assert _wrap_value("hello") == "hello"
+
+
+class TestUnwrap:
+    def test_mem_root(self):
         mem = Memory()
-        mem["a"] = "hello"
-        assert mem.unwrap(["$", "MEM", "a"], for_llm=True) == "hello"
+        mem["key"] = "val"
+        result = mem.unwrap(["$", "MEM", "key"])
+        assert result == "val"
 
-    def test_dollar_unwrap_without_mem_prefix(self):
+    def test_mem_nested(self):
         mem = Memory()
-        mem["a"] = "hello"
-        assert mem.unwrap(["$", "a"], for_llm=True) == "hello"
+        mem["a"] = {"b": "nested"}
+        result = mem.unwrap(["$", "MEM", "a", "b"])
+        assert result == "nested"
 
-    def test_recursive_dereference(self):
+    def test_mem_key_not_found(self):
         mem = Memory()
-        mem["a"] = "$MEM.b"
-        mem["b"] = "final"
-        assert mem.unwrap(["$", "MEM", "a"], for_llm=True) == "final"
+        with pytest.raises(MemoryKeyNotFoundError):
+            mem.unwrap(["$", "MEM", "nonexistent"])
 
-    def test_ampersand_one_level(self):
+    def test_mem_string_no_subkey(self):
         mem = Memory()
-        mem["a"] = "$MEM.b"
-        mem["b"] = "final"
-        assert mem.unwrap(["&", "MEM", "a"], for_llm=True) == "$MEM.b"
+        mem["s"] = "hello"
+        with pytest.raises(MemoryTypeError):
+            mem.unwrap(["$", "MEM", "s", "child"])
 
-    def test_unwrap_no_prefix(self):
+    def test_non_mem_device(self):
         mem = Memory()
-        mem["a"] = "val"
-        assert mem.unwrap(["a"], for_llm=True) == "val"
+        dev = StringDevice("hello")
+        mem.mount("io", dev)
+        result = mem.unwrap(["$", "io"])
+        assert result == "hello"
 
-    def test_unwrap_metadict(self):
+    def test_non_mem_device_subpath(self):
+        mem = Memory()
+        dev = InputsListDevice(data=["a", "b", "c"])
+        mem.mount("inputs", dev)
+        result = mem.unwrap(["$", "inputs", "0"])
+        assert result == "a"
+
+    def test_non_mem_unknown_raises(self):
+        mem = Memory()
+        with pytest.raises(VMMemoryError):
+            mem.unwrap(["$", "unknown_device"])
+
+    def test_mem_with_device_on_path(self):
+        mem = Memory()
+        mem["cfg"] = MetaDict(data={"key": "val"})
+        dev = StringDevice("device_val")
+        mem.mount("cfg.dev", dev)
+        # 走到 cfg.dev 命中设备，返回设备值
+        result = mem.unwrap(["$", "MEM", "cfg", "dev"])
+        assert result == "device_val"
+
+    def test_for_llm_false_returns_raw(self):
         mem = Memory()
         mem["d"] = MetaDict(data={"k": "v"})
-        result = mem.unwrap(["$", "d"], for_llm=True)
-        assert result == "dict[keys=['k'],metadata=None]"
+        result = mem.unwrap(["$", "MEM", "d"], for_llm=False)
+        assert isinstance(result, MetaDict)
+        assert result["k"] == "v"
 
-    def test_unwrap_metalist(self):
+    def test_no_prefix_passthrough(self):
         mem = Memory()
-        mem["l"] = MetaList(data=[1, 2, 3])
-        result = mem.unwrap(["$", "l"], for_llm=True)
-        assert result == "list[len=3,metadata=None]"
+        mem["key"] = "val"
+        # 无 $ 前缀直接走 resolve_path，非 MEM 路径需要设备
+        with pytest.raises(VMMemoryError):
+            mem.unwrap(["key"])
 
 
-class TestMemoryDevice:
-    def test_mount_read(self):
-        mem = Memory()
+class TestDeviceResolvePath:
+    def test_inputs_device_resolve_path(self):
+        dev = InputsListDevice(data=["x", "y"])
+        assert dev.resolve_path(["0"]) == "x"
+        assert dev.resolve_path(["1"]) == "y"
+
+    def test_inputs_device_multilevel_raises(self):
+        dev = InputsListDevice(data=["x"])
+        with pytest.raises(VMMemoryError):
+            dev.resolve_path(["0", "child"])
+
+    def test_outputs_device_resolve_path(self):
+        dev = OutputsListDevice(data=["a", "b"])
+        assert dev.resolve_path(["1"]) == "b"
+
+    def test_string_device_subpath_raises(self):
         dev = StringDevice("val")
-        mem.mount("io.test", dev)
-        assert mem.unwrap(["$", "MEM", "io", "test"], for_llm=True) == "val"
+        with pytest.raises(VMMemoryError):
+            dev.resolve_path(["child"])
 
-    def test_mount_write_string_device(self):
+
+class TestMemoryDeviceMount:
+    def test_mount_and_read(self):
         mem = Memory()
-        dev = StringDevice("old")
-        mem.mount("io.test", dev)
-        mem.set("$MEM.io.test", "new")
-        assert dev.get_value() == "new"
+        dev = StringDevice("hello")
+        mem.mount("path", dev)
+        assert mem.is_device_path(["path"])
 
-    def test_mount_invalid_device(self):
+    def test_mount_invalid_type_raises(self):
         mem = Memory()
         with pytest.raises(VMMemoryError):
             mem.mount("path", "not_a_device")
@@ -115,42 +174,81 @@ class TestMemoryDevice:
         mem.unmount("path")
         assert not mem.is_device_path(["path"])
 
-    def test_unmount_nonexistent(self):
+    def test_unmount_nonexistent_raises(self):
         mem = Memory()
         with pytest.raises(VMMemoryError):
             mem.unmount("nonexistent")
-
-    def test_is_device_path(self):
-        mem = Memory()
-        mem.mount("a.b", StringDevice("x"))
-        assert mem.is_device_path(["a", "b"])
-        assert not mem.is_device_path(["a"])
 
     def test_get_device(self):
         mem = Memory()
         dev = StringDevice("x")
         mem.mount("a", dev)
         assert mem.get_device(["a"]) is dev
+        assert mem.get_device(["nonexistent"]) is None
+
+
+class TestMemorySet:
+    def test_set_top_level(self):
+        mem = Memory()
+        mem.set("$MEM.key", "val")
+        assert mem["key"] == "val"
+
+    def test_set_nested(self):
+        mem = Memory()
+        mem["parent"] = {}
+        mem.set("$MEM.parent.child", "deep")
+        assert mem["parent"]["child"] == "deep"
+
+    def test_set_creates_intermediate(self):
+        mem = Memory()
+        mem.set("$MEM.a.b.c", "val")
+        assert mem["a"]["b"]["c"] == "val"
+
+    def test_set_without_dollar_raises(self):
+        mem = Memory()
+        with pytest.raises(ValueError):
+            mem.set("no_dollar", "val")
+
+    def test_set_by_path_device_root(self):
+        mem = Memory()
+        dev = StringDevice("old")
+        mem.mount("dev", dev)
+        mem.set_by_path(["dev"], "new")
+        assert dev.get_value() == "new"
+
+    def test_set_device_nested_through_data(self):
+        mem = Memory()
+        mem["cfg"] = MetaDict(data={"inner": "old"})
+        dev = StringDevice("device_val")
+        mem.mount("cfg.inner", dev)
+        mem.set_by_path(["cfg", "inner"], "overwritten")
+        assert dev.get_value() == "overwritten"
 
 
 class TestMemoryMake:
-    def test_make_dict(self):
+    def test_make_string_on_dict(self):
+        mem = Memory()
+        mem["base"] = {}
+        mem.make("$MEM.base", "child", "str")
+        assert mem["base"]["child"] == ""
+
+    def test_make_dict_on_dict(self):
         mem = Memory()
         mem["base"] = {}
         mem.make("$MEM.base", "child", "dict")
         assert mem["base"]["child"] == {}
 
-    def test_make_list(self):
+    def test_make_list_on_dict(self):
+        mem = Memory()
+        mem["base"] = {}
+        mem.make("$MEM.base", "child", "list")
+        assert mem["base"]["child"] == []
+
+    def test_make_on_list(self):
         mem = Memory()
         mem["base"] = [None]
         mem.make("$MEM.base", "0", "str")
         assert mem["base"][0] == ""
-
-    def test_make_str(self):
-        mem = Memory()
-        mem["base"] = {}
-        mem.make("$MEM.base", "child", "str")
-        assert mem["base"]["child"] == ""
 
     def test_make_on_string_raises(self):
         mem = Memory()
@@ -161,43 +259,35 @@ class TestMemoryMake:
     def test_make_on_nonexistent_raises(self):
         mem = Memory()
         with pytest.raises(VMMemoryError):
-            mem.make("$MEM.nonexistent", "child", "dict")
+            mem.make("$MEM.nonex", "child", "dict")
 
-    def test_make_list_bad_index(self):
+    def test_make_list_bad_index_raises(self):
         mem = Memory()
         mem["base"] = [None]
         with pytest.raises(VMMemoryError):
             mem.make("$MEM.base", "abc", "str")
 
-    def test_make_list_out_of_range(self):
+    def test_make_list_out_of_range_raises(self):
         mem = Memory()
         mem["base"] = [None]
         with pytest.raises(VMMemoryError):
             mem.make("$MEM.base", "5", "str")
 
-    def test_make_invalid_type(self):
-        mem = Memory()
-        mem["base"] = {}
-        with pytest.raises(VMMemoryError):
-            mem.make("$MEM.base", "child", "invalid_type")
 
-
-class TestMemorySet:
-    def test_set_invalid_ref(self):
+class TestMemorySaveLoad:
+    def test_save_and_load_roundtrip(self, tmp_path):
+        path = tmp_path / "mem.json"
         mem = Memory()
-        with pytest.raises(ValueError):
-            mem.set("no_dollar", "val")
+        mem["a"] = "hello"
+        mem["nested"] = MetaDict(data={"k": MetaList(data=["x", "y", "z"])})
+        mem.save(str(path))
 
-    def test_set_by_path_device(self):
-        mem = Memory()
-        dev = StringDevice("old")
-        mem.mount("io", dev)
-        mem.set_by_path(["io"], "new")
-        assert dev.get_value() == "new"
+        loaded = Memory.load(str(path))
+        assert loaded["a"] == "hello"
+        assert loaded["nested"]["k"] == ["x", "y", "z"]
 
-    def test_set_by_path_device_not_string(self):
-        mem = Memory()
-        dev = MetaListDevice()
-        mem.mount("io", dev)
-        with pytest.raises(VMMemoryError):
-            mem.set_by_path(["io"], "val")
+    def test_load_nonexistent_returns_empty(self, tmp_path):
+        path = tmp_path / "nonexistent.json"
+        mem = Memory.load(str(path))
+        # empty memory is fine
+        assert list(mem._data.keys()) == []
