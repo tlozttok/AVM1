@@ -13,6 +13,7 @@ from .types import MetaList, MetaDict
 from .exceptions import VMSyntaxError, VMMemoryError
 from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, message_to_api_dict
 from .memory import Memory
+from .memory_device import MemoryDevice
 
 logger = logging.getLogger(__name__)
 
@@ -175,18 +176,132 @@ class CreateSubInstruction(Instruction):
         core._ready_cids.insert(0, sub.cid)
 
 
+class RegisterServiceInstruction(Instruction):
+    tool_name = "register_service"
+    tool_def = {
+        "type": "function",
+        "function": {
+            "name": "register_service",
+            "description": "将当前对话注册为服务，其他对话可通过 call_service 调用",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "服务名"},
+                    "what": {"type": "string", "description": "服务做什么"},
+                    "needs": {"type": "string", "description": "需要什么输入"},
+                    "returns": {"type": "string", "description": "返回什么"},
+                },
+                "required": ["name", "what", "needs", "returns"],
+            }
+        }
+    }
+
+    def execute(self, core: 'Core', conv: Conversation):
+        core._services[self.name] = conv.cid
+        conv.service_desc = {
+            "name": self.name, "what": self.what,
+            "needs": self.needs, "returns": self.returns,
+        }
+        conv.user_batch.add_tool_response(f"服务 {self.name} 注册成功", self.call_id)
+
+
+class CallServiceInstruction(Instruction):
+    tool_name = "call_service"
+    tool_def = {
+        "type": "function",
+        "function": {
+            "name": "call_service",
+            "description": "调用一个已注册服务，等待返回后继续",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service_name": {"type": "string", "description": "要调用的服务名"},
+                    "input": {"type": "string", "description": "传给服务的输入"},
+                },
+                "required": ["service_name", "input"],
+            }
+        }
+    }
+
+    def execute(self, core: 'Core', conv: Conversation):
+        target_cid = core._services.get(self.service_name)
+        if target_cid is None:
+            conv.user_batch.add_tool_response(f"Error: 服务 {self.service_name} 不存在", self.call_id)
+            return
+        target = core._conv_by_cid[target_cid]
+        target.user_batch.add_user_content(self.input)
+        # 目标结束时回调 caller
+        target.metadata["caller_cid"] = str(conv.cid)
+        target.metadata["caller_call_id"] = self.call_id
+        core._ready_cids.insert(0, conv.cid)
+        core._ready_cids.insert(0, target.cid)
+
+
+class TransferServiceInstruction(Instruction):
+    tool_name = "transfer_service"
+    tool_def = {
+        "type": "function",
+        "function": {
+            "name": "transfer_service",
+            "description": "移交控制权给一个服务，自身休眠，不等待返回",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service_name": {"type": "string", "description": "要调用的服务名"},
+                    "input": {"type": "string", "description": "传给服务的输入"},
+                },
+                "required": ["service_name", "input"],
+            }
+        }
+    }
+
+    def execute(self, core: 'Core', conv: Conversation):
+        target_cid = core._services.get(self.service_name)
+        if target_cid is None:
+            conv.user_batch.add_tool_response(f"Error: 服务 {self.service_name} 不存在", self.call_id)
+            return
+        target = core._conv_by_cid[target_cid]
+        target.user_batch.add_user_content(self.input)
+        core._dormant_cids.append(conv.cid)
+        core._ready_cids.append(target.cid)
+
+
 def _instruction_registry() -> Dict[str, Type[Instruction]]:
     return {
         cls.tool_name: cls
         for cls in [
             MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction,
             CreateInstruction, CreateSubInstruction,
+            RegisterServiceInstruction, CallServiceInstruction, TransferServiceInstruction,
         ]
     }
 
 
 def _build_tools() -> list:
     return [cls.tool_def for cls in _instruction_registry().values()]
+
+
+class _ServicesDevice(MemoryDevice):
+    def __init__(self, core: 'Core'):
+        self._core = core
+
+    def pretend_as_type(self) -> str:
+        return "str"
+
+    def to_llm_string(self) -> str:
+        if not self._core._services:
+            return "暂无已注册服务"
+        lines = []
+        for name, cid in self._core._services.items():
+            conv = self._core._conv_by_cid.get(cid)
+            if conv and conv.service_desc:
+                d = conv.service_desc
+                lines.append(f"  {name}: {d.get('what','')} → {d.get('returns','')}")
+        return "已注册服务:\n" + "\n".join(lines) if lines else "暂无已注册服务"
+
+    def resolve_path(self, path: list):
+        from avm.exceptions import VMMemoryError
+        raise VMMemoryError("$services 只支持读（列出服务），不支持子路径")
 
 
 def _build_conversation(core: 'Core', system_ref: str, user_ref: str, para_ref: str, parent: Conversation, is_sub: bool) -> Conversation:
@@ -299,6 +414,7 @@ class LMU:
 class Core:
     def __init__(self):
         self._conv_by_cid: Dict[int, Conversation] = {}
+        self._services: Dict[str, int] = {}  # name → cid
         self._ready_cids: List[int] = []
         self._dormant_cids: List[int] = []
         self._active_cid: Optional[int] = None
@@ -310,6 +426,7 @@ class Core:
         self._monitor_running: bool = False
         self._state_observers: List[Callable] = []
         self._observer_lock: threading.Lock = threading.Lock()
+        self.mem.mount("services", _ServicesDevice(self))
 
     def _register(self, conv: Conversation) -> Conversation:
         conv.cid = self._next_cid
@@ -331,6 +448,17 @@ class Core:
             instr.execute(self, conv)
 
     def _on_conversation_finished(self, conv: Conversation, result: str):
+        # 服务回调：如果 caller_cid 存在，写回结果
+        caller_cid = conv.metadata.get("caller_cid")
+        if caller_cid is not None:
+            caller_cid = int(caller_cid)
+            call_id = conv.metadata.get("caller_call_id", "direct_output")
+            if caller_cid in self._conv_by_cid:
+                self._conv_by_cid[caller_cid].user_batch.add_tool_response(result, call_id)
+            self._active_cid = None
+            self._pick_next_active()
+            return
+
         if conv.is_sub:
             parent = conv.parent
             if parent is not None:
@@ -356,7 +484,7 @@ class Core:
         conv.user_batch.clear()
 
         if return_calls:
-            has_create = any(rc["cmd_type"] in ("create_cmd", "create_sub") for rc in return_calls)
+            has_create = any(rc["cmd_type"] in ("create_cmd", "create_sub", "call_service", "transfer_service") for rc in return_calls)
             self._process_return_calls(return_calls, conv)
             if has_create:
                 if conv.cid not in self._dormant_cids:

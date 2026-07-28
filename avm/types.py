@@ -201,8 +201,9 @@ class Conversation:
     parent: Optional['Conversation'] = None
     is_root: bool = False
     metadata: Dict[str, str]
+    service_desc: Optional[Dict[str, str]] = None  # {"name","what","needs","returns"}
     
-    def __init__(self, messages: List[Message] = None, cid: int = 0, is_sub:bool=False, parent: Optional['Conversation'] = None, is_root: bool = False, metadata: Dict[str, str] = None):
+    def __init__(self, messages: List[Message] = None, cid: int = 0, is_sub:bool=False, parent: Optional['Conversation'] = None, is_root: bool = False, metadata: Dict[str, str] = None, service_desc: Dict[str, str] = None):
         self.messages = messages or []
         self.user_batch = UserMessageBatch()
         self.cid = cid
@@ -210,6 +211,7 @@ class Conversation:
         self.parent = parent
         self.is_root = is_root
         self.metadata = metadata or {}
+        self.service_desc = service_desc
         self.validate(require_last_assistant=False)
     
     
