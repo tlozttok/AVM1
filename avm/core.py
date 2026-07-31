@@ -1,21 +1,14 @@
-from typing import Optional, List, Dict, Callable, Type
+from typing import Optional, List, Dict, Type
 
 from openai import OpenAI
 from dotenv import load_dotenv
 import json
-import logging
-import os
-import socket
-import threading
-import time
 
 from .types import MetaList, MetaDict
 from .exceptions import VMSyntaxError, VMMemoryError
 from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, message_to_api_dict
 from .memory import Memory
 from .memory_device import MemoryDevice
-
-logger = logging.getLogger(__name__)
 
 
 class Instruction:
@@ -347,7 +340,6 @@ class LMU:
         try:
             return json.loads(tool_call.function.arguments)
         except json.JSONDecodeError as e:
-            logger.error("[LMU] JSON decode error for %s (%s): %s", tool_call.function.name, call_id, e)
             return_calls.append({"call_id": call_id, "cmd_type": "json_error", "args": {"error": str(e), "name": tool_call.function.name}})
             return None
 
@@ -372,7 +364,6 @@ class LMU:
         return return_calls
 
     def exec(self, conversation: Conversation, para: MetaDict):
-        logger.info("[LMU.exec] model=%s use_tool=%s", para.get("model"), para.get("use_tool", False))
         messages = conversation.to_api_messages()
         messages.extend(conversation.user_batch.to_tool_messages())
 
@@ -422,10 +413,6 @@ class Core:
         self.mem: Memory = Memory()
         self.lmu: LMU = LMU()
         self.debug: bool = False
-        self._monitor_thread: Optional[threading.Thread] = None
-        self._monitor_running: bool = False
-        self._state_observers: List[Callable] = []
-        self._observer_lock: threading.Lock = threading.Lock()
         self.mem.mount("services", _ServicesDevice(self))
 
     def _register(self, conv: Conversation) -> Conversation:
@@ -506,16 +493,11 @@ class Core:
         return conv
 
     def run(self):
-        logger.info("[Core.run] start")
-
         if self._ready_cids:
             self._active_cid = self._ready_cids.pop(0)
 
         while self._active_cid is not None:
             self.advance_conversation()
-
-        logger.info("[Core.run] end")
-        self._notify("run_finished", {})
 
     def unwrap(self, value, for_llm=True):
         if not value.startswith("$"):
@@ -529,76 +511,3 @@ class Core:
             return self._conv_by_cid[int(value[2])].user_batch
         else:
             return self.mem.unwrap(value, for_llm=for_llm)
-
-    def add_state_observer(self, fn):
-        with self._observer_lock:
-            if fn not in self._state_observers:
-                self._state_observers.append(fn)
-
-    def remove_state_observer(self, fn):
-        with self._observer_lock:
-            if fn in self._state_observers:
-                self._state_observers.remove(fn)
-
-    def _notify(self, event_type: str, payload: dict):
-        with self._observer_lock:
-            observers = list(self._state_observers)
-        for fn in observers:
-            try:
-                fn(event_type, payload)
-            except Exception:
-                pass
-
-    def start_memory_monitor(self, output_file: str, interval: float = 0.3, socket_path: str | None = None):
-        self._monitor_running = True
-
-        def _monitor_loop():
-            while self._monitor_running:
-                try:
-                    dump = self.mem.dump_tree()
-                    with open(output_file, "w", encoding="utf-8") as f:
-                        f.write(dump)
-                except Exception:
-                    pass
-                time.sleep(interval)
-
-        self._monitor_thread = threading.Thread(target=_monitor_loop, daemon=True)
-        self._monitor_thread.start()
-        logger.info("[Core] memory monitor started, output=%s interval=%s", output_file, interval)
-
-        if socket_path:
-            self._start_mem_socket_server(socket_path)
-
-    def _start_mem_socket_server(self, socket_path: str):
-        def _server():
-            if os.path.exists(socket_path):
-                os.unlink(socket_path)
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.bind(socket_path)
-            sock.listen(1)
-            sock.settimeout(0.5)
-            logger.info("[Core] memory socket server listening on %s", socket_path)
-            while self._monitor_running:
-                try:
-                    conn, _ = sock.accept()
-                except socket.timeout:
-                    continue
-                except Exception:
-                    break
-                with conn:
-                    try:
-                        data = conn.recv(4096).decode("utf-8").strip()
-                        if data:
-                            result = self.mem.query_path(data)
-                            payload = result.encode("utf-8")
-                            header = format(len(payload), "08x").encode()
-                            conn.sendall(header + payload)
-                    except Exception:
-                        pass
-            sock.close()
-            try:
-                os.unlink(socket_path)
-            except OSError:
-                pass
-
-        threading.Thread(target=_server, daemon=True).start()

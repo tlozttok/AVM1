@@ -1,8 +1,5 @@
 """AVM 内存设备：可挂载到内存路径的虚拟设备"""
 from typing import Any, Optional, List
-import logging
-
-logger = logging.getLogger(__name__)
 
 
 class MemoryDevice:
@@ -30,11 +27,9 @@ class StringDevice(MemoryDevice):
         return "str"
 
     def get_value(self) -> str:
-        logger.debug("[StringDevice.get_value] -> %r", self._value)
         return self._value
 
     def set_value(self, value: str) -> None:
-        logger.debug("[StringDevice.set_value] %r", value)
         if not isinstance(value, str):
             from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
             raise MemoryTypeError(f"StringDevice 只接受 str，got {type(value).__name__}")
@@ -129,14 +124,12 @@ class InputsListDevice(MetaListDevice):
             # 伪列表语义：读最后一个元素 = 请求新用户输入
             self._pending_input = True
             try:
-                print("\n[用户输入请求] 请输入：", end="", flush=True)
                 user_input = input()
             except EOFError:
                 user_input = ""
             finally:
                 self._pending_input = False
                 self._data.append(user_input)
-            logger.info("[InputsListDevice] received input: %r", user_input)
             return user_input
         # 正常列表访问
         return super().__getitem__(index)
@@ -199,7 +192,6 @@ class OutputsListDevice(MetaListDevice):
             from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
             raise MemoryTypeError(f"OutputsListDevice 只接受 str，got {type(value).__name__}")
         self._data.append(value)
-        print(f"\n[Agent 输出] {value}")
 
     def set_value(self, value):
         """支持直接写入单个字符串（追加）或列表（替换）"""

@@ -131,9 +131,6 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple, Union
 from enum import Enum
 from openai.types.chat import ChatCompletionMessageToolCallUnion
-import logging
-
-logger = logging.getLogger(__name__)
 
 type ToolCall=ChatCompletionMessageToolCallUnion
 
@@ -267,7 +264,6 @@ class Conversation:
         self.validate(require_last_assistant=False)
         merged = self.merge_system_messages()
         result = [message_to_api_dict(msg) for msg in merged]
-        logger.debug("[Conversation.to_api_messages] count=%d", len(result))
         return result
 
     def append_user_message(self, content: str) -> None:
@@ -326,7 +322,6 @@ class UserMessageBatch:
 
     def add_tool_response(self, content: str, tool_call_id: str) -> None:
         """添加工具响应"""
-        logger.debug("[UserMessageBatch.add_tool_response] id=%s content=%r", tool_call_id, content)
         self.tool_responses.append(ToolMessage(content=content, tool_call_id=tool_call_id))
 
     def add_user_content(self, content: str) -> None:
