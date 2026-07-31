@@ -9,3 +9,4 @@ from .exceptions import VMSyntaxError, VMMemoryError, VMResourceError, \
     MemoryKeyNotFoundError, MemoryIndexOutOfRangeError, MemoryTypeError, MemoryCircularReferenceError
 from .memory_device import MemoryDevice, StringDevice, MetaListDevice, MetaDictDevice, \
     InputsListDevice, OutputsListDevice
+from .monitor import Monitor, Frame

@@ -3,12 +3,14 @@ from typing import Optional, List, Dict, Type
 from openai import OpenAI
 from dotenv import load_dotenv
 import json
+import time
 
 from .types import MetaList, MetaDict
 from .exceptions import VMSyntaxError, VMMemoryError
 from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, message_to_api_dict
 from .memory import Memory
 from .memory_device import MemoryDevice
+from .monitor import Monitor
 
 
 class Instruction:
@@ -317,6 +319,7 @@ class LMU:
 
     def __init__(self):
         self._client = None
+        self.last_call: Optional[dict] = None  # 最近一次 API 调用全文（供监测器写全文文件）
 
     @property
     def client(self):
@@ -374,14 +377,27 @@ class LMU:
         extra_para = self._filter_api_params(para.to_dict())
         use_tool = para.get("use_tool")
         tools = _build_tools()
+        model = para.get("model", "gpt-4")
 
-        response = self.client.chat.completions.create(
-            model=para.get("model", "gpt-4"),
-            messages=messages,
-            tools=tools,
-            tool_choice=use_tool,
-            **extra_para
-        )
+        start = time.time()
+        try:
+            response = self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=tools,
+                tool_choice=use_tool,
+                **extra_para
+            )
+        except Exception as e:
+            self.last_call = {
+                "model": model,
+                "messages": messages,
+                "result": None,
+                "tool_calls": [],
+                "elapsed_ms": (time.time() - start) * 1000,
+                "error": f"{type(e).__name__}: {e}",
+            }
+            raise
 
         choice = response.choices[0]
         message = choice.message
@@ -399,6 +415,14 @@ class LMU:
             tc_list = [{"id": tc.id, "type": tc.type, "function": {"name": tc.function.name, "arguments": tc.function.arguments}} for tc in message.tool_calls]
         conversation.append_assistant_message(result or "", tool_calls=tc_list)
 
+        self.last_call = {
+            "model": model,
+            "messages": messages,
+            "result": result,
+            "tool_calls": return_calls,
+            "elapsed_ms": (time.time() - start) * 1000,
+            "error": None,
+        }
         return result, return_calls, conversation
 
 
@@ -413,6 +437,7 @@ class Core:
         self.mem: Memory = Memory()
         self.lmu: LMU = LMU()
         self.debug: bool = False
+        self.monitor: Monitor = Monitor()
         self.mem.mount("services", _ServicesDevice(self))
 
     def _register(self, conv: Conversation) -> Conversation:
@@ -467,18 +492,24 @@ class Core:
     def advance_conversation(self):
         conv = self._conv_by_cid[self._active_cid]
         para = self.mem.get("model_params", MetaDict(data={"model": "gpt-4"}))
-        result, return_calls, _ = self.lmu.exec(conv, para)
-        conv.user_batch.clear()
+        try:
+            result, return_calls, _ = self.lmu.exec(conv, para)
+            conv.user_batch.clear()
 
-        if return_calls:
-            has_create = any(rc["cmd_type"] in ("create_cmd", "create_sub", "call_service", "transfer_service") for rc in return_calls)
-            self._process_return_calls(return_calls, conv)
-            if has_create:
-                if conv.cid not in self._dormant_cids:
-                    self._dormant_cids.append(conv.cid)
-                self._pick_next_active()
+            if return_calls:
+                has_create = any(rc["cmd_type"] in ("create_cmd", "create_sub", "call_service", "transfer_service") for rc in return_calls)
+                self._process_return_calls(return_calls, conv)
+                if has_create:
+                    if conv.cid not in self._dormant_cids:
+                        self._dormant_cids.append(conv.cid)
+                    self._pick_next_active()
+            else:
+                self._on_conversation_finished(conv, result)
+        except Exception as e:
+            self.monitor.record(self, error=e)
+            raise
         else:
-            self._on_conversation_finished(conv, result)
+            self.monitor.record(self)
 
     def start(self, system: str, user: str, para_ref: str = "$MEM.model_params") -> Conversation:
         conv = Conversation(
@@ -495,6 +526,8 @@ class Core:
     def run(self):
         if self._ready_cids:
             self._active_cid = self._ready_cids.pop(0)
+
+        self.monitor.record_baseline(self)
 
         while self._active_cid is not None:
             self.advance_conversation()
