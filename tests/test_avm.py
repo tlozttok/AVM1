@@ -5,9 +5,11 @@ from avm.core import Core, LMU, _instruction_registry, _build_conversation
 from avm.core import (
     MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction,
     CreateInstruction, CreateSubInstruction,
+    RegisterServiceInstruction, CallServiceInstruction, TransferServiceInstruction,
 )
 from avm.types import Conversation, UserMessageBatch, SystemMessage, UserMessage, AssistantMessage, MetaDict
 from avm.memory import Memory
+from types import SimpleNamespace
 
 
 class MockLMU:
@@ -247,8 +249,8 @@ class TestCreateChild:
 
 
 class TestCreateSub:
-    def test_create_sub_parent_ready_front(self):
-        """create_sub → 父插到就绪队首，亚对话进队首立即活跃"""
+    def test_create_sub_parent_dormant(self):
+        """create_sub → 亚对话立即活跃，父进入休眠等待子完成"""
         core = make_core([
             (None, [
                 {"call_id": "cs", "cmd_type": "create_sub", "args": {"system_ref": "$MEM.s", "user_ref": "$MEM.u", "para_ref": "$MEM.p"}},
@@ -264,7 +266,8 @@ class TestCreateSub:
 
         st = _state(core)
         assert st["active"] == 1        # sub becomes active
-        assert 0 in st["ready"]         # parent is in ready (front)
+        assert 0 in st["dormant"]       # parent dormant（子完成时由 core 唤醒）
+        assert 0 not in st["ready"]
 
     def test_sub_finished_writes_to_parent_and_wakes(self):
         """亚对话完成 → 输出写回 parent.user_batch，parent 回到 active"""
@@ -285,12 +288,15 @@ class TestCreateSub:
         core.advance_conversation()
         st1 = _state(core)
         assert st1["active"] == 1  # sub active
-        assert 0 in st1["ready"]  # parent in ready
+        assert 0 in st1["dormant"]  # parent dormant
+        assert 0 not in st1["ready"]
 
         # advance sub: finishes → parent wakes
         core.advance_conversation()
         st2 = _state(core)
         assert st2["active"] == 0  # parent wakes
+        assert 0 not in st2["dormant"]  # 休眠标记被清理
+        assert 1 in st2["dormant"]  # 亚对话交互结束进入休眠
 
         # parent batch has sub's result
         batch = _batch(core, 0)
@@ -409,3 +415,165 @@ class TestLMUExecCalled:
         tool_msgs = [m for m in recorded_messages if m.get("role") == "tool"]
         assert len(tool_msgs) == 1
         assert tool_msgs[0]["tool_call_id"] == "tc1"
+
+
+# ------------------------------------------------------------------
+# 服务调用 / 服务移交调度
+# ------------------------------------------------------------------
+
+class TestServiceScheduling:
+    def _root_with_service(self):
+        """root 创建服务对话 svc 并注册为 calc；root 随后调用它"""
+        core = make_core([
+            (None, [{"call_id": "cc", "cmd_type": "call_service", "args": {"service_name": "calc", "input": "2+3"}}], None),
+            (None, [{"call_id": "ret", "cmd_type": "return_result", "args": {"content": "6"}}], None),
+            ("ok", [], None),
+            ("done", [], None),
+        ])
+        root = _new_root(core)
+        core.mem["s"] = "svc_sys"
+        core.mem["u"] = "svc_usr"
+        core.mem["p"] = MetaDict(data={"model": "test"})
+        svc = _build_conversation(core, "$MEM.s", "$MEM.u", "$MEM.p", parent=root, is_sub=False)
+        RegisterServiceInstruction("rc", svc.cid, {"name": "calc", "what": "计算", "needs": "表达式", "returns": "结果"}).execute(core, svc)
+        core._ready_cids.clear()
+        core._active_cid = root.cid
+        return core, root, svc
+
+    def test_call_service_uses_tool_return(self):
+        core, root, svc = self._root_with_service()
+
+        # root: call_service → root 休眠，服务进入活跃
+        core.advance_conversation()
+        st1 = _state(core)
+        assert st1["active"] == svc.cid
+        assert root.cid in st1["dormant"]
+        assert root.cid not in st1["ready"]
+        assert svc.user_batch.user_contents == ["2+3"]
+
+        # svc: return_result → 结论投递 root、root 排到下一个、svc 收到确认（保持活跃）
+        core.advance_conversation()
+        st2 = _state(core)
+        assert st2["active"] == svc.cid  # 还有确认回合，未休眠
+        assert root.cid not in st2["dormant"]
+        assert st2["ready"][0] == root.cid  # 调用者是下一个被激活的对话
+        assert ("结果已发送", "ret") in _batch(core, svc.cid)
+        assert ("6", "cc") in _batch(core, root.cid)
+
+        # svc: 以无工具结果收尾 → 进入休眠，root 被激活
+        core.advance_conversation()
+        st3 = _state(core)
+        assert st3["active"] == root.cid
+        assert svc.cid in st3["dormant"]
+        assert ("6", "cc") in _batch(core, root.cid)
+        assert core._services["calc"] == svc.cid  # 交互结束不影响服务注册
+
+        # root: 完成 → 交互结束进入休眠
+        core.advance_conversation()
+        assert core._active_cid is None
+        assert root.cid in core._dormant_cids
+
+    def test_call_service_natural_finish_does_not_deliver(self):
+        """服务未调用 return_result 就自然结束：不投递结果、不唤醒调用者"""
+        core = make_core([
+            (None, [{"call_id": "cc", "cmd_type": "call_service", "args": {"service_name": "calc", "input": "2+3"}}], None),
+            ("ok", [], None),
+        ])
+        root = _new_root(core)
+        core.mem["s"] = "s"
+        core.mem["u"] = "u"
+        core.mem["p"] = MetaDict(data={"model": "test"})
+        svc = _build_conversation(core, "$MEM.s", "$MEM.u", "$MEM.p", parent=root, is_sub=False)
+        RegisterServiceInstruction("rc", svc.cid, {"name": "calc", "what": "计算", "needs": "表达式", "returns": "结果"}).execute(core, svc)
+        core._ready_cids.clear()
+        core._active_cid = root.cid
+
+        core.advance_conversation()  # root: call_service
+        assert core._active_cid == svc.cid
+
+        core.advance_conversation()  # svc: 自然结束
+        assert core._active_cid is None
+        assert root.cid in core._dormant_cids
+        assert svc.cid in core._dormant_cids
+        assert _batch(core, root.cid) == []  # 没有结果
+
+    def test_transfer_service_caller_stays_dormant(self):
+        core = make_core([
+            (None, [{"call_id": "tt", "cmd_type": "transfer_service", "args": {"service_name": "svc", "input": "x"}}], None),
+            ("bye", [], None),
+        ])
+        root = _new_root(core)
+        core.mem["s"] = "s"
+        core.mem["u"] = "u"
+        core.mem["p"] = MetaDict(data={"model": "test"})
+        svc = _build_conversation(core, "$MEM.s", "$MEM.u", "$MEM.p", parent=root, is_sub=False)
+        RegisterServiceInstruction("rc", svc.cid, {"name": "svc", "what": "x", "needs": "x", "returns": "x"}).execute(core, svc)
+        core._ready_cids.clear()
+        core._active_cid = root.cid
+
+        # root: transfer_service → root 休眠（不等待返回）
+        core.advance_conversation()
+        st1 = _state(core)
+        assert st1["active"] == svc.cid
+        assert root.cid in st1["dormant"]
+
+        # svc: 完成 → root 不被唤醒，也没有工具响应
+        core.advance_conversation()
+        assert core._active_cid is None
+        assert root.cid in core._dormant_cids
+        assert _batch(core, root.cid) == []
+
+
+# ------------------------------------------------------------------
+# 工具调用错误反馈（原来被静默丢弃）
+# ------------------------------------------------------------------
+
+class TestToolCallErrorFeedback:
+    def _fake_tool_call(self, name, arguments):
+        return SimpleNamespace(
+            id="tc-bad",
+            function=SimpleNamespace(name=name, arguments=arguments),
+        )
+
+    def test_malformed_json_reported_to_stderr(self, capsys):
+        lmu = LMU()
+        message = SimpleNamespace(tool_calls=[self._fake_tool_call("memory_read", "{bad json")])
+        return_calls = lmu._return_calls_from_message(message)
+        assert return_calls[0]["cmd_type"] == "json_error"
+
+        core = make_core()
+        conv = _new_root(core)
+        core._process_return_calls(return_calls, conv)
+        err = capsys.readouterr().err
+        assert "不是合法 JSON" in err
+        assert _batch(core, conv.cid) == []  # 不喂回 LLM
+
+    def test_unknown_tool_reported_to_stderr(self, capsys):
+        lmu = LMU()
+        message = SimpleNamespace(tool_calls=[self._fake_tool_call("definitely_not_a_tool", "{}")])
+        return_calls = lmu._return_calls_from_message(message)
+        assert return_calls[0]["cmd_type"] == "unknown_tool"
+
+        core = make_core()
+        conv = _new_root(core)
+        core._process_return_calls(return_calls, conv)
+        err = capsys.readouterr().err
+        assert "未知工具" in err
+        assert _batch(core, conv.cid) == []
+
+    def test_malformed_json_conversation_stays_active(self, capsys):
+        """json_error 不结束对话：错误面向运行者输出，对话继续"""
+        core = make_core([
+            (None, [{"call_id": "tc1", "cmd_type": "json_error", "args": {"error": "bad json", "name": "memory_read"}}], None),
+            ("recovered", [], None),
+        ])
+        _new_root(core)
+        core._active_cid = core._ready_cids.pop(0)
+
+        core.advance_conversation()
+        assert core._active_cid == 0  # 仍活跃
+        assert _batch(core, 0) == []  # 没有工具响应进 batch
+        assert "不是合法 JSON" in capsys.readouterr().err
+
+        core.advance_conversation()
+        assert core._active_cid is None

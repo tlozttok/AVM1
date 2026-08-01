@@ -1,0 +1,38 @@
+{
+  "meta": {
+    "name": "demo",
+    "version": 1,
+    "description": "最小交互演示：读输入 → 处理 → 写输出，循环"
+  },
+  "mem": {
+    "system": {
+      "kind": "str",
+      "value": "你是 AVM 中运行的 init 对话，通过工具调用操作系统。\n\n循环协议：\n1. memory_read(\"$MEM.inputs.-1\") 读取用户输入；\n2. 处理输入，把结论写入 memory_write(\"$MEM.outputs.-1\", 结论)；\n3. 重复。\n\n可用工具：memory_read、memory_write、memory_make、create_cmd、create_sub、register_service、call_service、transfer_service、return_result。"
+    },
+    "user": {
+      "kind": "str",
+      "value": "开始"
+    },
+    "model_params": {
+      "kind": "dict",
+      "meta": "LLM API 调用参数",
+      "ctrl": { "type": "para" },
+      "value": {
+        "model": { "kind": "str", "value": "deepseek-flash" }
+      }
+    },
+    "inputs": { "kind": "device" },
+    "outputs": { "kind": "device" }
+  },
+  "para_ref": "$MEM.model_params",
+  "devices": [
+    { "path": "inputs", "file": "devices/io.py", "class": "InputsListDevice", "args": {} },
+    { "path": "outputs", "file": "devices/io.py", "class": "OutputsListDevice", "args": {} }
+  ],
+  "init": {
+    "name": "init",
+    "system_ref": "$MEM.system",
+    "user_ref": "$MEM.user"
+  },
+  "persist_to": "out/mem.json"
+}

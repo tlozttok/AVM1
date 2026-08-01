@@ -340,34 +340,33 @@ class Memory:
         return self._data.copy()
 
     def save(self, filepath: str) -> None:
-        """将内存数据持久化到 JSON 文件（仅 _data，不含设备）"""
+        """将内存数据持久化到 JSON 文件（仅 _data，不含设备）。
+        格式与系统镜像 mem 段一致：显式节点 {kind, meta, ctrl, value}。"""
         import json
 
         def _serialize(value):
             if isinstance(value, MetaDict):
-                return {
-                    "__type": "MetaDict",
-                    "meta": value.get_metadata(),
-                    "data": {k: _serialize(v) for k, v in value.items()},
-                }
-            if isinstance(value, MetaList):
-                return {
-                    "__type": "MetaList",
-                    "meta": value.get_metadata(),
-                    "data": [_serialize(v) for v in value],
-                }
-            if isinstance(value, str):
-                return value
-            return str(value)
+                node = {"kind": "dict", "value": {k: _serialize(v) for k, v in value.items()}}
+            elif isinstance(value, MetaList):
+                node = {"kind": "list", "value": [_serialize(v) for v in value]}
+            else:
+                node = {"kind": "str", "value": str(value)}
+            meta = value.get_metadata() if hasattr(value, "get_metadata") else None
+            ctrl = value.get_ctrl() if hasattr(value, "get_ctrl") else None
+            if meta is not None:
+                node["meta"] = meta
+            if ctrl is not None:
+                node["ctrl"] = ctrl
+            return node
 
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(_serialize(self._data), f, ensure_ascii=False, indent=2)
 
     @classmethod
     def load(cls, filepath: str) -> "Memory":
-        """从 JSON 文件加载内存数据并返回 Memory 实例"""
+        """从 JSON 文件加载内存数据并返回 Memory 实例。
+        支持显式节点格式（kind/meta/ctrl/value）与旧 __type 格式。"""
         import json, os
-        from .types import MetaList, MetaDict
 
         mem = cls()
         if not os.path.isfile(filepath):
@@ -375,19 +374,50 @@ class Memory:
 
         with open(filepath, "r", encoding="utf-8") as f:
             raw = json.load(f)
+        mem._data = cls._deserialize_node(raw)
+        return mem
 
-        def _deserialize(value):
-            if isinstance(value, dict) and value.get("__type") == "MetaDict":
+    @classmethod
+    def _deserialize_node(cls, value):
+        """解析单个显式节点；兼容旧 __type 格式。"""
+        from .types import MetaList, MetaDict
+
+        if isinstance(value, dict):
+            if value.get("kind") in ("str", "dict", "list"):
+                kind = value["kind"]
+                v = value.get("value")
+                meta = value.get("meta")
+                ctrl = value.get("ctrl")
+                if kind == "str":
+                    return v
+                if kind == "dict":
+                    return MetaDict(
+                        data={k: cls._deserialize_node(x) for k, x in (v or {}).items()},
+                        metadata=meta, ctrl=ctrl,
+                    )
+                if kind == "list":
+                    return MetaList(
+                        data=[cls._deserialize_node(x) for x in (v or [])],
+                        metadata=meta, ctrl=ctrl,
+                    )
+            if value.get("__type") == "MetaDict":  # 旧格式兼容
                 return MetaDict(
-                    data={k: _deserialize(v) for k, v in value["data"].items()},
+                    data={k: cls._deserialize_node(x) for k, x in value.get("data", {}).items()},
                     metadata=value.get("meta"),
                 )
-            if isinstance(value, dict) and value.get("__type") == "MetaList":
+            if value.get("__type") == "MetaList":  # 旧格式兼容
                 return MetaList(
-                    data=[_deserialize(v) for v in value["data"]],
+                    data=[cls._deserialize_node(x) for x in value.get("data", [])],
                     metadata=value.get("meta"),
                 )
-            return value
+        return value
 
-        mem._data = _deserialize(raw)
+    @classmethod
+    def from_tree(cls, tree: dict) -> "Memory":
+        """从镜像 mem 段（顶层键 → 显式节点）构建内存。
+        注意：kind=device 的标记节点已在镜像加载器中处理，此处不接收。"""
+        from .types import MetaDict
+
+        mem = cls()
+        mem._data = MetaDict(data={k: cls._deserialize_node(v) for k, v in tree.items()})
         return mem

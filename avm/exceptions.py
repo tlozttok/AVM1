@@ -36,7 +36,7 @@ class MemoryTypeError(VMMemoryError):
 
 
 class MemoryCircularReferenceError(VMMemoryError):
-    """$ 解引用成环"""
+    """符号链接成环"""
     pass
 
 

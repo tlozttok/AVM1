@@ -3,6 +3,7 @@ from typing import Optional, List, Dict, Type
 from openai import OpenAI
 from dotenv import load_dotenv
 import json
+import sys
 import time
 
 from .types import MetaList, MetaDict
@@ -11,6 +12,11 @@ from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, m
 from .memory import Memory
 from .memory_device import MemoryDevice
 from .monitor import Monitor
+
+
+def _report_tool_error(conv: Conversation, message: str):
+    """工具调用错误面向运行者（stderr）输出，不喂回给 LLM。"""
+    print(f"[AVM] 对话 {conv.cid}: {message}", file=sys.stderr)
 
 
 class Instruction:
@@ -167,7 +173,7 @@ class CreateSubInstruction(Instruction):
     def execute(self, core: 'Core', conv: Conversation):
         sub = _build_conversation(core, self.system_ref, self.user_ref, self.para_ref, parent=conv, is_sub=True)
         sub.metadata["call_id"] = self.call_id
-        core._ready_cids.insert(0, conv.cid)
+        # 父进入休眠等待亚对话完成，完成时由 core 唤醒（_on_conversation_finished）
         core._ready_cids.insert(0, sub.cid)
 
 
@@ -228,7 +234,6 @@ class CallServiceInstruction(Instruction):
         # 目标结束时回调 caller
         target.metadata["caller_cid"] = str(conv.cid)
         target.metadata["caller_call_id"] = self.call_id
-        core._ready_cids.insert(0, conv.cid)
         core._ready_cids.insert(0, target.cid)
 
 
@@ -261,6 +266,57 @@ class TransferServiceInstruction(Instruction):
         core._ready_cids.append(target.cid)
 
 
+class ReturnResultInstruction(Instruction):
+    tool_name = "return_result"
+    tool_def = {
+        "type": "function",
+        "function": {
+            "name": "return_result",
+            "description": "将本对话的结论返回给调用者（父对话或 call_service 的调用者），并确保调用者成为下一个被激活的对话。调用后本对话应在下一轮以无工具的结果收尾，进入休眠",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "返回给调用者的结论"},
+                },
+                "required": ["content"],
+            }
+        }
+    }
+    content: str
+
+    def execute(self, core: 'Core', conv: Conversation):
+        caller_cid = conv.metadata.get("caller_cid")
+        if caller_cid is None and conv.parent is not None:
+            caller_cid = str(conv.parent.cid)
+
+        if caller_cid is None:
+            msg = "return_result 失败：本对话没有调用者"
+            _report_tool_error(conv, msg)
+            conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
+            return
+        caller_cid = int(caller_cid)
+        if caller_cid not in core._conv_by_cid:
+            msg = f"return_result 失败：调用者 {caller_cid} 不存在"
+            _report_tool_error(conv, msg)
+            conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
+            return
+
+        # 结论投递给调用者，挂到原调用的 call_id
+        call_id = conv.metadata.get("caller_call_id") or conv.metadata.get("call_id", "direct_output")
+        core._conv_by_cid[caller_cid].user_batch.add_tool_response(self.content, call_id)
+
+        # 确保调用者是下一个被激活的对话
+        if caller_cid in core._dormant_cids:
+            core._dormant_cids.remove(caller_cid)
+        if caller_cid in core._ready_cids:
+            core._ready_cids.remove(caller_cid)
+        core._ready_cids.insert(0, caller_cid)
+
+        # 该工具调用必须有一次返回（LLM API 规定）：告知本对话结果已发送
+        conv.user_batch.add_tool_response("结果已发送", self.call_id)
+        conv.metadata["returned"] = "1"
+
+
 def _instruction_registry() -> Dict[str, Type[Instruction]]:
     return {
         cls.tool_name: cls
@@ -268,6 +324,7 @@ def _instruction_registry() -> Dict[str, Type[Instruction]]:
             MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction,
             CreateInstruction, CreateSubInstruction,
             RegisterServiceInstruction, CallServiceInstruction, TransferServiceInstruction,
+            ReturnResultInstruction,
         ]
     }
 
@@ -334,16 +391,35 @@ class LMU:
         "seed", "logit_bias", "logprobs", "top_logprobs",
         "n", "response_format", "timeout",
     }
+    _NUMERIC_API_PARAMS: set = {
+        "temperature", "max_tokens", "top_p", "frequency_penalty",
+        "presence_penalty", "n", "seed", "timeout", "logprobs", "top_logprobs",
+    }
 
     def _filter_api_params(self, para: dict) -> dict:
-        return {k: v for k, v in para.items() if k in self._API_PARAM_KEYS}
+        out = {}
+        for k, v in para.items():
+            if k not in self._API_PARAM_KEYS:
+                continue
+            # para 以 str 存储在内存中，数值型参数需要还原为数值
+            if k in self._NUMERIC_API_PARAMS and isinstance(v, str):
+                try:
+                    v = float(v) if ("." in v or "e" in v.lower()) else int(v)
+                except ValueError:
+                    pass
+            out[k] = v
+        return out
 
     def _parse_tool_args(self, tool_call, return_calls: list):
         call_id = tool_call.id
         try:
             return json.loads(tool_call.function.arguments)
         except json.JSONDecodeError as e:
-            return_calls.append({"call_id": call_id, "cmd_type": "json_error", "args": {"error": str(e), "name": tool_call.function.name}})
+            return_calls.append({
+                "call_id": call_id,
+                "cmd_type": "json_error",
+                "args": {"error": str(e), "name": tool_call.function.name, "raw": tool_call.function.arguments},
+            })
             return None
 
     def _return_calls_from_message(self, message) -> list:
@@ -361,8 +437,8 @@ class LMU:
 
             if name in registry:
                 return_calls.append({"call_id": call_id, "cmd_type": name, "args": args})
-            elif name == "command":
-                return_calls.append({"call_id": call_id, "cmd_type": "command", "raw": args.get("command", "")})
+            else:
+                return_calls.append({"call_id": call_id, "cmd_type": "unknown_tool", "args": {"name": name, "raw": args}})
 
         return return_calls
 
@@ -438,6 +514,7 @@ class Core:
         self.lmu: LMU = LMU()
         self.debug: bool = False
         self.monitor: Monitor = Monitor()
+        self.para_ref: str = "$MEM.model_params"
         self.mem.mount("services", _ServicesDevice(self))
 
     def _register(self, conv: Conversation) -> Conversation:
@@ -453,45 +530,65 @@ class Core:
         registry = _instruction_registry()
         for rc in return_calls:
             cmd_type = rc.get("cmd_type", "")
+            call_id = rc.get("call_id", "")
+            if cmd_type == "json_error":
+                args = rc.get("args", {})
+                _report_tool_error(
+                    conv,
+                    f"工具调用 {args.get('name', '')} 参数不是合法 JSON: {args.get('error', '')}，原始参数: {args.get('raw', '')}",
+                )
+                continue
+            if cmd_type == "unknown_tool":
+                args = rc.get("args", {})
+                _report_tool_error(
+                    conv,
+                    f"未知工具 {args.get('name', '')}，参数: {args.get('raw', '')}",
+                )
+                continue
             if cmd_type not in registry:
                 continue
             instr_cls = registry[cmd_type]
-            instr = instr_cls(rc.get("call_id", ""), conv.cid, rc.get("args", {}))
+            instr = instr_cls(call_id, conv.cid, rc.get("args", {}))
             instr.execute(self, conv)
 
     def _on_conversation_finished(self, conv: Conversation, result: str):
-        # 服务回调：如果 caller_cid 存在，写回结果
-        caller_cid = conv.metadata.get("caller_cid")
-        if caller_cid is not None:
-            caller_cid = int(caller_cid)
-            call_id = conv.metadata.get("caller_call_id", "direct_output")
-            if caller_cid in self._conv_by_cid:
-                self._conv_by_cid[caller_cid].user_batch.add_tool_response(result, call_id)
-            self._active_cid = None
-            self._pick_next_active()
-            return
-
         if conv.is_sub:
             parent = conv.parent
             if parent is not None:
-                call_id = conv.metadata.get("call_id", "direct_output")
-                parent.user_batch.add_tool_response(result, call_id)
-                if parent.cid in self._ready_cids:
-                    self._ready_cids.remove(parent.cid)
-                self._active_cid = parent.cid
-        else:
-            self._active_cid = None
-            self._pick_next_active()
+                # 亚对话紧耦合：完成即唤醒父；已用 return_result 显式返回过则不再自动写回
+                if not conv.metadata.get("returned"):
+                    call_id = conv.metadata.get("call_id", "direct_output")
+                    parent.user_batch.add_tool_response(result, call_id)
+                if conv.cid not in self._dormant_cids:
+                    self._dormant_cids.append(conv.cid)
+                self._resume(parent.cid)
+                return
+        # 交互结束：对话进入休眠（个体保留，等待事件/再次被调用）。
+        # "finished" 是概念态（被内核级关闭指令关闭的对话），Core 调度状态只有活跃/休眠/就绪。
+        if conv.cid not in self._dormant_cids:
+            self._dormant_cids.append(conv.cid)
+        self._active_cid = None
+        self._pick_next_active()
+
+    def _resume(self, cid: int):
+        """将等待中的对话唤醒为活跃对话：清除休眠/就绪标记后直接激活。"""
+        if cid in self._dormant_cids:
+            self._dormant_cids.remove(cid)
+        if cid in self._ready_cids:
+            self._ready_cids.remove(cid)
+        self._active_cid = cid
 
     def _pick_next_active(self):
         if self._ready_cids:
             self._active_cid = self._ready_cids.pop(0)
+            if self._active_cid in self._dormant_cids:
+                self._dormant_cids.remove(self._active_cid)
         else:
             self._active_cid = None
 
     def advance_conversation(self):
         conv = self._conv_by_cid[self._active_cid]
-        para = self.mem.get("model_params", MetaDict(data={"model": "gpt-4"}))
+        para = self._get_para()
         try:
             result, return_calls, _ = self.lmu.exec(conv, para)
             conv.user_batch.clear()
@@ -511,6 +608,16 @@ class Core:
         else:
             self.monitor.record(self)
 
+    def _get_para(self):
+        """按 para_ref 读取模型调用参数（镜像可配置，默认 $MEM.model_params）"""
+        try:
+            para = self.unwrap(self.para_ref, for_llm=False)
+            if not isinstance(para, MetaDict):
+                para = MetaDict(data={"model": "gpt-4"})
+        except VMMemoryError:
+            para = MetaDict(data={"model": "gpt-4"})
+        return para
+
     def start(self, system: str, user: str, para_ref: str = "$MEM.model_params") -> Conversation:
         conv = Conversation(
             messages=[SystemMessage(content=system), UserMessage(content=user)],
@@ -524,8 +631,7 @@ class Core:
         return conv
 
     def run(self):
-        if self._ready_cids:
-            self._active_cid = self._ready_cids.pop(0)
+        self._pick_next_active()
 
         self.monitor.record_baseline(self)
 

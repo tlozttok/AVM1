@@ -1,11 +1,13 @@
 """AVM 类型系统：带元数据的集合类"""
+from typing import Dict, Optional
 
 
 class MetaList:
     """带元数据的列表，对 LLM 可展示自定义描述字符串"""
-    def __init__(self, data=None, metadata=None):
+    def __init__(self, data=None, metadata=None, ctrl=None):
         self._data: list = data if data is not None else []
         self._metadata: Optional[str] = metadata
+        self._ctrl: Optional[Dict[str, str]] = ctrl
 
     def __getitem__(self, index):
         return self._data[index]
@@ -21,6 +23,13 @@ class MetaList:
 
     def set_metadata(self, metadata: str):
         self._metadata = metadata
+
+    def get_ctrl(self):
+        """元数据二：给 Core/内核态的结构化控制信息（如 {"type": "para"}）"""
+        return self._ctrl
+
+    def set_ctrl(self, ctrl: Dict[str, str]):
+        self._ctrl = ctrl
 
     def __contains__(self, key):
         return key in self._data
@@ -55,14 +64,15 @@ class MetaList:
         return NotImplemented
 
     def __repr__(self):
-        return f"MetaList(data={self._data}, metadata={self._metadata})"
+        return f"MetaList(data={self._data}, metadata={self._metadata}, ctrl={self._ctrl})"
 
 
 class MetaDict:
     """带元数据的字典，对 LLM 可展示自定义描述字符串"""
-    def __init__(self, data=None, metadata=None):
+    def __init__(self, data=None, metadata=None, ctrl=None):
         self._data: dict = data if data is not None else {}
         self._metadata: Optional[str] = metadata
+        self._ctrl: Optional[Dict[str, str]] = ctrl
 
     def __getitem__(self, key):
         return self._data[key]
@@ -77,7 +87,7 @@ class MetaDict:
         return self._data.setdefault(key, default)
 
     def copy(self):
-        return MetaDict(data=self._data.copy(), metadata=self._metadata)
+        return MetaDict(data=self._data.copy(), metadata=self._metadata, ctrl=self._ctrl)
 
     def keys(self):
         return self._data.keys()
@@ -96,6 +106,13 @@ class MetaDict:
 
     def set_metadata(self, metadata: str):
         self._metadata = metadata
+
+    def get_ctrl(self):
+        """元数据二：给 Core/内核态的结构化控制信息（如 {"type": "para"}）"""
+        return self._ctrl
+
+    def set_ctrl(self, ctrl: Dict[str, str]):
+        self._ctrl = ctrl
 
     def __contains__(self, key):
         return key in self._data
@@ -124,7 +141,7 @@ class MetaDict:
         return NotImplemented
 
     def __repr__(self):
-        return f"MetaDict(data={self._data}, metadata={self._metadata})"
+        return f"MetaDict(data={self._data}, metadata={self._metadata}, ctrl={self._ctrl})"
 
 """AVM 消息类型定义"""
 from dataclasses import dataclass, field
@@ -199,8 +216,9 @@ class Conversation:
     is_root: bool = False
     metadata: Dict[str, str]
     service_desc: Optional[Dict[str, str]] = None  # {"name","what","needs","returns"}
+    name: Optional[str] = None
     
-    def __init__(self, messages: List[Message] = None, cid: int = 0, is_sub:bool=False, parent: Optional['Conversation'] = None, is_root: bool = False, metadata: Dict[str, str] = None, service_desc: Dict[str, str] = None):
+    def __init__(self, messages: List[Message] = None, cid: int = 0, is_sub:bool=False, parent: Optional['Conversation'] = None, is_root: bool = False, metadata: Dict[str, str] = None, service_desc: Dict[str, str] = None, name: Optional[str] = None):
         self.messages = messages or []
         self.user_batch = UserMessageBatch()
         self.cid = cid
@@ -209,6 +227,7 @@ class Conversation:
         self.is_root = is_root
         self.metadata = metadata or {}
         self.service_desc = service_desc
+        self.name = name
         self.validate(require_last_assistant=False)
     
     
