@@ -21,6 +21,7 @@
 9. 类型层：MetaDict/MetaList 增加 `ctrl`（元数据二）；Conversation 增加 `name`。`Memory.save/load` 切换为显式节点格式（兼容旧 `__type`）；`Core.para_ref` 可配置；LMU 数值参数字符串→数值转换。
 10. 调试入口（2026-08-01）：`main.py`（`python main.py <image.json>`，支持 `--frames` 帧摘要、`--transcript` API 全文落盘、`persist_to` 写回）+ 示例镜像 `images/demo.json` + `images/devices/io.py`；测试 `tests/test_main.py` 3 个。
 11. 文件内配置调试路径（2026-08-01）：`main.py` 无参数时从 `debug.json` 读取 `image`/`frames`/`transcript`（`--debug-config` 可指定其他文件），VSCode 中固定运行 `python main.py` 即可，参数改文件不改命令行；测试 2 个。
+12. 修复（2026-08-02）：`OutputsListDevice` 写入 `$MEM.outputs.-1` 不打印——docstring 承诺"并打印到屏幕"但实现缺失；补上 `print(value, flush=True)`（flush 保证逐步运行时立即可见），新增 2 个测试。
 
 **影响**: 状态机三态（活跃/休眠/就绪）互斥；工具调用错误面向运行者（stderr）可见、对话继续；服务注册不受对话交互结束影响（可再次被调用），对话个体结束才失效。现有 create_cmd 语义不变（父休眠、不唤醒，符合设计）。监测器状态推导在新状态机下正确。
 
@@ -34,12 +35,15 @@
 - CONTEXT.md 修订与设计决策留档：**按用户计划改动**——用户确认的设计决策（链接、返回工具、事件注册、$ /& 废弃）。
 - CONTEXT.md 新增"对话结束"术语（区分交互结束 / 个体结束）：**按用户计划改动**——用户要求明确该歧义。
 - `return_result` 指令、call_service 工具返回、交互结束一律进入休眠、finished 概念化：**按用户计划改动**——用户明确指令与语义（"把call_service改成使用工具返回"、"finished 是概念态，记录被关闭的对话，关闭是内核级指令"）。
-- `return_result` 直接唤醒调用者（含 create_cmd 的父），无需回调注册：**按用户计划改动**——用户明确"消息已可用就不留在休眠队列"；create_cmd 父的等待位置确认为休眠队列（就绪队尾会变成 create_sub 的自动恢复语义）。
+- `return_result` 工具调用后唤醒调用者（含 create_cmd 的父），无需回调注册：**按用户计划改动**——用户明确"消息已可用就不留在休眠队列"；create_cmd 父的等待位置确认为休眠队列（就绪队尾会变成 create_sub 的自动恢复语义）。返回必须由被调用方显式调用该工具完成。
 - mem 显式节点格式（kind/meta/ctrl/value，str 也强制包装）、para 作为 `ctrl.type="para"` 节点 + 顶层 `para_ref`、`kind=device` 顶层标记（link 是设备不是数据类型，device value 结构未定）、不预置其他对话、设备必须继承 MemoryDevice、save/load 与镜像格式统一：**按用户计划改动**——用户逐点确认。
 - `kind=device` 允许任意层级（点号路径如 `game.map.rooms` 与 devices 段 `path` 对应）：**按用户计划改动**——用户纠正"device 不是只允许在顶层"。
 - `main.py` 调试入口与示例镜像：**按用户计划改动**——用户要求提供调试 main 和可修改的示例镜像。
 - `debug.json` 文件内配置调试路径：**按用户计划改动**——用户明确不想在 VSCode 里反复改命令参数。
+- `OutputsListDevice` 补上打印：**按文档记录改动**——认为现有代码与设备文档承诺（"写入即打印到屏幕"）冲突而改动现有代码。
 - MetaDict/MetaList 增加 `ctrl`（元数据二）落地：**按文档记录改动**——CONTEXT.md 已定义双元数据（元数据二 `dict[str,str]` 给 Core）。
 - LMU 数值参数字符串→数值转换：**判断性改动**——para 以 str 存储，数值型参数需还原为数值才能调用 API。
 
 **待确认（镜像框架）**: JSON 镜像的 mem 段格式、init 段字段、设备插件约定、是否预置多对话/服务、是否持久化写回——见会话提问，确认后实施 `avm/image.py` + `avm/boot.py` + `docs/system-image.md`。
+
+**待定设计（2026-08-02，用户明确暂不处理）**: 错误处理机制整体未定，不要轻举妄动。挂起的问题包括：`json_error` / `unknown_tool` 被丢弃后缺少工具响应配对（下一轮 API 会 400）；`memory_write` 传非 `$` 开头的 ref 时 `Memory.set` 抛 `ValueError` 未被捕获（run 终止）；错误信息只面向运行者 vs 满足 API 配对之间的取舍。

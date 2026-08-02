@@ -15,7 +15,7 @@ _Avoid_: 会话、进程、agent
 _Avoid_: 会话结束、对话终止（指代不清）
 
 **子对话 (Child conversation)**:
-通过 `create_cmd` 指令创建的新对话。子对话对 AVM 整体内存的目的负责，不对父对话负责。父创建子后进入休眠；子对话完成（仅输出内容、无工具调用）不会唤醒父。子对话可通过返回工具（`return_result`）显式将结论投递给父的 tool response，投递即直接唤醒父（消息已可用就不留在休眠队列）；子对话在下一轮以无工具结果收尾后进入休眠。与 Linux 父子进程类似，父子松耦合。
+通过 `create_cmd` 指令创建的新对话。子对话对 AVM 整体内存的目的负责，不对父对话负责。父创建子后继续执行（不休眠），子对话创建后进入休眠、等待指令；父通过传指令工具（`send_instruction`）按 cid 寻址投递指令（携带 ICC id）。子对话完成（仅输出内容、无工具调用）不会唤醒父。子对话通过返回工具（`return_result`，携带 ICC id）把结论返回给发起请求的对话；创建关系不构成默认返回通道，AI 的思考不默认透露给其他 AI，输出默认写入共享内存。与 Linux 父子进程类似，父子松耦合。
 _Avoid_: sub-agent
 
 **亚对话 (Sub conversation)**:
@@ -23,7 +23,7 @@ _Avoid_: sub-agent
 _Avoid_: child conversation
 
 **服务 (Service)**:
-通过 `register_service` 注册的已存在对话。其他对话可通过 `call_service` 调用并等待返回——服务用 `return_result` 工具返回结果；或通过 `transfer_service` 移交控制权不等待返回。服务对话交互结束（进入休眠）后仍保持注册，可被再次调用；对话个体结束（被关闭）后服务才失效。
+通过 `register_service` 注册的已存在对话。其他对话可通过 `call_service` 调用并等待返回——服务用 `return_result` 工具（携带 ICC id）返回结果；或通过 `transfer_service` 移交控制权不等待返回。服务对话交互结束（进入休眠）后仍保持注册，可被再次调用；对话个体结束（被关闭）后服务才失效。
 
 ### 内存中的文件类型
 
@@ -57,10 +57,10 @@ AVM 的指令分发层和调度器。不参与管理决策——只执行指令�
 `memory_read`、`memory_write`、`memory_make`——读写内存和创建新内存地址。
 
 **对话程序指令 (Conversation program instructions)**:
-`create_cmd`、`create_sub`——创建子对话或亚对话以启动 Settingup 程序。
+`create_cmd`、`create_sub`——创建子对话或亚对话以启动 Settingup 程序。`create_cmd` 只创建并返回 cid（父不休眠、子对话休眠等待指令）；`create_sub` 保留 user_ref、立即执行。
 
 **调度模型指令 (Scheduling model instructions)**:
-`register_service`、`call_service`、`transfer_service`、`return_result`——对话间的调度关系管理，控制服务注册、调用、移交和结果返回。
+`register_service`、`call_service`、`transfer_service`、`return_result`、`send_instruction`——对话间的调度关系管理，控制服务注册、调用、移交、结果返回和按 cid 的指令投递。
 
 ### 内存与数据
 
@@ -90,7 +90,10 @@ _Avoid_: 解引用、符号、指针
 等待被调度的对话队列。调度优先级：主对话 > 子对话调用队列 > 回调队列。
 
 **事件 (Event)**:
-对话可显式注册监听的事件。VM 提供的事件源：定时、内存地址更改、其他对话注册的自定义信号。事件触发后 core 将监听者从休眠转为就绪。返回工具（`return_result`）的投递不需要注册——投递即直接唤醒调用者（消息已可用就不留在休眠队列）。组合事件与事件总线由 AI 程序（提示词）实现，不属于 VM。
+对话可显式注册监听的事件。VM 提供的事件源：定时、内存地址更改、其他对话注册的自定义信号。事件触发后 core 将监听者从休眠转为就绪。返回工具（`return_result`）的投递不需要注册——被调用方显式调用该工具后，Core 按 ICC id 把结论写入发起请求的对话的 batch 并唤醒它（消息已可用就不留在休眠队列）。组合事件与事件总线由 AI 程序（提示词）实现，不属于 VM。
+
+**ICC id（对话间通信 id）**:
+每次对话间调用（`call_service`、`send_instruction`）由 Core 记录一条通信记录：`icc_id → {发起者 cid, 发起者调用的 call_id}`，并把指令投递给被调用方——投递的消息是 JSON 格式字符串（默认），包含 `icc_id` 和 `content`，content 不强制 JSON。`return_result` 必须携带 icc_id，Core 按记录把结论路由回发起者；无记录即错误。创建关系不构成默认返回通道。
 
 ### 虚拟文件
 

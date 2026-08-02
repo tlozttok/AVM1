@@ -192,6 +192,7 @@ class OutputsListDevice(MetaListDevice):
             from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
             raise MemoryTypeError(f"OutputsListDevice 只接受 str，got {type(value).__name__}")
         self._data.append(value)
+        print(value, flush=True)  # 写入即打印到屏幕（文档承诺的"并打印到屏幕"）
 
     def set_value(self, value):
         """支持直接写入单个字符串（追加）或列表（替换）"""

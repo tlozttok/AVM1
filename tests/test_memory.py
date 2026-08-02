@@ -149,6 +149,18 @@ class TestDeviceResolvePath:
         dev = OutputsListDevice(data=["a", "b"])
         assert dev.resolve_path(["1"]) == "b"
 
+    def test_outputs_device_append_prints(self, capsys):
+        dev = OutputsListDevice()
+        dev.append("hello")
+        assert dev.resolve_path(["0"]) == "hello"
+        assert capsys.readouterr().out == "hello\n"
+
+    def test_outputs_device_write_minus_one_prints(self, capsys):
+        dev = OutputsListDevice()
+        dev[-1] = "printed"
+        assert dev.resolve_path(["0"]) == "printed"
+        assert capsys.readouterr().out == "printed\n"
+
     def test_string_device_subpath_raises(self):
         dev = StringDevice("val")
         with pytest.raises(VMMemoryError):
