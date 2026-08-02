@@ -126,26 +126,26 @@ class CreateInstruction(Instruction):
         "type": "function",
         "function": {
             "name": "create_cmd",
-            "description": "创建子对话",
+            "description": "创建子对话（只创建并返回 cid，子对话进入休眠等待指令；本对话保持活跃）",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "system_ref": {"type": "string", "description": "系统提示词引用"},
-                    "user_ref": {"type": "string", "description": "用户消息引用"},
                     "para_ref": {"type": "string", "description": "参数引用"},
                 },
-                "required": ["system_ref", "user_ref", "para_ref"],
+                "required": ["system_ref", "para_ref"],
             }
         }
     }
     system_ref: str
-    user_ref: str
     para_ref: str
 
     def execute(self, core: 'Core', conv: Conversation):
-        child = _build_conversation(core, self.system_ref, self.user_ref, self.para_ref, parent=conv, is_sub=False)
-        child.metadata["call_id"] = self.call_id
-        core._ready_cids.append(child.cid)
+        child = _build_conversation(core, self.system_ref, "", self.para_ref, parent=conv, is_sub=False)
+        # 子对话创建后进入休眠，等待 send_instruction 投递指令
+        if child.cid not in core._dormant_cids:
+            core._dormant_cids.append(child.cid)
+        conv.user_batch.add_tool_response(f"Success created: cid={child.cid}", self.call_id)
 
 
 class CreateSubInstruction(Instruction):
@@ -230,10 +230,15 @@ class CallServiceInstruction(Instruction):
             conv.user_batch.add_tool_response(f"Error: 服务 {self.service_name} 不存在", self.call_id)
             return
         target = core._conv_by_cid[target_cid]
-        target.user_batch.add_user_content(self.input)
-        # 目标结束时回调 caller
-        target.metadata["caller_cid"] = str(conv.cid)
-        target.metadata["caller_call_id"] = self.call_id
+        # ICC 记录：icc_id = 本次工具调用的 call_id
+        core._icc[self.call_id] = (conv.cid, self.call_id)
+        # 投递消息：JSON 字符串（默认格式），含 icc_id 和 content
+        message = json.dumps({"icc_id": self.call_id, "content": self.input}, ensure_ascii=False)
+        target.user_batch.add_user_content(message)
+        if target.cid in core._dormant_cids:
+            core._dormant_cids.remove(target.cid)
+        if target.cid in core._ready_cids:
+            core._ready_cids.remove(target.cid)
         core._ready_cids.insert(0, target.cid)
 
 
@@ -272,40 +277,38 @@ class ReturnResultInstruction(Instruction):
         "type": "function",
         "function": {
             "name": "return_result",
-            "description": "将本对话的结论返回给调用者（父对话或 call_service 的调用者），并确保调用者成为下一个被激活的对话。调用后本对话应在下一轮以无工具的结果收尾，进入休眠",
+            "description": "将本对话的结论按 ICC id 返回给发起请求的对话，并确保它成为下一个被激活的对话。调用后本对话应在下一轮以无工具的结果收尾，进入休眠",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "content": {"type": "string", "description": "返回给调用者的结论"},
+                    "content": {"type": "string", "description": "返回给发起请求的对话的结论"},
+                    "icc_id": {"type": "string", "description": "本次请求的 ICC id（从收到的指令消息中读取）"},
                 },
-                "required": ["content"],
+                "required": ["content", "icc_id"],
             }
         }
     }
     content: str
+    icc_id: str
 
     def execute(self, core: 'Core', conv: Conversation):
-        caller_cid = conv.metadata.get("caller_cid")
-        if caller_cid is None and conv.parent is not None:
-            caller_cid = str(conv.parent.cid)
-
-        if caller_cid is None:
-            msg = "return_result 失败：本对话没有调用者"
+        record = core._icc.pop(self.icc_id, None)
+        if record is None:
+            msg = f"return_result 失败：ICC id {self.icc_id} 无对应请求记录"
             _report_tool_error(conv, msg)
             conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
             return
-        caller_cid = int(caller_cid)
+        caller_cid, call_id = record
         if caller_cid not in core._conv_by_cid:
-            msg = f"return_result 失败：调用者 {caller_cid} 不存在"
+            msg = f"return_result 失败：发起者 {caller_cid} 不存在"
             _report_tool_error(conv, msg)
             conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
             return
 
-        # 结论投递给调用者，挂到原调用的 call_id
-        call_id = conv.metadata.get("caller_call_id") or conv.metadata.get("call_id", "direct_output")
+        # 结论投递给发起者，挂到原调用的 call_id
         core._conv_by_cid[caller_cid].user_batch.add_tool_response(self.content, call_id)
 
-        # 确保调用者是下一个被激活的对话
+        # 确保发起者是下一个被激活的对话
         if caller_cid in core._dormant_cids:
             core._dormant_cids.remove(caller_cid)
         if caller_cid in core._ready_cids:
@@ -317,6 +320,53 @@ class ReturnResultInstruction(Instruction):
         conv.metadata["returned"] = "1"
 
 
+class SendInstruction(Instruction):
+    tool_name = "send_instruction"
+    tool_def = {
+        "type": "function",
+        "function": {
+            "name": "send_instruction",
+            "description": "向指定 cid 的对话投递指令（消息为 JSON 字符串，含 icc_id 和 content）。wait=true 时本对话休眠等待返回，wait=false 时本对话继续",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cid": {"type": "integer", "description": "目标对话的 cid"},
+                    "content": {"type": "string", "description": "指令内容"},
+                    "wait": {"type": "boolean", "description": "是否休眠等待返回"},
+                    "format": {"type": "string", "description": "投递消息格式，默认 json（预留未来格式）"},
+                },
+                "required": ["cid", "content", "wait"],
+            }
+        }
+    }
+    cid: int
+    content: str
+    wait: bool
+
+    def execute(self, core: 'Core', conv: Conversation):
+        fmt = getattr(self, "format", "json")
+        if fmt != "json":
+            msg = f"send_instruction 失败：不支持的格式 {fmt}（当前仅支持 json）"
+            _report_tool_error(conv, msg)
+            conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
+            return
+        target = core._conv_by_cid.get(self.cid)
+        if target is None:
+            msg = f"send_instruction 失败：对话 {self.cid} 不存在"
+            _report_tool_error(conv, msg)
+            conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
+            return
+        # ICC 记录：icc_id = 本次工具调用的 call_id
+        core._icc[self.call_id] = (conv.cid, self.call_id)
+        message = json.dumps({"icc_id": self.call_id, "content": self.content}, ensure_ascii=False)
+        target.user_batch.add_user_content(message)
+        if target.cid in core._dormant_cids:
+            core._dormant_cids.remove(target.cid)
+        if target.cid in core._ready_cids:
+            core._ready_cids.remove(target.cid)
+        core._ready_cids.insert(0, target.cid)
+
+
 def _instruction_registry() -> Dict[str, Type[Instruction]]:
     return {
         cls.tool_name: cls
@@ -324,7 +374,7 @@ def _instruction_registry() -> Dict[str, Type[Instruction]]:
             MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction,
             CreateInstruction, CreateSubInstruction,
             RegisterServiceInstruction, CallServiceInstruction, TransferServiceInstruction,
-            ReturnResultInstruction,
+            ReturnResultInstruction, SendInstruction,
         ]
     }
 
@@ -358,10 +408,12 @@ class _ServicesDevice(MemoryDevice):
 
 def _build_conversation(core: 'Core', system_ref: str, user_ref: str, para_ref: str, parent: Conversation, is_sub: bool) -> Conversation:
     system = core.unwrap(system_ref)
-    user = core.unwrap(user_ref)
+    messages = [SystemMessage(content=system)]
+    if user_ref:
+        messages.append(UserMessage(content=core.unwrap(user_ref)))
     core.unwrap(para_ref, for_llm=False)
     conv = Conversation(
-        messages=[SystemMessage(content=system), UserMessage(content=user)],
+        messages=messages,
         cid=0,
         is_sub=is_sub,
         parent=parent,
@@ -512,6 +564,7 @@ class Core:
         self._next_cid: int = 0
         self.mem: Memory = Memory()
         self.lmu: LMU = LMU()
+        self._icc: dict = {}  # icc_id → (发起者 cid, 发起者调用的 call_id)
         self.debug: bool = False
         self.monitor: Monitor = Monitor()
         self.para_ref: str = "$MEM.model_params"
@@ -594,9 +647,13 @@ class Core:
             conv.user_batch.clear()
 
             if return_calls:
-                has_create = any(rc["cmd_type"] in ("create_cmd", "create_sub", "call_service", "transfer_service") for rc in return_calls)
+                suspends_caller = any(
+                    rc["cmd_type"] in ("create_sub", "call_service", "transfer_service")
+                    or (rc["cmd_type"] == "send_instruction" and rc.get("args", {}).get("wait"))
+                    for rc in return_calls
+                )
                 self._process_return_calls(return_calls, conv)
-                if has_create:
+                if suspends_caller:
                     if conv.cid not in self._dormant_cids:
                         self._dormant_cids.append(conv.cid)
                     self._pick_next_active()

@@ -1,11 +1,13 @@
 """Core 调度系统测试"""
 
+import json
 import pytest
 from avm.core import Core, LMU, _instruction_registry, _build_conversation
 from avm.core import (
     MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction,
     CreateInstruction, CreateSubInstruction,
     RegisterServiceInstruction, CallServiceInstruction, TransferServiceInstruction,
+    ReturnResultInstruction, SendInstruction,
 )
 from avm.types import Conversation, UserMessageBatch, SystemMessage, UserMessage, AssistantMessage, MetaDict
 from avm.memory import Memory
@@ -88,9 +90,12 @@ class TestConversationStart:
         assert "memory_make" in reg
         assert "create_cmd" in reg
         assert "create_sub" in reg
+        assert "return_result" in reg
+        assert "send_instruction" in reg
         assert reg["memory_read"] is MemoryReadInstruction
         assert reg["create_cmd"] is CreateInstruction
         assert reg["create_sub"] is CreateSubInstruction
+        assert reg["send_instruction"] is SendInstruction
 
 
 # ------------------------------------------------------------------
@@ -169,75 +174,51 @@ class TestMemoryOpsThroughScheduling:
 # ------------------------------------------------------------------
 
 class TestCreateChild:
-    def test_create_cmd_dormant_and_ready(self):
-        """根对话调用 create_cmd → 根休眠，子进就绪，子变活跃"""
+    def test_create_cmd_creates_dormant_child_and_returns_cid(self):
+        """create_cmd → 子对话休眠等待指令，父保持活跃，工具响应返回 cid"""
         core = make_core([
             (None, [
-                {"call_id": "ctc", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.sys2", "user_ref": "$MEM.usr2", "para_ref": "$MEM.para"}},
+                {"call_id": "ctc", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.sys2", "para_ref": "$MEM.para"}},
             ], None),
         ])
         _new_root(core)
         core.mem["sys2"] = "child_sys"
-        core.mem["usr2"] = "child_usr"
         core.mem["para"] = MetaDict(data={"model": "test"})
         core._active_cid = core._ready_cids.pop(0)
 
-        st0 = _state(core)
-        assert st0["active"] == 0
-        assert st0["ready"] == []
-
         core.advance_conversation()
 
-        st1 = _state(core)
-        assert st1["active"] == 1           # child becomes active
-        assert 0 in st1["dormant"]          # root dormant
-        assert 1 not in st1["ready"]        # child removed from ready
+        st = _state(core)
+        assert st["active"] == 0          # 父保持活跃
+        assert 1 in st["dormant"]         # 子对话休眠等待指令
+        assert 1 not in st["ready"]
+        content, call_id = _batch(core, 0)[0]
+        assert "Success created: cid=1" in content
+        assert call_id == "ctc"
 
-    def test_child_finished_picks_next_ready(self):
-        """子对话完成后取下一个就绪"""
+    def test_create_cmd_child_has_only_system_message(self):
+        """create_cmd 创建的子对话没有 user 消息（指令由 send_instruction 后续投递）"""
         core = make_core([
-            (None, [
-                {"call_id": "c1", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.sys2", "user_ref": "$MEM.usr2", "para_ref": "$MEM.p"}},
-                {"call_id": "c2", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.sys3", "user_ref": "$MEM.usr3", "para_ref": "$MEM.p"}},
-            ], None),
-            # child1 finishes
-            ("child1_done", [], None),
-            # child2 finishes
-            ("child2_done", [], None),
+            (None, [{"call_id": "ctc", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.sys2", "para_ref": "$MEM.para"}}], None),
         ])
         _new_root(core)
-        for k in ["sys2", "usr2", "sys3", "usr3", "p"]:
-            core.mem[k] = "x"
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["sys2"] = "child_sys"
+        core.mem["para"] = MetaDict(data={"model": "test"})
         core._active_cid = core._ready_cids.pop(0)
-
-        # advance root: creates 2 children, root → dormant
         core.advance_conversation()
-        st1 = _state(core)
-        assert st1["active"] == 1       # first child active
-        assert st1["dormant"] == [0]
-        assert 2 in st1["ready"]        # second child waiting
 
-        # advance child1: finishes → pick child2
-        core.advance_conversation()
-        st2 = _state(core)
-        assert st2["active"] == 2       # second child active
-        assert st2["ready"] == []
-
-        # advance child2: finishes → no more ready
-        core.advance_conversation()
-        st3 = _state(core)
-        assert st3["active"] is None
+        child = core._conv_by_cid[1]
+        assert len(child.messages) == 1
+        assert child.messages[0].role == "system"
 
     def test_child_has_parent_link(self):
         core = make_core([
             (None, [
-                {"call_id": "c", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.s", "user_ref": "$MEM.u", "para_ref": "$MEM.p"}},
+                {"call_id": "c", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.s", "para_ref": "$MEM.p"}},
             ], None),
         ])
         _new_root(core)
         core.mem["s"] = "x"
-        core.mem["u"] = "x"
         core.mem["p"] = MetaDict(data={"model": "test"})
         core._active_cid = core._ready_cids.pop(0)
         core.advance_conversation()
@@ -246,6 +227,138 @@ class TestCreateChild:
         assert child.parent is core._conv_by_cid[0]
         assert child.is_sub is False
         assert child.is_root is False
+
+
+class TestSendInstruction:
+    def _child_setup(self):
+        """root 用 create_cmd 创建子对话并保持活跃"""
+        core = make_core([
+            (None, [{"call_id": "ctc", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.s", "para_ref": "$MEM.p"}}], None),
+        ])
+        root = _new_root(core)
+        core.mem["s"] = "child_sys"
+        core.mem["p"] = MetaDict(data={"model": "test"})
+        core._active_cid = core._ready_cids.pop(0)
+        core.advance_conversation()  # root: create_cmd → 子休眠，root 活跃
+        child = core._conv_by_cid[1]
+        return core, root, child
+
+    def test_send_instruction_wait_true(self):
+        """wait=true：发起者休眠等待，子对话返回后发起者被激活"""
+        core, root, child = self._child_setup()
+        core.lmu = MockLMU([
+            (None, [{"call_id": "si", "cmd_type": "send_instruction", "args": {"cid": child.cid, "content": "do X", "wait": True}}], None),
+            (None, [{"call_id": "rr", "cmd_type": "return_result", "args": {"content": "done", "icc_id": "si"}}], None),
+            ("ok", [], None),
+            ("done", [], None),
+        ])
+
+        # root: send_instruction(wait=true) → root 休眠，child 活跃，指令为 JSON 消息
+        core.advance_conversation()
+        st1 = _state(core)
+        assert st1["active"] == child.cid
+        assert root.cid in st1["dormant"]
+        msg = json.loads(child.user_batch.user_contents[0])
+        assert msg == {"icc_id": "si", "content": "do X"}
+
+        # child: return_result → 结论投递 root，child 收到确认（保持活跃）
+        core.advance_conversation()
+        st2 = _state(core)
+        assert st2["active"] == child.cid
+        assert st2["ready"][0] == root.cid
+        assert ("结果已发送", "rr") in _batch(core, child.cid)
+        assert ("done", "si") in _batch(core, root.cid)
+
+        # child: 无工具收尾 → 休眠，root 被激活
+        core.advance_conversation()
+        st3 = _state(core)
+        assert st3["active"] == root.cid
+        assert child.cid in st3["dormant"]
+
+        # root: 完成
+        core.advance_conversation()
+        assert core._active_cid is None
+
+    def test_send_instruction_wait_false(self):
+        """wait=false：发起者继续执行，子对话返回异步进入发起者 batch"""
+        core, root, child = self._child_setup()
+        core.lmu = MockLMU([
+            (None, [{"call_id": "si", "cmd_type": "send_instruction", "args": {"cid": child.cid, "content": "fire", "wait": False}}], None),
+            ("root_done", [], None),
+            (None, [{"call_id": "rr", "cmd_type": "return_result", "args": {"content": "later", "icc_id": "si"}}], None),
+            ("ok", [], None),
+            ("root_final", [], None),
+        ])
+
+        # root: send_instruction(wait=false) → root 保持活跃，child 就绪
+        core.advance_conversation()
+        st1 = _state(core)
+        assert st1["active"] == root.cid
+        assert child.cid in st1["ready"]
+        assert root.cid not in st1["dormant"]
+
+        # root: 无工具收尾 → 休眠，child 被调度
+        core.advance_conversation()
+        st2 = _state(core)
+        assert st2["active"] == child.cid
+        assert root.cid in st2["dormant"]
+
+        # child: return_result → root 排到就绪队首（异步收信）
+        core.advance_conversation()
+        st3 = _state(core)
+        assert st3["active"] == child.cid
+        assert st3["ready"][0] == root.cid
+        assert ("later", "si") in _batch(core, root.cid)
+
+        # child 收尾 → 休眠；root 被激活
+        core.advance_conversation()
+        st4 = _state(core)
+        assert st4["active"] == root.cid
+        assert child.cid in st4["dormant"]
+
+        core.advance_conversation()
+        assert core._active_cid is None
+
+    def test_send_instruction_unknown_cid(self, capsys):
+        core = make_core([
+            (None, [{"call_id": "si", "cmd_type": "send_instruction", "args": {"cid": 99, "content": "x", "wait": False}}], None),
+        ])
+        _new_root(core)
+        core._active_cid = core._ready_cids.pop(0)
+
+        core.advance_conversation()
+        content, _ = _batch(core, 0)[0]
+        assert "不存在" in content
+        assert "不存在" in capsys.readouterr().err
+        assert core._active_cid == 0  # 仍活跃
+
+
+class TestIccRouting:
+    def test_return_result_routes_by_icc_id(self):
+        core = make_core()
+        root = _new_root(core)
+        core.mem["s"] = "s"
+        core.mem["u"] = "u"
+        core.mem["p"] = MetaDict(data={"model": "test"})
+        svc = _build_conversation(core, "$MEM.s", "$MEM.u", "$MEM.p", parent=root, is_sub=False)
+        RegisterServiceInstruction("rc", svc.cid, {"name": "svc", "what": "x", "needs": "x", "returns": "x"}).execute(core, svc)
+
+        # 两条请求各建 ICC 记录
+        CallServiceInstruction("req1", root.cid, {"service_name": "svc", "input": "q1"}).execute(core, root)
+        CallServiceInstruction("req2", root.cid, {"service_name": "svc", "input": "q2"}).execute(core, root)
+        assert set(core._icc) == {"req1", "req2"}
+
+        # 按 req2 返回 → 路由到 req2 的 call_id
+        ReturnResultInstruction("ret2", svc.cid, {"content": "ans2", "icc_id": "req2"}).execute(core, svc)
+        assert ("ans2", "req2") in _batch(core, root.cid)
+
+        # 按 req1 返回
+        ReturnResultInstruction("ret1", svc.cid, {"content": "ans1", "icc_id": "req1"}).execute(core, svc)
+        assert ("ans1", "req1") in _batch(core, root.cid)
+
+        # 记录已消费，再次返回报错（stderr）且不投递
+        ReturnResultInstruction("ret3", svc.cid, {"content": "dup", "icc_id": "req1"}).execute(core, svc)
+        assert ("dup", "req1") not in _batch(core, root.cid)
 
 
 class TestCreateSub:
@@ -426,7 +539,7 @@ class TestServiceScheduling:
         """root 创建服务对话 svc 并注册为 calc；root 随后调用它"""
         core = make_core([
             (None, [{"call_id": "cc", "cmd_type": "call_service", "args": {"service_name": "calc", "input": "2+3"}}], None),
-            (None, [{"call_id": "ret", "cmd_type": "return_result", "args": {"content": "6"}}], None),
+            (None, [{"call_id": "ret", "cmd_type": "return_result", "args": {"content": "6", "icc_id": "cc"}}], None),
             ("ok", [], None),
             ("done", [], None),
         ])
@@ -449,7 +562,7 @@ class TestServiceScheduling:
         assert st1["active"] == svc.cid
         assert root.cid in st1["dormant"]
         assert root.cid not in st1["ready"]
-        assert svc.user_batch.user_contents == ["2+3"]
+        assert svc.user_batch.user_contents == [json.dumps({"icc_id": "cc", "content": "2+3"})]
 
         # svc: return_result → 结论投递 root、root 排到下一个、svc 收到确认（保持活跃）
         core.advance_conversation()

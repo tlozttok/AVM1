@@ -22,6 +22,7 @@
 10. 调试入口（2026-08-01）：`main.py`（`python main.py <image.json>`，支持 `--frames` 帧摘要、`--transcript` API 全文落盘、`persist_to` 写回）+ 示例镜像 `images/demo.json` + `images/devices/io.py`；测试 `tests/test_main.py` 3 个。
 11. 文件内配置调试路径（2026-08-01）：`main.py` 无参数时从 `debug.json` 读取 `image`/`frames`/`transcript`（`--debug-config` 可指定其他文件），VSCode 中固定运行 `python main.py` 即可，参数改文件不改命令行；测试 2 个。
 12. 修复（2026-08-02）：`OutputsListDevice` 写入 `$MEM.outputs.-1` 不打印——docstring 承诺"并打印到屏幕"但实现缺失；补上 `print(value, flush=True)`（flush 保证逐步运行时立即可见），新增 2 个测试。
+13. create_cmd 简化与 ICC 路由实施（2026-08-02）：create_cmd 去掉 user_ref（只创建 + 返回 cid，父保持活跃，子对话休眠等待指令）；新增 `send_instruction(cid, content, wait, format)`（按 cid 寻址，wait 双语义，投递消息为 JSON 字符串含 icc_id+content）；Core 增加 ICC 记录表（icc_id = 发起者工具调用的 call_id）；return_result 必填 icc_id、按记录路由、废弃 parent 回退；call_service 改 ICC + JSON 投递；create_sub 不动。测试 150 个全部通过。
 
 **影响**: 状态机三态（活跃/休眠/就绪）互斥；工具调用错误面向运行者（stderr）可见、对话继续；服务注册不受对话交互结束影响（可再次被调用），对话个体结束才失效。现有 create_cmd 语义不变（父休眠、不唤醒，符合设计）。监测器状态推导在新状态机下正确。
 
@@ -41,6 +42,7 @@
 - `main.py` 调试入口与示例镜像：**按用户计划改动**——用户要求提供调试 main 和可修改的示例镜像。
 - `debug.json` 文件内配置调试路径：**按用户计划改动**——用户明确不想在 VSCode 里反复改命令参数。
 - `OutputsListDevice` 补上打印：**按文档记录改动**——认为现有代码与设备文档承诺（"写入即打印到屏幕"）冲突而改动现有代码。
+- create_cmd 简化、send_instruction、ICC 路由、return_result 必填 icc_id、call_service 改 ICC：**按用户计划改动**——用户逐点确认的设计（含"投递消息是 JSON 字符串（默认），icc_id = 工具调用 call_id"、"父不再是默认接收者"）。
 - MetaDict/MetaList 增加 `ctrl`（元数据二）落地：**按文档记录改动**——CONTEXT.md 已定义双元数据（元数据二 `dict[str,str]` 给 Core）。
 - LMU 数值参数字符串→数值转换：**判断性改动**——para 以 str 存储，数值型参数需还原为数值才能调用 API。
 

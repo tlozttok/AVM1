@@ -89,11 +89,10 @@ class TestFrameSequence:
 
     def test_conversation_state_derivation(self):
         core = make_core([
-            (None, [{"call_id": "c", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.s", "user_ref": "$MEM.u", "para_ref": "$MEM.p"}}], None),
+            (None, [{"call_id": "c", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.s", "para_ref": "$MEM.p"}}], None),
         ])
         _new_root(core)
-        for k in ["s", "u"]:
-            core.mem[k] = "x"
+        core.mem["s"] = "x"
         core.mem["p"] = MetaDict(data={"model": "test"})
         core._active_cid = core._ready_cids.pop(0)
         core.monitor.record_baseline(core)
@@ -101,9 +100,9 @@ class TestFrameSequence:
         core.advance_conversation()
 
         f = core.monitor.frame(1)
-        assert f.conversations[0]["state"] == "dormant"  # 根对话休眠
-        assert f.conversations[1]["state"] == "active"   # 子对话活跃
-        assert f.sched["dormant_cids"] == [0]
+        assert f.conversations[0]["state"] == "active"   # 父保持活跃
+        assert f.conversations[1]["state"] == "dormant"  # 子对话休眠等待指令
+        assert f.sched["dormant_cids"] == [1]
 
 
 class TestQuery:

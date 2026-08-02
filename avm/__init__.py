@@ -2,7 +2,7 @@
 from .core import Core, LMU, \
     Instruction, CreateInstruction, CreateSubInstruction, \
     MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction, \
-    ReturnResultInstruction
+    ReturnResultInstruction, SendInstruction
 from .memory import Memory
 from .types import MetaDict, MetaList, Conversation, UserMessageBatch, \
     SystemMessage, UserMessage, AssistantMessage, ToolMessage, message_to_api_dict
