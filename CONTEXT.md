@@ -32,7 +32,7 @@ _Avoid_: child conversation
 _Avoid_: system prompt、系统提示词
 
 **Python 程序**:
-已注册的 Python 代码，与 Settingup 对等——都是 AVM 中的一等执行单元。type = `"python"`。结构同 Settingup：`content`（Python 代码）、可选的 `signature`（输入/输出规格）。Python 和 LLM 在 AVM 中无层级差异，可互相外包弱点。
+已注册的 Python 代码，与 Settingup 对等——都是 AVM 中的一等执行单元。type = `"python"`。结构同 Settingup：`content`（Python 代码）、可选的 `signature`（输入/输出规格）。执行器接口与各家 AI 厂商提供的 API 一致（兼容 OpenAI）：输入 OpenAI 格式的 messages 列表（system/user/assistant/tool），输出 content + tool_calls，与真实 LLM 端点对等。Python 和 LLM 在 AVM 中无层级差异，可互相外包弱点。
 _Avoid_: plugin、tool、function
 
 **Para**:
@@ -93,7 +93,10 @@ _Avoid_: 解引用、符号、指针
 对话可显式注册监听的事件。VM 提供的事件源：定时、内存地址更改、其他对话注册的自定义信号。事件触发后 core 将监听者从休眠转为就绪。返回工具（`return_result`）的投递不需要注册——被调用方显式调用该工具后，Core 按 ICC id 把结论写入发起请求的对话的 batch 并唤醒它（消息已可用就不留在休眠队列）。组合事件与事件总线由 AI 程序（提示词）实现，不属于 VM。
 
 **ICC id（对话间通信 id）**:
-每次对话间调用（`call_service`、`send_instruction`）由 Core 记录一条通信记录：`icc_id → {发起者 cid, 发起者调用的 call_id}`，并把指令投递给被调用方——投递的消息是 JSON 格式字符串（默认），包含 `icc_id` 和 `content`，content 不强制 JSON。`return_result` 必须携带 icc_id，Core 按记录把结论路由回发起者；无记录即错误。创建关系不构成默认返回通道。
+每次对话间调用（`call_service`、`send_instruction`）由 Core 记录一条通信记录：`icc_id → {发起者 cid, 发起者调用的 call_id}`，并把指令投递给被调用方——投递的消息是 JSON 格式字符串（默认），包含 `from`、`to`、`icc_id` 和 `content`，content 不强制 JSON。`to` 是名字或名字列表，多播时每个目标一条记录。`return_result` 必须携带 icc_id，Core 按记录把结论路由回发起者；无记录即错误。创建关系不构成默认返回通道。
+
+**名字 (Name)**:
+对话的身份标识，来自其 settingup 文件（name 是信息不是元信息，不放 meta/ctrl，放节点数据）。名字不唯一，冲突时用文件地址消歧（如 `MEM.math Analysis`）。带名字的对话必然有 settingup 文件（`create_cmd` 创建）；亚对话（直接传提示词）没有名字，其身份 = 父对话身份 + 亚对话 cid。名字↔cid 转换是内核职责，不是 VM 职责（简单内核字符串匹配，复杂内核可支持 AI 匹配）；`send_instruction` 只用 cid 寻址。
 
 ### 虚拟文件
 

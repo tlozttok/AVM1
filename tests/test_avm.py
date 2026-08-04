@@ -59,6 +59,7 @@ def _new_root(core, system="sys", user="hello"):
     core.mem["system"] = system
     core.mem["user"] = user
     conv = core.start(system, user)
+    conv.name = "init"
     return conv
 
 
@@ -211,6 +212,21 @@ class TestCreateChild:
         assert len(child.messages) == 1
         assert child.messages[0].role == "system"
 
+    def test_create_cmd_reads_name_from_settingup(self):
+        """create_cmd 从 settingup 节点的 name 数据字段读取对话名字"""
+        core = make_core([
+            (None, [{"call_id": "ctc", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.prog", "para_ref": "$MEM.p"}}], None),
+        ])
+        _new_root(core)
+        core.mem["prog"] = MetaDict(data={"name": "Analyzer", "content": "prog"}, ctrl={"type": "settingup"})
+        core.mem["p"] = MetaDict(data={"model": "test"})
+        core._active_cid = core._ready_cids.pop(0)
+
+        core.advance_conversation()
+        child = core._conv_by_cid[1]
+        assert child.name == "Analyzer"
+        assert child.identity == "Analyzer"
+
     def test_child_has_parent_link(self):
         core = make_core([
             (None, [
@@ -259,7 +275,7 @@ class TestSendInstruction:
         assert st1["active"] == child.cid
         assert root.cid in st1["dormant"]
         msg = json.loads(child.user_batch.user_contents[0])
-        assert msg == {"icc_id": "si", "content": "do X"}
+        assert msg == {"from": "init", "to": "init#1", "icc_id": "si", "content": "do X"}
 
         # child: return_result → 结论投递 root，child 收到确认（保持活跃）
         core.advance_conversation()
@@ -331,6 +347,88 @@ class TestSendInstruction:
         assert "不存在" in content
         assert "不存在" in capsys.readouterr().err
         assert core._active_cid == 0  # 仍活跃
+
+    def test_send_instruction_multicast(self):
+        core, root, child = self._child_setup()
+        core.lmu = MockLMU([
+            (None, [{"call_id": "ctc2", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.s", "para_ref": "$MEM.p"}}], None),
+            (None, [{"call_id": "ms", "cmd_type": "send_instruction", "args": {"cid": [1, 2], "content": "broadcast", "wait": False}}], None),
+        ])
+        core.advance_conversation()  # root: 创建第二个子对话
+        child2 = core._conv_by_cid[2]
+        core.advance_conversation()  # root: 多播
+
+        assert set(core._icc) == {"ms#0", "ms#1"}  # 每个目标一条独立记录
+        assert core._icc_groups == {"ms": 2}        # 工具返回多播：等待所有目标返回
+        assert root.cid in core._dormant_cids       # 工具返回多播期间发起者休眠
+        for t in (child, child2):
+            msg = json.loads(t.user_batch.user_contents[-1])
+            assert msg["from"] == "init"
+            assert msg["to"] == ["init#1", "init#2"]
+            assert msg["icc_id"] in ("ms#0", "ms#1")
+            assert msg["content"] == "broadcast"
+
+    def test_multicast_tool_mode_merges_returns(self):
+        """工具返回多播：各目标返回按 cid+名字合并成一条工具响应，最后一个返回唤醒发起者"""
+        core, root, child = self._child_setup()
+        core.lmu = MockLMU([
+            (None, [{"call_id": "ctc2", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.s", "para_ref": "$MEM.p"}}], None),
+            (None, [{"call_id": "ms", "cmd_type": "send_instruction", "args": {"cid": [1, 2], "content": "broadcast", "wait": False}}], None),
+            (None, [{"call_id": "rr2", "cmd_type": "return_result", "args": {"content": "reply2", "icc_id": "ms#1"}}], None),
+            ("ok2", [], None),
+            (None, [{"call_id": "rr1", "cmd_type": "return_result", "args": {"content": "reply1", "icc_id": "ms#0"}}], None),
+            ("ok1", [], None),
+            ("done", [], None),
+        ])
+        core.advance_conversation()
+        core.advance_conversation()
+
+        # 子对话 2 返回（ms#1）：合并进 batch，但还有未返回目标，发起者不唤醒
+        core.advance_conversation()
+        assert root.cid in core._dormant_cids
+        root.user_batch.to_tool_messages()  # 物化合并
+        assert json.loads(_batch(core, root.cid)[0][0]) == [
+            {"from": "init#2", "cid": 2, "icc_id": "ms#1", "content": "reply2"},
+        ]
+        core.advance_conversation()  # 子对话 2 收尾
+
+        # 子对话 1 返回（ms#0）：合并完成 → 发起者排到就绪队首
+        core.advance_conversation()
+        root.user_batch.to_tool_messages()  # 物化合并
+        assert json.loads(_batch(core, root.cid)[0][0]) == [
+            {"from": "init#2", "cid": 2, "icc_id": "ms#1", "content": "reply2"},
+            {"from": "init#1", "cid": 1, "icc_id": "ms#0", "content": "reply1"},
+        ]
+        assert root.cid in core._ready_cids
+        assert root.cid not in core._dormant_cids
+        core.advance_conversation()  # 子对话 1 收尾
+        core.advance_conversation()  # root 收尾
+        assert core._active_cid is None
+
+    def test_single_message_mode(self):
+        """单目标 message 模式：确认响应满足配对，返回以消息形式投递并唤醒发起者"""
+        core, root, child = self._child_setup()
+        core.lmu = MockLMU([
+            (None, [{"call_id": "si", "cmd_type": "send_instruction", "args": {"cid": child.cid, "content": "ask", "wait": True, "return_mode": "message"}}], None),
+            (None, [{"call_id": "rr", "cmd_type": "return_result", "args": {"content": "msg-reply", "icc_id": "si"}}], None),
+            ("ok", [], None),
+            ("done", [], None),
+        ])
+
+        # root: 发送 → 确认响应 + root 休眠，child 活跃
+        core.advance_conversation()
+        assert _batch(core, root.cid) == [("已投递到 init#1", "si")]
+        assert root.cid in core._dormant_cids
+
+        # child: return_result → 消息投递 root 并唤醒
+        core.advance_conversation()
+        msg = json.loads(root.user_batch.user_contents[-1])
+        assert msg == {"from": "init#1", "to": "init", "icc_id": "si", "content": "msg-reply"}
+        assert root.cid in core._ready_cids
+
+        core.advance_conversation()  # child 收尾
+        core.advance_conversation()  # root 收尾
+        assert core._active_cid is None
 
 
 class TestIccRouting:
@@ -562,7 +660,7 @@ class TestServiceScheduling:
         assert st1["active"] == svc.cid
         assert root.cid in st1["dormant"]
         assert root.cid not in st1["ready"]
-        assert svc.user_batch.user_contents == [json.dumps({"icc_id": "cc", "content": "2+3"})]
+        assert svc.user_batch.user_contents == [json.dumps({"from": "init", "to": "init#1", "icc_id": "cc", "content": "2+3"})]
 
         # svc: return_result → 结论投递 root、root 排到下一个、svc 收到确认（保持活跃）
         core.advance_conversation()

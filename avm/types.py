@@ -1,4 +1,5 @@
 """AVM 类型系统：带元数据的集合类"""
+import json
 from typing import Dict, Optional
 
 
@@ -229,6 +230,16 @@ class Conversation:
         self.service_desc = service_desc
         self.name = name
         self.validate(require_last_assistant=False)
+
+    @property
+    def identity(self) -> str:
+        """对话身份：有名字用名字；无名字（亚对话）用父身份 + 自身 cid。"""
+        if self.name:
+            return self.name
+        if self.parent is not None:
+            parent_name = self.parent.name or str(self.parent.cid)
+            return f"{parent_name}#{self.cid}"
+        return str(self.cid)
     
     
 
@@ -339,8 +350,32 @@ class UserMessageBatch:
     tool_responses: List[ToolMessage] = field(default_factory=list)
     user_contents: List[str] = field(default_factory=list)
 
-    def add_tool_response(self, content: str, tool_call_id: str) -> None:
-        """添加工具响应"""
+    def __post_init__(self):
+        # 结构化合并段：tool_call_id → [{from, cid, icc_id, content}, ...]
+        self._merged: dict = {}
+
+    def add_tool_response(
+        self,
+        content: str,
+        tool_call_id: str,
+        from_identity: str = None,
+        cid: int = None,
+        icc_id: str = None,
+    ) -> None:
+        """添加工具响应。
+        from_identity/cid/icc_id 非空时为结构化返回段：同 tool_call_id 的多个段
+        合并为一个 JSON 数组（多播工具返回，方便 Python 程序 json.loads 解读）；
+        无结构化信息时按普通工具响应追加。
+        """
+        if from_identity is not None:
+            segment = {"from": from_identity, "cid": cid, "icc_id": icc_id, "content": content}
+            if tool_call_id in self._merged:
+                self._merged[tool_call_id].append(segment)
+            else:
+                self._merged[tool_call_id] = [segment]
+                # 占位工具响应保证 call_id 配对；内容在 to_tool_messages 时物化为 JSON 数组
+                self.tool_responses.append(ToolMessage(content="", tool_call_id=tool_call_id))
+            return
         self.tool_responses.append(ToolMessage(content=content, tool_call_id=tool_call_id))
 
     def add_user_content(self, content: str) -> None:
@@ -351,6 +386,7 @@ class UserMessageBatch:
         """清空所有内容"""
         self.tool_responses.clear()
         self.user_contents.clear()
+        self._merged.clear()
 
     @classmethod
     def from_any_list(cls, items: List[Union[Tuple[str, str], str]]) -> 'UserMessageBatch':
@@ -364,11 +400,15 @@ class UserMessageBatch:
         return batch
 
     def to_tool_messages(self) -> List[dict]:
-        """转换为工具消息列表"""
-        return [
-            {"role": "tool", "content": resp.content, "tool_call_id": resp.tool_call_id}
-            for resp in self.tool_responses
-        ]
+        """转换为工具消息列表；结构化合并段在此物化为 JSON 数组。"""
+        out = []
+        for resp in self.tool_responses:
+            content = resp.content
+            if resp.tool_call_id in self._merged:
+                content = json.dumps(self._merged[resp.tool_call_id], ensure_ascii=False)
+                resp.content = content  # 物化，供提交到对话历史时使用
+            out.append({"role": "tool", "content": content, "tool_call_id": resp.tool_call_id})
+        return out
 
     def get_user_content(self) -> str:
         """获取合并后的用户内容"""

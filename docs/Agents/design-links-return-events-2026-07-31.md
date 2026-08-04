@@ -42,3 +42,20 @@
 - **父不再是默认接收者（废弃 parent 回退）**：创建关系不构成返回通道；AI 的思考不默认透露给其他 AI；子对话输出默认写入共享内存（`$MEM`），谁需要谁读。
 - **create_sub 保持原样**：保留 `user_ref`，立即执行，完成自动写回并唤醒父（紧耦合；亚对话是父的控制延伸，功能上不可信）。
 - **取代旧决定**：~~"create_cmd 的父进休眠队列"~~（绑定旧语义"创建即执行"，已废弃）；~~"return_result 的 parent 回退"~~（已废弃）。与现有代码的冲突（parent 回退、单槽 caller_cid、create_cmd 带 user_ref 且父休眠）均已标记，待实现。
+
+## Python 对话与消息格式 v2（2026-08-04 设计确认，按用户计划改动）
+
+- **Python 对话接口与各家 AI 厂商提供的 API 一致（兼容 OpenAI）**：输入 OpenAI 格式 messages 列表，输出 content + tool_calls，与真实 LLM 端点对等（用户纠正：不是"和 LMU 一样"，LMU 只是真实 API 的客户端适配器）。程序以 `type="python"` 节点存在内存中，Core 加载代码并实例化执行器。para 对 Python 对话意义减少，暂不管。
+- **消息格式 v2**：投递消息为 JSON 字符串，字段 `from`、`to`、`icc_id`、`content`。`to` 是名字或名字列表；多播时每个目标建立一条独立 ICC 记录（各自可 return_result）。
+- **名字身份**：名字不唯一；冲突时用 settingup 文件地址消歧（如 `MEM.math Analysis`）。带名字的对话必然来自 settingup 文件（create_cmd 创建），文件地址可作名字；亚对话（直接传提示词）没有名字。name 是信息不是元信息（不放 meta/ctrl，放节点数据）。
+- **寻址职责划分**：`send_instruction` 只用 cid；名字↔cid 转换是内核（kernel）职责，不是 VM 职责——简单内核字符串匹配，复杂内核可支持 AI 匹配。VM 只按 cid / ICC 路由。
+
+## 消息 v2 实施（2026-08-04，按用户计划改动）
+
+- `send_instruction` / `call_service` 投递消息为 JSON 字符串：`from`、`to`、`icc_id`、`content`。`from`/`to` 由 Core 填身份：有名字用名字；无名字（亚对话）= 父身份 + 自身 cid（如 `init#1`）。
+- `create_cmd` 从 settingup 节点的 name 数据字段（value.name，信息不是元信息）读取对话名字。
+- 多播：`send_instruction` 的 cid 可为整数列表；每个目标一条独立 ICC 记录（icc_id = `call_id#i`）；消息的 `to` 为名字列表。
+- **两种返回方式统一**（2026-08-04）：`send_instruction` / `call_service` 带 `return_mode` 参数（`tool` 默认 / `message`）。
+  - `tool` 模式：返回为工具响应；多播时 `UserMessageBatch` 按 call_id 累积结构化段并物化为 JSON 数组（每条含 from/cid/icc_id/content，方便 Python 程序 json.loads 解读），一次工具调用只有一次返回；发起者在所有目标返回前休眠，最后一个返回到达时被唤醒。
+  - `message` 模式：发送时给"已投递到 X"确认响应满足 API 配对；各目标返回以消息（user content，含 from/to/icc_id/content）投递；返回到达时唤醒休眠的发起者（wait=false 时发起者继续，返回异步累积进 batch）。
+- 调度修正：发起者是否挂起由指令执行结果决定（成功投递/创建才置入休眠），不再由工具参数预先判定——失败的 send_instruction 不会把发起者挂起。
