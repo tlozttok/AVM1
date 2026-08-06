@@ -12,6 +12,7 @@ from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, m
 from .memory import Memory
 from .memory_device import MemoryDevice
 from .monitor import Monitor
+from .python_server import PLM_REGISTRY, create_plm
 
 
 def _report_tool_error(conv: Conversation, message: str):
@@ -485,6 +486,65 @@ def _build_tools() -> list:
     return [cls.tool_def for cls in _instruction_registry().values()]
 
 
+class PLMExecutor:
+    """把 PLMServer 适配成与 LMU 相同的 exec 接口，供 Core 统一调度。
+
+    输入：Conversation + para；内部构建 OpenAI 格式消息调用 PLM，
+    输出：(result, return_calls, conversation)，与 LMU.exec 形状一致。
+    """
+
+    def __init__(self, plm):
+        self.plm = plm
+        self.last_call: Optional[dict] = None
+
+    def exec(self, conversation: Conversation, para: MetaDict):
+        messages = conversation.to_api_messages()
+        messages.extend(conversation.user_batch.to_tool_messages())
+        user_content = conversation.user_batch.get_user_content()
+        if user_content:
+            messages.append({"role": "user", "content": user_content})
+
+        params = para.to_dict()
+        params["tools"] = _build_tools()
+        response = self.plm.handle_messages(messages, params)
+        result = response.get("content", "") or ""
+        return_calls = self._parse_tool_calls(response.get("tool_calls") or [])
+        self.last_call = {
+            "messages": messages,
+            "result": result,
+            "tool_calls": return_calls,
+        }
+
+        # 提交历史（与 LMU.exec 一致）：工具响应 → 用户内容 → 新的 assistant 消息
+        for resp in conversation.user_batch.tool_responses:
+            conversation.append_tool_message(resp.content, resp.tool_call_id)
+        if user_content:
+            conversation.append_user_message(user_content)
+        tc_list = [
+            {"id": t.get("id"), "type": t.get("type", "function"), "function": t.get("function")}
+            for t in (response.get("tool_calls") or [])
+        ] or None
+        conversation.append_assistant_message(result, tool_calls=tc_list)
+        return result, return_calls, conversation
+
+    @staticmethod
+    def _parse_tool_calls(tool_calls: list) -> list:
+        out = []
+        for tc in tool_calls:
+            fn = tc.get("function") or {}
+            args_raw = fn.get("arguments", "{}")
+            try:
+                args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+            except ValueError as e:
+                out.append({
+                    "call_id": tc.get("id"), "cmd_type": "json_error",
+                    "args": {"error": str(e), "name": fn.get("name"), "raw": args_raw},
+                })
+                continue
+            out.append({"call_id": tc.get("id"), "cmd_type": fn.get("name"), "args": args})
+        return out
+
+
 class _ServicesDevice(MemoryDevice):
     def __init__(self, core: 'Core'):
         self._core = core
@@ -509,11 +569,21 @@ class _ServicesDevice(MemoryDevice):
 
 
 def _build_conversation(core: 'Core', system_ref: str, user_ref: str, para_ref: str, parent: Conversation, is_sub: bool) -> Conversation:
-    system = core.unwrap(system_ref)
+    node = core.unwrap(system_ref, for_llm=False)
+    if isinstance(node, MetaDict):
+        content = node.get("content")
+        system = content if isinstance(content, str) else node.to_llm_string()
+        is_python = (node.get_ctrl() or {}).get("type") == "python"
+    elif isinstance(node, str):
+        system = node
+        is_python = False
+    else:
+        system = str(node)
+        is_python = False
     messages = [SystemMessage(content=system)]
     if user_ref:
         messages.append(UserMessage(content=core.unwrap(user_ref)))
-    core.unwrap(para_ref, for_llm=False)
+    para_node = core.unwrap(para_ref, for_llm=False)
     conv = Conversation(
         messages=messages,
         cid=0,
@@ -522,6 +592,8 @@ def _build_conversation(core: 'Core', system_ref: str, user_ref: str, para_ref: 
         is_root=False,
     )
     core._register(conv)
+    conv.para_ref = para_ref
+    conv.is_python = is_python
     return conv
 
 
@@ -668,6 +740,7 @@ class Core:
         self.lmu: LMU = LMU()
         self._icc: dict = {}  # icc_id → (发起者 cid, 发起者调用的 call_id)
         self._icc_groups: dict = {}  # 多播工具返回：call_id → 尚未返回的目标数
+        self._executors: Dict[int, PLMExecutor] = {}  # cid → PLM 执行器（Python 对话；PLM 状态跨轮次保留）
         self.debug: bool = False
         self.monitor: Monitor = Monitor()
         self.para_ref: str = "$MEM.model_params"
@@ -744,9 +817,10 @@ class Core:
 
     def advance_conversation(self):
         conv = self._conv_by_cid[self._active_cid]
-        para = self._get_para()
+        para = self._get_para(conv)
+        executor = self._get_executor(conv, para)
         try:
-            result, return_calls, _ = self.lmu.exec(conv, para)
+            result, return_calls, _ = executor.exec(conv, para)
             conv.user_batch.clear()
 
             if return_calls:
@@ -762,10 +836,28 @@ class Core:
         else:
             self.monitor.record(self)
 
-    def _get_para(self):
-        """按 para_ref 读取模型调用参数（镜像可配置，默认 $MEM.model_params）"""
+    def _get_executor(self, conv: Conversation, para: MetaDict):
+        """按对话的程序类型选择执行器（由 Core 管理，不挂在对话上）。
+        Python 对话：model 必须在 PLM_REGISTRY 中，否则报错（不静默回退）；
+        LLM 对话：用 core.lmu（model 交给 API 校验）。"""
+        if conv.cid in self._executors:
+            return self._executors[conv.cid]
+        model = para.get("model")
+        if conv.is_python:
+            if not isinstance(model, str) or model not in PLM_REGISTRY:
+                raise ValueError(
+                    f"Python 对话 {conv.cid} 的 model {model!r} 不在 PLM_REGISTRY 中（可用: {list(PLM_REGISTRY)}）"
+                )
+            executor = PLMExecutor(create_plm(model))
+            self._executors[conv.cid] = executor
+            return executor
+        return self.lmu
+
+    def _get_para(self, conv: Conversation):
+        """按对话自己的 para_ref 读取模型调用参数（缺省用 Core.para_ref）"""
+        para_ref = getattr(conv, "para_ref", None) or self.para_ref
         try:
-            para = self.unwrap(self.para_ref, for_llm=False)
+            para = self.unwrap(para_ref, for_llm=False)
             if not isinstance(para, MetaDict):
                 para = MetaDict(data={"model": "gpt-4"})
         except VMMemoryError:
@@ -781,6 +873,7 @@ class Core:
             is_root=True,
         )
         self._register(conv)
+        conv.para_ref = para_ref
         self._ready_cids.append(conv.cid)
         return conv
 

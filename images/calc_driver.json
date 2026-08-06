@@ -1,0 +1,55 @@
+{
+  "meta": {
+    "name": "calc_driver",
+    "version": 1,
+    "description": "AI 接收自然语言表达式描述 → 转成一行 Python 表达式 → 交给计算器 PLM 对话求值 → 返回结果"
+  },
+  "mem": {
+    "system": {
+      "kind": "str",
+      "value": "你是 AVM 中运行的 init 对话。\n\n循环协议：\n1. memory_read(\"$MEM.inputs.-1\") 读取用户输入（自然语言表达式描述，如“3 加 5 乘以 2”）；\n2. 把描述转换成一行的 Python 表达式（如 3 + 5 * 2），只允许数字、四则运算、括号和 math 函数（math.sqrt、math.sin 等）；\n3. memory_read(\"$MEM.calc_cid\") 查计算器句柄：如果返回错误（键不存在），用 create_cmd(system_ref=\"$MEM.calc_program\", para_ref=\"$MEM.calc_params\") 创建计算器对话，从响应中提取 cid 数字，用 memory_write(\"$MEM.calc_cid\", 数字) 存起来；\n4. send_instruction(cid=计算器 cid, content=表达式, wait=true) 发送并等待返回；\n5. 把返回的结果写入 memory_write(\"$MEM.outputs.-1\", 结果)，回到步 1。\n输入为“exit”时，输出告别并结束，不要调用工具。\n\n可用工具：memory_read、memory_write、memory_make、create_cmd、create_sub、register_service、call_service、transfer_service、return_result、send_instruction。"
+    },
+    "user": {
+      "kind": "str",
+      "value": "开始"
+    },
+    "model_params": {
+      "kind": "dict",
+      "meta": "init 对话的 LLM 参数",
+      "ctrl": { "type": "para" },
+      "value": {
+        "model": { "kind": "str", "value": "deepseek-v4-flash" }
+      }
+    },
+    "calc_program": {
+      "kind": "dict",
+      "meta": "计算器 PLM 程序（SimplePLM 无状态，内容可为空）",
+      "ctrl": { "type": "python" },
+      "value": {
+        "name": { "kind": "str", "value": "calc" },
+        "content": { "kind": "str", "value": "" }
+      }
+    },
+    "calc_params": {
+      "kind": "dict",
+      "meta": "计算器 PLM 的参数（model 选择 PLM 类型）",
+      "ctrl": { "type": "para" },
+      "value": {
+        "model": { "kind": "str", "value": "plm.simple" }
+      }
+    },
+    "inputs": { "kind": "device" },
+    "outputs": { "kind": "device" }
+  },
+  "para_ref": "$MEM.model_params",
+  "devices": [
+    { "path": "inputs", "file": "devices/io.py", "class": "InputsListDevice", "args": {} },
+    { "path": "outputs", "file": "devices/io.py", "class": "OutputsListDevice", "args": {} }
+  ],
+  "init": {
+    "name": "init",
+    "system_ref": "$MEM.system",
+    "user_ref": "$MEM.user"
+  },
+  "persist_to": "out/mem.json"
+}

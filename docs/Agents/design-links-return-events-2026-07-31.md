@@ -50,6 +50,14 @@
 - **名字身份**：名字不唯一；冲突时用 settingup 文件地址消歧（如 `MEM.math Analysis`）。带名字的对话必然来自 settingup 文件（create_cmd 创建），文件地址可作名字；亚对话（直接传提示词）没有名字。name 是信息不是元信息（不放 meta/ctrl，放节点数据）。
 - **寻址职责划分**：`send_instruction` 只用 cid；名字↔cid 转换是内核（kernel）职责，不是 VM 职责——简单内核字符串匹配，复杂内核可支持 AI 匹配。VM 只按 cid / ICC 路由。
 
+## Python 执行器实现进度（2026-08-04，按用户计划改动）
+
+- `avm/python_server.py`：`message_list_from_api_dict`（OpenAI 格式 dict → Message，assistant 无内容时跳过）；`PLMServer` 保存上一次输入，比较前后两次输入取最新消息（共同前缀之后的切片）。
+- Python 程序输出确定：AI 端角色消息（assistant）不处理；用户端角色有三种——system、user、tool（tool 返回值也是用户端消息），执行行为目前留空，逐条调用。
+- 约束：Python 程序与 AI 一样只能通过设备访问外部（网络/OS/IO 封锁），不直接触碰系统。
+- 入口 `handle_messages`：先解析工具定义（params 里的 OpenAI 格式 tools 列表）按名字存入实例字段 `_tools`（用户纠正：不是传入的 tool_calls，是工具定义）；再对最新消息逐个执行（`_dispatch` 分派 system/user/tool）；只有最后一个消息的返回被保留（程序确定性：同样输入序列只有同样输出），经 `make_response` 包装成 OpenAI 兼容 Response（{"content", "tool_calls"}）返回。处理函数返回原始消息（字符串或 Message），不自行包装。
+- 确定性与设备随机（2026-08-04 用户纠正）：程序的一个工具调用必然对应恰好一个返回（Core 无条件执行，返回值永远存在），不存在"派发/不派发工具调用"的概念。工具返回就是输入消息的一部分，程序处理输入消息、最后一条产生 Response。确定性的主体是程序（输入序列 → 输出的确定性函数），不是输入——设备可以随机（如 `$random`），随机值只是输入值，不影响程序本身是确定性函数。
+
 ## 消息 v2 实施（2026-08-04，按用户计划改动）
 
 - `send_instruction` / `call_service` 投递消息为 JSON 字符串：`from`、`to`、`icc_id`、`content`。`from`/`to` 由 Core 填身份：有名字用名字；无名字（亚对话）= 父身份 + 自身 cid（如 `init#1`）。

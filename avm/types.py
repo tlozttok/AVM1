@@ -218,6 +218,8 @@ class Conversation:
     metadata: Dict[str, str]
     service_desc: Optional[Dict[str, str]] = None  # {"name","what","needs","returns"}
     name: Optional[str] = None
+    para_ref: Optional[str] = None  # 本对话的 para 引用（缺省用 Core.para_ref）
+    is_python: bool = False  # 程序类型：True = Python 对话（system_ref 指向 type="python" 节点），False = LLM 对话
     
     def __init__(self, messages: List[Message] = None, cid: int = 0, is_sub:bool=False, parent: Optional['Conversation'] = None, is_root: bool = False, metadata: Dict[str, str] = None, service_desc: Dict[str, str] = None, name: Optional[str] = None):
         self.messages = messages or []
