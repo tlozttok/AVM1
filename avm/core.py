@@ -13,6 +13,10 @@ from .memory import Memory
 from .memory_device import MemoryDevice
 from .monitor import Monitor
 from .python_server import PLM_REGISTRY, create_plm
+from .info_devices import (
+    ConversationsDevice, SchedulerDevice, IccDevice,
+    MemorySummaryDevice, MonitorDevice,
+)
 
 
 def _report_tool_error(conv: Conversation, message: str):
@@ -127,11 +131,11 @@ class CreateInstruction(Instruction):
         "type": "function",
         "function": {
             "name": "create_cmd",
-            "description": "创建子对话（只创建并返回 cid，子对话进入休眠等待指令；本对话保持活跃）",
+            "description": "创建子对话（system_ref 必须指向 ctrl.type='settingup' 的 LLM 程序节点或 ctrl.type='python' 的 Python 程序节点；只创建并返回 cid，子对话进入休眠等待指令；本对话保持活跃）",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "system_ref": {"type": "string", "description": "系统提示词引用"},
+                    "system_ref": {"type": "string", "description": "程序节点引用（settingup 或 python）"},
                     "para_ref": {"type": "string", "description": "参数引用"},
                 },
                 "required": ["system_ref", "para_ref"],
@@ -142,8 +146,13 @@ class CreateInstruction(Instruction):
     para_ref: str
 
     def execute(self, core: 'Core', conv: Conversation):
-        node = core.unwrap(self.system_ref, for_llm=False)
-        child = _build_conversation(core, self.system_ref, "", self.para_ref, parent=conv, is_sub=False)
+        try:
+            node = core.unwrap(self.system_ref, for_llm=False)
+            child = _build_conversation(core, self.system_ref, self.para_ref, parent=conv, is_sub=False)
+        except (VMMemoryError, ValueError) as e:
+            # system_ref 不是程序节点或引用不存在：错误作为工具响应返回，不创建对话，本对话保持活跃可自纠
+            conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
+            return
         # 带名字的对话必然来自 settingup 文件：name 是节点数据字段，不是元信息
         if isinstance(node, MetaDict):
             name = node.get("name")
@@ -178,7 +187,14 @@ class CreateSubInstruction(Instruction):
     para_ref: str
 
     def execute(self, core: 'Core', conv: Conversation):
-        sub = _build_conversation(core, self.system_ref, self.user_ref, self.para_ref, parent=conv, is_sub=True)
+        try:
+            user_content = core.unwrap(self.user_ref)
+            sub = _build_conversation(core, self.system_ref, self.para_ref, parent=conv, is_sub=True)
+        except (VMMemoryError, ValueError) as e:
+            # system_ref 不是程序节点或引用不存在：错误作为工具响应返回，不创建对话，本对话保持活跃可自纠
+            conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
+            return
+        sub.append_user_message(user_content)  # 亚对话的任务在创建时直接给出
         sub.metadata["call_id"] = self.call_id
         # 父进入休眠等待亚对话完成，完成时由 core 唤醒（_on_conversation_finished）
         core._ready_cids.insert(0, sub.cid)
@@ -251,6 +267,7 @@ class CallServiceInstruction(Instruction):
             "caller_cid": conv.cid,
             "caller_call_id": self.call_id,
             "mode": return_mode,
+            "callee_cid": target_cid,
         }
         # 投递消息：JSON 字符串（默认格式），含 from/to/icc_id/content
         message = json.dumps({
@@ -264,7 +281,7 @@ class CallServiceInstruction(Instruction):
             core._dormant_cids.remove(target.cid)
         if target.cid in core._ready_cids:
             core._ready_cids.remove(target.cid)
-        core._ready_cids.insert(0, target.cid)
+        core._ready_cids.append(target.cid)  # 排队调度：被唤醒者进队列末尾
         if return_mode == "message":
             # 一次工具调用只能有一个工具响应：message 模式用确认响应满足配对
             conv.user_batch.add_tool_response(f"已投递到 {target.identity}", self.call_id)
@@ -323,7 +340,7 @@ class ReturnResultInstruction(Instruction):
     icc_id: str
 
     def execute(self, core: 'Core', conv: Conversation):
-        record = core._icc.pop(self.icc_id, None)
+        record = core._icc.get(self.icc_id)
         if record is None:
             msg = f"return_result 失败：ICC id {self.icc_id} 无对应请求记录"
             _report_tool_error(conv, msg)
@@ -332,13 +349,15 @@ class ReturnResultInstruction(Instruction):
         caller_cid = record["caller_cid"]
         call_id = record["caller_call_id"]
         mode = record.get("mode", "tool")
-        if caller_cid not in core._conv_by_cid:
-            msg = f"return_result 失败：发起者 {caller_cid} 不存在"
+        caller = core._conv_by_cid.get(caller_cid)
+        if caller is None or caller_cid in core._finished:
+            # 发起者不存在或已关闭：记录作废，不投递
+            core._drop_icc(self.icc_id, record)
+            msg = f"return_result 失败：发起者 {caller_cid} 不存在或已关闭"
             _report_tool_error(conv, msg)
             conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
             return
 
-        caller = core._conv_by_cid[caller_cid]
         if mode == "message":
             # 返回以消息形式投递（确认响应已单独给出）
             message = json.dumps({
@@ -359,17 +378,20 @@ class ReturnResultInstruction(Instruction):
                 )
                 core._icc_groups[group_key] -= 1
                 wake = core._icc_groups[group_key] <= 0
+                if wake:
+                    del core._icc_groups[group_key]
             else:
                 caller.user_batch.add_tool_response(self.content, call_id)
                 wake = True
         if wake:
-            # 确保发起者是下一个被激活的对话
+            # 排队调度：发起者进队列末尾（create_sub 是唯一前插例外）
             if caller_cid in core._dormant_cids:
                 core._dormant_cids.remove(caller_cid)
             if caller_cid in core._ready_cids:
                 core._ready_cids.remove(caller_cid)
-            core._ready_cids.insert(0, caller_cid)
+            core._ready_cids.append(caller_cid)
 
+        core._icc.pop(self.icc_id, None)  # 成功路由后移除记录
         # 该工具调用必须有一次返回（LLM API 规定）：告知本对话结果已发送
         conv.user_batch.add_tool_response("结果已发送", self.call_id)
         conv.metadata["returned"] = "1"
@@ -429,6 +451,11 @@ class SendInstruction(Instruction):
                 _report_tool_error(conv, msg)
                 conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
                 return
+            if cid in core._finished:
+                msg = f"send_instruction 失败：对话 {cid} 已关闭"
+                _report_tool_error(conv, msg)
+                conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
+                return
             resolved.append(target)
         to_value = [t.identity for t in resolved] if multicast else resolved[0].identity
 
@@ -439,6 +466,7 @@ class SendInstruction(Instruction):
                 "caller_call_id": self.call_id,
                 "mode": return_mode,
                 "group_key": self.call_id if multicast else None,
+                "callee_cid": target.cid,
             }
             message = json.dumps({
                 "from": conv.identity,
@@ -451,7 +479,7 @@ class SendInstruction(Instruction):
                 core._dormant_cids.remove(target.cid)
             if target.cid in core._ready_cids:
                 core._ready_cids.remove(target.cid)
-            core._ready_cids.insert(0, target.cid)
+            core._ready_cids.append(target.cid)  # 排队调度：被唤醒者进队列末尾
 
         if multicast and return_mode == "tool":
             # 工具返回多播：等所有目标返回后在 batch 中合并成一条工具响应，期间发起者休眠
@@ -470,6 +498,36 @@ class SendInstruction(Instruction):
                 core._dormant_cids.append(conv.cid)
 
 
+class CloseInstruction(Instruction):
+    tool_name = "close_conversation"
+    tool_def = {
+        "type": "function",
+        "function": {
+            "name": "close_conversation",
+            "description": "内核级关闭指令：关闭指定 cid 的对话（可关闭自身或其他对话），不需要被关闭对话的回应。关闭后该对话不可再调度、不可再被调用，记录为 finished；其注册的服务注销、PLM 状态释放、未完成调用清理（发给它的调用会以 Error 通知发起者并唤醒）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cid": {"type": "integer", "description": "要关闭的对话 cid（自身 cid 可从 create_cmd 的工具响应或 $MEM.conversations 获取）"},
+                },
+                "required": ["cid"],
+            }
+        }
+    }
+    cid: int
+
+    def execute(self, core: 'Core', conv: Conversation):
+        target = core._conv_by_cid.get(self.cid)
+        if target is None:
+            conv.user_batch.add_tool_response(f"Error: 对话 {self.cid} 不存在", self.call_id)
+            return
+        if self.cid in core._finished:
+            conv.user_batch.add_tool_response(f"Error: 对话 {self.cid} 已是 finished", self.call_id)
+            return
+        core._close_conversation(self.cid)
+        conv.user_batch.add_tool_response(f"对话 {self.cid} 已关闭（finished）", self.call_id)
+
+
 def _instruction_registry() -> Dict[str, Type[Instruction]]:
     return {
         cls.tool_name: cls
@@ -477,7 +535,7 @@ def _instruction_registry() -> Dict[str, Type[Instruction]]:
             MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction,
             CreateInstruction, CreateSubInstruction,
             RegisterServiceInstruction, CallServiceInstruction, TransferServiceInstruction,
-            ReturnResultInstruction, SendInstruction,
+            ReturnResultInstruction, SendInstruction, CloseInstruction,
         ]
     }
 
@@ -568,21 +626,20 @@ class _ServicesDevice(MemoryDevice):
         raise VMMemoryError("$services 只支持读（列出服务），不支持子路径")
 
 
-def _build_conversation(core: 'Core', system_ref: str, user_ref: str, para_ref: str, parent: Conversation, is_sub: bool) -> Conversation:
+def _build_conversation(core: 'Core', system_ref: str, para_ref: str, parent: Conversation, is_sub: bool) -> Conversation:
     node = core.unwrap(system_ref, for_llm=False)
-    if isinstance(node, MetaDict):
-        content = node.get("content")
-        system = content if isinstance(content, str) else node.to_llm_string()
-        is_python = (node.get_ctrl() or {}).get("type") == "python"
-    elif isinstance(node, str):
-        system = node
-        is_python = False
-    else:
-        system = str(node)
-        is_python = False
+    # 程序节点校验：与 Python 对话要求 ctrl.type='python' 对等，LLM 对话要求 ctrl.type='settingup'。
+    # str 节点、无类型 dict 节点（如参考手册）都不是程序，create_cmd/create_sub 不接受。
+    node_type = (node.get_ctrl() or {}).get("type") if isinstance(node, MetaDict) else None
+    if node_type not in ("settingup", "python"):
+        raise VMMemoryError(
+            f"{system_ref} 不是程序节点：system_ref 必须指向 ctrl.type='settingup'（LLM 程序）"
+            f"或 'python'（Python 程序）的 dict 节点"
+        )
+    content = node.get("content")
+    system = content if isinstance(content, str) else node.to_llm_string()
+    is_python = (node_type == "python")
     messages = [SystemMessage(content=system)]
-    if user_ref:
-        messages.append(UserMessage(content=core.unwrap(user_ref)))
     para_node = core.unwrap(para_ref, for_llm=False)
     conv = Conversation(
         messages=messages,
@@ -615,7 +672,7 @@ class LMU:
         "temperature", "max_tokens", "top_p", "frequency_penalty",
         "presence_penalty", "stop", "stream", "extra_body",
         "seed", "logit_bias", "logprobs", "top_logprobs",
-        "n", "response_format", "timeout",
+        "n", "response_format", "timeout", "reasoning_effort",
     }
     _NUMERIC_API_PARAMS: set = {
         "temperature", "max_tokens", "top_p", "frequency_penalty",
@@ -704,6 +761,8 @@ class LMU:
         choice = response.choices[0]
         message = choice.message
         result = message.content
+        # 思维链内容：防御性读取（openai SDK 对非标准响应字段的支持依赖版本）
+        reasoning_content = getattr(message, "reasoning_content", None)
         return_calls = self._return_calls_from_message(message)
 
         for resp in conversation.user_batch.tool_responses:
@@ -715,12 +774,17 @@ class LMU:
         tc_list = None
         if message.tool_calls:
             tc_list = [{"id": tc.id, "type": tc.type, "function": {"name": tc.function.name, "arguments": tc.function.arguments}} for tc in message.tool_calls]
-        conversation.append_assistant_message(result or "", tool_calls=tc_list)
+        conversation.append_assistant_message(
+            result or "",
+            tool_calls=tc_list,
+            reasoning_content=reasoning_content,
+        )
 
         self.last_call = {
             "model": model,
             "messages": messages,
             "result": result,
+            "reasoning": reasoning_content,
             "tool_calls": return_calls,
             "elapsed_ms": (time.time() - start) * 1000,
             "error": None,
@@ -741,10 +805,18 @@ class Core:
         self._icc: dict = {}  # icc_id → (发起者 cid, 发起者调用的 call_id)
         self._icc_groups: dict = {}  # 多播工具返回：call_id → 尚未返回的目标数
         self._executors: Dict[int, PLMExecutor] = {}  # cid → PLM 执行器（Python 对话；PLM 状态跨轮次保留）
+        self._finished: set = set()  # 已关闭（个体结束）的对话 cid；记录供监测/信息设备展示
+        self._instruction_budget: int = 50  # 每次激活的指令预算（核心中断阈值）
+        self._activation_instructions: int = 0
         self.debug: bool = False
         self.monitor: Monitor = Monitor()
         self.para_ref: str = "$MEM.model_params"
         self.mem.mount("services", _ServicesDevice(self))
+        self.mem.mount("conversations", ConversationsDevice(self))
+        self.mem.mount("scheduler", SchedulerDevice(self))
+        self.mem.mount("icc", IccDevice(self))
+        self.mem.mount("memory", MemorySummaryDevice(self))
+        self.mem.mount("monitor", MonitorDevice(self))
 
     def _register(self, conv: Conversation) -> Conversation:
         conv.cid = self._next_cid
@@ -783,7 +855,7 @@ class Core:
     def _on_conversation_finished(self, conv: Conversation, result: str):
         if conv.is_sub:
             parent = conv.parent
-            if parent is not None:
+            if parent is not None and parent.cid not in self._finished:
                 # 亚对话紧耦合：完成即唤醒父；已用 return_result 显式返回过则不再自动写回
                 if not conv.metadata.get("returned"):
                     call_id = conv.metadata.get("call_id", "direct_output")
@@ -792,6 +864,7 @@ class Core:
                     self._dormant_cids.append(conv.cid)
                 self._resume(parent.cid)
                 return
+            # 父已关闭：无处写回，亚对话按普通交互结束进入休眠
         # 交互结束：对话进入休眠（个体保留，等待事件/再次被调用）。
         # "finished" 是概念态（被内核级关闭指令关闭的对话），Core 调度状态只有活跃/休眠/就绪。
         if conv.cid not in self._dormant_cids:
@@ -800,20 +873,110 @@ class Core:
         self._pick_next_active()
 
     def _resume(self, cid: int):
-        """将等待中的对话唤醒为活跃对话：清除休眠/就绪标记后直接激活。"""
+        """将等待中的对话唤醒为活跃对话（亚对话完成唤醒父：同一调用链，延续预算不重置）。"""
+        if cid in self._finished:
+            return  # 已关闭的对话不可再被激活
         if cid in self._dormant_cids:
             self._dormant_cids.remove(cid)
         if cid in self._ready_cids:
             self._ready_cids.remove(cid)
         self._active_cid = cid
 
+    def _close_conversation(self, cid: int) -> None:
+        """内核级关闭：对话个体结束，不需要被关闭对话的回应。
+
+        效果：标记 finished、移出调度队列、释放 PLM 执行器（变量空间）、
+        注销其注册的服务、清理未完成调用（其发起的调用作废；发给它的调用
+        以 Error 通知发起者并按组/单目标唤醒）。
+        """
+        if cid in self._finished:
+            return
+        self._finished.add(cid)
+        if cid in self._ready_cids:
+            self._ready_cids.remove(cid)
+        if cid in self._dormant_cids:
+            self._dormant_cids.remove(cid)
+        self._executors.pop(cid, None)  # 释放 PLM 状态（命名空间等）
+        for name in [n for n, svc_cid in self._services.items() if svc_cid == cid]:
+            del self._services[name]
+        closed = self._conv_by_cid.get(cid)
+        closed_identity = closed.identity if closed is not None else str(cid)
+        for icc_id, rec in list(self._icc.items()):
+            if rec.get("caller_cid") == cid:
+                # 已关闭对话发起的调用：无接收者，记录作废（多播组计数同步递减）
+                self._drop_icc(icc_id, rec)
+            elif rec.get("callee_cid") == cid:
+                # 发给已关闭对话的调用：通知发起者（工具响应或消息）并唤醒
+                caller_cid = rec["caller_cid"]
+                caller = self._conv_by_cid.get(caller_cid)
+                group_key = rec.get("group_key")
+                mode = rec.get("mode", "tool")
+                call_id = rec["caller_call_id"]
+                self._drop_icc(icc_id, rec)
+                if caller is None or caller_cid in self._finished:
+                    continue
+                if mode == "message":
+                    message = json.dumps({
+                        "from": closed_identity,
+                        "to": caller.identity,
+                        "icc_id": icc_id,
+                        "content": f"Error: 对方已关闭（{cid}），请求未完成",
+                    }, ensure_ascii=False)
+                    caller.user_batch.add_user_content(message)
+                    wake = True
+                elif group_key is not None:
+                    # 多播工具返回：作为一段错误并入组，组归零才唤醒发起者
+                    caller.user_batch.add_tool_response(
+                        f"Error: 对方已关闭（{cid}），请求未完成",
+                        call_id,
+                        from_identity=closed_identity, cid=cid, icc_id=icc_id,
+                    )
+                    wake = self._icc_groups.get(group_key, 0) <= 0
+                else:
+                    caller.user_batch.add_tool_response(
+                        f"Error: 对方已关闭（{cid}），请求未完成", call_id
+                    )
+                    wake = True
+                if wake:
+                    if caller_cid in self._dormant_cids:
+                        self._dormant_cids.remove(caller_cid)
+                    if caller_cid in self._ready_cids:
+                        self._ready_cids.remove(caller_cid)
+                    self._ready_cids.append(caller_cid)
+
+    def _drop_icc(self, icc_id: str, rec: dict) -> None:
+        """移除一条 ICC 记录；多播组计数同步递减，组归零时清理组记录。"""
+        group_key = rec.get("group_key")
+        if group_key is not None and group_key in self._icc_groups:
+            self._icc_groups[group_key] -= 1
+            if self._icc_groups[group_key] <= 0:
+                del self._icc_groups[group_key]
+        self._icc.pop(icc_id, None)
+
     def _pick_next_active(self):
         if self._ready_cids:
-            self._active_cid = self._ready_cids.pop(0)
-            if self._active_cid in self._dormant_cids:
-                self._dormant_cids.remove(self._active_cid)
+            picked = self._ready_cids.pop(0)
+            if picked in self._dormant_cids:
+                self._dormant_cids.remove(picked)
+            if not self._same_chain(self._active_cid, picked):
+                self._activation_instructions = 0  # 调用链断开：新链重新给满预算
+            self._active_cid = picked
         else:
             self._active_cid = None
+
+    def _same_chain(self, prev_cid, new_cid) -> bool:
+        """亚对话与父对话是同一调用链（预算共享）：
+        亚对话激活时续用父的剩余预算；亚对话完成、父恢复时也续用。
+        create_cmd 子对话（is_sub=False）独立预算，不在此列。"""
+        prev = self._conv_by_cid.get(prev_cid)
+        new = self._conv_by_cid.get(new_cid)
+        if prev is None or new is None:
+            return False
+        if new.is_sub and new.parent is not None and new.parent.cid == prev.cid:
+            return True
+        if prev.is_sub and prev.parent is not None and prev.parent.cid == new.cid:
+            return True
+        return False
 
     def advance_conversation(self):
         conv = self._conv_by_cid[self._active_cid]
@@ -825,16 +988,27 @@ class Core:
 
             if return_calls:
                 self._process_return_calls(return_calls, conv)
-                # 是否挂起由指令执行结果决定（成功投递/创建才把发起者置入休眠）
-                if conv.cid in self._dormant_cids:
+                self._activation_instructions += len(return_calls)
+                if conv.cid in self._finished:
+                    # 内核级关闭（个体结束）：本轮结束后选择下一个活跃对话
+                    self._active_cid = None
+                    self._pick_next_active()
+                elif conv.cid in self._dormant_cids:
+                    # 对话自己让出（等待返回/子完成）
+                    self._pick_next_active()
+                elif self._activation_instructions >= self._instruction_budget:
+                    # 核心中断：工具返回已加入 batch、状态完整；让出执行权，进就绪队列末尾
+                    self._activation_instructions = 0  # 链被中断，重新计数
+                    if conv.cid not in self._ready_cids:
+                        self._ready_cids.append(conv.cid)
                     self._pick_next_active()
             else:
                 self._on_conversation_finished(conv, result)
         except Exception as e:
-            self.monitor.record(self, error=e)
+            self.monitor.record(self, error=e, last_call=getattr(executor, "last_call", None))
             raise
         else:
-            self.monitor.record(self)
+            self.monitor.record(self, last_call=getattr(executor, "last_call", None))
 
     def _get_executor(self, conv: Conversation, para: MetaDict):
         """按对话的程序类型选择执行器（由 Core 管理，不挂在对话上）。

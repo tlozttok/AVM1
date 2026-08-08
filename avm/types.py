@@ -185,6 +185,7 @@ class AssistantMessage(Message):
     """助手消息"""
     role: str = "assistant"
     tool_calls: Optional[List[ToolCall]] = None
+    reasoning_content: Optional[str] = None
 
 
 @dataclass
@@ -196,8 +197,12 @@ class ToolMessage(Message):
 
 def message_to_api_dict(msg: Message) -> dict:
     d: dict = {"role": msg.role, "content": msg.content}
-    if isinstance(msg, AssistantMessage) and msg.tool_calls:
-        d["tool_calls"] = msg.tool_calls
+    if isinstance(msg, AssistantMessage):
+        # 用户决定：回传所有推理内容（越来越多的模型回传全部思维链）。
+        # 总是带 reasoning_content 字段：有值带值，无值带空字符串。
+        d["reasoning_content"] = msg.reasoning_content or ""
+        if msg.tool_calls:
+            d["tool_calls"] = msg.tool_calls
     if isinstance(msg, ToolMessage):
         d["tool_call_id"] = msg.tool_call_id
     return d
@@ -302,9 +307,19 @@ class Conversation:
         """添加用户消息"""
         self.messages.append(UserMessage(role=Role.CMD.value, content=content))
 
-    def append_assistant_message(self, content: str, tool_calls: Optional[List[dict]] = None) -> None:
+    def append_assistant_message(
+        self,
+        content: str,
+        tool_calls: Optional[List[dict]] = None,
+        reasoning_content: Optional[str] = None,
+    ) -> None:
         """添加助手消息"""
-        self.messages.append(AssistantMessage(role=Role.ASSISTANT.value, content=content, tool_calls=tool_calls))
+        self.messages.append(AssistantMessage(
+            role=Role.ASSISTANT.value,
+            content=content,
+            tool_calls=tool_calls,
+            reasoning_content=reasoning_content,
+        ))
 
     def append_tool_message(self, content: str, tool_call_id: str) -> None:
         """添加工具响应消息"""

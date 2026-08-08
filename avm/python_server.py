@@ -1,7 +1,10 @@
 
+import contextlib
+import hashlib
+import io
 import json
 import math
-import hashlib
+import re
 from typing import List
 from abc import ABC, abstractmethod
 
@@ -9,6 +12,7 @@ from .types import (
     Conversation, MetaDict, MetaList, Role, message_to_api_dict, Message,
     SystemMessage, UserMessage, AssistantMessage, ToolMessage,
 )
+from .sandbox import safe_globals, exec_safe, check_code
 
 
 def message_list_from_api_dict(messages: List[dict]) -> List[Message]:
@@ -25,7 +29,11 @@ def message_list_from_api_dict(messages: List[dict]) -> List[Message]:
         elif role == "user":
             result.append(UserMessage(content=content))
         elif role == "assistant":
-            result.append(AssistantMessage(content=content or "", tool_calls=d.get("tool_calls")))
+            result.append(AssistantMessage(
+                content=content or "",
+                tool_calls=d.get("tool_calls"),
+                reasoning_content=d.get("reasoning_content"),
+            ))
         elif role == "tool":
             result.append(ToolMessage(content=content, tool_call_id=d.get("tool_call_id", "")))
         else:
@@ -179,8 +187,9 @@ class SimplePLM(PLMServer):
             expr = msg["content"]
             icc_id = msg.get("icc_id")
         try:
-            # eval 模式天然只接受单个表达式；受限命名空间禁用内置函数
-            value = eval(compile(expr, "<expr>", "eval"), {"__builtins__": {}, "math": math}, {})
+            # eval 模式天然只接受单个表达式；受限命名空间（安全 builtins + math）
+            check_code(expr, mode="eval")
+            value = eval(compile(expr, "<expr>", "eval"), safe_globals({"math": math}), {})
             result = str(value)
         except Exception as e:
             result = f"错误: {type(e).__name__}: {e}"
@@ -201,8 +210,58 @@ class SimplePLM(PLMServer):
         return ""
 
 
+class PythonPLM(PLMServer):
+    """图灵完备 PLM：Jupyter 笔记本式——系统/用户提示词都执行进同一个持久命名空间，
+    stdout 全部捕获并按顺序拼接为整体返回。
+
+    固定行为模式：
+    - 系统提示词：setup 代码，受限执行进持久命名空间（跨轮次保留）；
+    - 用户提示词：代码，也执行进同一个命名空间（与 setup 共享变量、可读写）；
+    - 多个 print 全部执行，输出按顺序拼接为一个整体作为返回；
+    - 信封带 icc_id 时自动构造 return_result 返回；
+    - 沙箱：安全 builtins 白名单 + AST 检查（禁 import、禁双下划线属性、禁危险调用）。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.namespace = safe_globals({"math": math, "json": json, "re": re})
+
+    def _execute_system_message(self, content: str):
+        exec_safe(content, self.namespace)
+
+    def _execute_user_message(self, content: str):
+        msg = self.parse_message(content)
+        code = content
+        icc_id = None
+        if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+            code = msg["content"]
+            icc_id = msg.get("icc_id")
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                exec_safe(code, self.namespace)
+            result = buf.getvalue()
+        except Exception as e:
+            result = f"错误: {type(e).__name__}: {e}"
+        if icc_id:
+            tool_calls = [{
+                "id": self.call_id_for(content),
+                "type": "function",
+                "function": {
+                    "name": "return_result",
+                    "arguments": json.dumps({"content": result, "icc_id": icc_id}),
+                },
+            }]
+            return self.make_response(result, tool_calls=tool_calls)
+        return result
+
+    def _execute_tool_message(self, content: str, call_id: str):
+        return ""
+
+
 PLM_REGISTRY = {
     "plm.simple": SimplePLM,
+    "plm.python": PythonPLM,
 }
 
 

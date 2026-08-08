@@ -4,9 +4,10 @@ import os
 
 import pytest
 
-from avm.core import Core
+from avm.core import Core, _build_conversation
 from avm.monitor import Monitor
 from avm.types import MetaDict
+from types import SimpleNamespace
 
 
 class MockLMU:
@@ -92,7 +93,7 @@ class TestFrameSequence:
             (None, [{"call_id": "c", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.s", "para_ref": "$MEM.p"}}], None),
         ])
         _new_root(core)
-        core.mem["s"] = "x"
+        core.mem["s"] = MetaDict(data={"content": "x"}, ctrl={"type": "settingup"})
         core.mem["p"] = MetaDict(data={"model": "test"})
         core._active_cid = core._ready_cids.pop(0)
         core.monitor.record_baseline(core)
@@ -230,6 +231,57 @@ class TestExceptionPath:
         assert lmu.last_call["error"] == "ConnectionError: network down"
         assert lmu.last_call["messages"][-1]["role"] == "user"
         assert core.monitor.frame(1).lmu["error"] == "ConnectionError: network down"
+
+    def test_reasoning_recorded_like_result(self):
+        """真实 LMU.exec：reasoning_content 与 result 一样进帧（同截断策略）"""
+        class FakeCompletions:
+            @staticmethod
+            def create(**kwargs):
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                    content="final",
+                    reasoning_content="链式思考内容链式思考内容",
+                    tool_calls=None,
+                ))])
+
+        class FakeChat:
+            completions = FakeCompletions
+
+        class FakeClient:
+            chat = FakeChat
+
+        from avm.core import LMU
+
+        lmu = LMU()
+        lmu._client = FakeClient
+        core = make_core()
+        core.lmu = lmu
+        core.monitor = Monitor(max_item_len=8)
+        _new_root(core)
+        core._active_cid = core._ready_cids.pop(0)
+        core.monitor.record_baseline(core)
+
+        core.advance_conversation()
+
+        f = core.monitor.frame(1)
+        assert f.lmu["result"] == "final"
+        assert f.lmu["reasoning"] == "链式思考内容链式..."
+
+    def test_plm_executor_last_call_recorded_in_frame(self):
+        """Python 对话执行后，监测器帧记录 PLM 执行器的 last_call（result/tool_calls）"""
+        core = make_core()
+        core.mem["prog"] = MetaDict(data={"content": ""}, ctrl={"type": "python"})
+        core.mem["p"] = MetaDict(data={"model": "plm.simple"}, ctrl={"type": "para"})
+        root = _build_conversation(core, "$MEM.prog", "$MEM.p", parent=None, is_sub=False)
+        root.append_user_message("6 * 7")
+        core._ready_cids.append(root.cid)
+        core._active_cid = root.cid
+        core.monitor.record_baseline(core)
+
+        core.advance_conversation()
+
+        f = core.monitor.frame(1)
+        assert f.lmu["result"] == "42"
+        assert f.lmu["tool_calls"] == []
 
 
 class TestTranscript:

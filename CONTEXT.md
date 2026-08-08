@@ -62,6 +62,9 @@ AVM 的指令分发层和调度器。不参与管理决策——只执行指令�
 **调度模型指令 (Scheduling model instructions)**:
 `register_service`、`call_service`、`transfer_service`、`return_result`、`send_instruction`——对话间的调度关系管理，控制服务注册、调用、移交、结果返回和按 cid 的指令投递。
 
+**内核指令 (Kernel instruction)**:
+`close_conversation`——关闭对话（个体结束）。可由对话自身或其他对话调用，不需要被关闭对话的回应；关闭后不可再调度、不可再被调用，记录为 finished。
+
 ### 内存与数据
 
 **内存 (Memory)**:

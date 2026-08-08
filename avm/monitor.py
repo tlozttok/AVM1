@@ -27,7 +27,7 @@ class Frame:
     """一轮推进结束后的状态向量"""
     seq: int
     ts: float
-    lmu: Dict[str, Any]                 # result / tool_calls / elapsed_ms / error
+    lmu: Dict[str, Any]                 # result / reasoning / tool_calls / elapsed_ms / error
     sched: Dict[str, Any]               # active_cid / ready_cids / dormant_cids / next_cid
     conversations: Dict[int, Dict[str, Any]]  # cid -> state / msgs / batch
 
@@ -55,9 +55,18 @@ class Monitor:
         self._frames.append(self._build_frame(core))
         self._next_seq += 1
 
-    def record(self, core, error: Optional[BaseException] = None) -> None:
-        """一轮推进结束时调用：写全文段（可选）+ 追加一帧"""
-        last_call = getattr(core.lmu, "last_call", None)
+    def record(
+        self,
+        core,
+        error: Optional[BaseException] = None,
+        last_call: Optional[dict] = None,
+    ) -> None:
+        """一轮推进结束时调用：写全文段（可选）+ 追加一帧
+
+        last_call：本轮执行的调用记录（LLM 用 core.lmu，Python 对话用对应 PLMExecutor）；
+        为 None 时回退到 core.lmu.last_call（兼容直接调用与 MockLMU）。"""
+        if last_call is None:
+            last_call = getattr(core.lmu, "last_call", None)
         if self._transcript_path and last_call is not None:
             self._write_transcript(self._next_seq, last_call)
         self._frames.append(self._build_frame(core, last_call=last_call, error=error))
@@ -76,6 +85,8 @@ class Monitor:
         if last_call:
             lmu = {
                 "result": _truncate(last_call.get("result"), self._max_item_len),
+                # reasoning_content 与普通内容同样记录（思维链等价于传统代码的调试输出）
+                "reasoning": _truncate(last_call.get("reasoning"), self._max_item_len),
                 "tool_calls": [self._summarize_tc(tc) for tc in (last_call.get("tool_calls") or [])],
                 "elapsed_ms": last_call.get("elapsed_ms"),
                 "error": last_call.get("error") or (str(error) if error else None),
@@ -83,6 +94,7 @@ class Monitor:
         else:
             lmu = {
                 "result": None,
+                "reasoning": None,
                 "tool_calls": [],
                 "elapsed_ms": None,
                 "error": str(error) if error else None,

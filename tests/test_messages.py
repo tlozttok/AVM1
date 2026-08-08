@@ -86,12 +86,13 @@ class TestMessageToApiDict:
 
     def test_assistant_no_tool_calls(self):
         d = message_to_api_dict(AssistantMessage(content="ok"))
-        assert d == {"role": "assistant", "content": "ok"}
+        assert d == {"role": "assistant", "content": "ok", "reasoning_content": ""}
 
     def test_assistant_with_tool_calls(self):
         tc = [{"id": "1", "type": "function", "function": {"name": "read"}}]
         d = message_to_api_dict(AssistantMessage(content="", tool_calls=tc))
         assert d["tool_calls"] == tc
+        assert d["reasoning_content"] == ""
 
     def test_tool_message(self):
         d = message_to_api_dict(ToolMessage(content="result", tool_call_id="tc1"))
@@ -222,6 +223,13 @@ class TestConversationApi:
         assert conv.messages[-1].role == "assistant"
         assert conv.messages[-1].tool_calls == tc
 
+    def test_append_assistant_with_reasoning_content(self):
+        conv = Conversation.from_any_list([
+            ("system", "s"), ("user", "u"), ("assistant", "a"),
+        ])
+        conv.append_assistant_message("final", reasoning_content="思考")
+        assert conv.messages[-1].reasoning_content == "思考"
+
     def test_append_tool_message(self):
         conv = Conversation.from_any_list([
             ("system", "s"), ("user", "u"), ("assistant", "a"),
@@ -251,6 +259,29 @@ class TestUserMessageBatch:
         batch = UserMessageBatch()
         batch.add_user_content("hello")
         assert batch.user_contents == ["hello"]
+
+
+class TestReasoningContent:
+    """思维链内容：总是回传、反向解析保留、往返一致"""
+
+    def test_message_to_api_dict_always_carries_reasoning(self):
+        d = message_to_api_dict(AssistantMessage(content="ok"))
+        assert d["reasoning_content"] == ""
+
+        d2 = message_to_api_dict(AssistantMessage(content="ok", reasoning_content="思考"))
+        assert d2["reasoning_content"] == "思考"
+
+    def test_reverse_parse_preserves_reasoning(self):
+        from avm.python_server import message_list_from_api_dict
+
+        msgs = message_list_from_api_dict([
+            {"role": "assistant", "content": "ok", "reasoning_content": "思考", "tool_calls": None},
+        ])
+        assert isinstance(msgs[0], AssistantMessage)
+        assert msgs[0].reasoning_content == "思考"
+        # 往返一致：转回字典不丢字段
+        back = message_to_api_dict(msgs[0])
+        assert back["reasoning_content"] == "思考"
 
     def test_clear(self):
         batch = UserMessageBatch()

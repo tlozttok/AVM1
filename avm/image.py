@@ -160,6 +160,9 @@ def load_image(image_path: str) -> Core:
         raise ImageError("镜像必须包含 mem 段（对象）")
 
     core = Core()
+    budget = meta.get("instruction_budget")
+    if isinstance(budget, int) and budget > 0:
+        core._instruction_budget = budget
     device_markers = []
     root = MetaDict(data={})
     for key, node in image["mem"].items():
