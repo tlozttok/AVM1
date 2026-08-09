@@ -5,11 +5,12 @@ import pytest
 from avm.core import Core, LMU, _instruction_registry, _build_conversation
 from avm.core import (
     MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction,
+    EditMetadataInstruction,
     CreateInstruction, CreateSubInstruction,
     RegisterServiceInstruction, CallServiceInstruction, TransferServiceInstruction,
     ReturnResultInstruction, SendInstruction, CloseInstruction,
 )
-from avm.types import Conversation, UserMessageBatch, SystemMessage, UserMessage, AssistantMessage, MetaDict
+from avm.types import Conversation, UserMessageBatch, SystemMessage, UserMessage, AssistantMessage, MetaDict, MetaList
 from avm.memory import Memory
 from avm.exceptions import VMMemoryError
 from types import SimpleNamespace
@@ -1190,3 +1191,110 @@ class TestCloseInstruction:
         merged = json.loads(_batch(core, root.cid)[0][0])
         assert {"from": "init#1", "cid": 1, "icc_id": "ms#0", "content": "Error: 对方已关闭（1），请求未完成"} in merged
         assert {"from": "init#2", "cid": 2, "icc_id": "ms#1", "content": "reply2"} in merged
+
+
+class TestEditMetadata:
+    """edit_metadata：编辑节点的 ctrl 元数据（set/get/del）"""
+
+    def _root(self):
+        core = make_core()
+        root = _new_root(core)
+        return core, root
+
+    def _exec(self, core, root, args, call_id="em"):
+        EditMetadataInstruction(call_id, root.cid, args).execute(core, root)
+        return _batch(core, root.cid)[-1]
+
+    def test_set_creates_ctrl(self):
+        core, root = self._root()
+        core.mem["a"] = MetaDict(data={})
+        content, call_id = self._exec(core, root, {"ref": "$MEM.a", "type": "set", "key": "type", "value": "settingup"})
+        assert core.mem["a"].get_ctrl() == {"type": "settingup"}
+        assert "已写入" in content and call_id == "em"
+
+    def test_set_keeps_existing_keys(self):
+        core, root = self._root()
+        core.mem["a"] = MetaDict(data={}, ctrl={"x": "1"})
+        self._exec(core, root, {"ref": "$MEM.a", "type": "set", "key": "y", "value": "2"})
+        assert core.mem["a"].get_ctrl() == {"x": "1", "y": "2"}
+
+    def test_set_missing_value_errors(self):
+        core, root = self._root()
+        core.mem["a"] = MetaDict(data={})
+        content, _ = self._exec(core, root, {"ref": "$MEM.a", "type": "set", "key": "type"})
+        assert "key 和 value 都必需" in content
+        assert core.mem["a"].get_ctrl() is None
+
+    def test_get_by_key(self):
+        core, root = self._root()
+        core.mem["a"] = MetaDict(data={}, ctrl={"type": "para"})
+        content, _ = self._exec(core, root, {"ref": "$MEM.a", "type": "get", "key": "type"})
+        assert content == "para"
+
+    def test_get_whole_ctrl(self):
+        core, root = self._root()
+        core.mem["a"] = MetaDict(data={}, ctrl={"type": "para", "x": "1"})
+        content, _ = self._exec(core, root, {"ref": "$MEM.a", "type": "get"})
+        assert content == '{"type": "para", "x": "1"}'
+
+    def test_get_empty_ctrl_returns_empty_object(self):
+        core, root = self._root()
+        core.mem["a"] = MetaDict(data={})
+        content, _ = self._exec(core, root, {"ref": "$MEM.a", "type": "get"})
+        assert content == "{}"
+
+    def test_get_missing_key_errors(self):
+        core, root = self._root()
+        core.mem["a"] = MetaDict(data={}, ctrl={"type": "para"})
+        content, _ = self._exec(core, root, {"ref": "$MEM.a", "type": "get", "key": "nope"})
+        assert "ctrl 中没有键" in content
+
+    def test_del(self):
+        core, root = self._root()
+        core.mem["a"] = MetaDict(data={}, ctrl={"type": "para", "x": "1"})
+        content, _ = self._exec(core, root, {"ref": "$MEM.a", "type": "del", "key": "type"})
+        assert core.mem["a"].get_ctrl() == {"x": "1"}
+        assert "已删除" in content
+
+    def test_del_missing_key_errors(self):
+        core, root = self._root()
+        core.mem["a"] = MetaDict(data={}, ctrl={"type": "para"})
+        content, _ = self._exec(core, root, {"ref": "$MEM.a", "type": "del", "key": "nope"})
+        assert "ctrl 中没有键" in content
+
+    def test_invalid_type_errors(self):
+        core, root = self._root()
+        core.mem["a"] = MetaDict(data={})
+        content, _ = self._exec(core, root, {"ref": "$MEM.a", "type": "upsert"})
+        assert "必须是 set/get/del" in content
+
+    def test_str_node_errors(self):
+        core, root = self._root()
+        core.mem["a"] = "leaf"
+        content, _ = self._exec(core, root, {"ref": "$MEM.a", "type": "set", "key": "type", "value": "x"})
+        assert "不是 MetaDict/MetaList" in content
+
+    def test_invalid_ref_errors(self):
+        core, root = self._root()
+        content, _ = self._exec(core, root, {"ref": "$MEM.nope", "type": "get"})
+        assert "Error" in content
+
+    def test_list_node_works(self):
+        core, root = self._root()
+        core.mem["a"] = MetaList(data=[], ctrl={"type": "para"})
+        content, _ = self._exec(core, root, {"ref": "$MEM.a", "type": "get"})
+        assert content == '{"type": "para"}'
+
+    def test_edit_metadata_via_advance_keeps_conversation_active(self):
+        """通过完整推进执行 edit_metadata：ctrl 生效，对话保持活跃可自纠"""
+        core = make_core([
+            (None, [{"call_id": "em", "cmd_type": "edit_metadata", "args": {"ref": "$MEM.a", "type": "set", "key": "type", "value": "settingup"}}], None),
+        ])
+        _new_root(core)
+        core.mem["a"] = MetaDict(data={})
+        core._active_cid = core._ready_cids.pop(0)
+
+        core.advance_conversation()
+
+        assert core.mem["a"].get_ctrl() == {"type": "settingup"}
+        assert core._active_cid == 0

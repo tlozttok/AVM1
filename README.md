@@ -71,6 +71,7 @@ Core 只执行指令，不做业务决策。全部指令如下：
 | `memory_read` | 读取内存，返回给 LLM 的表示 | `ref` |
 | `memory_write` | 写入内存 | `ref`, `content` |
 | `memory_make` | 创建新内存地址 | `ref`, `key`, `mem_type`(str/dict/list) |
+| `edit_metadata` | 编辑节点的 ctrl 元数据：set 写入 / get 读取（key 省略返回整个 ctrl）/ del 删除 | `ref`, `type`(set/get/del), `key`?, `value`? |
 | `create_cmd` | 创建子对话（`system_ref` 必须指向 settingup 或 python 程序节点；只创建，返回 cid；子对话休眠等待指令；本对话保持活跃） | `system_ref`, `para_ref` |
 | `create_sub` | 创建亚对话（立即执行；完成自动写回并唤醒父） | `system_ref`, `user_ref`, `para_ref` |
 | `register_service` | 将当前对话注册为服务 | `name`, `what`, `needs`, `returns` |
@@ -327,7 +328,7 @@ Python 程序对同样的输入序列只有同样的输出；非最后一条消�
 
 已实现：
 
-- 11 条指令（内存、对话创建、服务、返回、投递、关闭）；
+- 12 条指令（内存读写与创建、ctrl 元数据编辑、对话创建、服务、返回、投递、关闭）；
 - 内存树与持久化（写回文件）；
 - 调度状态机：活跃/休眠/就绪，排队调度、核心中断（指令预算）、调用链预算继承；
 - ICC 协议与消息 v2（from/to/icc_id/content），多播工具返回合并；

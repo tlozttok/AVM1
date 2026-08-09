@@ -71,6 +71,7 @@ Core executes instructions; it does not make business decisions. The full instru
 | `memory_read` | Read memory; returns the LLM-facing representation | `ref` |
 | `memory_write` | Write memory | `ref`, `content` |
 | `memory_make` | Create a new memory address | `ref`, `key`, `mem_type`(str/dict/list) |
+| `edit_metadata` | Edit a node's ctrl metadata: set writes / get reads (omit key to return the whole ctrl) / del removes | `ref`, `type`(set/get/del), `key`?, `value`? |
 | `create_cmd` | Create a child conversation (`system_ref` must point to a settingup or python program node; create only, return cid; the child sleeps awaiting instructions; this conversation stays active) | `system_ref`, `para_ref` |
 | `create_sub` | Create a sub conversation (executes immediately; on completion, auto-writes the result and wakes the parent) | `system_ref`, `user_ref`, `para_ref` |
 | `register_service` | Register this conversation as a service | `name`, `what`, `needs`, `returns` |
@@ -327,7 +328,7 @@ Every advance produces a frame: active/ready/dormant, tool-call summary, result,
 
 Implemented:
 
-- 11 instructions (memory, conversation creation, services, return, delivery, close);
+- 12 instructions (memory read/write/create, ctrl metadata editing, conversation creation, services, return, delivery, close);
 - Memory tree and persistence (write-back to file);
 - Scheduling state machine: active/dormant/ready, queue scheduling, core interrupt (instruction budget), call-chain budget inheritance;
 - ICC protocol and message v2 (`from`/`to`/`icc_id`/`content`), multicast tool-return merging;

@@ -125,6 +125,79 @@ class MemoryMakeInstruction(Instruction):
             conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
 
 
+class EditMetadataInstruction(Instruction):
+    tool_name = "edit_metadata"
+    tool_def = {
+        "type": "function",
+        "function": {
+            "name": "edit_metadata",
+            "description": "编辑内存节点的 ctrl 元数据（元数据二，dict[str,str]）。type=set：用 value 写入 ctrl[key]（key/value 都必需，ctrl 不存在时创建）；type=get：key 省略时返回整个 ctrl（JSON），带 key 时返回 ctrl[key]；type=del：删除 ctrl[key]（key 必需）。非法参数以 Error 工具响应返回，对话保持活跃可自纠",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ref": {"type": "string", "description": "内存节点引用，如 $MEM.a.b"},
+                    "type": {"type": "string", "enum": ["set", "get", "del"], "description": "操作类型"},
+                    "key": {"type": "string", "description": "ctrl 键名；type=set/del 时必需"},
+                    "value": {"type": "string", "description": "ctrl 值（字符串）；仅 type=set 时使用且必需"},
+                },
+                "required": ["ref", "type"],
+            }
+        }
+    }
+    ref: str
+
+    def execute(self, core: 'Core', conv: Conversation):
+        op = getattr(self, "type", None)
+        key = getattr(self, "key", None)
+        value = getattr(self, "value", None)
+        if op not in ("set", "get", "del"):
+            conv.user_batch.add_tool_response(
+                f"Error: edit_metadata 的 type 必须是 set/get/del，得到 {op!r}", self.call_id
+            )
+            return
+        try:
+            node = core.unwrap(self.ref, for_llm=False)
+        except (VMMemoryError, KeyError, IndexError, TypeError, ValueError) as e:
+            conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
+            return
+        if not isinstance(node, (MetaDict, MetaList)):
+            conv.user_batch.add_tool_response(
+                f"Error: {self.ref} 不是 MetaDict/MetaList 节点，无法编辑 ctrl", self.call_id
+            )
+            return
+        ctrl = dict(node.get_ctrl() or {})
+        if op == "set":
+            if not key or value is None:
+                conv.user_batch.add_tool_response(
+                    "Error: edit_metadata type=set 时 key 和 value 都必需", self.call_id
+                )
+                return
+            ctrl[key] = value
+            node.set_ctrl(ctrl)
+            conv.user_batch.add_tool_response(f"ctrl.{key} = {value!r} 已写入", self.call_id)
+        elif op == "get":
+            if not key:
+                conv.user_batch.add_tool_response(
+                    json.dumps(ctrl, ensure_ascii=False) if ctrl else "{}", self.call_id
+                )
+            elif key in ctrl:
+                conv.user_batch.add_tool_response(str(ctrl[key]), self.call_id)
+            else:
+                conv.user_batch.add_tool_response(f"Error: ctrl 中没有键 {key}", self.call_id)
+        else:  # del
+            if not key:
+                conv.user_batch.add_tool_response(
+                    "Error: edit_metadata type=del 时 key 必需", self.call_id
+                )
+                return
+            if key not in ctrl:
+                conv.user_batch.add_tool_response(f"Error: ctrl 中没有键 {key}", self.call_id)
+                return
+            del ctrl[key]
+            node.set_ctrl(ctrl)
+            conv.user_batch.add_tool_response(f"ctrl.{key} 已删除", self.call_id)
+
+
 class CreateInstruction(Instruction):
     tool_name = "create_cmd"
     tool_def = {
@@ -532,7 +605,7 @@ def _instruction_registry() -> Dict[str, Type[Instruction]]:
     return {
         cls.tool_name: cls
         for cls in [
-            MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction,
+            MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction, EditMetadataInstruction,
             CreateInstruction, CreateSubInstruction,
             RegisterServiceInstruction, CallServiceInstruction, TransferServiceInstruction,
             ReturnResultInstruction, SendInstruction, CloseInstruction,

@@ -54,7 +54,7 @@ AVM 的指令分发层和调度器。不参与管理决策——只执行指令�
 ### 指令集
 
 **内存指令 (Memory instructions)**:
-`memory_read`、`memory_write`、`memory_make`——读写内存和创建新内存地址。
+`memory_read`、`memory_write`、`memory_make`、`edit_metadata`——读写内存、创建新内存地址、编辑节点的 ctrl 元数据（set/get/del）。
 
 **对话程序指令 (Conversation program instructions)**:
 `create_cmd`、`create_sub`——创建子对话或亚对话以启动 Settingup 程序。`create_cmd` 只创建并返回 cid（父不休眠、子对话休眠等待指令）；`create_sub` 保留 user_ref、立即执行。

@@ -42,6 +42,8 @@ python -m avm.image <image.json>
 
 **程序节点（settingup / python）**：`create_cmd` / `create_sub` 的 `system_ref` 必须指向这类节点（运行时校验；指向 str 节点、无类型 dict 节点或其他类型会报错，不创建对话）。`settingup` 节点的 `value` 含 `name`（对话身份）与 `content`（提示词文本）；`python` 节点的 `value` 含 `content`（Python 代码）。两者均可带可选的 `signature`（预期输入/输出描述）。`para_ref` 指向该程序使用的模型参数节点。
 
+运行期可用 `edit_metadata` 指令给节点补 ctrl（例如给运行时创建的 dict 节点设置 `type='settingup'` / `'python'`），配合 `memory_make` / `memory_write` 组合出可被 `create_cmd` 使用的程序节点——程序节点不一定只在镜像中预置。
+
 `init` 的 `system_ref` 仍指向 str 节点（入口对话的字面量提示词，不属于程序节点）。
 
 ## para（模型调用参数）

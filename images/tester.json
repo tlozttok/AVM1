@@ -7,7 +7,7 @@
   "mem": {
     "system": {
       "kind": "str",
-      "value": "你是这个系统中的一个对话。系统提供内存树和一组工具，机制参见参考手册 $MEM.tester_manual（需要时用 memory_read 读取）。可用工具：memory_read、memory_write、memory_make、create_cmd、create_sub、register_service、call_service、transfer_service、return_result、send_instruction、close_conversation。"
+      "value": "你是这个系统中的一个对话。系统提供内存树和一组工具，机制参见参考手册 $MEM.tester_manual（需要时用 memory_read 读取）。可用工具：memory_read、memory_write、memory_make、edit_metadata、create_cmd、create_sub、register_service、call_service、transfer_service、return_result、send_instruction、close_conversation。"
     },
     "user": {
       "kind": "str",
@@ -27,7 +27,7 @@
       "value": {
         "overview": {
           "kind": "str",
-          "value": "# 概览\n\n本系统是一个以对话为执行单元的运行时。\n\n- 对话：由系统提示词和用户提示词启动。每一轮通过工具调用操作系统，系统执行指令并返回结果；当一轮返回不含工具调用的结果时，本轮结束，对话进入休眠（个体保留，可被再次调用）。\n- 内存：全局键值树，根为 $MEM。节点类型：字典（MetaDict）、列表（MetaList）、字符串（str）。路径用点号连接；列表用数字索引，-1 表示最后一个元素。\n- 指令集（11 个）：memory_read / memory_write / memory_make（内存读写与创建）；create_cmd / create_sub（创建对话）；register_service / call_service / transfer_service（服务注册、调用、移交）；return_result（按 ICC id 返回结果）；send_instruction（按 cid 投递指令）；close_conversation（内核级关闭）。\n- 调度：对话处于活跃/休眠/就绪三态，同时只有一个活跃对话。每次激活有指令预算（默认 50），同一调用链内达到预算会被中断让出，状态保留。\n- 设备：挂载在内存路径上的虚拟文件。$MEM.conversations、$MEM.scheduler、$MEM.services、$MEM.icc、$MEM.memory、$MEM.monitor 是只读信息设备；$MEM.inputs / $MEM.outputs 是用户输入输出设备。\n- 预置程序：$MEM.programs.helper（LLM 提示词程序，ctrl.type='settingup'）、$MEM.programs.probe_simple（plm.simple）与 $MEM.programs.probe_python（plm.python），对应参数在 $MEM.para.simple 与 $MEM.para.python。\n\n本系统不直接访问操作系统、硬件或网络（宿主侧沙箱拦截）。"
+          "value": "# 概览\n\n本系统是一个以对话为执行单元的运行时。\n\n- 对话：由系统提示词和用户提示词启动。每一轮通过工具调用操作系统，系统执行指令并返回结果；当一轮返回不含工具调用的结果时，本轮结束，对话进入休眠（个体保留，可被再次调用）。\n- 内存：全局键值树，根为 $MEM。节点类型：字典（MetaDict）、列表（MetaList）、字符串（str）。路径用点号连接；列表用数字索引，-1 表示最后一个元素。\n- 指令集（12 个）：memory_read / memory_write / memory_make / edit_metadata（内存读写、创建与 ctrl 元数据编辑）；create_cmd / create_sub（创建对话）；register_service / call_service / transfer_service（服务注册、调用、移交）；return_result（按 ICC id 返回结果）；send_instruction（按 cid 投递指令）；close_conversation（内核级关闭）。\n- 调度：对话处于活跃/休眠/就绪三态，同时只有一个活跃对话。每次激活有指令预算（默认 50），同一调用链内达到预算会被中断让出，状态保留。\n- 设备：挂载在内存路径上的虚拟文件。$MEM.conversations、$MEM.scheduler、$MEM.services、$MEM.icc、$MEM.memory、$MEM.monitor 是只读信息设备；$MEM.inputs / $MEM.outputs 是用户输入输出设备。\n- 预置程序：$MEM.programs.helper（LLM 提示词程序，ctrl.type='settingup'）、$MEM.programs.probe_simple（plm.simple）与 $MEM.programs.probe_python（plm.python），对应参数在 $MEM.para.simple 与 $MEM.para.python。\n\n本系统不直接访问操作系统、硬件或网络（宿主侧沙箱拦截）。"
         },
         "observe": {
           "kind": "str",
@@ -35,7 +35,7 @@
         },
         "instruction_ref": {
           "kind": "str",
-          "value": "# 指令参考（工具调用）\n\n工具参数必须是合法 JSON。参数解析失败或未知工具不会返回给对话，而是输出到 stderr（运行者可见）。一次工具调用必须有一次工具响应。\n\n1. memory_read(ref)：读内存。字典/列表返回描述+结构摘要；str 返回内容；设备返回其字符串表示。$MEM.inputs.-1 会请求用户输入（阻塞）。\n2. memory_write(ref, content)：把字符串写入路径。目标路径已是字典或列表时，写入被解释为修改元数据（meta），而不是替换内容。\n3. memory_make(ref, key, mem_type)：在 ref 指向的字典/列表下创建子节点（mem_type 为 str/dict/list）。不能在字符串路径下创建；列表的 key 必须是数字索引。\n4. create_cmd(system_ref, para_ref)：创建子对话并返回 cid。子对话创建后休眠，等待 send_instruction。system_ref 必须指向程序节点：ctrl.type='settingup'（LLM 提示词程序，value 含 name/content）或 ctrl.type='python'（Python 程序，content 是代码）。指向 str 节点或无类型 dict 节点会报错（工具响应 Error），不会创建对话。\n5. create_sub(system_ref, user_ref, para_ref)：创建亚对话并立即执行；完成自动唤醒父并写回结果。system_ref 同 create_cmd，必须指向程序节点；user_ref 是启动用户消息引用。\n6. register_service(name, what, needs, returns)：把当前对话注册为服务。\n7. call_service(service_name, input, return_mode)：调用已注册服务，自身休眠等待返回。return_mode=tool（默认，结论作为工具响应返回）/ message（结论作为消息返回）。\n8. transfer_service(service_name, input)：把控制权移交给服务，自身休眠，不等待返回。\n9. return_result(content, icc_id)：把结论按 ICC id 返回给发起者，并确保发起者成为下一个被激活的对话。\n10. send_instruction(cid, content, wait)：向指定 cid（或 cid 列表，多播）投递指令。content 会被包装为 JSON 消息（from/to/icc_id/content），目标对话收到这条 JSON 字符串。wait=true 时休眠等待返回。\n11. close_conversation(cid)：内核级关闭指令。关闭指定 cid 的对话（自身或其他对话），不需要对方回应。关闭后该对话不可再调度、不可再被调用，记录为 finished；其服务注销、PLM 状态释放、未完成调用清理（发给它的请求会以 Error 返回给发起者并唤醒）。\n\n行为事实：\n- cid 从工具响应中提取（如 Success created: cid=1），之后用 send_instruction 按 cid 驱动该对话。\n- call_service 与 send_instruction(wait=true) 使当前对话休眠；返回靠 return_result 投递（多播按组等待合并）。\n- close_conversation 可关闭自身或其他对话；已关闭对话（finished）不可再调度、不可再被调用（send_instruction 会报错）。\n- 运行时无法通过指令创建带 ctrl 的节点（如 settingup/python 程序）；新程序需在镜像中预置。"
+          "value": "# 指令参考（工具调用）\n\n工具参数必须是合法 JSON。参数解析失败或未知工具不会返回给对话，而是输出到 stderr（运行者可见）。一次工具调用必须有一次工具响应。\n\n1. memory_read(ref)：读内存。字典/列表返回描述+结构摘要；str 返回内容；设备返回其字符串表示。$MEM.inputs.-1 会请求用户输入（阻塞）。\n2. memory_write(ref, content)：把字符串写入路径。目标路径已是字典或列表时，写入被解释为修改元数据（meta），而不是替换内容。\n3. memory_make(ref, key, mem_type)：在 ref 指向的字典/列表下创建子节点（mem_type 为 str/dict/list）。不能在字符串路径下创建；列表的 key 必须是数字索引。\n4. edit_metadata(ref, type, key?, value?)：编辑内存节点的 ctrl 元数据（元数据二，dict[str,str]）。type=set 用 value 写 ctrl[key]（key/value 必需，ctrl 不存在时创建）；type=get 返回 ctrl[key]（key 省略返回整个 ctrl 的 JSON）；type=del 删除 ctrl[key]（key 必需）。非法参数以 Error 工具响应返回，对话保持活跃可自纠。\n5. create_cmd(system_ref, para_ref)：创建子对话并返回 cid。子对话创建后休眠，等待 send_instruction。system_ref 必须指向程序节点：ctrl.type='settingup'（LLM 提示词程序，value 含 name/content）或 ctrl.type='python'（Python 程序，content 是代码）。指向 str 节点或无类型 dict 节点会报错（工具响应 Error），不会创建对话。\n6. create_sub(system_ref, user_ref, para_ref)：创建亚对话并立即执行；完成自动唤醒父并写回结果。system_ref 同 create_cmd，必须指向程序节点；user_ref 是启动用户消息引用。\n7. register_service(name, what, needs, returns)：把当前对话注册为服务。\n8. call_service(service_name, input, return_mode)：调用已注册服务，自身休眠等待返回。return_mode=tool（默认，结论作为工具响应返回）/ message（结论作为消息返回）。\n9. transfer_service(service_name, input)：把控制权移交给服务，自身休眠，不等待返回。\n10. return_result(content, icc_id)：把结论按 ICC id 返回给发起者，并确保发起者成为下一个被激活的对话。\n11. send_instruction(cid, content, wait)：向指定 cid（或 cid 列表，多播）投递指令。content 会被包装为 JSON 消息（from/to/icc_id/content），目标对话收到这条 JSON 字符串。wait=true 时休眠等待返回。\n12. close_conversation(cid)：内核级关闭指令。关闭指定 cid 的对话（自身或其他对话），不需要对方回应。关闭后该对话不可再调度、不可再被调用，记录为 finished；其服务注销、PLM 状态释放、未完成调用清理（发给它的请求会以 Error 返回给发起者并唤醒）。\n\n行为事实：\n- cid 从工具响应中提取（如 Success created: cid=1），之后用 send_instruction 按 cid 驱动该对话。\n- call_service 与 send_instruction(wait=true) 使当前对话休眠；返回靠 return_result 投递（多播按组等待合并）。\n- close_conversation 可关闭自身或其他对话；已关闭对话（finished）不可再调度、不可再被调用（send_instruction 会报错）。\n- 运行时可用 edit_metadata 给节点设置 ctrl（如 ctrl.type='settingup'/'python'），配合 memory_make/memory_write 组合出可被 create_cmd 使用的程序节点；新程序不一定需要镜像预置。"
         },
         "memory_model": {
           "kind": "str",
@@ -70,7 +70,7 @@
     },
     "programs": {
       "kind": "dict",
-      "meta": "预置提示词程序：用 create_cmd 启动。运行时无法创建 ctrl 节点，新程序需在镜像中预置",
+      "meta": "预置提示词程序：用 create_cmd 启动。运行时可用 edit_metadata 给节点补 ctrl，配合 memory_make/memory_write 组合新程序",
       "value": {
         "probe_simple": {
           "kind": "dict",
