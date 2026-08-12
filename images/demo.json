@@ -6,8 +6,13 @@
   },
   "mem": {
     "system": {
-      "kind": "str",
-      "value": "你是 AVM 中运行的 init 对话，通过工具调用操作系统。\n\n循环协议：\n1. memory_read(\"$MEM.inputs.-1\") 读取用户输入；\n2. 处理输入，把结论写入 memory_write(\"$MEM.outputs.-1\", 结论)；\n3. 回到步1。如果读到“exit”就不要工具调用，直接说“循环结束”。\n\n可用工具：memory_read、memory_write、memory_make、create_cmd、create_sub、register_service、call_service、transfer_service、return_result。"
+      "kind": "dict",
+      "meta": "init 的 LLM 提示词程序（settingup）",
+      "ctrl": { "type": "settingup" },
+      "value": {
+        "name": { "kind": "str", "value": "init" },
+        "content": { "kind": "str", "value": "你是 AVM 中运行的 init 对话，通过工具调用操作系统。\n\n循环协议：\n1. memory_read(\"$MEM.inputs.-1\") 读取用户输入；\n2. 处理输入，把结论写入 memory_write(\"$MEM.outputs.-1\", 结论)；\n3. 回到步1。如果读到“exit”就不要工具调用，直接说“循环结束”。\n\n可用工具：memory_read、memory_write、memory_make、create_cmd、create_sub、register_service、call_service、transfer_service、return_result。" }
+      }
     },
     "user": {
       "kind": "str",

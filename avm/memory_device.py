@@ -1,9 +1,14 @@
 """AVM 内存设备：可挂载到内存路径的虚拟设备"""
+import os
 from typing import Any, Optional, List
 
 
 class MemoryDevice:
     """设备基类"""
+
+    def attach_core(self, core) -> None:
+        """调试用：可选钩子，把 Core 引用交给设备（设备需要访问运行时状态时覆写）。"""
+        pass
 
     def pretend_as_type(self) -> str:
         raise NotImplementedError
@@ -108,6 +113,11 @@ class InputsListDevice(MetaListDevice):
     def __init__(self, data=None, metadata=None):
         super().__init__(data=data, metadata=metadata)
         self._pending_input = False
+        self._core = None  # 调试用：Core 引用（/save 检查点命令需要），由镜像加载器注入
+
+    def attach_core(self, core) -> None:
+        """调试用：接收 Core 引用（检查点 /save 调试命令使用）"""
+        self._core = core
 
     def _parse_index(self, index):
         if isinstance(index, str):
@@ -124,7 +134,7 @@ class InputsListDevice(MetaListDevice):
             # 伪列表语义：读最后一个元素 = 请求新用户输入
             self._pending_input = True
             try:
-                user_input = input()
+                user_input = self._prompt_operator()
             except EOFError:
                 user_input = ""
             finally:
@@ -133,6 +143,40 @@ class InputsListDevice(MetaListDevice):
             return user_input
         # 正常列表访问
         return super().__getitem__(index)
+
+    def _prompt_operator(self) -> str:
+        """调试用：读取操作者输入；行首 /save 触发单对话检查点保存并继续等待真实输入。
+
+        对话感知不到 /save：命令只在设备层消费，返回给对话的永远是真实输入。
+        """
+        while True:
+            raw = input()
+            if raw.startswith("/save"):
+                self._save_checkpoint(raw)
+                continue
+            return raw
+
+    def _save_checkpoint(self, cmd: str) -> None:
+        """调试用：保存当前活跃对话的检查点。缺省路径由 Core.checkpoint_path 决定；/save <path> 可指定。"""
+        if self._core is None:
+            print("[检查点] 设备未接入 Core，无法保存", flush=True)
+            return
+        cid = self._core._active_cid
+        if cid is None:
+            print("[检查点] 无活跃对话，无法保存", flush=True)
+            return
+        rest = cmd[len("/save"):].strip()
+        if rest:
+            base = getattr(self._core, "image_dir", None) or "."
+            path = rest if os.path.isabs(rest) else os.path.join(base, rest)
+        else:
+            path = self._core.checkpoint_path(cid)
+        try:
+            self._core.save_conversation(cid, path)
+        except Exception as e:
+            print(f"[检查点] 保存失败: {e}", flush=True)
+            return
+        print(f"[检查点] 对话 {cid} 已保存到 {path}", flush=True)
 
     def resolve_path(self, path: list) -> Any:
         if len(path) == 1:

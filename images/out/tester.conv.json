@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "name": "tester",
+  "para_ref": "$MEM.model_params",
+  "is_python": false,
+  "is_sub": false,
+  "is_root": true,
+  "metadata": {},
+  "service_desc": null,
+  "messages": [
+    {
+      "role": "system",
+      "content": "你是这个系统中的一个对话。系统提供内存树和一组工具，机制参见参考手册 $MEM.tester_manual（需要时用 memory_read 读取）。可用工具：memory_read、memory_write、memory_make、edit_metadata、create_cmd、create_sub、register_service、call_service、transfer_service、return_result、send_instruction、close_conversation。你需要在开发者用户的指导下对系统做模糊测试。你无法了解系统的代码，这是设计之中的，你只需要思考各种AI系统的编排，包括固定的工作流、Agentic、控制系统甚至复杂自组织系统，创建简易的toy程序，以用户指令为准，调用各种工具，并且监控系统。如果你发现用户指令你做不到，就直接说，用户本意就是查漏补缺，如果你不知道怎么执行，你可以问用户。这里的用户都指通过memory读写获取的指令，而不是直接输入的东西。"
+    },
+    {
+      "role": "user",
+      "content": "这里不是用户指令。这里是初始指令的一部分。你在收到后需要执行如下步骤：1.调用memory_write，向\"$MEM.outputs.-1\"（这会向用户终端发送消息）写入你对用户的打招呼，让用户确定你已经运行。2.调用memory_read，阅读手册。3.向\"$MEM.outputs.-1\"发送消息表明你已经理解了AVM。4.memory_read(\"$MEM.inputs.-1\") 读取用户输入；\n5. 根据工具调用返回的输入的用户指令执行。把反馈写入 memory_write(\"$MEM.outputs.-1\", 反馈)；\n6. 回到步4。"
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_00_FmOmOvcVFMxAWamOD9aQ3959",
+          "type": "function",
+          "function": {
+            "name": "memory_write",
+            "arguments": "{\"ref\": \"$MEM.outputs.-1\", \"content\": \"你好，用户！模糊测试代理已启动并运行。我将按照指令执行初始步骤，请稍候。\"}"
+          }
+        },
+        {
+          "id": "call_01_i16OJM2jLa7Q2M2VZTts4021",
+          "type": "function",
+          "function": {
+            "name": "memory_read",
+            "arguments": "{\"ref\": \"$MEM.tester_manual\"}"
+          }
+        }
+      ],
+      "reasoning_content": "Let me start by following the initial instructions. I need to:\n1. Call memory_write to \"$MEM.outputs.-1\" to greet the user\n2. Call memory_read to read the manual\n3. Send message to \"$MEM.outputs.-1\" indicating understanding of AVM\n4. Read user input from \"$MEM.inputs.-1\"\n5. Execute user instructions based on tool returns\n6. Loop back to step 4\n\nLet me start with steps 1 and 2 which are independent, so I can do them in parallel."
+    },
+    {
+      "role": "tool",
+      "content": "Success set: $MEM.outputs.-1",
+      "tool_call_id": "call_00_FmOmOvcVFMxAWamOD9aQ3959"
+    },
+    {
+      "role": "tool",
+      "content": "dict[keys=['overview', 'observe', 'instruction_ref', 'memory_model', 'scheduling'],metadata='系统参考手册：内存结构、工具说明、调度状态、可观测设备。共 5 节：overview、observe、instruction_ref、memory_model、scheduling']",
+      "tool_call_id": "call_01_i16OJM2jLa7Q2M2VZTts4021"
+    },
+    {
+      "role": "assistant",
+      "content": "手册已找到，包含 5 个章节。让我读取各章节内容以理解 AVM 机制。",
+      "tool_calls": [
+        {
+          "id": "call_00_O2GYskD5aGstbSfzMw9r8905",
+          "type": "function",
+          "function": {
+            "name": "memory_read",
+            "arguments": "{\"ref\": \"$MEM.tester_manual.overview\"}"
+          }
+        },
+        {
+          "id": "call_01_gPaDcbpiJECOFBoyKYHp8558",
+          "type": "function",
+          "function": {
+            "name": "memory_read",
+            "arguments": "{\"ref\": \"$MEM.tester_manual.observe\"}"
+          }
+        },
+        {
+          "id": "call_02_e2E0qQTFOFHqvqSif84f3254",
+          "type": "function",
+          "function": {
+            "name": "memory_read",
+            "arguments": "{\"ref\": \"$MEM.tester_manual.instruction_ref\"}"
+          }
+        },
+        {
+          "id": "call_03_z8knA36nmrEjZdPhastG1491",
+          "type": "function",
+          "function": {
+            "name": "memory_read",
+            "arguments": "{\"ref\": \"$MEM.tester_manual.memory_model\"}"
+          }
+        },
+        {
+          "id": "call_04_nbLDwydIABoWR5HOo8qZ6517",
+          "type": "function",
+          "function": {
+            "name": "memory_read",
+            "arguments": "{\"ref\": \"$MEM.tester_manual.scheduling\"}"
+          }
+        }
+      ],
+      "reasoning_content": "The manual is a dict with keys. Let me read the manual sections to understand AVM. Let me read each section of the manual."
+    },
+    {
+      "role": "tool",
+      "content": "# 概览\n\n本系统是一个以对话为执行单元的运行时。\n\n- 对话：由系统提示词和用户提示词启动。每一轮通过工具调用操作系统，系统执行指令并返回结果；当一轮返回不含工具调用的结果时，本轮结束，对话进入休眠（个体保留，可被再次调用）。\n- 内存：全局键值树，根为 $MEM。节点类型：字典（MetaDict）、列表（MetaList）、字符串（str）。路径用点号连接；列表用数字索引，-1 表示最后一个元素。\n- 指令集（12 个）：memory_read / memory_write / memory_make / edit_metadata（内存读写、创建与 ctrl 元数据编辑）；create_cmd / create_sub（创建对话）；register_service / call_service / transfer_service（服务注册、调用、移交）；return_result（按 ICC id 返回结果）；send_instruction（按 cid 投递指令）；close_conversation（内核级关闭）。\n- 调度：对话处于活跃/休眠/就绪三态，同时只有一个活跃对话。每次激活有指令预算（默认 50），同一调用链内达到预算会被中断让出，状态保留。\n- 设备：挂载在内存路径上的虚拟文件。$MEM.conversations、$MEM.scheduler、$MEM.services、$MEM.icc、$MEM.memory、$MEM.monitor 是只读信息设备；$MEM.inputs / $MEM.outputs 是用户输入输出设备。\n- 预置程序：$MEM.programs.helper（LLM 提示词程序，ctrl.type='settingup'）、$MEM.programs.probe_simple（plm.simple）与 $MEM.programs.probe_python（plm.python），对应参数在 $MEM.para.simple 与 $MEM.para.python。\n\n本系统不直接访问操作系统、硬件或网络（宿主侧沙箱拦截）。",
+      "tool_call_id": "call_00_O2GYskD5aGstbSfzMw9r8905"
+    },
+    {
+      "role": "tool",
+      "content": "# 观测系统状态（只读信息设备）\n\n以下设备挂载在 $MEM 下，只读（向其写入会报错）。读取方式：memory_read(\"$MEM.<名字>\")；部分设备支持子路径。\n\n- $MEM.conversations：对话列表。每行 cid、身份、状态、para、是否 Python 对话。子路径 $MEM.conversations.<cid> 返回单个对话详情（名字、身份、状态、is_sub、is_python、para、消息数）。\n- $MEM.scheduler：调度状态。active=<cid>、ready=[...]、dormant=[...]、instruction_budget=当前链计数/预算。子路径：active / ready / dormant / budget。\n- $MEM.services：已注册服务列表（名字：做什么 → 返回什么）。\n- $MEM.icc：待处理 ICC 记录（icc_id → 发起者、模式）。return_result 成功后记录消失。\n- $MEM.memory：内存树摘要（顶层键 + 各类型节点统计）。具体内容用 memory_read 按路径读。\n- $MEM.monitor：监测器最近一帧（seq、active、本轮工具）。子路径 $MEM.monitor.<seq> 读指定帧。\n\n$MEM.inputs 读 -1 会请求用户输入（阻塞）；$MEM.outputs 写 -1 追加输出并打印到屏幕。",
+      "tool_call_id": "call_01_gPaDcbpiJECOFBoyKYHp8558"
+    },
+    {
+      "role": "tool",
+      "content": "# 指令参考（工具调用）\n\n工具参数必须是合法 JSON。参数解析失败或未知工具不会返回给对话，而是输出到 stderr（运行者可见）。一次工具调用必须有一次工具响应。\n\n1. memory_read(ref)：读内存。字典/列表返回描述+结构摘要；str 返回内容；设备返回其字符串表示。$MEM.inputs.-1 会请求用户输入（阻塞）。\n2. memory_write(ref, content)：把字符串写入路径。目标路径已是字典或列表时，写入被解释为修改元数据（meta），而不是替换内容。\n3. memory_make(ref, key, mem_type)：在 ref 指向的字典/列表下创建子节点（mem_type 为 str/dict/list）。不能在字符串路径下创建；列表的 key 必须是数字索引。\n4. edit_metadata(ref, type, key?, value?)：编辑内存节点的 ctrl 元数据（元数据二，dict[str,str]）。type=set 用 value 写 ctrl[key]（key/value 必需，ctrl 不存在时创建）；type=get 返回 ctrl[key]（key 省略返回整个 ctrl 的 JSON）；type=del 删除 ctrl[key]（key 必需）。非法参数以 Error 工具响应返回，对话保持活跃可自纠。\n5. create_cmd(system_ref, para_ref)：创建子对话并返回 cid。子对话创建后休眠，等待 send_instruction。system_ref 必须指向程序节点：ctrl.type='settingup'（LLM 提示词程序，value 含 name/content）或 ctrl.type='python'（Python 程序，content 是代码）。指向 str 节点或无类型 dict 节点会报错（工具响应 Error），不会创建对话。\n6. create_sub(system_ref, user_ref, para_ref)：创建亚对话并立即执行；完成自动唤醒父并写回结果。system_ref 同 create_cmd，必须指向程序节点；user_ref 是启动用户消息引用。\n7. register_service(name, what, needs, returns)：把当前对话注册为服务。\n8. call_service(service_name, input, return_mode)：调用已注册服务，自身休眠等待返回。return_mode=tool（默认，结论作为工具响应返回）/ message（结论作为消息返回）。\n9. transfer_service(service_name, input)：把控制权移交给服务，自身休眠，不等待返回。\n10. return_result(content, icc_id)：把结论按 ICC id 返回给发起者，并确保发起者成为下一个被激活的对话。\n11. send_instruction(cid, content, wait)：向指定 cid（或 cid 列表，多播）投递指令。content 会被包装为 JSON 消息（from/to/icc_id/content），目标对话收到这条 JSON 字符串。wait=true 时休眠等待返回。\n12. close_conversation(cid)：内核级关闭指令。关闭指定 cid 的对话（自身或其他对话），不需要对方回应。关闭后该对话不可再调度、不可再被调用，记录为 finished；其服务注销、PLM 状态释放、未完成调用清理（发给它的请求会以 Error 返回给发起者并唤醒）。\n\n行为事实：\n- cid 从工具响应中提取（如 Success created: cid=1），之后用 send_instruction 按 cid 驱动该对话。\n- call_service 与 send_instruction(wait=true) 使当前对话休眠；返回靠 return_result 投递（多播按组等待合并）。\n- close_conversation 可关闭自身或其他对话；已关闭对话（finished）不可再调度、不可再被调用（send_instruction 会报错）。\n- 运行时可用 edit_metadata 给节点设置 ctrl（如 ctrl.type='settingup'/'python'），配合 memory_make/memory_write 组合出可被 create_cmd 使用的程序节点；新程序不一定需要镜像预置。",
+      "tool_call_id": "call_02_e2E0qQTFOFHqvqSif84f3254"
+    },
+    {
+      "role": "tool",
+      "content": "# 内存模型\n\n- 全局根：$MEM。顶层键是显式节点；设备也是顶层键。\n- 类型：MetaDict（字典）、MetaList（列表）、str。\n- 路径：$MEM.a.b.c；列表索引用数字，-1 是最后一个元素。\n- 读取语义：字典返回 meta+键列表，列表返回 meta+长度，str 返回内容；深入索引才展开子节点。写字符串到字典/列表路径 = 改 meta。\n- 设备（虚拟文件）：挂载在内存路径上，读取返回其字符串表示；部分支持子路径（如 $MEM.conversations.<cid>）。信息设备只读；$MEM.inputs 读 -1 请求用户输入；$MEM.outputs 写 -1 追加输出并打印到屏幕。\n- memory_write 到不存在的键会直接创建 str 叶子；创建 dict/list 节点用 memory_make。\n- 越界、不存在路径、字符串下创建子节点等错误会作为工具响应返回（Error: ...）。\n- $MEM.test 是预置的工作区（plans / results / notes 三个字典节点）。",
+      "tool_call_id": "call_03_z8knA36nmrEjZdPhastG1491"
+    },
+    {
+      "role": "tool",
+      "content": "# 调度与对话关系\n\n- 状态：活跃（当前执行推理，同时只有一个）/ 休眠（挂起，等待返回、事件或被再次调用）/ 就绪（排队等待被调度）。finished 是概念态：记录被 close_conversation 关闭的对话（个体结束）。\n- 调度顺序：主对话 > 子对话调用队列 > 回调队列。就绪队列先进先出（create_sub 前插）。\n- 指令预算：每次激活默认 50。同一调用链内指令数达到预算时 Core 中断让出，对话进就绪队列末尾，状态保留；调用链断开（新子对话激活）时预算重新计数。create_sub 与父共享链预算；create_cmd 子对话独立预算。\n- 交互结束 → 休眠；再次被调用（send_instruction / call_service）→ 就绪/活跃。\n- 个体结束（close_conversation）：关闭自身或其他对话，不需要对方回应；关闭后不可再调度、不可再被调用（send_instruction 报错），其服务注销、PLM 状态释放、未完成调用清理（发给它的请求以 Error 返回给发起者并唤醒）。\n- 子对话（create_cmd）：创建即休眠，父不休眠；子完成（无工具结果）不唤醒父；父恢复靠 return_result 投递。\n- 亚对话（create_sub）：创建即就绪（前插），父休眠；完成自动写回结果并唤醒父（同一调用链，预算延续）。\n- 服务：register_service 把当前对话绑定到名字；call_service 记录 ICC 并唤醒服务、休眠调用者；return_result 消耗 ICC 并把结论投回调用者（工具响应或消息）。服务交互结束后注册保留；服务被关闭则注销。\n- ICC：icc_id = 发起方工具调用的 call_id（send_instruction 多播为 call_id#序号）。return_result 必须带有效 icc_id，否则报错且不会路由。\n- 移交（transfer_service）：调用者休眠，目标收到内容后激活；没有 ICC，调用者不等待返回。",
+      "tool_call_id": "call_04_nbLDwydIABoWR5HOo8qZ6517"
+    }
+  ]
+}

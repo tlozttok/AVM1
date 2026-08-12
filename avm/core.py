@@ -3,6 +3,7 @@ from typing import Optional, List, Dict, Type
 from openai import OpenAI
 from dotenv import load_dotenv
 import json
+import os
 import sys
 import time
 
@@ -881,6 +882,8 @@ class Core:
         self._finished: set = set()  # 已关闭（个体结束）的对话 cid；记录供监测/信息设备展示
         self._instruction_budget: int = 50  # 每次激活的指令预算（核心中断阈值）
         self._activation_instructions: int = 0
+        self.image_dir: Optional[str] = None  # 调试用：镜像目录（检查点默认路径）
+        self.image_name: Optional[str] = None  # 调试用：镜像名（不含扩展名，检查点默认路径）
         self.debug: bool = False
         self.monitor: Monitor = Monitor()
         self.para_ref: str = "$MEM.model_params"
@@ -899,6 +902,50 @@ class Core:
 
     def get_conversation(self, cid: int) -> Optional[Conversation]:
         return self._conv_by_cid.get(cid)
+
+    def checkpoint_path(self, cid: int) -> str:
+        """调试用：单对话检查点的默认路径（镜像目录/out/<镜像名>.conv.json；无镜像上下文时用 checkpoints/conv-<cid>.json）"""
+        if self.image_dir and self.image_name:
+            return os.path.join(self.image_dir, "out", f"{self.image_name}.conv.json")
+        return os.path.join("checkpoints", f"conv-{cid}.json")
+
+    def save_conversation(self, cid: int, path: str) -> None:
+        """调试用：保存单对话检查点（独立 JSON 文件，无损、确定性）。
+
+        若历史末尾是未配对的 assistant 工具调用（如等待输入响应时），截掉该条，
+        保证恢复后的历史是"截至最后一条完整交换"的干净前缀，to_api_messages()
+        与保存时的请求前缀逐字节一致（前缀缓存命中）。v1 不支持 Python 对话。
+        """
+        conv = self._conv_by_cid.get(cid)
+        if conv is None:
+            raise VMMemoryError(f"对话 {cid} 不存在")
+        if conv.is_python:
+            raise ValueError("v1 检查点不支持 Python 对话")
+        cp = conv.to_checkpoint()
+        msgs = cp["messages"]
+        if msgs and msgs[-1].get("role") == "assistant" and "tool_calls" in msgs[-1]:
+            msgs = msgs[:-1]  # 末尾未配对工具调用：截断到最后一个完整交换
+            cp["messages"] = msgs
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cp, f, ensure_ascii=False, indent=2)
+
+    def restore_conversation(self, path: str, schedule: str = "dormant") -> Conversation:
+        """调试用：从检查点恢复对话（注册新 cid；v1 不支持 Python 对话）。
+
+        schedule: "dormant"（默认，等待被调用）或 "ready"（排队等待调度）。
+        """
+        with open(path, encoding="utf-8") as f:
+            cp = json.load(f)
+        conv = Conversation.from_checkpoint(cp)
+        if conv.is_python:
+            raise ValueError("v1 检查点不支持 Python 对话")
+        self._register(conv)
+        if schedule == "ready":
+            self._ready_cids.append(conv.cid)
+        else:
+            self._dormant_cids.append(conv.cid)
+        return conv
 
     def _process_return_calls(self, return_calls: list, conv: Conversation):
         registry = _instruction_registry()

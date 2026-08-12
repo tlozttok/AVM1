@@ -179,7 +179,7 @@ PLM 代码运行在受限环境：安全 builtins 白名单 + AST 检查（禁�
 - **显式节点**：内存每个节点都是 `{ "kind": "str"|"dict"|"list"|"device", "meta"?, "ctrl"?, "value" }`，无任何隐式转换（str 也必须显式包装）。`kind="device"` 是任意层级都可出现的可读性标记，实际挂载在 `devices` 段。
 - **para**：`ctrl.type="para"` 的 dict 节点存放模型调用参数（`model`、`temperature`、`use_tool`、`extra_body`、`reasoning_effort` 等），均以字符串存储，数值型加载时自动转回。
 - **devices**：数组，每项 `{ path, file, class, args }`。`file` 是相对镜像文件的 Python 模块路径，`class` 是其中的设备类，**必须继承** `MemoryDevice`，否则加载报错。这样"一个 JSON + 几个定义设备的 Python 文件"就是一个完整的系统镜像。
-- **init**：启动对话配置（`name` 默认 `"init"`，`system`/`system_ref`、`user`/`user_ref`）。只启动 0 号对话，不预置其他对话；服务由对话运行期自己注册。
+- **init**：启动对话配置（`name` 默认 `"init"`，`system`/`system_ref`、`user`/`user_ref`）。`system_ref` 必须指向 `ctrl.type="settingup"` 的 LLM 程序节点（`system` 字面量可用于匿名入口程序）；`user_ref` 指向 str 节点。只启动 0 号对话，不预置其他对话；服务由对话运行期自己注册。
 - **persist_to**：运行结束后内存写回路径（异常也写）。
 - **meta**：`version` 必须为 1；`instruction_budget` 可配核心中断预算。
 
@@ -206,6 +206,12 @@ python main.py <image.json> --transcript api.txt  # API 调用全文落盘
 - `conversations`：每个对话的状态、消息条数、输入批次内容。
 
 提供 `trail()`（单变量跨帧轨迹）、`diff()`（两帧间变化）、`find()`（按谓词找帧）等查询；`--transcript` 把每次 API 调用全文写入文件。
+
+### 单对话检查点（调试用）
+
+`Core.save_conversation(cid, path)` / `Core.restore_conversation(path)` 保存/恢复单个 LLM 对话：序列化无损、确定性，恢复后发送给 API 的消息前缀与保存时逐字节一致（可命中厂商前缀缓存）。历史末尾是未配对的工具调用时（如等待输入响应），保存会自动截到最后一个完整交换。v1 不支持 Python 对话。
+
+输入设备支持操作者命令 `/save`（可带路径 `/save <path>`）：在输入前截取，保存当前活跃对话的检查点后继续等待真实输入——对话感知不到该命令。恢复在 host 侧进行（`restore_conversation`），不做 AVM 内 `/load`。
 
 ### 思维链内容
 
@@ -339,7 +345,8 @@ Python 程序对同样的输入序列只有同样的输出；非最后一条消�
 - 信息设备（conversations / scheduler / icc / memory / monitor）；
 - 监测器（帧 / 轨迹 / diff / find / 全文文件，含思维链记录）；
 - 思维链内容回传（历史保留、总是回传、monitor 记录、不内部暴露）；
-- 测试 194 个全部通过（MockLMU，不调真实 API）。
+- 单对话检查点（`save_conversation` / `restore_conversation`，输入 `/save` 调试命令）；
+- 测试 223 个全部通过（MockLMU，不调真实 API）。
 
 设计中（未实现）：
 

@@ -52,7 +52,15 @@ def _sample_image():
     return {
         "meta": {"name": "demo", "version": 1},
         "mem": {
-            "system": {"kind": "str", "value": "sys"},
+            "system": {
+                "kind": "dict",
+                "meta": "init 的 LLM 提示词程序",
+                "ctrl": {"type": "settingup"},
+                "value": {
+                    "name": {"kind": "str", "value": "init"},
+                    "content": {"kind": "str", "value": "sys"},
+                },
+            },
             "user": {"kind": "str", "value": "hello"},
             "model_params": {
                 "kind": "dict",
@@ -82,7 +90,10 @@ class TestLoadImage:
         path = _write(tmp_path, _sample_image(), devices_code=DEVICE_CODE)
         core = load_image(path)
 
-        assert core.mem["system"] == "sys"
+        system = core.mem["system"]
+        assert isinstance(system, MetaDict)
+        assert system.get_ctrl() == {"type": "settingup"}
+        assert system["content"] == "sys"
         assert core.mem["nested"]["k"] == ["a"]
         para = core.mem["model_params"]
         assert isinstance(para, MetaDict)
@@ -179,6 +190,39 @@ class TestLoadImage:
         image["init"] = {"system_ref": "not_a_ref", "user_ref": "$MEM.user"}
         path = _write(tmp_path, image, devices_code=DEVICE_CODE)
         with pytest.raises(ImageError, match="开头的内存引用"):
+            load_image(path)
+
+    def test_init_system_ref_requires_settingup(self, tmp_path):
+        """init 的 system_ref 指向 str 节点：与 create_cmd 一致，要求 settingup 程序节点"""
+        image = _sample_image()
+        image["mem"]["system"] = {"kind": "str", "value": "sys"}
+        path = _write(tmp_path, image, devices_code=DEVICE_CODE)
+        with pytest.raises(ImageError, match="settingup"):
+            load_image(path)
+
+    def test_init_system_ref_rejects_untyped_dict(self, tmp_path):
+        image = _sample_image()
+        image["mem"]["system"] = {"kind": "dict", "value": {"content": {"kind": "str", "value": "sys"}}}
+        path = _write(tmp_path, image, devices_code=DEVICE_CODE)
+        with pytest.raises(ImageError, match="settingup"):
+            load_image(path)
+
+    def test_init_settingup_requires_content(self, tmp_path):
+        image = _sample_image()
+        image["mem"]["system"] = {"kind": "dict", "ctrl": {"type": "settingup"}, "value": {}}
+        path = _write(tmp_path, image, devices_code=DEVICE_CODE)
+        with pytest.raises(ImageError, match="content"):
+            load_image(path)
+
+    def test_init_user_ref_must_be_str_node(self, tmp_path):
+        image = _sample_image()
+        image["mem"]["user"] = {
+            "kind": "dict",
+            "ctrl": {"type": "settingup"},
+            "value": {"content": {"kind": "str", "value": "hello"}},
+        }
+        path = _write(tmp_path, image, devices_code=DEVICE_CODE)
+        with pytest.raises(ImageError, match="str 节点"):
             load_image(path)
 
     def test_device_file_missing(self, tmp_path):

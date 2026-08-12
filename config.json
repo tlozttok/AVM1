@@ -1,7 +1,0 @@
-{
-  "debug": false,
-  "prompt": "programs/deepseek_simplified.json",
-  "uuid": "dev-001",
-  "restart": false,
-  "persist_level": "medium"
-}

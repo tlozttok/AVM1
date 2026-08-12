@@ -6,12 +6,17 @@
   },
   "mem": {
     "system": {
-      "kind": "str",
-      "value": "你是这个系统中的一个对话。系统提供内存树和一组工具，机制参见参考手册 $MEM.tester_manual（需要时用 memory_read 读取）。可用工具：memory_read、memory_write、memory_make、edit_metadata、create_cmd、create_sub、register_service、call_service、transfer_service、return_result、send_instruction、close_conversation。"
+      "kind": "dict",
+      "meta": "tester 的 LLM 提示词程序（settingup）",
+      "ctrl": { "type": "settingup" },
+      "value": {
+        "name": { "kind": "str", "value": "tester" },
+        "content": { "kind": "str", "value": "你是这个系统中的一个对话。系统提供内存树和一组工具，机制参见参考手册 $MEM.tester_manual（需要时用 memory_read 读取）。可用工具：memory_read、memory_write、memory_make、edit_metadata、create_cmd、create_sub、register_service、call_service、transfer_service、return_result、send_instruction、close_conversation。你需要在开发者用户的指导下对系统做模糊测试。你无法了解系统的代码，这是设计之中的，你只需要思考各种AI系统的编排，包括固定的工作流、Agentic、控制系统甚至复杂自组织系统，创建简易的toy程序，以用户指令为准，调用各种工具，并且监控系统。如果你发现用户指令你做不到，就直接说，用户本意就是查漏补缺，如果你不知道怎么执行，你可以问用户。这里的用户都指通过memory读写获取的指令，而不是直接输入的东西。" }
+      }
     },
     "user": {
       "kind": "str",
-      "value": "开始"
+      "value": "这里不是用户指令。这里是初始指令的一部分。你在收到后需要执行如下步骤：1.调用memory_write，向\"$MEM.outputs.-1\"（这会向用户终端发送消息）写入你对用户的打招呼，让用户确定你已经运行。2.调用memory_read，阅读手册。3.向\"$MEM.outputs.-1\"发送消息表明你已经理解了AVM。4.memory_read(\"$MEM.inputs.-1\") 读取用户输入；\n5. 根据工具调用返回的输入的用户指令执行。把反馈写入 memory_write(\"$MEM.outputs.-1\", 反馈)；\n6. 回到步4。"
     },
     "model_params": {
       "kind": "dict",
@@ -39,7 +44,7 @@
         },
         "memory_model": {
           "kind": "str",
-          "value": "# 内存模型\n\n- 全局根：$MEM。顶层键是显式节点；设备也是顶层键。\n- 类型：MetaDict（字典）、MetaList（列表）、str。str 永远是 str，不会被解引用；以 $ 开头的 str 会被当作地址递归解析，& 开头只解析一层。\n- 路径：$MEM.a.b.c；列表索引用数字，-1 是最后一个元素。\n- 读取语义：字典返回 meta+键列表，列表返回 meta+长度，str 返回内容；深入索引才展开子节点。写字符串到字典/列表路径 = 改 meta。\n- 设备（虚拟文件）：挂载在内存路径上，读取返回其字符串表示；部分支持子路径（如 $MEM.conversations.<cid>）。信息设备只读；$MEM.inputs 读 -1 请求用户输入；$MEM.outputs 写 -1 追加输出并打印到屏幕。\n- memory_write 到不存在的键会直接创建 str 叶子；创建 dict/list 节点用 memory_make。\n- 越界、不存在路径、字符串下创建子节点等错误会作为工具响应返回（Error: ...）。\n- $MEM.test 是预置的工作区（plans / results / notes 三个字典节点）。"
+          "value": "# 内存模型\n\n- 全局根：$MEM。顶层键是显式节点；设备也是顶层键。\n- 类型：MetaDict（字典）、MetaList（列表）、str。\n- 路径：$MEM.a.b.c；列表索引用数字，-1 是最后一个元素。\n- 读取语义：字典返回 meta+键列表，列表返回 meta+长度，str 返回内容；深入索引才展开子节点。写字符串到字典/列表路径 = 改 meta。\n- 设备（虚拟文件）：挂载在内存路径上，读取返回其字符串表示；部分支持子路径（如 $MEM.conversations.<cid>）。信息设备只读；$MEM.inputs 读 -1 请求用户输入；$MEM.outputs 写 -1 追加输出并打印到屏幕。\n- memory_write 到不存在的键会直接创建 str 叶子；创建 dict/list 节点用 memory_make。\n- 越界、不存在路径、字符串下创建子节点等错误会作为工具响应返回（Error: ...）。\n- $MEM.test 是预置的工作区（plans / results / notes 三个字典节点）。"
         },
         "scheduling": {
           "kind": "str",

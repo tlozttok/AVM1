@@ -179,7 +179,7 @@ One JSON file plus a few device Python files is a standard AVM system image. The
 - **Explicit nodes**: every memory node is `{ "kind": "str"|"dict"|"list"|"device", "meta"?, "ctrl"?, "value" }` — no implicit conversion (even str must be wrapped explicitly). `kind="device"` is a readability marker allowed at any level; the actual mount happens in the `devices` section.
 - **para**: a dict node with `ctrl.type="para"` holds model-call parameters (`model`, `temperature`, `use_tool`, `extra_body`, `reasoning_effort`, etc.), all stored as strings; numeric values are converted back on load.
 - **devices**: an array of `{ path, file, class, args }`. `file` is a Python module path relative to the image file, `class` is the device class defined there, and it **must subclass** `MemoryDevice` or loading fails. This is how "one JSON plus a few device Python files" composes into a complete system image.
-- **init**: startup conversation config (`name` defaults to `"init"`; `system`/`system_ref`, `user`/`user_ref`). Only conversation 0 is started; no other conversations are preset — services register themselves at runtime.
+- **init**: startup conversation config (`name` defaults to `"init"`; `system`/`system_ref`, `user`/`user_ref`). `system_ref` must point to an LLM program node with `ctrl.type="settingup"` (a literal `system` is allowed as an anonymous entry program); `user_ref` points to a str node. Only conversation 0 is started; no other conversations are preset — services register themselves at runtime.
 - **persist_to**: memory write-back path after the run (also on exception).
 - **meta**: `version` must be 1; `instruction_budget` configures the core-interrupt budget.
 
@@ -206,6 +206,12 @@ One frame is recorded after every conversation advance; frame 0 is the baseline.
 - `conversations`: per-conversation state, message count, and batch contents.
 
 Queries include `trail()` (per-variable trajectory across frames), `diff()` (changes between two frames), and `find()` (frames matching a predicate); `--transcript` writes the full text of every API call to a file.
+
+### Single-Conversation Checkpoint (debug)
+
+`Core.save_conversation(cid, path)` / `Core.restore_conversation(path)` save/restore a single LLM conversation: serialization is lossless and deterministic, so after restore the message prefix sent to the API is byte-identical to the saved one (hitting the vendor's prefix cache). When history ends with an unmatched tool call (e.g., while waiting for an input response), saving automatically truncates to the last complete exchange. Python conversations are not supported in v1.
+
+The input device supports the operator command `/save` (optional path: `/save <path>`): it intercepts before delivery, saves a checkpoint of the currently active conversation, and keeps prompting for real input — the conversation never sees the command. Restore happens host-side (`restore_conversation`); there is no in-AVM `/load`.
 
 ### Reasoning Content
 
@@ -339,7 +345,8 @@ Implemented:
 - Info devices (conversations / scheduler / icc / memory / monitor);
 - Monitor (frames / trail / diff / find / full-text transcript, including reasoning recording);
 - Reasoning content return (kept in history, always returned, recorded by monitor, not exposed internally);
-- 194 tests passing (MockLMU, no real API calls).
+- Single-conversation checkpoint (`save_conversation` / `restore_conversation`, input `/save` debug command);
+- 223 tests passing (MockLMU, no real API calls).
 
 Under design (not implemented):
 

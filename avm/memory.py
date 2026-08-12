@@ -25,7 +25,6 @@ def _wrap_value(value: Any) -> Any:
 class Memory:
     """
     内存类
-    封装内存访问逻辑，支持 $（递归解引用）和 &（一层解引用）
     注意：MEM 中只存储 MetaDict/MetaList/str，不会出现普通 dict/list
     """
 

@@ -105,6 +105,8 @@ def _mount_devices(core: Core, image_path: str, devices: list, mem_device_paths:
         except TypeError as e:
             raise ImageError(f"设备 {path}: 实例化失败（args 与构造函数不匹配）: {e}")
         core.mem.mount(path, device)
+        # 调试用：把 Core 引用交给设备（检查点 /save 等调试命令需要访问运行时状态）
+        device.attach_core(core)
         mounted.add(path)
 
     for mp in mem_device_paths:
@@ -133,13 +135,25 @@ def _start_init(core: Core, init: dict):
     if system_ref is not None:
         if not isinstance(system_ref, str) or not system_ref.startswith("$"):
             raise ImageError("system_ref 必须是 $ 开头的内存引用（字面量请用 system 字段）")
-        system = core.unwrap(system_ref)
+        node = core.unwrap(system_ref, for_llm=False)
+        if not isinstance(node, MetaDict) or (node.get_ctrl() or {}).get("type") != "settingup":
+            raise ImageError(
+                f"system_ref {system_ref} 必须指向 ctrl.type='settingup' 的 LLM 程序节点"
+                "（str 节点、无类型 dict 节点不接受）"
+            )
+        content = node.get("content")
+        if not isinstance(content, str):
+            raise ImageError(f"settingup 节点 {system_ref} 必须有字符串 content 字段")
+        system = content
     if user_ref is not None:
         if not isinstance(user_ref, str) or not user_ref.startswith("$"):
             raise ImageError("user_ref 必须是 $ 开头的内存引用（字面量请用 user 字段）")
-        user = core.unwrap(user_ref)
+        user = core.unwrap(user_ref, for_llm=False)
     if not isinstance(system, str) or not isinstance(user, str):
-        raise ImageError("init 的 system/user 最终必须是字符串（引用需指向 str 节点）")
+        raise ImageError(
+            "init 的 system/user 必须是字符串（system 字面量或 settingup 节点的 content；"
+            "user_ref 需指向 str 节点）"
+        )
     conv = core.start(system, user, core.para_ref)
     conv.name = name
 
@@ -160,6 +174,8 @@ def load_image(image_path: str) -> Core:
         raise ImageError("镜像必须包含 mem 段（对象）")
 
     core = Core()
+    core.image_dir = os.path.dirname(os.path.abspath(image_path))
+    core.image_name = os.path.splitext(os.path.basename(image_path))[0]
     budget = meta.get("instruction_budget")
     if isinstance(budget, int) and budget > 0:
         core._instruction_budget = budget

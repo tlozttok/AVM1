@@ -2,6 +2,25 @@
 import json
 from typing import Dict, Optional
 
+CHECKPOINT_VERSION = 1
+
+
+def _tool_call_to_dict(tc) -> dict:
+    """工具调用无损转 dict（兼容 ToolCall 对象与已转好的 dict，检查点序列化用）"""
+    if isinstance(tc, dict):
+        fn = tc.get("function") or {}
+        return {
+            "id": tc.get("id"),
+            "type": tc.get("type", "function"),
+            "function": {"name": fn.get("name"), "arguments": fn.get("arguments")},
+        }
+    fn = tc.function
+    return {
+        "id": tc.id,
+        "type": getattr(tc, "type", "function"),
+        "function": {"name": fn.name, "arguments": fn.arguments},
+    }
+
 
 class MetaList:
     """带元数据的列表，对 LLM 可展示自定义描述字符串"""
@@ -332,6 +351,72 @@ class Conversation:
     def get_last_messages(self, count: int = 1) -> List[Message]:
         """获取最后 n 条消息"""
         return self.messages[-count:] if self.messages else []
+
+    def to_checkpoint(self) -> dict:
+        """单对话检查点：无损、确定性序列化（调试用）。
+
+        保留每条消息的全部字段（content 空串、tool_calls 原样、reasoning_content、
+        tool_call_id），字段顺序固定，保证恢复后 to_api_messages() 与保存时逐字节一致
+        （前缀缓存命中的前提）。
+        """
+        def _msg(m: Message) -> dict:
+            d = {"role": m.role, "content": m.content}
+            if isinstance(m, ToolMessage):
+                d["tool_call_id"] = m.tool_call_id
+            if isinstance(m, AssistantMessage):
+                if m.tool_calls:
+                    d["tool_calls"] = [_tool_call_to_dict(tc) for tc in m.tool_calls]
+                if m.reasoning_content is not None:
+                    d["reasoning_content"] = m.reasoning_content
+            return d
+
+        return {
+            "version": CHECKPOINT_VERSION,
+            "name": self.name,
+            "para_ref": self.para_ref,
+            "is_python": self.is_python,
+            "is_sub": self.is_sub,
+            "is_root": self.is_root,
+            "metadata": dict(self.metadata or {}),
+            "service_desc": dict(self.service_desc) if self.service_desc else None,
+            "messages": [_msg(m) for m in self.messages],
+        }
+
+    @classmethod
+    def from_checkpoint(cls, cp: dict) -> 'Conversation':
+        """从检查点恢复对话（to_checkpoint 的逆操作；cid 由 Core 恢复时重新分配）。"""
+        version = cp.get("version")
+        if version != CHECKPOINT_VERSION:
+            raise ValueError(f"不支持的检查点版本 {version}（当前支持 {CHECKPOINT_VERSION}）")
+        msgs = []
+        for d in cp.get("messages", []):
+            role = d.get("role")
+            content = d.get("content", "")
+            if role == "assistant":
+                msgs.append(AssistantMessage(
+                    content=content,
+                    tool_calls=d.get("tool_calls"),
+                    reasoning_content=d.get("reasoning_content"),
+                ))
+            elif role == "tool":
+                msgs.append(ToolMessage(content=content, tool_call_id=d.get("tool_call_id", "")))
+            elif role == "user":
+                msgs.append(UserMessage(content=content))
+            elif role == "system":
+                msgs.append(SystemMessage(content=content))
+            else:
+                msgs.append(Message(content=content, role=role or ""))
+        conv = cls(
+            messages=msgs,
+            is_sub=bool(cp.get("is_sub", False)),
+            is_root=bool(cp.get("is_root", False)),
+            metadata=cp.get("metadata") or {},
+            service_desc=cp.get("service_desc"),
+            name=cp.get("name"),
+        )
+        conv.para_ref = cp.get("para_ref")
+        conv.is_python = bool(cp.get("is_python", False))
+        return conv
 
     @classmethod
     def from_any_list(cls, items: list) -> 'Conversation':
