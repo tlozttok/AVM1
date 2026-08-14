@@ -78,25 +78,6 @@ class SchedulerDevice(MemoryDevice):
         }[path[0]]
 
 
-class IccDevice(MemoryDevice):
-    """$MEM.icc：待处理 ICC 记录摘要。"""
-
-    def __init__(self, core):
-        self._core = core
-
-    def pretend_as_type(self):
-        return "str"
-
-    def to_llm_string(self):
-        if not self._core._icc:
-            return "暂无待处理 ICC 记录"
-        lines = [
-            f"  {icc_id} → caller={rec['caller_cid']} callee={rec.get('callee_cid')} mode={rec.get('mode', 'tool')}"
-            for icc_id, rec in self._core._icc.items()
-        ]
-        return "ICC 记录:\n" + "\n".join(lines)
-
-
 class MemorySummaryDevice(MemoryDevice):
     """$MEM.memory：内存树摘要（顶层键 + 节点统计）。"""
 

@@ -49,7 +49,7 @@ A conversation is in one of three scheduling states:
 
 Scheduling follows a queue model:
 
-- Woken conversations go to the **tail** of the ready queue (e.g., `call_service`, `send_instruction`, and `return_result` waking the caller);
+- Woken conversations go to the **tail** of the ready queue (e.g., `send_instruction` waking a target, or a sub conversation waking its parent);
 - `create_sub` is the only exception: the sub conversation is inserted at the front and executes immediately;
 - When a sub conversation finishes, its parent is activated directly (same call chain).
 
@@ -59,8 +59,8 @@ To keep a single conversation from holding the execution turn indefinitely, each
 
 "Conversation end" has two meanings that must be kept apart:
 
-- **End of an interaction**: the conversation produced a result without tool calls and the current round is done. The conversation itself still exists and can be woken again (service call, event callback, etc.). It becomes dormant.
-- **End of an individual**: the conversation is closed by the kernel-level `close_conversation` instruction (callable by itself or another conversation; the closed conversation's consent is not required). After closure it cannot be scheduled or called again and is recorded as finished; its service is unregistered, its PLM state is released, and its pending calls are cleaned up.
+- **End of an interaction**: the conversation produced a result without tool calls and the current round is done. The conversation itself still exists and can be woken again (being delivered an instruction again, event callback, etc.). It becomes dormant.
+- **End of an individual**: the conversation is closed by the kernel-level `close_conversation` instruction (callable by itself or another conversation; the closed conversation's consent is not required). After closure it cannot be scheduled or called again and is recorded as finished; its PLM state is released.
 
 ## Instruction Set
 
@@ -74,11 +74,7 @@ Core executes instructions; it does not make business decisions. The full instru
 | `edit_metadata` | Edit a node's ctrl metadata: set writes / get reads (omit key to return the whole ctrl) / del removes | `ref`, `type`(set/get/del), `key`?, `value`? |
 | `create_cmd` | Create a child conversation (`system_ref` must point to a settingup or python program node; create only, return cid; the child sleeps awaiting instructions; this conversation stays active) | `system_ref`, `para_ref` |
 | `create_sub` | Create a sub conversation (executes immediately; on completion, auto-writes the result and wakes the parent) | `system_ref`, `user_ref`, `para_ref` |
-| `register_service` | Register this conversation as a service | `name`, `what`, `needs`, `returns` |
-| `call_service` | Call a registered service and wait for its return | `service_name`, `input`, `return_mode`(tool/message) |
-| `transfer_service` | Transfer control to a service; this conversation sleeps and does not wait | `service_name`, `input` |
-| `return_result` | Explicitly return a conclusion to the requester by ICC id and make it the next active conversation | `content`, `icc_id` |
-| `send_instruction` | Deliver an instruction to a conversation by cid (multicast supported) | `cid`(int/list), `content`, `wait`, `return_mode`, `format` |
+| `send_instruction` | Deliver instruction content to a conversation by cid (multicast supported; only confirms delivery, no guaranteed reply; the caller keeps executing and does not sleep automatically) | `cid`(int/list), `content` |
 | `close_conversation` | Kernel-level close: close the conversation with the given cid (self or another; consent not required); after closure it cannot be scheduled or called again | `cid` |
 
 ## Memory Model
@@ -110,40 +106,24 @@ A device is a subclass of `avm.memory_device.MemoryDevice` that interacts with c
 - `resolve_path(path)`: sub-path access (optional; raises by default);
 - `set_value(value)`: writes (optional).
 
-Core mounts built-in read-only info devices: `$MEM.conversations` (conversation list and per-conversation detail), `$MEM.scheduler` (active/ready/dormant and budget), `$MEM.icc` (pending ICC records), `$MEM.memory` (memory tree summary), `$MEM.monitor` (frame summary). Images can mount their own devices, e.g. `$inputs`, `$outputs` (see [System Images](#system-images-and-quick-start)).
+Core mounts built-in read-only info devices: `$MEM.conversations` (conversation list and per-conversation detail), `$MEM.scheduler` (active/ready/dormant and budget), `$MEM.memory` (memory tree summary), `$MEM.monitor` (frame summary). Images can mount their own devices, e.g. `$inputs`, `$outputs` (see [System Images](#system-images-and-quick-start)).
 
 ## Inter-Conversation Communication
 
-### ICC Records
+### Simple Delivery
 
-Every inter-conversation call (`call_service`, `send_instruction`) is recorded by Core:
+`send_instruction` is the only inter-conversation primitive: deliver instruction content by cid, placed **verbatim** into the target's input batch, and wake it (tail of the ready queue). The caller immediately receives a "delivered to <identity>" confirmation — **delivery is guaranteed, a reply is not**. The caller keeps executing after delivery and does not sleep automatically.
 
-```
-icc_id → { caller_cid, caller_call_id, mode, group_key? }
-```
+To get a result, the conversation decides how to wait by itself:
 
-The `icc_id` is the caller's tool-call `call_id` for that invocation. `return_result` must carry the `icc_id`; Core routes the conclusion back to the caller using the record. A missing record is an error (printed to stderr).
+- **Ask in the content to be notified when the target finishes**: the target sends the conclusion back as a delivered message (still via `send_instruction`), waking the caller on receipt;
+- **Register an event listener** (planned): register a listener for an "expected behavior" (e.g. a memory address change, a conversation finishing); Core wakes the listener automatically when it fires.
 
-### Message Format (v2)
+**The parent is not a default receiver**: a creation relationship does not constitute a return channel; an AI's thinking is not by default revealed to other AIs; output is written to shared memory by default.
 
-Delivered messages are JSON-format strings (the default; the `format` parameter reserves room for future formats, currently only `json`):
+### Message Content
 
-```json
-{ "from": "sender identity", "to": "target identity", "icc_id": "...", "content": "instruction content" }
-```
-
-`from` and `to` are filled in by Core from conversation identities; they are not written by the AI itself. `content` is not required to be JSON.
-
-### Return Modes
-
-Two return modes (`return_mode`) are supported:
-
-- **Tool return (default)**: the `return_result` conclusion is delivered as a tool response attached to the caller's original `call_id`; the caller is woken and placed at the tail of the ready queue.
-- **Message return**: the conclusion is delivered to the caller as a user message (`from`/`to`/`icc_id`/`content`); the caller's tool call first receives a confirmation response so that the "one tool call, one return" protocol constraint is satisfied.
-
-For multicast (`send_instruction` with a cid list), each target gets an independent ICC record (`call_id#i`); in tool-return mode Core waits for all targets, then merges the results by cid and name into one JSON-array tool response that Python programs can decode with `json.loads`.
-
-**The parent is not a default receiver**: a creation relationship does not constitute a return channel. Whether a child returns is decided by the child itself via `return_result`; an AI's thinking is not by default revealed to other AIs.
+Delivered content is an ordinary string, **not wrapped in a JSON envelope** (no `from`/`to`/`icc_id` fields). If a conversation needs to know who sent a message, it says so in the content.
 
 ### Names and cids
 
@@ -166,7 +146,7 @@ The `model` of a Python conversation must be a name in the registry (`PLM_REGIST
 
 ### Determinism
 
-Python program output is deterministic: the executor compares the previous input with the current input and processes only newly added messages; only the return of the last message is kept (the same input sequence always yields the same output). When a message carries an `icc_id`, the concrete PLM automatically constructs a `return_result` (tool-call construction is the concrete PLM's behavior; the base class does not guarantee it). Tool-call ids are a deterministic hash of the message content.
+Python program output is deterministic: the executor compares the previous input with the current input and processes only newly added messages; only the return of the last message is kept (the same input sequence always yields the same output). Message content is executed directly as code/expression; no envelope is parsed.
 
 ### Sandbox
 
@@ -179,7 +159,7 @@ One JSON file plus a few device Python files is a standard AVM system image. The
 - **Explicit nodes**: every memory node is `{ "kind": "str"|"dict"|"list"|"device", "meta"?, "ctrl"?, "value" }` — no implicit conversion (even str must be wrapped explicitly). `kind="device"` is a readability marker allowed at any level; the actual mount happens in the `devices` section.
 - **para**: a dict node with `ctrl.type="para"` holds model-call parameters (`model`, `temperature`, `use_tool`, `extra_body`, `reasoning_effort`, etc.), all stored as strings; numeric values are converted back on load.
 - **devices**: an array of `{ path, file, class, args }`. `file` is a Python module path relative to the image file, `class` is the device class defined there, and it **must subclass** `MemoryDevice` or loading fails. This is how "one JSON plus a few device Python files" composes into a complete system image.
-- **init**: startup conversation config (`name` defaults to `"init"`; `system`/`system_ref`, `user`/`user_ref`). `system_ref` must point to an LLM program node with `ctrl.type="settingup"` (a literal `system` is allowed as an anonymous entry program); `user_ref` points to a str node. Only conversation 0 is started; no other conversations are preset — services register themselves at runtime.
+- **init**: startup conversation config (`name` defaults to `"init"`; `system`/`system_ref`, `user`/`user_ref`). `system_ref` must point to an LLM program node with `ctrl.type="settingup"` (a literal `system` is allowed as an anonymous entry program); `user_ref` points to a str node. Only conversation 0 is started; no other conversations are preset — other conversations are created at runtime by the conversations themselves via `create_cmd` / `create_sub`.
 - **persist_to**: memory write-back path after the run (also on exception).
 - **meta**: `version` must be 1; `instruction_budget` configures the core-interrupt budget.
 
@@ -239,15 +219,15 @@ A linear context grows with every round; revisiting early reasoning means scanni
 
 ### Different Wake Behavior for Child vs. Sub Conversations
 
-The two collaboration kinds differ in coupling. A sub conversation is an extension of its parent's control, so it wakes the parent on completion and writes its result back automatically. A child conversation is an independent unit responsible to the overall memory purpose of AVM; the parent goes dormant after creation and waits for an instruction, and the child's completion is not a wake event for the parent. A parent resumes via the message delivered by `return_result` (direct wake) or a registered event.
+The two collaboration kinds differ in coupling. A sub conversation is an extension of its parent's control, so it wakes the parent on completion and writes its result back automatically. A child conversation is an independent unit responsible to the overall memory purpose of AVM; the parent goes dormant after creation and waits for an instruction, and the child's completion is not a wake event for the parent. A parent resumes via a message delivered by `send_instruction` (direct wake) or a registered event.
 
 ### A str Is Always a str; Links Are Devices
 
 If a string value could be interpreted as a reference, what is stored and what is read back would differ, and the indirection would be uncontrollable. A link is an explicit device: alias mounting, sub-path delegation, cycle detection — and it carries the capability boundary, because a conversation only receives the alias, never the real path, and cannot reach sibling nodes through it.
 
-### Returning via an Explicit Tool
+### Delivery Is Simple
 
-The LLM API requires exactly one return per tool call. If conclusion delivery depended on a conversation "naturally finishing in the right shape", the outcome would be unreliable: an LLM always produces content but does not always produce a tool call. `return_result` makes returning an explicit action decided by the child conversation. After the call, the child receives a confirmation and ends the next round with a tool-free result, entering dormancy; the caller becomes the next activated conversation.
+Inter-conversation communication only needs to "deliver content to a target and wake it". Forcing a JSON envelope and ICC records is premature addressing design — who sent it and where to route a reply should be expressed by the conversation itself in the content (or, later, provided by the event mechanism); Core should not maintain a request-response map for the AI. Delivery only confirms arrival: the "one tool call, one return" protocol constraint is satisfied by the "delivered" confirmation, and whether to wait for a result is the conversation's own decision.
 
 ### End of an Interaction Means Dormant
 
@@ -273,9 +253,9 @@ Inter-conversation communication dominates the workload, and each communication 
 
 A sub conversation is an extension of its parent (activated on start); if every activation reset the budget, recursive calls could continue indefinitely. Shared chain budgets bound this. A `create_cmd` child is an independent individual with its own budget.
 
-### ICC and the Message Format
+### Why Simple Delivery
 
-Delivering a conclusion to the right conversation requires addressing, so every call has an ICC record, and the `icc_id` is guaranteed by Core (the caller's tool-call `call_id`). The parent is not a default receiver — an AI's thinking is not revealed to other AIs by default, and a creation relationship is not a return channel. `from`/`to` are filled by Core; the AI neither needs nor should forge them.
+Which conversation receives a conclusion should not require Core to maintain an ICC map. Inter-conversation communication degrades to "deliver + wake": content is delivered verbatim, only arrival is confirmed, and whether to wait is the conversation's own decision. The parent is not a default receiver — an AI's thinking is not revealed to other AIs by default, and a creation relationship is not a return channel. When a result is needed, the conversation asks in the content to be notified, or registers an event listener (planned).
 
 ### Reasoning Content Return
 
@@ -308,19 +288,18 @@ Choose along three dimensions (control, waiting, return channel):
 
 | Need | Use | Notes |
 |---|---|---|
-| Create an independent unit, send instructions later | `create_cmd` | Parent stays active; child sleeps awaiting instructions; returns via `return_result` |
+| Create an independent unit, send instructions later | `create_cmd` | Parent stays active; child sleeps awaiting instructions; delivery via `send_instruction` |
 | Execute one small thing immediately and get the result | `create_sub` | Parent sleeps; sub conversation auto-writes back and wakes the parent |
-| Reuse an already-registered conversation | `call_service` | Caller sleeps waiting for the return |
-| Hand over control, no waiting | `transfer_service` | Suited for infinite loops / tail recursion |
+| Send a message to an existing cid | `send_instruction` | Multicast supported; only confirms delivery; how to wait is the conversation's own decision |
 | Send a message to a conversation by cid | `send_instruction` | Multicast and two return modes supported |
 
 ### The Return Channel Is Not Default
 
-A creation relationship is not a return channel. To get a result, carry an `icc_id` in the instruction message (the tool-call `call_id` is one), and the callee fills it in when returning. Other conversations learn results through signal events (under design).
+A creation relationship is not a return channel. To get a result, ask in the content to be notified (the callee delivers the conclusion back via `send_instruction`), or register an event listener (under design). Other conversations learn results through signal events (under design).
 
 ### Messages Are Strings
 
-A delivered message is just a JSON-format string: `from`/`to`/`icc_id`/`content`. Python programs parse it with `json.loads`; LLMs are constrained by prompts to take the fields from it. Do not invent extra envelope structures — these are the fields.
+Delivered content is just an ordinary string, not wrapped in an envelope. Python programs execute it directly as code/expression; LLMs are constrained by prompts to act on the content. If a conversation needs to know who sent a message, it says so in the content.
 
 ### Determinism
 
@@ -338,25 +317,25 @@ Every advance produces a frame: active/ready/dormant, tool-call summary, result,
 
 Implemented:
 
-- 12 instructions (memory read/write/create, ctrl metadata editing, conversation creation, services, return, delivery, close);
+- 8 instructions (memory read/write/create, ctrl metadata editing, conversation creation, delivery, close);
 - Memory tree and persistence (write-back to file);
 - Scheduling state machine: active/dormant/ready, queue scheduling, core interrupt (instruction budget), call-chain budget inheritance;
-- ICC protocol and message v2 (`from`/`to`/`icc_id`/`content`), multicast tool-return merging;
-- `return_result` explicit return;
-- `close_conversation` kernel-level close (end of an individual: service unregistration, PLM state release, pending-call cleanup);
+- Simple delivery (`send_instruction`: content delivered verbatim + wake + "delivered" confirmation, no ICC, no envelope);
+- `close_conversation` kernel-level close (end of an individual: PLM state release);
 - System image loading (explicit nodes, para, device plugins, init, persist_to, instruction_budget) and the `main.py` / `debug.json` debugging entry point;
 - Python executor (`plm.simple` / `plm.python`) and sandbox;
-- Info devices (conversations / scheduler / icc / memory / monitor);
+- Info devices (conversations / scheduler / memory / monitor);
 - Monitor (frames / trail / diff / find / full-text transcript, including reasoning recording);
 - Reasoning content return (kept in history, always returned, recorded by monitor, not exposed internally);
 - Single-conversation checkpoint (`save_conversation` / `restore_conversation`, input `/save` debug command);
-- 223 tests passing (MockLMU, no real API calls).
+- 220 tests passing (MockLMU, no real API calls).
 
 Under design (not implemented):
 
+- Device-ification: service calls, registries, etc. become device access (`xx.xx.post` / `xx.xx.response` direction; see docs/record/9.md);
 - Kernel/user mode separation;
 - Link devices;
-- Event registration and dispatch (timers, memory changes, custom signals) and event bus (implemented by AI programs);
+- Event registration and dispatch (timers, memory changes, custom signals) and event bus (implemented by AI programs) — the carrier for "conversation-decided dormancy + expected-behavior listeners";
 - Name-to-cid conversion tool;
 - File passwords and access callbacks;
 - Refined error-handling mechanism (json_error / unknown_tool response pairing);
@@ -364,7 +343,7 @@ Under design (not implemented):
 
 ## Document Index
 
-- [CONTEXT.md](CONTEXT.md) — glossary (conversation, child conversation, sub conversation, service, link, ICC id, name, end of interaction vs. end of individual, etc.)
+- [CONTEXT.md](CONTEXT.md) — glossary (conversation, child conversation, sub conversation, link, name, end of interaction vs. end of individual, etc.)
 - [docs/system-image.md](docs/system-image.md) — system image format specification
 - [docs/Agents](docs/Agents) — archived plans and design decisions
 - [docs/record/author-notes.md](docs/record/author-notes.md) — author notes (historical archive)

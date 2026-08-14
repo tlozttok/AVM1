@@ -77,7 +77,7 @@ python -m avm.image <image.json>
 - `system` / `system_ref`：二选一。`system` 是字面量提示词（匿名入口程序，不注册为节点）；`system_ref` 是 `$` 开头的内存引用，**必须指向 `ctrl.type="settingup"` 的 LLM 程序节点**（`value` 含 `content` 提示词文本，可选 `name`）；指向 str 节点或无类型 dict 节点会报错（与 `create_cmd` / `create_sub` 的校验一致）。
 - `user` / `user_ref`：二选一。`user` 是字面量；`user_ref` 是 `$` 开头的内存引用，必须指向 str 节点（启动用户消息）。
 
-只启动 0 号对话；**不预置其他对话**（服务由对话运行期自己 `register_service`）。
+只启动 0 号对话；**不预置其他对话**（其他对话由对话运行期自己 `create_cmd` / `create_sub` 创建）。
 
 ## 启动流程
 

@@ -40,7 +40,6 @@ class TestConversationCheckpoint:
             cid=0,
             is_root=True,
             metadata={"k": "v"},
-            service_desc={"name": "svc", "what": "x"},
             name="init",
         )
         conv.para_ref = "$MEM.model_params"
@@ -50,7 +49,6 @@ class TestConversationCheckpoint:
         assert restored.name == "init"
         assert restored.para_ref == "$MEM.model_params"
         assert restored.metadata == {"k": "v"}
-        assert restored.service_desc == {"name": "svc", "what": "x"}
         assert restored.messages == conv.messages
         assert restored.to_api_messages() == conv.to_api_messages()
         assert json.dumps(restored.to_api_messages(), ensure_ascii=False) == \

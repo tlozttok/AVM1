@@ -40,7 +40,7 @@ def test_calc_driver_flow():
     core, root = _setup()
     core.lmu = MockLMU([
         (None, [{"call_id": "cc", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.calc_program", "para_ref": "$MEM.calc_params"}}], None),
-        (None, [{"call_id": "si", "cmd_type": "send_instruction", "args": {"cid": 1, "content": "2 + 3", "wait": True}}], None),
+        (None, [{"call_id": "si", "cmd_type": "send_instruction", "args": {"cid": 1, "content": "2 + 3"}}], None),
         ("done", [], None),
     ])
 
@@ -52,25 +52,26 @@ def test_calc_driver_flow():
     assert ("Success created: cid=1", "cc") in _batch(core, 0)
     assert core._active_cid == 0
 
-    # root: send_instruction(wait=true) → 计算器活跃，root 休眠
+    # root: send_instruction（简单投递）→ 计算器唤醒进就绪，root 收到确认、继续执行
+    core.advance_conversation()
+    assert core._active_cid == 0
+    assert root.cid not in core._dormant_cids
+    assert ("已投递到 calc", "si") in _batch(core, 0)
+    assert calc.cid in core._ready_cids
+
+    # root: 无工具收尾 → 休眠，计算器被调度
     core.advance_conversation()
     assert core._active_cid == 1
     assert root.cid in core._dormant_cids
 
-    # 计算器（SimplePLM）求值 2+3=5 并 return_result → root 收到结果
+    # 计算器（SimplePLM）把收到的内容直接当表达式求值：输出 5，无工具调用 → 交互结束休眠
     core.advance_conversation()
     assert 1 in core._executors  # PLM 执行器由 Core 按 cid 惰性创建并缓存
-    assert ("5", "si") in _batch(core, 0)
-    assert core._active_cid == 1  # 计算器还有确认回合
-
-    # 计算器收尾（无工具）→ 休眠，root 被唤醒
-    core.advance_conversation()
-    assert core._active_cid == 0
+    assert core._active_cid is None  # 计算器输出结果后休眠，无返回、无唤醒
     assert 1 in core._dormant_cids
 
-    # root 收尾
-    core.advance_conversation()
-    assert core._active_cid is None
+    # 没有 return_result：结果不自动回传给 root（root 的 batch 已随其收尾轮清空，无"5"投递）
+    assert _batch(core, 0) == []
 
 
 def test_llm_conversation_uses_core_lmu():
@@ -95,12 +96,14 @@ def test_python_conversation_wrong_model_raises():
     core.mem["calc_params"] = MetaDict(data={"model": "not_a_plm"}, ctrl={"type": "para"})
     core.lmu = MockLMU([
         (None, [{"call_id": "cc", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.calc_program", "para_ref": "$MEM.calc_params"}}], None),
-        (None, [{"call_id": "si", "cmd_type": "send_instruction", "args": {"cid": 1, "content": "2 + 3", "wait": True}}], None),
+        (None, [{"call_id": "si", "cmd_type": "send_instruction", "args": {"cid": 1, "content": "2 + 3"}}], None),
+        ("done", [], None),
     ])
 
     core.advance_conversation()  # root: create_cmd
     calc = core.get_conversation(1)
     assert calc.is_python is True
-    core.advance_conversation()  # root: send_instruction → 计算器就绪
+    core.advance_conversation()  # root: send_instruction → 计算器就绪，root 继续
+    core.advance_conversation()  # root: 收尾 → 休眠，计算器被调度
     with pytest.raises(ValueError, match="PLM_REGISTRY"):
         core.advance_conversation()  # 计算器首轮执行 → model 错误 → 报错

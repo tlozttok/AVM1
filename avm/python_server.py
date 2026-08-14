@@ -1,6 +1,5 @@
 
 import contextlib
-import hashlib
 import io
 import json
 import math
@@ -56,11 +55,6 @@ class PLMServer(ABC):
         self._prev_input: List[dict] = []
         self._tools: dict = {}  # 工具定义：name → {"description", "parameters"}
         self._call_records: dict = {}  # 基类保证的函数调用记录：call_id → {"name", "arguments"}，用于返回与调用配对
-
-    @staticmethod
-    def call_id_for(message: str) -> str:
-        """确定性工具调用 id：对发来的消息做 sha256 编码（同一消息必然同一 id）。"""
-        return hashlib.sha256(message.encode("utf-8")).hexdigest()[:16]
 
     def _new_input_messages(self, raw_messages: List[dict]) -> List[dict]:
         """比较上一次输入与本次输入，返回本次新增的消息（共同前缀之后的切片）"""
@@ -133,16 +127,6 @@ class PLMServer(ABC):
             response["tool_calls"] = tool_calls
         return response
 
-    def parse_message(self, content: str) -> dict:
-        """解析指令消息（JSON：from/to/icc_id/content）；失败返回带 __error__ 的字典。"""
-        try:
-            msg = json.loads(content)
-        except (ValueError, TypeError):
-            return {"__raw__": content, "__error__": "JSON 解析失败"}
-        if not isinstance(msg, dict):
-            return {"__raw__": content, "__error__": "不是对象"}
-        return msg
-
     def handle_messages(self, raw_messages, params):
         # 解析工具定义，放到实例字段（供程序了解可用工具）
         self._capture_tools(params)
@@ -170,9 +154,7 @@ class SimplePLM(PLMServer):
     """最简单的 PLM：计算器。只接受一行表达式，eval 求值后直接返回。
 
     固定行为模式：
-    - 用户提示词：消息为 JSON 信封（from/to/icc_id/content），取 content 字段作表达式，
-      eval 求值（受限命名空间：无内置函数，提供 math）；
-    - 信封带 icc_id 时，构造 return_result 工具调用把结果投递给发起者（工具调用是具体实现的行为）；
+    - 用户提示词：消息内容直接作为一行表达式，eval 求值（受限命名空间：无内置函数，提供 math）；
     - 系统 / 工具消息：计算器无状态，不处理。
     """
 
@@ -180,12 +162,7 @@ class SimplePLM(PLMServer):
         pass
 
     def _execute_user_message(self, content: str):
-        msg = self.parse_message(content)
         expr = content
-        icc_id = None
-        if isinstance(msg, dict) and isinstance(msg.get("content"), str):
-            expr = msg["content"]
-            icc_id = msg.get("icc_id")
         try:
             # eval 模式天然只接受单个表达式；受限命名空间（安全 builtins + math）
             check_code(expr, mode="eval")
@@ -193,17 +170,6 @@ class SimplePLM(PLMServer):
             result = str(value)
         except Exception as e:
             result = f"错误: {type(e).__name__}: {e}"
-        if icc_id:
-            # 返回工具：结果通过 return_result 投递给发起者（id = 确定性 hash(发来的消息)）
-            tool_calls = [{
-                "id": self.call_id_for(content),
-                "type": "function",
-                "function": {
-                    "name": "return_result",
-                    "arguments": json.dumps({"content": result, "icc_id": icc_id}),
-                },
-            }]
-            return self.make_response(result, tool_calls=tool_calls)
         return result
 
     def _execute_tool_message(self, content: str, call_id: str):
@@ -218,7 +184,6 @@ class PythonPLM(PLMServer):
     - 系统提示词：setup 代码，受限执行进持久命名空间（跨轮次保留）；
     - 用户提示词：代码，也执行进同一个命名空间（与 setup 共享变量、可读写）；
     - 多个 print 全部执行，输出按顺序拼接为一个整体作为返回；
-    - 信封带 icc_id 时自动构造 return_result 返回；
     - 沙箱：安全 builtins 白名单 + AST 检查（禁 import、禁双下划线属性、禁危险调用）。
     """
 
@@ -230,12 +195,7 @@ class PythonPLM(PLMServer):
         exec_safe(content, self.namespace)
 
     def _execute_user_message(self, content: str):
-        msg = self.parse_message(content)
         code = content
-        icc_id = None
-        if isinstance(msg, dict) and isinstance(msg.get("content"), str):
-            code = msg["content"]
-            icc_id = msg.get("icc_id")
         try:
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
@@ -243,16 +203,6 @@ class PythonPLM(PLMServer):
             result = buf.getvalue()
         except Exception as e:
             result = f"错误: {type(e).__name__}: {e}"
-        if icc_id:
-            tool_calls = [{
-                "id": self.call_id_for(content),
-                "type": "function",
-                "function": {
-                    "name": "return_result",
-                    "arguments": json.dumps({"content": result, "icc_id": icc_id}),
-                },
-            }]
-            return self.make_response(result, tool_calls=tool_calls)
         return result
 
     def _execute_tool_message(self, content: str, call_id: str):

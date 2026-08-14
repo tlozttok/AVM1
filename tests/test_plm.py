@@ -57,13 +57,14 @@ class TestPythonPLM:
         code = "def fib(n):\n    a, b = 0, 1\n    for _ in range(n): a, b = b, a + b\n    return a\nprint(fib(10))"
         assert plm.handle_messages([{"role": "user", "content": code}], {}) == {"content": "55\n"}
 
-    def test_envelope_returns_via_tool(self):
+    def test_content_executed_directly_without_envelope(self):
+        """不解析 JSON 信封：消息内容直接作为代码执行，无 return_result 工具调用"""
         plm = self._plm()
         env = json.dumps({"from": "init", "to": "py", "icc_id": "i1", "content": "print(6 * 7)"})
         r = plm.handle_messages([{"role": "user", "content": env}], {})
-        assert r["content"] == "42\n"
-        assert r["tool_calls"][0]["function"]["name"] == "return_result"
-        assert json.loads(r["tool_calls"][0]["function"]["arguments"]) == {"content": "42\n", "icc_id": "i1"}
+        # 整个信封文本被当作代码执行（dict 字面量，无 print 输出），不解析信封取 content
+        assert r == {"content": ""}
+        assert r.get("tool_calls") is None
 
     def test_escape_attempt_returns_error(self):
         plm = self._plm()
