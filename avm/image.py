@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 import sys
+from typing import Optional
 
 from .core import Core
 from .exceptions import VMMemoryError
@@ -158,8 +159,11 @@ def _start_init(core: Core, init: dict):
     conv.name = name
 
 
-def load_image(image_path: str) -> Core:
-    """加载系统镜像并完成全部启动配置（不运行）。"""
+def load_image(image_path: str, checkpoint_in: Optional[str] = None) -> Core:
+    """加载系统镜像并完成全部启动配置（不运行）。
+
+    checkpoint_in：调试用——启动时加载单对话检查点（跳过 init，恢复为就绪对话）。
+    """
     if not os.path.isfile(image_path):
         raise ImageError(f"镜像文件不存在: {image_path}")
     with open(image_path, "r", encoding="utf-8") as f:
@@ -192,7 +196,15 @@ def load_image(image_path: str) -> Core:
     _mount_devices(core, image_path, image.get("devices") or [], device_markers)
 
     init = image.get("init")
-    if init:
+    if checkpoint_in:
+        # 调试用：后续启动加载已保存的对话，而不是重新从 init 开始
+        if not isinstance(checkpoint_in, str) or not checkpoint_in:
+            raise ImageError("checkpoint_in 必须是文件路径")
+        try:
+            core.restore_conversation(checkpoint_in, schedule="ready")
+        except OSError as e:
+            raise ImageError(f"检查点不存在或不可读: {checkpoint_in}: {e}")
+    elif init:
         if not isinstance(init, dict):
             raise ImageError("init 段必须是对象")
         _start_init(core, init)
@@ -209,9 +221,11 @@ def load_image(image_path: str) -> Core:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="AVM 系统镜像启动器")
     parser.add_argument("image", help="系统镜像 JSON 文件路径")
+    parser.add_argument("--checkpoint-in", metavar="PATH",
+                        help="调试用：启动时加载单对话检查点（跳过 init，恢复为就绪对话）")
     args = parser.parse_args(argv)
     try:
-        core = load_image(args.image)
+        core = load_image(args.image, checkpoint_in=args.checkpoint_in)
     except (ImageError, VMMemoryError, OSError, json.JSONDecodeError) as e:
         print(f"[AVM] 镜像错误: {e}", file=sys.stderr)
         return 1

@@ -37,3 +37,9 @@
 - avm/image.py：`_mount_devices` 挂载后调用 `device.attach_core(core)`（注释"调试用"）；`load_image` 设置 image_dir/image_name。
 - tests/test_checkpoint.py：新增 11 个测试（无损往返字节一致、reasoning_content None/空串区分、版本拒绝、save/restore 新 cid 与调度、截断、Python 拒绝、/save 默认路径/自定义路径/无 Core）。全量 223 通过（原 212 + 11）。
 - README.md / README_EN.md：调试与观测节新增"单对话检查点（调试用）"；当前状态补充检查点与测试数。
+
+**补充实施记录（2026-08-12，启动加载）**:
+- 用户运行并保存后，需要"后续启动加载该对话"的入口。`load_image(image_path, checkpoint_in=None)`：传入检查点时**跳过 init**，恢复为 cid 0 的就绪对话（直接续跑）；检查点文件不存在抛 ImageError。
+- `python -m avm.image <image.json> --checkpoint-in PATH` 与 `python main.py <image.json> --checkpoint-in PATH` 均支持；debug.json 增加 `checkpoint_in` 字段（相对 debug.json 所在目录解析），延续 VSCode 固定命令习惯。
+- tests/test_image.py +2（checkpoint_in 跳过 init 恢复就绪、文件缺失报错）、tests/test_main.py +2（debug.json 字段、CLI 标志，LMU.exec monkeypatch）。全量 227 通过（原 223 + 4）。
+- README.md / README_EN.md：检查点小节补充启动加载说明。

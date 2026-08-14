@@ -66,3 +66,38 @@ def test_main_debug_config_missing_image(tmp_path, capsys):
     rc = main(["--debug-config", str(cfg_path)])
     assert rc == 1
     assert "缺少 image 字段" in capsys.readouterr().err
+
+
+def _make_checkpoint(tmp_path):
+    """造一个检查点文件：对话历史以完整 assistant 消息结束"""
+    from avm.core import Core
+    from avm.types import MetaDict
+
+    core = Core()
+    core.mem["model_params"] = MetaDict(data={"model": "m"}, ctrl={"type": "para"})
+    conv = core.start("sys", "hello")
+    conv.append_assistant_message("done")
+    cp = tmp_path / "cp.json"
+    core.save_conversation(conv.cid, str(cp))
+    return str(cp)
+
+
+def test_main_checkpoint_in_debug_config(tmp_path, capsys, monkeypatch):
+    path = _write(tmp_path, _no_init_image())
+    cp = _make_checkpoint(tmp_path)
+    cfg_path = tmp_path / "debug.json"
+    cfg_path.write_text(json.dumps({"image": "image.json", "checkpoint_in": "cp.json", "frames": True}), encoding="utf-8")
+    monkeypatch.setattr("avm.core.LMU.exec", lambda self, conv, para: ("ok", [], conv))
+
+    rc = main(["--debug-config", str(cfg_path)])
+    assert rc == 0
+    assert "监测帧" in capsys.readouterr().err
+
+
+def test_main_checkpoint_in_flag(tmp_path, capsys, monkeypatch):
+    path = _write(tmp_path, _no_init_image())
+    cp = _make_checkpoint(tmp_path)
+    monkeypatch.setattr("avm.core.LMU.exec", lambda self, conv, para: ("ok", [], conv))
+
+    rc = main([path, "--checkpoint-in", cp])
+    assert rc == 0

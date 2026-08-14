@@ -225,6 +225,28 @@ class TestLoadImage:
         with pytest.raises(ImageError, match="str 节点"):
             load_image(path)
 
+    def test_checkpoint_in_skips_init_and_restores_ready(self, tmp_path):
+        """启动时加载检查点：跳过 init，恢复的对话为 cid 0 且就绪（直接续跑）"""
+        path = _write(tmp_path, _sample_image(), devices_code=DEVICE_CODE)
+        core0 = load_image(path)
+        conv0 = core0.get_conversation(0)
+        conv0.append_assistant_message("done")
+        cp = tmp_path / "cp.json"
+        core0.save_conversation(conv0.cid, str(cp))
+
+        core = load_image(path, checkpoint_in=str(cp))
+
+        assert len(core._conv_by_cid) == 1  # init 被跳过，只有恢复的对话
+        restored = core.get_conversation(0)
+        assert restored.name == "init"
+        assert restored.cid in core._ready_cids
+        assert restored.to_api_messages()[-1]["content"] == "done"
+
+    def test_checkpoint_in_missing_file(self, tmp_path):
+        path = _write(tmp_path, _sample_image(), devices_code=DEVICE_CODE)
+        with pytest.raises(ImageError, match="检查点"):
+            load_image(path, checkpoint_in=str(tmp_path / "nope.json"))
+
     def test_device_file_missing(self, tmp_path):
         image = _sample_image()
         image["devices"] = [{"path": "inputs", "file": "devices/nope.py", "class": "X", "args": {}}]

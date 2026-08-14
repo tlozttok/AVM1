@@ -715,6 +715,11 @@ def _build_conversation(core: 'Core', system_ref: str, para_ref: str, parent: Co
     is_python = (node_type == "python")
     messages = [SystemMessage(content=system)]
     para_node = core.unwrap(para_ref, for_llm=False)
+    para_type = (para_node.get_ctrl() or {}).get("type") if isinstance(para_node, MetaDict) else None
+    if para_type != "para":
+        raise VMMemoryError(
+            f"{para_ref} 不是参数节点：para_ref 必须指向 ctrl.type='para' 的 dict 节点"
+        )
     conv = Conversation(
         messages=messages,
         cid=0,
@@ -1152,7 +1157,12 @@ class Core:
         para_ref = getattr(conv, "para_ref", None) or self.para_ref
         try:
             para = self.unwrap(para_ref, for_llm=False)
-            if not isinstance(para, MetaDict):
+            if not isinstance(para, MetaDict) or (para.get_ctrl() or {}).get("type") != "para":
+                # 类型检查补全：指向的节点不是 para 节点时不再静默使用；回退默认参数并提示运行者
+                _report_tool_error(
+                    conv,
+                    f"para_ref {para_ref} 不是 ctrl.type='para' 的 dict 节点，回退默认参数（model=gpt-4）",
+                )
                 para = MetaDict(data={"model": "gpt-4"})
         except VMMemoryError:
             para = MetaDict(data={"model": "gpt-4"})

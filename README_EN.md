@@ -213,6 +213,10 @@ Queries include `trail()` (per-variable trajectory across frames), `diff()` (cha
 
 The input device supports the operator command `/save` (optional path: `/save <path>`): it intercepts before delivery, saves a checkpoint of the currently active conversation, and keeps prompting for real input — the conversation never sees the command. Restore happens host-side (`restore_conversation`); there is no in-AVM `/load`.
 
+Startup loading: `python main.py <image.json> --checkpoint-in cp.json` (or the `checkpoint_in` field in debug.json) **skips init** and restores the checkpoint as conversation 0 in the ready queue, continuing directly — this is the entry point for "start the next run from the previously saved conversation".
+
+Terminal input: while waiting for input, the prompt shows which conversation is waiting (e.g. `[tester (cid=0) 等待输入，/save 保存检查点]`) instead of a blank screen; readline line editing is enabled (history/arrow keys, friendlier to Chinese IME composition); a non-UTF-8 terminal encoding warns once — garbled Chinese is usually a terminal encoding issue, not a program issue.
+
 ### Reasoning Content
 
 The `reasoning_content` (chain of thought) from LLM responses is stored in full in the conversation history and sent back with assistant messages in subsequent requests (empty string when absent) — this is a hard requirement of vendor protocols and the chosen "return all reasoning content" policy. The monitor records it (same truncation policy as ordinary content); `$MEM` info devices do not expose it (leak control works by prohibiting internal access, not by not recording).

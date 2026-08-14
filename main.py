@@ -5,9 +5,10 @@
     python main.py <image.json>             # 加载镜像并运行
     python main.py <image.json> --frames    # 运行结束后打印监测帧摘要（stderr）
     python main.py <image.json> --transcript api.txt  # API 调用全文落盘
+    python main.py <image.json> --checkpoint-in cp.json  # 启动时加载单对话检查点（跳过 init）
 
 文件内配置调试（VSCode 里固定运行 python main.py，参数改 debug.json 即可）:
-    python main.py                          # 从 debug.json 读取 image/frames/transcript
+    python main.py                          # 从 debug.json 读取 image/frames/transcript/checkpoint_in
     python main.py --debug-config other.json
 """
 import argparse
@@ -58,12 +59,15 @@ def main(argv=None) -> int:
     parser.add_argument("image", nargs="?", help="系统镜像 JSON 文件路径（缺省时从 --debug-config 读取）")
     parser.add_argument("--frames", action="store_true", help="运行结束后打印监测帧摘要（stderr）")
     parser.add_argument("--transcript", metavar="PATH", help="API 调用全文写入该文件（监测器）")
+    parser.add_argument("--checkpoint-in", metavar="PATH",
+                        help="调试用：启动时加载单对话检查点（跳过 init，恢复为就绪对话）")
     parser.add_argument("--debug-config", metavar="PATH", default="debug.json",
                         help="无 image 参数时的配置文件（默认 debug.json）")
     args = parser.parse_args(argv)
 
     frames = args.frames
     transcript = args.transcript
+    checkpoint_in = args.checkpoint_in
     image = args.image
     config_dir = os.getcwd()
     if image is None:
@@ -81,11 +85,14 @@ def main(argv=None) -> int:
         image = image if os.path.isabs(image) else os.path.join(config_dir, image)
         frames = frames or bool(cfg.get("frames"))
         transcript = transcript or cfg.get("transcript")
+        checkpoint_in = checkpoint_in or cfg.get("checkpoint_in")
     if transcript and not os.path.isabs(transcript):
         transcript = os.path.join(config_dir, transcript)
+    if checkpoint_in and not os.path.isabs(checkpoint_in):
+        checkpoint_in = os.path.join(config_dir, checkpoint_in)
 
     try:
-        core = load_image(image)
+        core = load_image(image, checkpoint_in=checkpoint_in)
     except (ImageError, VMMemoryError, OSError, ValueError) as e:
         print(f"[AVM] 镜像错误: {e}", file=sys.stderr)
         return 1

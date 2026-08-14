@@ -13,7 +13,7 @@ from avm.memory_device import InputsListDevice
 
 
 def _root(core):
-    core.mem["model_params"] = MetaDict(data={"model": "test"})
+    core.mem["model_params"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
     conv = core.start("sys", "hello")
     conv.name = "init"
     return conv
@@ -163,7 +163,7 @@ class TestSaveDebugCommand:
     def test_save_default_path_then_real_input(self, monkeypatch, tmp_path):
         dev, core = self._device_with_inputs(tmp_path)
         seq = iter(["/save", "real input"])
-        monkeypatch.setattr("builtins.input", lambda: next(seq))
+        monkeypatch.setattr("builtins.input", lambda _: next(seq))
 
         assert dev[-1] == "real input"
         assert core.saved == [(7, str(tmp_path) + "/default.conv.json")]
@@ -172,7 +172,7 @@ class TestSaveDebugCommand:
     def test_save_with_custom_path(self, monkeypatch, tmp_path):
         dev, core = self._device_with_inputs(tmp_path)
         seq = iter(["/save out/custom.json", "x"])
-        monkeypatch.setattr("builtins.input", lambda: next(seq))
+        monkeypatch.setattr("builtins.input", lambda _: next(seq))
 
         assert dev[-1] == "x"
         assert core.saved == [(7, str(tmp_path) + "/out/custom.json")]
@@ -180,7 +180,28 @@ class TestSaveDebugCommand:
     def test_save_without_core_does_not_crash(self, monkeypatch, capsys):
         dev = InputsListDevice()
         seq = iter(["/save", "x"])
-        monkeypatch.setattr("builtins.input", lambda: next(seq))
+        monkeypatch.setattr("builtins.input", lambda _: next(seq))
 
         assert dev[-1] == "x"
         assert "未接入 Core" in capsys.readouterr().out
+
+    def test_prompt_shows_waiting_conversation_identity(self, monkeypatch):
+        """输入提示标明正在等待输入的对话身份，避免黑屏裸等"""
+        core = Core()
+        core.mem["model_params"] = MetaDict(data={"model": "m"}, ctrl={"type": "para"})
+        root = core.start("sys", "hello")
+        root.name = "tester"
+        core._active_cid = root.cid
+
+        dev = InputsListDevice()
+        dev.attach_core(core)
+        seen = {}
+
+        def fake_input(prompt):
+            seen["prompt"] = prompt
+            return "x"
+
+        monkeypatch.setattr("builtins.input", fake_input)
+        assert dev[-1] == "x"
+        assert "tester" in seen["prompt"]
+        assert "等待输入" in seen["prompt"]

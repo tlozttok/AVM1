@@ -1,5 +1,10 @@
 """AVM 内存设备：可挂载到内存路径的虚拟设备"""
+try:
+    import readline  # noqa: F401  调试用：启用行编辑（历史/方向键/中文输入法组合支持）
+except ImportError:
+    readline = None  # Windows 无 readline，input() 仍可用
 import os
+import sys
 from typing import Any, Optional, List
 
 
@@ -114,6 +119,7 @@ class InputsListDevice(MetaListDevice):
         super().__init__(data=data, metadata=metadata)
         self._pending_input = False
         self._core = None  # 调试用：Core 引用（/save 检查点命令需要），由镜像加载器注入
+        self._encoding_warned = False
 
     def attach_core(self, core) -> None:
         """调试用：接收 Core 引用（检查点 /save 调试命令使用）"""
@@ -148,13 +154,40 @@ class InputsListDevice(MetaListDevice):
         """调试用：读取操作者输入；行首 /save 触发单对话检查点保存并继续等待真实输入。
 
         对话感知不到 /save：命令只在设备层消费，返回给对话的永远是真实输入。
+        显示等待输入的对话身份提示（避免黑屏裸等）；终端非 UTF-8 时警告一次
+        （中文输入乱码通常源于终端编码）。
         """
+        self._warn_encoding_once()
         while True:
-            raw = input()
+            try:
+                raw = input(self._prompt_text())
+            except UnicodeDecodeError:
+                print("[输入] 解码失败：请确认终端使用 UTF-8 编码", flush=True)
+                continue
             if raw.startswith("/save"):
                 self._save_checkpoint(raw)
                 continue
             return raw
+
+    def _prompt_text(self) -> str:
+        """调试用：输入提示，标明正在等待哪个对话输入（及 /save 调试命令）"""
+        who = "对话"
+        if self._core is not None:
+            cid = self._core._active_cid
+            if cid is not None:
+                convs = getattr(self._core, "_conv_by_cid", {})
+                conv = convs.get(cid)
+                who = f"{conv.identity}（cid={cid}）" if conv is not None else f"cid={cid}"
+        return f"[{who} 等待输入，/save 保存检查点] "
+
+    def _warn_encoding_once(self) -> None:
+        """调试用：终端非 UTF-8 时警告一次（中文输入/显示乱码的常见原因）"""
+        if self._encoding_warned:
+            return
+        self._encoding_warned = True
+        enc = getattr(sys.stdout, "encoding", None) or ""
+        if "utf" not in enc.lower():
+            print(f"[输入] 警告：终端编码 {enc!r} 不是 UTF-8，中文输入可能乱码", flush=True)
 
     def _save_checkpoint(self, cmd: str) -> None:
         """调试用：保存当前活跃对话的检查点。缺省路径由 Core.checkpoint_path 决定；/save <path> 可指定。"""

@@ -191,7 +191,7 @@ class TestCreateChild:
         ])
         _new_root(core)
         core.mem["sys2"] = _settingup("child_sys")
-        core.mem["para"] = MetaDict(data={"model": "test"})
+        core.mem["para"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         core._active_cid = core._ready_cids.pop(0)
 
         core.advance_conversation()
@@ -211,7 +211,7 @@ class TestCreateChild:
         ])
         _new_root(core)
         core.mem["sys2"] = _settingup("child_sys")
-        core.mem["para"] = MetaDict(data={"model": "test"})
+        core.mem["para"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         core._active_cid = core._ready_cids.pop(0)
         core.advance_conversation()
 
@@ -226,7 +226,7 @@ class TestCreateChild:
         ])
         _new_root(core)
         core.mem["prog"] = MetaDict(data={"name": "Analyzer", "content": "prog"}, ctrl={"type": "settingup"})
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         core._active_cid = core._ready_cids.pop(0)
 
         core.advance_conversation()
@@ -242,7 +242,7 @@ class TestCreateChild:
         ])
         _new_root(core)
         core.mem["s"] = _settingup("x")
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         core._active_cid = core._ready_cids.pop(0)
         core.advance_conversation()
 
@@ -258,7 +258,7 @@ class TestCreateChild:
         ])
         _new_root(core)
         core.mem["s"] = "not_a_program"
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         core._active_cid = core._ready_cids.pop(0)
 
         core.advance_conversation()
@@ -276,13 +276,31 @@ class TestCreateChild:
         ])
         _new_root(core)
         core.mem["manual"] = MetaDict(data={"overview": "..."})
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         core._active_cid = core._ready_cids.pop(0)
 
         core.advance_conversation()
 
         content, _ = _batch(core, 0)[0]
         assert "Error" in content and "settingup" in content
+        assert len(core._conv_by_cid) == 1
+
+    def test_create_cmd_requires_para_node(self):
+        """create_cmd 的 para_ref 必须指向 ctrl.type='para' 的参数节点；指向程序节点报错且不创建"""
+        core = make_core([
+            (None, [{"call_id": "ctc", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.s", "para_ref": "$MEM.p"}}], None),
+        ])
+        _new_root(core)
+        core.mem["s"] = _settingup("x")
+        core.mem["p"] = _settingup("not_para")  # 程序节点不是参数节点
+        core._active_cid = core._ready_cids.pop(0)
+
+        core.advance_conversation()
+
+        content, call_id = _batch(core, 0)[0]
+        assert "Error" in content and "para" in content
+        assert call_id == "ctc"
+        assert core._active_cid == 0
         assert len(core._conv_by_cid) == 1
 
 
@@ -294,7 +312,7 @@ class TestSendInstruction:
         ])
         root = _new_root(core)
         core.mem["s"] = _settingup("child_sys")
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         core._active_cid = core._ready_cids.pop(0)
         core.advance_conversation()  # root: create_cmd → 子休眠，root 活跃
         child = core._conv_by_cid[1]
@@ -478,7 +496,7 @@ class TestIccRouting:
         root = _new_root(core)
         core.mem["s"] = _settingup("s")
         core.mem["u"] = "u"
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         svc = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         RegisterServiceInstruction("rc", svc.cid, {"name": "svc", "what": "x", "needs": "x", "returns": "x"}).execute(core, svc)
 
@@ -511,7 +529,7 @@ class TestCreateSub:
         _new_root(core)
         core.mem["s"] = _settingup("sub_sys")
         core.mem["u"] = "sub_usr"
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         core._active_cid = core._ready_cids.pop(0)
 
         core.advance_conversation()
@@ -529,7 +547,7 @@ class TestCreateSub:
         _new_root(core)
         core.mem["s"] = "not_a_program"
         core.mem["u"] = "sub_usr"
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         core._active_cid = core._ready_cids.pop(0)
 
         core.advance_conversation()
@@ -539,6 +557,23 @@ class TestCreateSub:
         assert call_id == "cs"
         assert core._active_cid == 0          # 父保持活跃，可自纠
         assert len(core._conv_by_cid) == 1    # 未创建亚对话
+
+    def test_create_sub_requires_para_node(self):
+        """create_sub 的 para_ref 同样必须是参数节点；str 节点报错且不创建亚对话"""
+        core = make_core([
+            (None, [{"call_id": "cs", "cmd_type": "create_sub", "args": {"system_ref": "$MEM.s", "user_ref": "$MEM.u", "para_ref": "$MEM.p"}}], None),
+        ])
+        _new_root(core)
+        core.mem["s"] = _settingup("x")
+        core.mem["u"] = "sub_usr"
+        core.mem["p"] = "not_a_para_node"
+        core._active_cid = core._ready_cids.pop(0)
+
+        core.advance_conversation()
+
+        content, _ = _batch(core, 0)[0]
+        assert "Error" in content and "para" in content
+        assert len(core._conv_by_cid) == 1
 
     def test_sub_finished_writes_to_parent_and_wakes(self):
         """亚对话完成 → 输出写回 parent.user_batch，parent 回到 active"""
@@ -552,7 +587,7 @@ class TestCreateSub:
         _new_root(core)
         core.mem["s"] = _settingup("x")
         core.mem["u"] = "x"
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         core._active_cid = core._ready_cids.pop(0)
 
         # advance root: create sub
@@ -582,7 +617,7 @@ class TestCreateSub:
         _new_root(core)
         core.mem["s"] = _settingup("x")
         core.mem["u"] = "x"
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         core._active_cid = core._ready_cids.pop(0)
         core.advance_conversation()
 
@@ -654,7 +689,7 @@ class TestLMUExecCalled:
         core = Core()
         core.lmu = RecordingLMU()
         _new_root(core)
-        core.mem["model_params"] = MetaDict(data={"model": "gpt-4o"})
+        core.mem["model_params"] = MetaDict(data={"model": "gpt-4o"}, ctrl={"type": "para"})
         core._active_cid = core._ready_cids.pop(0)
 
         core.advance_conversation()
@@ -704,7 +739,7 @@ class TestServiceScheduling:
         root = _new_root(core)
         core.mem["s"] = _settingup("svc_sys")
         core.mem["u"] = "svc_usr"
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         svc = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         RegisterServiceInstruction("rc", svc.cid, {"name": "calc", "what": "计算", "needs": "表达式", "returns": "结果"}).execute(core, svc)
         core._ready_cids.clear()
@@ -753,7 +788,7 @@ class TestServiceScheduling:
         root = _new_root(core)
         core.mem["s"] = _settingup("s")
         core.mem["u"] = "u"
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         svc = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         RegisterServiceInstruction("rc", svc.cid, {"name": "calc", "what": "计算", "needs": "表达式", "returns": "结果"}).execute(core, svc)
         core._ready_cids.clear()
@@ -776,7 +811,7 @@ class TestServiceScheduling:
         root = _new_root(core)
         core.mem["s"] = _settingup("s")
         core.mem["u"] = "u"
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         svc = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         RegisterServiceInstruction("rc", svc.cid, {"name": "svc", "what": "x", "needs": "x", "returns": "x"}).execute(core, svc)
         core._ready_cids.clear()
@@ -856,7 +891,7 @@ class TestQueueSchedulingAndInterrupt:
         core = make_core()
         root = _new_root(core)
         core.mem["s"] = _settingup("s")
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         svc = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         other = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         RegisterServiceInstruction("rc", svc.cid, {"name": "svc", "what": "x", "needs": "x", "returns": "x"}).execute(core, svc)
@@ -880,7 +915,7 @@ class TestQueueSchedulingAndInterrupt:
         core._instruction_budget = 2
         root = _new_root(core)
         core.mem["s"] = _settingup("x")
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         other = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         core._ready_cids.clear()
         core._ready_cids.append(other.cid)
@@ -909,9 +944,9 @@ class TestQueueSchedulingAndInterrupt:
         core._instruction_budget = 5
         root = _new_root(core)
         core.mem["s"] = _settingup("x")
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         core.mem["sub_sys"] = _settingup("sub")
-        core.mem["sub_p"] = MetaDict(data={"model": "test"})
+        core.mem["sub_p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         other = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         core._ready_cids.clear()
         core._ready_cids.append(other.cid)
@@ -983,7 +1018,7 @@ class TestReasoningContent:
         core = make_core()
         core.lmu = lmu
         conv = _new_root(core)
-        para = MetaDict(data={"model": "test"})
+        para = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
 
         lmu.exec(conv, para)
         last = conv.messages[-1]
@@ -1003,7 +1038,7 @@ class TestReasoningContent:
         core = make_core()
         core.lmu = lmu
         conv = _new_root(core)
-        para = MetaDict(data={"model": "test"})
+        para = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
 
         lmu.exec(conv, para)
         assert conv.messages[-1].reasoning_content is None
@@ -1022,7 +1057,7 @@ class TestCloseInstruction:
     def _root_with_two(self, core):
         root = _new_root(core)
         core.mem["s"] = _settingup("x")
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         c1 = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         c2 = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         return root, c1, c2
@@ -1086,7 +1121,7 @@ class TestCloseInstruction:
         ])
         root = _new_root(core)
         core.mem["s"] = _settingup("x")
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         child = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         core._close_conversation(child.cid)
         core._active_cid = root.cid
@@ -1102,7 +1137,7 @@ class TestCloseInstruction:
         ])
         root = _new_root(core)
         core.mem["s"] = _settingup("x")
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         child = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         core._close_conversation(child.cid)
         core._active_cid = root.cid
@@ -1121,7 +1156,7 @@ class TestCloseInstruction:
         ])
         root = _new_root(core)
         core.mem["s"] = _settingup("svc_sys")
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         svc = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         RegisterServiceInstruction("rc", svc.cid, {"name": "calc", "what": "计算", "needs": "表达式", "returns": "结果"}).execute(core, svc)
         core._active_cid = root.cid
@@ -1137,7 +1172,7 @@ class TestCloseInstruction:
         core = make_core()
         root = _new_root(core)
         core.mem["s"] = _settingup("svc_sys")
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         svc = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         RegisterServiceInstruction("rc", svc.cid, {"name": "calc", "what": "计算", "needs": "表达式", "returns": "结果"}).execute(core, svc)
         CallServiceInstruction("req", root.cid, {"service_name": "calc", "input": "2+3"}).execute(core, root)
@@ -1156,7 +1191,7 @@ class TestCloseInstruction:
         core = make_core()
         root = _new_root(core)
         core.mem["s"] = _settingup("svc_sys")
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         svc = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         RegisterServiceInstruction("rc", svc.cid, {"name": "calc", "what": "计算", "needs": "表达式", "returns": "结果"}).execute(core, svc)
         CallServiceInstruction("req", root.cid, {"service_name": "calc", "input": "2+3"}).execute(core, root)
@@ -1298,3 +1333,18 @@ class TestEditMetadata:
 
         assert core.mem["a"].get_ctrl() == {"type": "settingup"}
         assert core._active_cid == 0
+
+
+class TestParaTypeCheck:
+    def test_get_para_warns_and_falls_back_on_wrong_type(self, capsys):
+        """para_ref 指向的节点不是 para 类型：stderr 警告并回退默认参数（不再静默）"""
+        core = make_core()
+        root = _new_root(core)
+        core.mem["s"] = _settingup("x")
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
+        child = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
+        child.para_ref = "$MEM.s"  # 把 para_ref 指向程序节点
+
+        para = core._get_para(child)
+        assert para.get("model") == "gpt-4"
+        assert "不是 ctrl.type='para'" in capsys.readouterr().err

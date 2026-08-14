@@ -37,7 +37,7 @@ def make_core(responses=None):
 
 
 def _new_root(core):
-    core.mem["model_params"] = MetaDict(data={"model": "test"})
+    core.mem["model_params"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
     return core.start("sys", "hello")
 
 
@@ -94,7 +94,7 @@ class TestFrameSequence:
         ])
         _new_root(core)
         core.mem["s"] = MetaDict(data={"content": "x"}, ctrl={"type": "settingup"})
-        core.mem["p"] = MetaDict(data={"model": "test"})
+        core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         core._active_cid = core._ready_cids.pop(0)
         core.monitor.record_baseline(core)
 
