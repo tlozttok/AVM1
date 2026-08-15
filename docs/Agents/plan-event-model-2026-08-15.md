@@ -1,7 +1,7 @@
 # 计划（提案，待定夺）：以工具调用为事件源的事件模型
 
 **时间**: 2026-08-15
-**状态**: 提案（第三轮讨论后部分定夺；未实施）
+**状态**: 决策闭合（第四轮确认；详细实施计划见 plan-event-v1-2026-08-15.md）
 **背景**: 事件机制是 README「当前状态」中列出的未实现项，也是 docs/record/9.md 确认的调度状态机缺失的另一半：Dormant → Active 目前只有显式调用（send_instruction 唤醒）一条路径。record/9 已确定两个前提：事件以硬件中断为原型、不做事件溯源；并区分事实事件（emit，通知）与钩子事件（waterfall，可改写/拦截），后者的同步等待语义当时留为开放问题。
 **起因**: 用户给出事件模型的新想法：不按传统事件源分类（定时、内存变化、信号），而是**每个工具调用对应一个事件**。本文件记录模型、对照与定夺过程；全部决策点闭合后，再形成可实施的正式计划。
 
@@ -50,19 +50,19 @@
 ```
 
 - `source.kind = "device"` 时 `source.path` 必须是该设备自身挂载路径，且 target 在该路径之内。
-- `action`：`execute`（按 payload 执行原操作）/ `replace`（不执行原操作，直接把 response 返回给调用者）/ `pass`（交给下一监听器）。
+- `action`：`execute`（按 payload 执行原操作）/ `replace`（不执行原操作，直接把 response 返回给调用者）。处理器不改 action 即继续流动；首个 replace 短路。
 - 管道顺序：注册顺序即优先级；先注册者先处理。
 - 处理器输出：原样或修改后的 payload 继续流动；或 `action="replace"` + `response`；可携带 `notify` 列表，由 Core 投递。
 
-## 仍待定夺（第四轮）
+## 第四轮建议默认值（已由用户确认）
 
-1. **事件类型表**：严格 9 类（memory_read / memory_write / memory_make / edit_metadata / create_cmd / create_sub / send_instruction / close_conversation / listen_event），还是把 memory_make、edit_metadata 归并为 memory_write？建议严格 9 类：工具与事件一一对应，监听者可按工具精确注册，归并会丢失选择能力。
-2. **waterfall 范围**：哪些事件允许 `replace` 拦截；哪些只产生 after 通知。至少 memory_read / memory_write 可拦截；close_conversation 若可被拦截，内核级关闭就不再无条件；listen_event 自身若可被拦截，会成为权限争夺入口。建议第一版：memory_read / memory_write / memory_make / edit_metadata / send_instruction 可拦截；create_cmd / create_sub / close_conversation / listen_event 只通知。
-3. **处理器程序**：第一版只允许 `type="python"` 程序节点；每个监听器持有一个持久处理器实例（可跨事件保留命名空间），还是每次事件新建实例？建议持久实例：与「程序是注册过的执行单元」一致，且可维护计数器等状态。
-4. **管道短路**：先注册者输出 `replace` 后是否短路、后续监听器不可再改？建议短路，落实「先注册者优先」。
-5. **owner 细节**：`edit_metadata` 是否禁止修改/删除 `owner`；镜像预置节点（无 owner）视为无主、内核所有，还是禁止任何拦截型监听？建议：owner 键对普通对话只读；无主节点仅内核态（暂无）可注册拦截，第一版等于不可拦截。
-6. **监听工具形状**：单条 `listen_event`，参数 `action=listen/modify/cancel`、`event_type`、`target`、`handler_ref`、`para_ref`；listen 返回 listener_id；modify/cancel 按 listener_id 操作。注册、修改、取消各自产生 `listen_event` after 事件。
-7. **可见性**：注册表挂 `$MEM.listeners` 信息设备；事件瞬时、不落盘；monitor 记录事件进管道的首尾状态。
+1. **事件类型表**：严格 9 类（memory_read / memory_write / memory_make / edit_metadata / create_cmd / create_sub / send_instruction / close_conversation / listen_event）；工具与事件一一对应。
+2. **waterfall 范围**：memory_read / memory_write / memory_make / edit_metadata / send_instruction 可拦截；create_cmd / create_sub / close_conversation / listen_event 只产生 after 通知。
+3. **处理器程序**：普通 Python 代码（`type="python"` 节点 content），每次事件在全新沙箱命名空间执行，不创建对话、不保留实例状态。
+4. **管道短路**：先注册者输出 `replace` 后短路，后续监听器不可再改。
+5. **owner 细节**：`edit_metadata` 禁止普通对话修改/删除 `owner`；镜像预置无主节点第一版不可注册拦截型监听。
+6. **监听工具形状**：单条 `listen_event`，参数 `action=listen/modify/cancel`、`event_type`、`target`、`handler_ref`、`listener_id`；listen 返回 listener_id；modify/cancel 按 listener_id 操作；三种成功动作各自产生 `listen_event` after 事件。
+7. **可见性**：注册表挂 `$MEM.listeners` 信息设备；事件瞬时、不落盘；monitor 记录事件进管道的首尾摘要。
 8. **生命周期**：close_conversation 自动撤销该对话注册的全部监听；检查点不保存监听，恢复后重新注册。
 
 ## 影响预估（若实施）
@@ -74,4 +74,4 @@
 - 与 capability/文件密码设计重叠：文件访问回调可被本事件模型吸收。
 - `ctrl.owner` 进入内存持久化格式与镜像；镜像规范、CONTEXT、README 需同步。
 
-**待办**: 用户对「仍待定夺」第 1–8 项给出确认或修改，并对四部分（事件类型与设备 self / waterfall 管道 / 处理器与返回 / 权限与生命周期）评分；随后形成时间/背景/起因/行动/影响的正式实施计划。
+**第四轮定夺（2026-08-15）**: 用户确认第 3 项改为「处理器程序就是普通 Python 代码，不是持久对话（每次事件执行于全新沙箱命名空间）」；其余默认值均接受。详细实施计划另立：docs/Agents/plan-event-v1-2026-08-15.md。
