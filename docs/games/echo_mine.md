@@ -170,6 +170,7 @@ def handle(event):
   3. DiceDevice 范围与 MapDevice 渲染；
   4. MockLMU 驱动完整回合：初始化、search（GOLD 结算）、move（cavern）、talk（ghost 回复），断言世界状态与调度终态；
   5. HP after 事件：TRAP 归零唤醒 ghost 发出 GHOST_ALERT，guide 关闭双方对话并撤销监听；
-  6. 真实 `main.py` 入口 + 终端输入 + persist_to + 会话关闭；
-  7. subprocess + OpenAI 兼容假 API：从标准输入喂 look/quit，验证 OpenAI 客户端、终端设备与写回的全链路。
+  6. 完整胜利路线：4 次 search 攒满 10 gold、2 次 move 到达 vault、exit 获胜并关闭对话；
+  7. 真实 `main.py` 入口 + 终端输入 + persist_to + 会话关闭；
+  8. subprocess + OpenAI 兼容假 API：从标准输入喂 look/quit，验证 OpenAI 客户端、终端设备与写回的全链路。
 - 手工：`python main.py images/games/echo_mine/echo_mine.json`。

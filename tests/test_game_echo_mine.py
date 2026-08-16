@@ -417,6 +417,97 @@ class TestEchoMineHPAfterEvent:
         assert [cid for cid, _ in core.lmu.calls] == [0, 0, 0, 0, 1, 1, 0]
 
 
+class TestEchoMineFullWinPlaythrough:
+    def test_four_searches_two_moves_and_exit_win(self, capsys):
+        """从初始状态自然打完整局：4 次 search 攒满 10 gold，2 次 move 到达 vault，exit 胜利。"""
+        core = load_image(str(GAME_IMAGE))
+
+        def search_turn(search_no):
+            return [
+                ("", [
+                    tool(f"sr{search_no}a", "memory_read", ref="$MEM.dice.d6"),
+                    tool(f"sr{search_no}b", "memory_write", ref="$MEM.mechanics.request",
+                         content=f"print(resolve_search({6 if search_no < 4 else 5}))"),
+                    tool(f"sr{search_no}c", "create_sub", system_ref="$MEM.programs.mechanics",
+                         user_ref="$MEM.mechanics.request", para_ref="$MEM.para.python"),
+                ], None),
+            ]
+
+        def apply_search(search_no, gold_after):
+            return ("", [
+                tool(f"sa{search_no}a", "memory_read", ref="$MEM.world.player.gold"),
+                tool(f"sa{search_no}b", "memory_write", ref="$MEM.world.player.gold", content=gold_after),
+                tool(f"sa{search_no}c", "memory_write", ref="$MEM.world.last_event", content=f"search GOLD {search_no}"),
+                tool(f"sa{search_no}d", "memory_read", ref="$MEM.world.turn"),
+                tool(f"sa{search_no}e", "memory_write", ref="$MEM.world.turn", content=str(search_no)),
+                tool(f"sa{search_no}f", "memory_write", ref="$MEM.outputs.-1", content=f"第 {search_no} 次搜索"),
+            ], None)
+
+        def move_turn(move_no, current, direction):
+            return ("", [
+                tool(f"mr{move_no}a", "memory_read", ref="$MEM.world.player.room_id"),
+                tool(f"mr{move_no}b", "memory_write", ref="$MEM.mechanics.request",
+                     content=f"print(next_room('{current}', '{direction}'))"),
+                tool(f"mr{move_no}c", "create_sub", system_ref="$MEM.programs.mechanics",
+                     user_ref="$MEM.mechanics.request", para_ref="$MEM.para.python"),
+            ], None)
+
+        def apply_move(move_no, room, turn):
+            return ("", [
+                tool(f"ma{move_no}a", "memory_write", ref="$MEM.world.player.room_id", content=room),
+                tool(f"ma{move_no}b", "memory_write", ref="$MEM.world.last_event", content=f"move {room}"),
+                tool(f"ma{move_no}c", "memory_read", ref="$MEM.world.turn"),
+                tool(f"ma{move_no}d", "memory_write", ref="$MEM.world.turn", content=turn),
+                tool(f"ma{move_no}e", "memory_read", ref="$MEM.map"),
+                tool(f"ma{move_no}f", "memory_write", ref="$MEM.outputs.-1", content=f"到达 {room}"),
+            ], None)
+
+        cid0_script = [
+            ("", [
+                tool("w0a", "listen_event", action="listen", event_type="memory_write",
+                     target="$MEM.world.player.hp", handler_ref="$MEM.handlers.hp_guard", phase="before"),
+                tool("w0b", "create_cmd", system_ref="$MEM.programs.ghost", para_ref="$MEM.para.llm"),
+                tool("w0c", "listen_event", action="listen", event_type="memory_write",
+                     target="$MEM.world.player.hp", handler_ref="$MEM.handlers.hp_watch", phase="after"),
+                tool("w0d", "memory_write", ref="$MEM.state.ghost_cid", content="1"),
+                tool("w0e", "memory_write", ref="$MEM.world.status", content="playing"),
+                tool("w0f", "memory_read", ref="$MEM.map"),
+                tool("w0g", "memory_write", ref="$MEM.outputs.-1", content="欢迎来到回声矿洞"),
+            ], None),
+            search_turn(1)[0], apply_search(1, "3"),
+            search_turn(2)[0], apply_search(2, "6"),
+            search_turn(3)[0], apply_search(3, "9"),
+            search_turn(4)[0], apply_search(4, "10"),
+            move_turn(1, "entrance", "north"), apply_move(1, "cavern", "5"),
+            move_turn(2, "cavern", "east"), apply_move(2, "vault", "6"),
+            ("", [
+                tool("wx1", "memory_read", ref="$MEM.world.player.room_id"),
+                tool("wx2", "memory_read", ref="$MEM.world.player.gold"),
+                tool("wx3", "memory_write", ref="$MEM.world.status", content="won"),
+                tool("wx4", "memory_write", ref="$MEM.outputs.-1", content="你带着 10 gold 离开了回声矿洞"),
+                tool("wx5", "close_conversation", cid=1),
+                tool("wx6", "close_conversation", cid=0),
+            ], None),
+        ]
+
+        core.lmu = ScriptedLMU({0: cid0_script})
+        core.run()
+        capsys.readouterr()
+
+        assert core.unwrap("$MEM.world.player.gold", for_llm=False) == "10"
+        assert core.unwrap("$MEM.world.player.room_id", for_llm=False) == "vault"
+        assert core.unwrap("$MEM.world.turn", for_llm=False) == "6"
+        assert core.unwrap("$MEM.world.status", for_llm=False) == "won"
+        assert core.mem._devices["outputs"]._data[-1] == "你带着 10 gold 离开了回声矿洞"
+
+        st = _state(core)
+        assert st["active"] is None
+        assert st["ready"] == []
+        assert set(st["finished"]) == {0, 1}
+        assert set(st["dormant"]) == {2, 3, 4, 5, 6, 7}  # 6 个短命结算亚对话
+        assert [cid for cid, _ in core.lmu.calls] == [0] * 14
+
+
 class TestEchoMineSubprocessWithFakeOpenAIAPI:
     """最接近真实运行的冒烟测试：起一个 OpenAI 兼容假 API，
     通过 subprocess 运行 main.py，从终端输入 look/quit。"""

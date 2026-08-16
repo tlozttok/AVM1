@@ -52,7 +52,7 @@ python main.py <image.json> --transcript api.txt  # API 调用全文落盘
 - 单对话检查点（`save_conversation` / `restore_conversation`，输入 `/save` 调试命令）；
 - AVM 应用套件（courier_office / vault_guard / plm_ledger：镜像 + 自定义设备 + 镜像外自定义 PLM 服务器）；
 - AVM 小游戏 echo_mine（GM 对话 + ghost 子对话 + 骰子/地图设备 + plm.python 结算 + HP 事件守卫）；
-- 测试 300 个全部通过（MockLMU，不调真实 API）。
+- 测试 301 个全部通过（MockLMU，不调真实 API）。
 
 设计中（未实现）：
 
