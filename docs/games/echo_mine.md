@@ -151,5 +151,7 @@ def handle(event):
   1. 镜像严格加载，地图/骰子设备挂载；
   2. HP 守卫钳制与 replace；
   3. DiceDevice 范围与 MapDevice 渲染；
-  4. MockLMU 驱动完整回合：初始化、search（GOLD 结算）、move（cavern）、talk（ghost 回复），断言世界状态与调度终态。
+  4. MockLMU 驱动完整回合：初始化、search（GOLD 结算）、move（cavern）、talk（ghost 回复），断言世界状态与调度终态；
+  5. 真实 `main.py` 入口 + 终端输入 + persist_to + 会话关闭；
+  6. subprocess + OpenAI 兼容假 API：从标准输入喂 look/quit，验证 OpenAI 客户端、终端设备与写回的全链路。
 - 手工：`python main.py images/games/echo_mine/echo_mine.json`。

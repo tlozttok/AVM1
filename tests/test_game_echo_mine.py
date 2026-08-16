@@ -4,7 +4,12 @@
 （初始化 -> search 结算 -> move 结算 -> 与 ghost 子对话交谈 -> 双方休眠）。
 """
 import json
+import os
 import shutil
+import subprocess
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -339,4 +344,115 @@ class TestEchoMineMainEntrypoint:
         assert "欢迎来到回声矿洞" in captured.out
         assert "你站在回声矿洞的入口" in captured.out
         assert "内存已写回" in captured.err
+        assert (game_dir / "out" / "mem.json").is_file()
+
+
+class TestEchoMineSubprocessWithFakeOpenAIAPI:
+    """最接近真实运行的冒烟测试：起一个 OpenAI 兼容假 API，
+    通过 subprocess 运行 main.py，从终端输入 look/quit。"""
+
+    def test_real_entrypoint_talks_to_openai_client_and_terminal(self, tmp_path):
+        game_dir = tmp_path / "game"
+        shutil.copytree(GAME_IMAGE.parent, game_dir)
+        image_path = str(game_dir / GAME_IMAGE.name)
+
+        class FakeAPI(BaseHTTPRequestHandler):
+            guide_calls = 0
+            lock = threading.Lock()
+
+            def log_message(self, fmt, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                messages = body.get("messages", [])
+                system = messages[0].get("content", "") if messages else ""
+
+                def tc(call_id, name, args):
+                    return {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+                    }
+
+                calls = []
+                if "游戏向导" in system:
+                    with self.lock:
+                        FakeAPI.guide_calls += 1
+                        n = FakeAPI.guide_calls
+                    if n == 1:
+                        calls = [
+                            tc("i1", "listen_event", {"action": "listen", "event_type": "memory_write",
+                                                       "target": "$MEM.world.player.hp",
+                                                       "handler_ref": "$MEM.handlers.hp_guard", "phase": "before"}),
+                            tc("i2", "create_cmd", {"system_ref": "$MEM.programs.ghost", "para_ref": "$MEM.para.llm"}),
+                            tc("i3", "memory_write", {"ref": "$MEM.state.ghost_cid", "content": "1"}),
+                            tc("i4", "memory_write", {"ref": "$MEM.world.status", "content": "playing"}),
+                            tc("i5", "memory_read", {"ref": "$MEM.map"}),
+                            tc("i6", "memory_write", {"ref": "$MEM.outputs.-1", "content": "欢迎来到回声矿洞"}),
+                        ]
+                    elif n == 2:
+                        calls = [tc("p1", "memory_read", {"ref": "$MEM.inputs.-1"})]
+                    elif n == 3:
+                        calls = [
+                            tc("p2", "memory_read", {"ref": "$MEM.world.player.room_id"}),
+                            tc("p3", "memory_read", {"ref": "$MEM.world.rooms.entrance.desc"}),
+                            tc("p4", "memory_read", {"ref": "$MEM.world.turn"}),
+                            tc("p5", "memory_write", {"ref": "$MEM.world.turn", "content": "1"}),
+                            tc("p6", "memory_write", {"ref": "$MEM.outputs.-1", "content": "你站在回声矿洞的入口"}),
+                        ]
+                    elif n == 4:
+                        calls = [tc("q1", "memory_read", {"ref": "$MEM.inputs.-1"})]
+                    else:
+                        calls = [
+                            tc("q2", "memory_read", {"ref": "$MEM.state.ghost_cid"}),
+                            tc("q3", "close_conversation", {"cid": 1}),
+                            tc("q4", "close_conversation", {"cid": 0}),
+                        ]
+
+                response = {
+                    "id": "chatcmpl-fake",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": body.get("model", "fake"),
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "", "tool_calls": calls},
+                        "finish_reason": "tool_calls" if calls else "stop",
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                }
+                data = json.dumps(response).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FakeAPI)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            env = os.environ.copy()
+            env["OPENAI_API_KEY"] = "dummy"
+            env["OPENAI_BASE_URL"] = f"http://127.0.0.1:{server.server_address[1]}/v1"
+            result = subprocess.run(
+                [sys.executable, "main.py", image_path],
+                input="look\nquit\n",
+                text=True,
+                capture_output=True,
+                cwd=ROOT,
+                env=env,
+                timeout=30,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        assert result.returncode == 0, result.stderr
+        assert "欢迎来到回声矿洞" in result.stdout
+        assert "你站在回声矿洞的入口" in result.stdout
+        assert "内存已写回" in result.stderr
         assert (game_dir / "out" / "mem.json").is_file()
