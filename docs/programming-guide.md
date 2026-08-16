@@ -31,7 +31,17 @@
 
 ## 记住返回通道不是默认的
 
-创建关系不构成返回通道。想让对方把结果发回来，在指令内容里说明（对方完成后用 `send_instruction` 投递回来），或注册事件监听（设计中，未实现）。其他对话要知道结果，靠信号事件（设计中，未实现）。
+创建关系不构成返回通道。想让对方把结果发回来，在指令内容里说明（对方完成后用 `send_instruction` 投递回来），或注册事件监听（事件模型 v1 已实现，用 `listen_event` + Python 处理器 + `notify` 内部投递）。其他对话要知道结果，可以监听生命周期/内存事件并让 Core 用 `notify` 唤醒自己。
+
+## 用 listen_event 表达等待
+
+- 监听器是 `ctrl.type="python"` 节点中的 `content`，每次事件在全新受限沙箱中执行，定义 `handle(event)` 返回 dict。
+- 内存 before 事件需要路径 owner 才能注册；`send_instruction` 只能监听发往自己的消息；after 事件可通配监听。
+- 处理器可返回 `action="replace"` 拦截 before 事件，或改写允许的 payload 字段；返回 `notify` 可让 Core 向指定对话投递消息并唤醒它。
+- `notify` 不允许投递给当前对话（禁止自我投递）。
+- 注意：before 事件只表示「放行/改写」，不保证结果发生——后续处理器可能失败，因此 before 事件不是操作已完成的承诺。
+
+更多细节见 [docs/runtime.md#事件模型-v1](runtime.md#事件模型-v1)。
 
 ## 消息是字符串
 

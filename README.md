@@ -36,25 +36,26 @@ python main.py <image.json> --transcript api.txt  # API 调用全文落盘
 
 已实现：
 
-- 8 条指令（内存读写与创建、ctrl 元数据编辑、对话创建、投递、关闭）；
+- 9 条指令（内存读写与创建、ctrl 元数据编辑、对话创建、投递、关闭、事件监听）；
 - 内存树与持久化（写回文件）；
 - 调度状态机：活跃/休眠/就绪，排队调度、核心中断（指令预算）、调用链预算继承；
 - 简单投递（`send_instruction`：内容原样投递 + 唤醒 + "已投递"确认，无 ICC、无信封）；
 - `close_conversation` 内核级关闭（个体结束：PLM 状态释放）；
 - 系统镜像加载（显式节点、para、设备插件、init、persist_to、instruction_budget）与 `main.py` / `debug.json` 调试入口；
 - Python 执行器（`plm.simple` / `plm.python`）与沙箱（消息直接作为代码/表达式执行，不解析信封）；
-- 信息设备（conversations / scheduler / memory / monitor）；
-- 监测器（帧 / 轨迹 / diff / find / 全文文件，含思维链记录）；
+- 信息设备（conversations / scheduler / memory / monitor / listeners）；
+- 事件模型 v1（Core 发布 before 请求事件、Memory/设备/Core 发布 after 事实事件、phase=before/after/all、设备 `authorize_listener` / `after_event`、Python 处理器、owner 校验、notify 内部投递、`$MEM.listeners`）；
+- 监测器（帧 / 轨迹 / diff / find / 全文文件，含思维链记录与事件摘要）；
 - 思维链内容回传（历史保留、总是回传、monitor 记录、不内部暴露）；
 - 单对话检查点（`save_conversation` / `restore_conversation`，输入 `/save` 调试命令）；
-- 测试 220 个全部通过（MockLMU，不调真实 API）。
+- 测试 279 个全部通过（MockLMU，不调真实 API）。
 
 设计中（未实现）：
 
 - 设备化：服务调用、注册表等改为设备访问（`xx.xx.post` / `xx.xx.response` 方向，见 docs/record/9.md）；
 - 内核态 / 用户态分离；
 - 链接设备；
-- 事件注册与分发（定时、内存变更、自定义信号）与事件总线（AI 程序实现）——"对话自决休眠 + 预期行为监听"的载体；
+- 事件条件（ECA 的 C）、事件持久化/重放、事件总线与定时器等剩余事件能力——"对话自决休眠 + 预期行为监听"的后续载体；
 - 名字 ↔ cid 转换工具；
 - 文件密码与访问回调；
 - 错误处理机制细化（json_error / unknown_tool 的响应配对）；

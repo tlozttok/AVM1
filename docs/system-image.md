@@ -39,6 +39,15 @@ python -m avm.image <image.json>
 - `kind` 未知即报错；`ctrl` 必须是对象。
 - `kind=device` 可出现在**任意层级**，作为可读性标记；该节点从 mem 根到自身的点号路径（如 `game.map.rooms`）必须与 `devices` 段的 `path` 一一对应。device 节点不写入数据树，实际挂载由 `devices` 段完成。
 - `ctrl.type` 目前定义的取值：`para`（模型调用参数）、`settingup`（LLM 提示词程序）、`python`（Python 程序）。
+- `ctrl.owner` 是 Core 维护的所有者标记（字符串 cid）。`memory_make` / `memory_write` 创建容器节点时会自动写入；镜像作者也可在 `ctrl` 中显式预置 `"owner": "0"` 来声明所有权。无主节点在事件模型 v1 中不可注册 before 内存监听。
+
+```json
+{
+  "kind": "dict",
+  "ctrl": { "type": "settingup", "owner": "0" },
+  "value": { "content": { "kind": "str", "value": "..." } }
+}
+```
 
 **程序节点（settingup / python）**：`create_cmd` / `create_sub` 的 `system_ref` 必须指向这类节点（运行时校验；指向 str 节点、无类型 dict 节点或其他类型会报错，不创建对话）。`settingup` 节点的 `value` 含 `name`（对话身份）与 `content`（提示词文本）；`python` 节点的 `value` 含 `content`（Python 代码）。两者均可带可选的 `signature`（预期输入/输出描述）。`para_ref` 指向该程序使用的模型参数节点。
 

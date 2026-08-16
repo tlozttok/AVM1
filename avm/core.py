@@ -14,15 +14,53 @@ from .memory import Memory
 from .memory_device import MemoryDevice
 from .monitor import Monitor
 from .python_server import PLM_REGISTRY, create_plm
+from .events import EventSystem, build_event, EVENT_TYPES
 from .info_devices import (
     ConversationsDevice, SchedulerDevice,
-    MemorySummaryDevice, MonitorDevice,
+    ListenersDevice, MemorySummaryDevice, MonitorDevice,
 )
 
 
 def _report_tool_error(conv: Conversation, message: str):
     """工具调用错误面向运行者（stderr）输出，不喂回给 LLM。"""
     print(f"[AVM] 对话 {conv.cid}: {message}", file=sys.stderr)
+
+
+def _publish_memory_after(
+    core: 'Core',
+    event_type: str,
+    conv: Conversation,
+    target: str,
+    payload: dict,
+    result: Optional[dict] = None,
+) -> None:
+    """读取/写入成功后发布 memory/device after 事实事件。
+
+    memory 目标由 Core 直接以 source=memory 发布；device 目标询问 device.after_event，
+    设备返回纯 payload，Core 统一加事件字段并强制 actor_cid/ref。
+    """
+    split = core.mem.split_path(target)
+    kind = split[0]
+    if kind == "memory":
+        mount_key = None
+        remainder = []
+    else:
+        _, mount_key, remainder = split
+    if kind == "memory":
+        core.events.publish_after_event(
+            event_type, conv, target, payload, source_kind="memory"
+        )
+        return
+    device = core.mem._devices[mount_key]
+    extra = device.after_event(event_type, remainder, result or {})
+    if extra is None:
+        return
+    merged = dict(extra)
+    merged["ref"] = target
+    merged["actor_cid"] = conv.cid
+    core.events.publish_after_event(
+        event_type, conv, target, merged, device_path=mount_key
+    )
 
 
 class Instruction:
@@ -59,9 +97,25 @@ class MemoryReadInstruction(Instruction):
     ref: str
 
     def execute(self, core: 'Core', conv: Conversation):
+        event = build_event(core, "memory_read", "before", conv=conv, target=self.ref, payload={"ref": self.ref})
+        event = core.events.dispatch(event)
+        core.events.deliver_notifies(event)
+        if event["action"] == "handler_error":
+            _report_tool_error(conv, event["response"])
+        if event["action"] in ("replace", "handler_error"):
+            conv.user_batch.add_tool_response(event["response"], self.call_id)
+            return
         try:
             content = core.unwrap(self.ref, for_llm=True)
             conv.user_batch.add_tool_response(content, self.call_id)
+            _publish_memory_after(
+                core,
+                "memory_read",
+                conv,
+                self.ref,
+                {"ref": self.ref, "actor_cid": conv.cid, "result": content},
+                result={"result": content},
+            )
         except (VMMemoryError, KeyError, IndexError, TypeError, ValueError) as e:
             conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
         except Exception as e:
@@ -89,9 +143,33 @@ class MemoryWriteInstruction(Instruction):
     content: str
 
     def execute(self, core: 'Core', conv: Conversation):
+        event = build_event(
+            core,
+            "memory_write",
+            "before",
+            conv=conv,
+            target=self.ref,
+            payload={"ref": self.ref, "content": self.content},
+        )
+        event = core.events.dispatch(event)
+        core.events.deliver_notifies(event)
+        if event["action"] == "handler_error":
+            _report_tool_error(conv, event["response"])
+        if event["action"] in ("replace", "handler_error"):
+            conv.user_batch.add_tool_response(event["response"], self.call_id)
+            return
+        content = event["payload"]["content"]
         try:
-            core.mem.set(self.ref, self.content)
+            core.mem.set(self.ref, content, owner_cid=conv.cid)
             conv.user_batch.add_tool_response(f"Success set: {self.ref}", self.call_id)
+            _publish_memory_after(
+                core,
+                "memory_write",
+                conv,
+                self.ref,
+                {"ref": self.ref, "content": content, "actor_cid": conv.cid},
+                result={"content": content},
+            )
         except VMMemoryError as e:
             conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
 
@@ -119,9 +197,39 @@ class MemoryMakeInstruction(Instruction):
     mem_type: str
 
     def execute(self, core: 'Core', conv: Conversation):
+        target = f"{self.ref}.{self.key}" if self.ref != "$MEM" else f"$MEM.{self.key}"
+        event = build_event(
+            core,
+            "memory_make",
+            "before",
+            conv=conv,
+            target=target,
+            payload={"ref": self.ref, "key": self.key, "mem_type": self.mem_type},
+        )
+        event = core.events.dispatch(event)
+        core.events.deliver_notifies(event)
+        if event["action"] == "handler_error":
+            _report_tool_error(conv, event["response"])
+        if event["action"] in ("replace", "handler_error"):
+            conv.user_batch.add_tool_response(event["response"], self.call_id)
+            return
         try:
-            core.mem.make(self.ref, self.key, self.mem_type)
+            core.mem.make(self.ref, self.key, self.mem_type, owner_cid=conv.cid)
             conv.user_batch.add_tool_response(f"Success created {self.mem_type} at {self.ref}.{self.key}", self.call_id)
+            _publish_memory_after(
+                core,
+                "memory_make",
+                conv,
+                target,
+                {
+                    "ref": self.ref,
+                    "key": self.key,
+                    "mem_type": self.mem_type,
+                    "path": target,
+                    "actor_cid": conv.cid,
+                },
+                result={"key": self.key, "mem_type": self.mem_type, "path": target},
+            )
         except VMMemoryError as e:
             conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
 
@@ -151,6 +259,23 @@ class EditMetadataInstruction(Instruction):
         op = getattr(self, "type", None)
         key = getattr(self, "key", None)
         value = getattr(self, "value", None)
+        # 在参数合法性校验之前先分发 before 事件；处理器可以 replace 短路。
+        event = build_event(
+            core,
+            "edit_metadata",
+            "before",
+            conv=conv,
+            target=self.ref,
+            payload={"ref": self.ref, "type": op, "key": key, "value": value},
+        )
+        event = core.events.dispatch(event)
+        core.events.deliver_notifies(event)
+        if event["action"] == "handler_error":
+            _report_tool_error(conv, event["response"])
+        if event["action"] in ("replace", "handler_error"):
+            conv.user_batch.add_tool_response(event["response"], self.call_id)
+            return
+        value = event["payload"].get("value")
         if op not in ("set", "get", "del"):
             conv.user_batch.add_tool_response(
                 f"Error: edit_metadata 的 type 必须是 set/get/del，得到 {op!r}", self.call_id
@@ -173,16 +298,42 @@ class EditMetadataInstruction(Instruction):
                     "Error: edit_metadata type=set 时 key 和 value 都必需", self.call_id
                 )
                 return
+            if key == "owner":
+                conv.user_batch.add_tool_response(
+                    "Error: owner 由 Core 维护，不允许通过 edit_metadata 修改", self.call_id
+                )
+                return
             ctrl[key] = value
             node.set_ctrl(ctrl)
             conv.user_batch.add_tool_response(f"ctrl.{key} = {value!r} 已写入", self.call_id)
+            core.events.publish_after_event(
+                "edit_metadata",
+                conv,
+                self.ref,
+                {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
+                source_kind="memory",
+            )
         elif op == "get":
             if not key:
                 conv.user_batch.add_tool_response(
                     json.dumps(ctrl, ensure_ascii=False) if ctrl else "{}", self.call_id
                 )
+                core.events.publish_after_event(
+                    "edit_metadata",
+                    conv,
+                    self.ref,
+                    {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
+                    source_kind="memory",
+                )
             elif key in ctrl:
                 conv.user_batch.add_tool_response(str(ctrl[key]), self.call_id)
+                core.events.publish_after_event(
+                    "edit_metadata",
+                    conv,
+                    self.ref,
+                    {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
+                    source_kind="memory",
+                )
             else:
                 conv.user_batch.add_tool_response(f"Error: ctrl 中没有键 {key}", self.call_id)
         else:  # del
@@ -191,12 +342,24 @@ class EditMetadataInstruction(Instruction):
                     "Error: edit_metadata type=del 时 key 必需", self.call_id
                 )
                 return
+            if key == "owner":
+                conv.user_batch.add_tool_response(
+                    "Error: owner 由 Core 维护，不允许通过 edit_metadata 修改", self.call_id
+                )
+                return
             if key not in ctrl:
                 conv.user_batch.add_tool_response(f"Error: ctrl 中没有键 {key}", self.call_id)
                 return
             del ctrl[key]
             node.set_ctrl(ctrl)
             conv.user_batch.add_tool_response(f"ctrl.{key} 已删除", self.call_id)
+            core.events.publish_after_event(
+                "edit_metadata",
+                conv,
+                self.ref,
+                {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
+                source_kind="memory",
+            )
 
 
 class CreateInstruction(Instruction):
@@ -235,6 +398,13 @@ class CreateInstruction(Instruction):
         # 子对话创建后进入休眠，等待 send_instruction 投递指令
         if child.cid not in core._dormant_cids:
             core._dormant_cids.append(child.cid)
+        core.events.publish_after_event(
+            "create_cmd",
+            conv,
+            f"cid:{child.cid}",
+            {"cid": child.cid, "actor_cid": conv.cid},
+            source_kind="core",
+        )
         conv.user_batch.add_tool_response(f"Success created: cid={child.cid}", self.call_id)
 
 
@@ -274,6 +444,13 @@ class CreateSubInstruction(Instruction):
         core._ready_cids.insert(0, sub.cid)
         if conv.cid not in core._dormant_cids:
             core._dormant_cids.append(conv.cid)
+        core.events.publish_after_event(
+            "create_sub",
+            conv,
+            f"cid:{sub.cid}",
+            {"cid": sub.cid, "actor_cid": conv.cid},
+            source_kind="core",
+        )
 
 
 class SendInstruction(Instruction):
@@ -282,7 +459,7 @@ class SendInstruction(Instruction):
         "type": "function",
         "function": {
             "name": "send_instruction",
-            "description": "向指定 cid 的对话投递指令内容（不保证对方返回消息，只确认投递成功）。cid 可为整数或整数列表（多播，每个目标各收一条）。投递后本对话继续执行，不等待返回；是否休眠由本对话自己决定",
+            "description": "向指定 cid 的对话投递指令内容（不保证对方返回消息，只确认投递成功）。不允许向自己投递。cid 可为整数或整数列表（多播，每个目标各收一条；多播中单个目标被事件拦截/处理失败不阻断其他目标）。投递后本对话继续执行，不等待返回；是否休眠由本对话自己决定",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -303,6 +480,12 @@ class SendInstruction(Instruction):
             _report_tool_error(conv, msg)
             conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
             return
+        for cid in targets:
+            if cid == conv.cid:
+                msg = f"send_instruction 不允许自我投递（cid={cid} 是当前对话）"
+                _report_tool_error(conv, msg)
+                conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
+                return
         # 先解析目标，任一不存在或已关闭即整体失败
         resolved = []
         for cid in targets:
@@ -319,15 +502,58 @@ class SendInstruction(Instruction):
                 return
             resolved.append(target)
 
+        delivered = 0
+        blocked = []
+        failed = []
         for target in resolved:
+            event = build_event(
+                core,
+                "send_instruction",
+                "before",
+                conv=conv,
+                target=f"cid:{target.cid}",
+                payload={"cid": target.cid, "content": self.content},
+            )
+            event = core.events.dispatch(event)
+            core.events.deliver_notifies(event)
+            if event["action"] == "handler_error":
+                failed.append(event["response"])
+                _report_tool_error(conv, event["response"])
+                continue
+            if event["action"] == "replace":
+                blocked.append(event["response"])
+                continue
+            content = event["payload"]["content"]
             # 简单投递：内容原样放入目标对话的输入批次，不包装 JSON 信封
-            target.user_batch.add_user_content(self.content)
+            target.user_batch.add_user_content(content)
             if target.cid in core._dormant_cids:
                 core._dormant_cids.remove(target.cid)
             if target.cid in core._ready_cids:
                 core._ready_cids.remove(target.cid)
             core._ready_cids.append(target.cid)  # 排队调度：被唤醒者进队列末尾
+            # TODO(issue): send_instruction 事实事件的语义需进一步研究
+            core.events.publish_after_event(
+                "send_instruction",
+                conv,
+                f"cid:{target.cid}",
+                {"cid": target.cid, "content": content, "actor_cid": conv.cid},
+                source_kind="core",
+            )
+            delivered += 1
 
+        if delivered > 0 and (blocked or failed):
+            conv.user_batch.add_tool_response(
+                f"已投递到 {delivered}，{len(blocked)} 个被拦截，{len(failed)} 个处理失败",
+                self.call_id,
+            )
+            return
+        if delivered == 0:
+            if failed:
+                conv.user_batch.add_tool_response(failed[0], self.call_id)
+                return
+            if blocked:
+                conv.user_batch.add_tool_response(blocked[0], self.call_id)
+                return
         label = len(resolved) if len(resolved) > 1 else resolved[0].identity
         conv.user_batch.add_tool_response(f"已投递到 {label}", self.call_id)
 
@@ -338,7 +564,7 @@ class CloseInstruction(Instruction):
         "type": "function",
         "function": {
             "name": "close_conversation",
-            "description": "内核级关闭指令：关闭指定 cid 的对话（可关闭自身或其他对话），不需要被关闭对话的回应。关闭后该对话不可再调度、不可再被调用，记录为 finished；其注册的服务注销、PLM 状态释放、未完成调用清理（发给它的调用会以 Error 通知发起者并唤醒）",
+            "description": "内核级关闭指令：关闭指定 cid 的对话（可关闭自身或其他对话），不需要被关闭对话的回应。关闭后该对话不可再调度、不可再被调用，记录为 finished；其注册的事件监听自动撤销、PLM 状态释放",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -359,7 +585,91 @@ class CloseInstruction(Instruction):
             conv.user_batch.add_tool_response(f"Error: 对话 {self.cid} 已是 finished", self.call_id)
             return
         core._close_conversation(self.cid)
+        core.events.publish_after_event(
+            "close_conversation",
+            conv,
+            f"cid:{self.cid}",
+            {"cid": self.cid, "actor_cid": conv.cid},
+            source_kind="core",
+        )
         conv.user_batch.add_tool_response(f"对话 {self.cid} 已关闭（finished）", self.call_id)
+
+
+class ListenEventInstruction(Instruction):
+    tool_name = "listen_event"
+    tool_def = {
+        "type": "function",
+        "function": {
+            "name": "listen_event",
+            "description": "注册/修改/取消事件监听。action=listen：按 event_type/target/handler_ref 注册（handler_ref 必须指向 ctrl.type='python' 的 Python 节点，其 content 定义 handle(event)->dict）；phase 可选 before/after/all，缺省 all；action=modify：用新的 handler_ref 替换已注册监听器的处理器（event_type/target/phase 不可变）；action=cancel：取消监听器。注册/修改/取消只允许所有者执行。处理器返回 notify 时不允许投递给当前对话（禁止自我投递）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["listen", "modify", "cancel"]},
+                    "event_type": {"type": "string", "enum": EVENT_TYPES},
+                    "target": {"type": "string"},
+                    "handler_ref": {"type": "string"},
+                    "listener_id": {"type": "integer"},
+                    "phase": {"type": "string", "enum": ["before", "after", "all"]},
+                },
+                "required": ["action"],
+            }
+        }
+    }
+
+    def execute(self, core: 'Core', conv: Conversation):
+        action = getattr(self, "action", None)
+        if action not in ("listen", "modify", "cancel"):
+            conv.user_batch.add_tool_response(
+                f"Error: listen_event 的 action 必须是 listen/modify/cancel，得到 {action!r}",
+                self.call_id,
+            )
+            return
+        try:
+            if action == "listen":
+                event_type = getattr(self, "event_type", None)
+                target = getattr(self, "target", None)
+                handler_ref = getattr(self, "handler_ref", None)
+                if event_type is None or target is None or handler_ref is None:
+                    raise ValueError("action=listen 时必须提供 event_type、target、handler_ref")
+                phase = getattr(self, "phase", None) or "all"
+                if phase not in ("before", "after", "all"):
+                    raise ValueError("phase 必须是 before/after/all")
+                listener_id = core.events.register(conv.cid, event_type, target, handler_ref, phase=phase)
+                response = f"listener_id={listener_id} 已注册"
+                after_payload = {"listener_id": listener_id, "action": "listen", "actor_cid": conv.cid}
+            elif action == "modify":
+                listener_id = getattr(self, "listener_id", None)
+                handler_ref = getattr(self, "handler_ref", None)
+                if listener_id is None or handler_ref is None:
+                    raise ValueError("action=modify 时必须提供 listener_id、handler_ref")
+                if (
+                    getattr(self, "event_type", None) is not None
+                    or getattr(self, "target", None) is not None
+                    or getattr(self, "phase", None) is not None
+                ):
+                    raise ValueError("action=modify 只允许修改 handler_ref，不能改 event_type/target/phase")
+                core.events.modify(listener_id, conv.cid, handler_ref)
+                response = f"listener_id={listener_id} 已更新"
+                after_payload = {"listener_id": listener_id, "action": "modify", "actor_cid": conv.cid}
+            else:  # cancel
+                listener_id = getattr(self, "listener_id", None)
+                if listener_id is None:
+                    raise ValueError("action=cancel 时必须提供 listener_id")
+                core.events.cancel(listener_id, conv.cid)
+                response = f"listener_id={listener_id} 已取消"
+                after_payload = {"listener_id": listener_id, "action": "cancel", "actor_cid": conv.cid}
+
+            core.events.publish_after_event(
+                "listen_event",
+                conv,
+                f"listener:{listener_id}",
+                after_payload,
+                source_kind="core",
+            )
+            conv.user_batch.add_tool_response(response, self.call_id)
+        except ValueError as e:
+            conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
 
 
 def _instruction_registry() -> Dict[str, Type[Instruction]]:
@@ -368,7 +678,7 @@ def _instruction_registry() -> Dict[str, Type[Instruction]]:
         for cls in [
             MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction, EditMetadataInstruction,
             CreateInstruction, CreateSubInstruction,
-            SendInstruction, CloseInstruction,
+            SendInstruction, CloseInstruction, ListenEventInstruction,
         ]
     }
 
@@ -625,10 +935,13 @@ class Core:
         self.debug: bool = False
         self.monitor: Monitor = Monitor()
         self.para_ref: str = "$MEM.model_params"
+        self.events: EventSystem = EventSystem(self)
+        self._turn_events: List[dict] = []
         self.mem.mount("conversations", ConversationsDevice(self))
         self.mem.mount("scheduler", SchedulerDevice(self))
         self.mem.mount("memory", MemorySummaryDevice(self))
         self.mem.mount("monitor", MonitorDevice(self))
+        self.mem.mount("listeners", ListenersDevice(self))
 
     def _register(self, conv: Conversation) -> Conversation:
         conv.cid = self._next_cid
@@ -750,6 +1063,7 @@ class Core:
             self._ready_cids.remove(cid)
         if cid in self._dormant_cids:
             self._dormant_cids.remove(cid)
+        self.events.cancel_all_for_owner(cid)
         self._executors.pop(cid, None)  # 释放 PLM 状态（命名空间等）
 
     def _pick_next_active(self):
@@ -778,6 +1092,7 @@ class Core:
         return False
 
     def advance_conversation(self):
+        self._turn_events.clear()
         conv = self._conv_by_cid[self._active_cid]
         para = self._get_para(conv)
         executor = self._get_executor(conv, para)
@@ -804,10 +1119,16 @@ class Core:
             else:
                 self._on_conversation_finished(conv, result)
         except Exception as e:
-            self.monitor.record(self, error=e, last_call=getattr(executor, "last_call", None))
+            last_call = getattr(executor, "last_call", None)
+            if last_call is not None and self._turn_events:
+                last_call = {**last_call, "events": list(self._turn_events)}
+            self.monitor.record(self, error=e, last_call=last_call)
             raise
         else:
-            self.monitor.record(self, last_call=getattr(executor, "last_call", None))
+            last_call = getattr(executor, "last_call", None)
+            if last_call is not None and self._turn_events:
+                last_call = {**last_call, "events": list(self._turn_events)}
+            self.monitor.record(self, last_call=last_call)
 
     def _get_executor(self, conv: Conversation, para: MetaDict):
         """按对话的程序类型选择执行器（由 Core 管理，不挂在对话上）。
@@ -862,6 +1183,32 @@ class Core:
 
         while self._active_cid is not None:
             self.advance_conversation()
+
+    def emit_device_event(self, device_path: str, target: str, payload: dict) -> dict:
+        """设备自改事件入口（v1）。
+
+        device_path 是内存设备挂载路径（不含 $MEM 前缀），例如 "io"。
+        只支持 memory_write before 事件；target 必须位于该设备路径下。
+        走正常 before 管道，并返回处理后的 event，设备据此决定是否执行自改。
+        """
+        if device_path not in self.mem._devices:
+            raise VMMemoryError(f"设备 {device_path} 未挂载")
+        split = self.mem.split_path(target)
+        if len(split) != 3 or split[0] != "device" or split[1] != device_path:
+            raise VMMemoryError(
+                f"设备自改事件 target 必须属于 $MEM.{device_path}：{target}"
+            )
+        event = build_event(
+            self,
+            "memory_write",
+            "before",
+            target=target,
+            payload=payload,
+            source={"kind": "device", "path": "$MEM." + device_path},
+        )
+        event = self.events.dispatch(event)
+        self.events.deliver_notifies(event)
+        return event
 
     def unwrap(self, value, for_llm=True):
         if not value.startswith("$"):

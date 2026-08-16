@@ -88,6 +88,7 @@ class Monitor:
                 # reasoning_content 与普通内容同样记录（思维链等价于传统代码的调试输出）
                 "reasoning": _truncate(last_call.get("reasoning"), self._max_item_len),
                 "tool_calls": [self._summarize_tc(tc) for tc in (last_call.get("tool_calls") or [])],
+                "events": [self._summarize_event(ev) for ev in (last_call.get("events") or [])],
                 "elapsed_ms": last_call.get("elapsed_ms"),
                 "error": last_call.get("error") or (str(error) if error else None),
             }
@@ -96,6 +97,7 @@ class Monitor:
                 "result": None,
                 "reasoning": None,
                 "tool_calls": [],
+                "events": [],
                 "elapsed_ms": None,
                 "error": str(error) if error else None,
             }
@@ -135,6 +137,31 @@ class Monitor:
         for k, v in (tc.get("args") or {}).items():
             args[k] = _truncate(str(v), 80)
         return {"cmd_type": tc.get("cmd_type"), "call_id": tc.get("call_id"), "args": args}
+
+    @staticmethod
+    def _summarize_event(ev: dict) -> dict:
+        source = ev.get("source")
+        if isinstance(source, str):
+            source = _truncate(source, 80)
+        summary = {
+            "event_id": ev.get("event_id"),
+            "event_type": ev.get("event_type"),
+            "phase": ev.get("phase"),
+            "target": _truncate(str(ev.get("target")), 80),
+            "source": source,
+            "action": ev.get("action"),
+        }
+        if ev.get("error") is not None:
+            summary["error"] = _truncate(str(ev["error"]), 80)
+        if ev.get("handler_errors"):
+            summary["handler_errors"] = [
+                {
+                    "listener_id": h.get("listener_id"),
+                    "error": _truncate(str(h.get("error")), 80),
+                }
+                for h in ev["handler_errors"]
+            ]
+        return summary
 
     # ------------------------------------------------------------------
     # 查询

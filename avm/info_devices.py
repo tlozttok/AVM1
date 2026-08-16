@@ -112,6 +112,42 @@ class MemorySummaryDevice(MemoryDevice):
         raise VMMemoryError("$MEM.memory 只读摘要；读取具体路径请用 memory_read")
 
 
+class ListenersDevice(MemoryDevice):
+    """$MEM.listeners：事件监听器列表；子路径 <listener_id> 查单条详情。"""
+
+    def __init__(self, core):
+        self._core = core
+
+    def pretend_as_type(self):
+        return "str"
+
+    def to_llm_string(self):
+        lines = []
+        for l in self._core.events.listeners:
+            lines.append(
+                f"  listener_id={l['listener_id']} owner_cid={l['owner_cid']} "
+                f"event_type={l['event_type']} phase={l.get('phase', 'all')} "
+                f"target={l['target']} handler_ref={l['handler_ref']}"
+            )
+        return "监听器列表:\n" + ("\n".join(lines) if lines else "（无）")
+
+    def resolve_path(self, path):
+        if len(path) != 1:
+            raise VMMemoryError("$MEM.listeners 只支持单个 listener_id 子路径")
+        try:
+            listener_id = int(path[0])
+        except ValueError:
+            raise VMMemoryError(f"listener_id 必须是数字: {path[0]}")
+        for l in self._core.events.listeners:
+            if l["listener_id"] == listener_id:
+                return (
+                    f"listener_id={l['listener_id']} owner_cid={l['owner_cid']} "
+                    f"event_type={l['event_type']} phase={l.get('phase', 'all')} "
+                    f"target={l['target']} handler_ref={l['handler_ref']}"
+                )
+        raise VMMemoryError(f"监听器 {listener_id} 不存在")
+
+
 class MonitorDevice(MemoryDevice):
     """$MEM.monitor：监测帧摘要；子路径 <seq> 查单帧。"""
 
@@ -129,7 +165,8 @@ class MonitorDevice(MemoryDevice):
         return (
             f"监测帧: {len(frames)} 帧（基线+{len(frames) - 1}轮）\n"
             f"最近 seq={last.seq} active={last.sched['active_cid']} "
-            f"tools={[t.get('cmd_type') for t in (last.lmu.get('tool_calls') or [])]}"
+            f"tools={[t.get('cmd_type') for t in (last.lmu.get('tool_calls') or [])]} "
+            f"events={len(last.lmu.get('events') or [])}"
         )
 
     def resolve_path(self, path):

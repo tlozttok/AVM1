@@ -1,8 +1,10 @@
-"""AVM — Agent Virtual Machine"""
+"""AVM — 以 LLM 推理为原始计算单元的运行时"""
 from .core import Core, LMU, \
     Instruction, CreateInstruction, CreateSubInstruction, \
     MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction, \
-    SendInstruction
+    EditMetadataInstruction, SendInstruction, CloseInstruction, ListenEventInstruction
+from .events import EventSystem, EVENT_TYPES
+from .info_devices import ListenersDevice
 from .memory import Memory
 from .types import MetaDict, MetaList, Conversation, UserMessageBatch, \
     SystemMessage, UserMessage, AssistantMessage, ToolMessage, message_to_api_dict

@@ -45,6 +45,9 @@ def _print_frames(core) -> None:
         tools = [t.get("cmd_type") for t in (f.lmu.get("tool_calls") or [])]
         if tools:
             line += f" tools={tools}"
+        events = f.lmu.get("events") or []
+        if events:
+            line += f" events={len(events)}"
         result = f.lmu.get("result")
         if result:
             line += f" result={result[:80]!r}"

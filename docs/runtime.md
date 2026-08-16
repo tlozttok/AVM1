@@ -55,7 +55,8 @@ Core 只执行指令，不做业务决策。全部指令如下：
 | `create_cmd` | 创建子对话（`system_ref` 必须指向 settingup 或 python 程序节点；只创建，返回 cid；子对话休眠等待指令；本对话保持活跃） | `system_ref`, `para_ref` |
 | `create_sub` | 创建亚对话（立即执行；完成自动写回并唤醒父） | `system_ref`, `user_ref`, `para_ref` |
 | `send_instruction` | 按 cid 投递指令内容（支持多播；只确认投递成功，不保证返回；投递后本对话继续执行，不自动休眠） | `cid`(int/列表), `content` |
-| `close_conversation` | 内核级关闭：关闭指定 cid 的对话（自身或他人，不需要对方回应）；关闭后不可再调度、不可再被调用 | `cid` |
+| `close_conversation` | 内核级关闭：关闭指定 cid 的对话（自身或他人，不需要对方回应）；关闭后不可再调度、不可再被调用，其注册的事件监听自动撤销 | `cid` |
+| `listen_event` | 注册/修改/取消事件监听；监听器是 `ctrl.type="python"` 节点的 `content`，每次事件在受限沙箱中执行 | `action`, `event_type`?, `target`?, `handler_ref`?, `listener_id`? |
 
 ## 内存模型
 
@@ -70,7 +71,9 @@ Core 只执行指令，不做业务决策。全部指令如下：
 MetaDict / MetaList 有两份元数据：
 
 - 元数据一（`meta`，字符串）：给 LLM 快速扫描的文件摘要/描述。LLM 读取时默认只看到摘要和键列表，深入索引后才返回子节点。
-- 元数据二（`ctrl`，`dict[str,str]`）：给 Core / 内核态的结构化控制信息，如 `type="para"`（模型参数）、`type="settingup"`（LLM 提示词程序）、`type="python"`（Python 程序）。
+- 元数据二（`ctrl`，`dict[str,str]`）：给 Core / 内核态的结构化控制信息，如 `type="para"`（模型参数）、`type="settingup"`（LLM 提示词程序）、`type="python"`（Python 程序）、`owner`（节点所有者 cid，由 Core 维护）。
+
+`memory_make` 创建 dict/list 节点、`memory_write` 隐式创建中间容器或新建最终容器时，Core 会写入 `ctrl.owner`；覆盖已有节点不改 owner；str 叶子没有 ctrl。`edit_metadata` 对 `owner` 键的 set/del 一律拒绝，get 允许。无主路径在事件模型 v1 中不能注册 before 内存监听；镜像作者可在 `ctrl` 中显式预置 `"owner": "0"`。
 
 ### 字符串与链接
 
@@ -86,7 +89,7 @@ MetaDict / MetaList 有两份元数据：
 - `resolve_path(path)`：子路径访问（可选，默认抛错）；
 - `set_value(value)`：写入（可选）。
 
-Core 内置只读信息设备：`$MEM.conversations`（对话列表与单对话详情）、`$MEM.scheduler`（活跃/就绪/休眠与预算）、`$MEM.memory`（内存树摘要）、`$MEM.monitor`（监测帧摘要）。镜像可挂载自己的设备，例如 `$inputs`、`$outputs`（见[系统镜像](#系统镜像)）。
+Core 内置只读信息设备：`$MEM.conversations`（对话列表与单对话详情）、`$MEM.scheduler`（活跃/就绪/休眠与预算）、`$MEM.memory`（内存树摘要）、`$MEM.monitor`（监测帧摘要）、`$MEM.listeners`（事件监听器列表）。镜像可挂载自己的设备，例如 `$inputs`、`$outputs`（见[系统镜像](#系统镜像)）。
 
 ## 对话间通信
 
@@ -97,7 +100,7 @@ Core 内置只读信息设备：`$MEM.conversations`（对话列表与单对话�
 想要结果，由对话自己决定等待方式：
 
 - **在内容里要求对方完成时通知自己**：对方把结论作为消息投递回来（仍走 `send_instruction`），收到时被唤醒；
-- **注册事件监听**（设计中，未实现）：对"预期行为"（如某内存地址变化、某对话完成）注册监听，触发时 Core 自动唤醒。
+- **注册事件监听**：对"预期行为"（如某内存地址变化、某对话完成）注册监听，处理器返回 `notify` 时 Core 自动唤醒目标（见[事件模型 v1](#事件模型-v1)）。
 
 **父对话不是默认接收者**：创建关系不构成返回通道，AI 的思考不默认透露给其他 AI，输出默认写入共享内存。
 
@@ -132,6 +135,66 @@ Python 程序输出是确定性的：执行器通过比较上一次输入与本�
 
 PLM 代码运行在受限环境：安全 builtins 白名单 + AST 检查（禁止 import、禁止双下划线属性访问、禁止危险调用名如 open/eval/exec）。它防止 Python 程序访问宿主系统（文件、网络、进程、时钟、熵源）；AVM 内部行为不受限。真正强隔离（子进程 + OS 级隔离）超出 VM 范围。
 
+## 事件模型 v1
+
+事件是瞬时 dict，不落盘；由 Core 单调递增生成 `event_id`。**发布者分工**：before 请求事件由 Core 发布（source 为 `{"kind":"core","initiator_cid":cid}`）；after 事实事件由实际执行组件发布（Memory 发布 `{"kind":"memory"}`，设备发布 `{"kind":"device","path":"$MEM.<mount>"}`，Core 发布 `{"kind":"core"}`）。对话身份只出现在 before 的 `source.initiator_cid` 与 after 的 `payload.actor_cid`。
+
+### before 事件（5 种可拦截工具）
+
+| event_type | source | target 格式 |
+|---|---|---|
+| `memory_read` | `{"kind":"core","initiator_cid":cid}` | 原 `ref` |
+| `memory_write` | 同上 | 原 `ref` |
+| `memory_make` | 同上 | 新建完整路径 `ref.key` |
+| `edit_metadata` | 同上 | 原 `ref` |
+| `send_instruction` | 同上（每个目标一条） | `"cid:<cid>"` |
+
+before 语义：操作被请求，不保证到达执行组件；可被 `replace` / `handler_error` 阻断。
+
+### after 事件（9 种工具，成功时）
+
+| event_type | source | target | 基础 payload |
+|---|---|---|---|
+| `memory_read` | memory 或 device | 原 `ref` | `{"ref", "actor_cid", "result"}` |
+| `memory_write` | memory 或 device | 原 `ref` | `{"ref", "content", "actor_cid"}` |
+| `memory_make` | memory | 新建完整路径 | `{"ref", "key", "mem_type", "path", "actor_cid"}` |
+| `edit_metadata` | memory | 原 `ref` | `{"ref", "type", "key", "value", "actor_cid"}` |
+| `send_instruction` | core | `"cid:<目标>"` | `{"cid", "content", "actor_cid"}` |
+| `create_cmd` | core | `"cid:<新 cid>"` | `{"cid", "actor_cid"}` |
+| `create_sub` | core | `"cid:<新 cid>"` | `{"cid", "actor_cid"}` |
+| `close_conversation` | core | `"cid:<被关闭 cid>"` | `{"cid", "actor_cid"}` |
+| `listen_event` | core | `"listener:<id>"` | `{"listener_id", "action", "actor_cid"}` |
+
+规则：失败、被 replace、handler_error 的操作不产生 after；after 的 action 固定为 `execute`，处理器不能 replace。
+
+### 监听器与 waterfall
+
+- `listen_event` 支持 `phase=before/after/all`，缺省 `all`；`$MEM.listeners` 会显示 phase。
+- 监听器是 `ctrl.type="python"` 节点中的 `content`，每次事件在全新受限沙箱命名空间执行（只提供 `json` 和受限 builtins），不创建对话、不保留处理器实例状态。
+- 处理器代码必须定义可调用 `handle(event)`，返回 dict；返回的 `action` 在 before 阶段可为 `execute` / `replace`，首个 `replace` 短路，后续监听器不再执行。
+- `replace` 后原指令不执行，调用者收到 `response`（缺省为 `事件被监听器拦截`）。
+- 处理器可改的 payload 字段：`memory_write.content`、`send_instruction.content`、`edit_metadata.value`（仅原操作 `type=set`）。身份字段不可改。
+- 处理器可返回 `notify`：`[{"cid": int, "content": str}]`，由 Core 在管道结束后内部投递（与 `send_instruction` 相同语义，但不产生事件、不递归）。**不允许自我投递**：before 阶段视为处理器错误；after 阶段丢弃该条并记入 `handler_errors`。
+- before 处理器错误不再抛异常，而是返回 `action="handler_error"` 的事件结果：管道停止、原指令不执行、调用者收到 Error 工具响应；此前已累积的 notify 仍会投递。after 处理器错误 fail open：记录 stderr、跳过该处理器的 notify、继续后续监听器。
+
+### 监听权限与 owner
+
+- 内存类 before/after 监听（`memory_read` / `memory_write` / `edit_metadata` / `memory_make`）按 `split_path` 区分：
+  - memory 路径：`_owner_of(target)` 必须等于注册者 cid；`memory_make` 要求父路径所有者等于注册者 cid；
+  - device 路径：询问设备 `authorize_listener(event_type, remainder, owner_cid)`，设备返回 `False` 则拒绝。
+- `send_instruction` before/after 监听只允许目标对话监听发往自己的消息（`target="cid:<自己>"`）。`send_instruction` 本身不允许对话向自己投递；多播中单个目标被拦截或处理失败不阻断其他目标。
+- `create_cmd` / `create_sub` / `close_conversation` / `listen_event` 只有 after，允许 `target="*"` 或精确 target。
+- `modify` / `cancel` 只允许注册该监听器的对话执行。
+- `close_conversation` 自动撤销被关闭对话注册的全部监听。
+- `_owner_of` 只处理 memory kind；device kind 返回 None（设备授权交给 `authorize_listener`）。`split_path` 按最长挂载键匹配，权限检查不会调用设备 `resolve_path`。
+
+### 信息设备与设备自改
+
+- `$MEM.listeners` 只读列出 `listener_id / owner_cid / event_type / phase / target / handler_ref`；子路径 `<listener_id>` 返回单条详情；不暴露 handler 代码全文。
+- 事件本身瞬时，不提供 `$MEM.events` 历史、不写盘。
+- `Core.emit_device_event(device_path, target, payload)` 是设备自改事件入口：只支持 `memory_write` before，source 为设备自身路径，target 必须属于 `$MEM.<device_path>`（用 `split_path` 判定，避免字符串前缀误匹配）；返回处理后的 event，设备据此决定是否执行自改。
+- 设备路径的 after 事件不由 `emit_device_event` 产生；设备可在操作成功后通过 `after_event(event_type, remainder, result)` 返回纯 payload，由 Core 统一包装成 after 事件。v1 不实现设备异步自发 after 事件。
+
 ## 系统镜像
 
 一个 JSON 文件 + 若干设备 Python 文件 = 一个标准 AVM 系统镜像。规范见 [docs/system-image.md](system-image.md)，要点：
@@ -149,7 +212,7 @@ PLM 代码运行在受限环境：安全 builtins 白名单 + AST 检查（禁�
 
 每轮对话推进结束后生成一帧（Frame），第 0 帧为基线。帧内容：
 
-- `lmu`：最近一次执行的结果（`result`）、思维链内容（`reasoning`，与 result 同截断策略）、工具调用摘要（`tool_calls`）、耗时、错误；
+- `lmu`：最近一次执行的结果（`result`）、思维链内容（`reasoning`，与 result 同截断策略）、工具调用摘要（`tool_calls`）、事件摘要（`events`，每条含 event_id/event_type/phase/target/source/action，失败时含 error/handler_errors）、耗时、错误；
 - `sched`：活跃 cid、就绪队列、休眠队列、下一个 cid；
 - `conversations`：每个对话的状态、消息条数、输入批次内容。
 

@@ -11,9 +11,26 @@ from typing import Any, Optional, List
 class MemoryDevice:
     """设备基类"""
 
+    mount_path: Optional[str] = None  # 挂载键（不含 $MEM 前缀），由镜像加载器设置
+
     def attach_core(self, core) -> None:
         """调试用：可选钩子，把 Core 引用交给设备（设备需要访问运行时状态时覆写）。"""
         pass
+
+    def authorize_listener(self, event_type: str, remainder: list, owner_cid: int) -> bool:
+        """Core 注册监听时询问：是否允许该对话监听此设备内路径。
+
+        默认拒绝。实现方不得在授权检查中调用 resolve_path / 触发设备副作用。
+        """
+        return False
+
+    def after_event(self, event_type: str, remainder: list, result: dict) -> Optional[dict]:
+        """设备操作成功后 Core 询问是否有事实事件。
+
+        返回纯 payload dict；返回 None 表示无 after 事件。
+        Core 会统一加 event_id / phase / source / target，并强制合并 actor_cid / ref。
+        """
+        return None
 
     def pretend_as_type(self) -> str:
         raise NotImplementedError

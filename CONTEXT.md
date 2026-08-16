@@ -59,8 +59,11 @@ AVM 的指令分发层和调度器。不参与管理决策——只执行指令�
 **投递指令 (Delivery instruction)**:
 `send_instruction`——按 cid 向对话投递指令内容（支持多播）。内容原样投递，不包装 JSON 信封；只返回"已投递"确认，不保证对方返回消息。投递后调用者继续执行，不自动休眠——是否休眠由对话自己决定（在内容里要求对方完成时通知自己，或注册事件监听）。
 
+**事件指令 (Event instruction)**:
+`listen_event`——注册/修改/取消事件监听。监听器是 `ctrl.type="python"` 节点中的普通 Python 代码；事件触发时按注册顺序以 waterfall 管道处理，先注册者优先，首个 `replace` 短路。处理器可返回 `notify` 让 Core 向指定对话内部投递消息。
+
 **内核指令 (Kernel instruction)**:
-`close_conversation`——关闭对话（个体结束）。可由对话自身或其他对话调用，不需要被关闭对话的回应；关闭后不可再调度、不可再被调用，记录为 finished。
+`close_conversation`——关闭对话（个体结束）。可由对话自身或其他对话调用，不需要被关闭对话的回应；关闭后不可再调度、不可再被调用，记录为 finished，其注册的事件监听自动撤销。
 
 ### 内存与数据
 
@@ -68,7 +71,7 @@ AVM 的指令分发层和调度器。不参与管理决策——只执行指令�
 全局共享的键值树。三种数据类型：MetaDict、MetaList、str。内核态对话管理根目录 `$MEM`，用户态对话被映射到 workspace 子树。
 
 **MetaDict / MetaList**:
-带双元数据的复合类型。元数据一（`str`）：给 LLM 快速扫描的文件摘要/描述。元数据二（`dict[str,str]`）：给 Core/内核态的结构化控制信息（如 `type`、`signature`）。LLM 读取时默认只看到元数据一和键列表；深入索引后才返回子节点。
+带双元数据的复合类型。元数据一（`str`）：给 LLM 快速扫描的文件摘要/描述。元数据二（`dict[str,str]`）：给 Core/内核态的结构化控制信息（如 `type`、`signature`、`owner`）。`owner` 由 Core 在 `memory_make` / `memory_write` 创建容器节点时记录，值为创建者 cid 的字符串；`edit_metadata` 不允许修改/删除 `owner`。str 叶子本身无 ctrl，不能直接携带 owner，需要由带 owner 的祖先容器提供所有权。LLM 读取时默认只看到元数据一和键列表；深入索引后才返回子节点。
 
 **字符串 (str)**:
 叶子节点，无元数据，直接返回内容。需要元数据的字符串用 MetaDict 包装（如 Settingup 的 `content` 字段）。将来可选支持对字符串的特征查询（len、grep 等）。
@@ -84,13 +87,13 @@ _Avoid_: 解引用、符号、指针
 当前正在执行 LLM 推理的对话。同时只有一个活跃对话。
 
 **休眠 (Dormant)**:
-主动挂起、等待事件或再次被调用的对话。事件机制（设计中，未实现）落地后，事件触发将对话转为就绪。
+主动挂起、等待事件或再次被调用的对话。事件触发（处理器返回 notify 的内部投递）会将对话转为就绪。
 
 **就绪 (Ready)**:
 等待被调度的对话队列。被唤醒的对话进入就绪队列末尾；`create_sub` 亚对话前插、立即执行（唯一例外）。
 
-**事件 (Event)**（设计中，未实现）:
-对话可显式注册监听的事件。VM 提供的事件源：定时、内存地址更改、其他对话注册的自定义信号。事件触发后 core 将监听者从休眠转为就绪。投递（`send_instruction`）只确认送达，不保证对方返回消息——想要结果，对话在指令内容里要求对方完成时通知自己，或注册事件监听。组合事件与事件总线由 AI 程序（提示词）实现，不属于 VM。
+**事件 (Event)**:
+每个工具调用对应一个瞬时事件，`listen_event` 可注册监听。事件按发布者分工：Core 发布 before 请求事件（source 含 `initiator_cid`），Memory/设备/Core 发布 after 事实事件（payload 含 `actor_cid`）。v1 实现 9 种工具事件：5 种 before 事件可被监听器拦截/改写（memory_read / memory_write / memory_make / edit_metadata / send_instruction），9 种 after 成功事件只产生通知。监听器是普通 Python 代码（`ctrl.type="python"` 节点的 `content`），每次事件在全新受限命名空间执行、无状态；`listen_event` 可指定 `phase=before/after/all`；先注册者优先，首个 `replace` 短路。处理器可返回 `notify` 由 Core 内部投递并唤醒目标，但禁止自我投递。before 处理器失败会以 `handler_error` 事件结果返回，原指令不执行、已收集 notify 仍投递。事件条件（ECA 的 C）、事件持久化/重放、事件总线、定时器等仍在设计/后续计划中。
 
 **名字 (Name)**:
 对话的身份标识，来自其 settingup 文件（name 是信息不是元信息，不放 meta/ctrl，放节点数据）。名字不唯一，冲突时用文件地址消歧（如 `MEM.math Analysis`）。带名字的对话必然有 settingup 文件（`create_cmd` 创建）；亚对话（直接传提示词）没有名字，其身份 = 父对话身份 + 亚对话 cid。名字↔cid 转换是内核职责，不是 VM 职责（简单内核字符串匹配，复杂内核可支持 AI 匹配）；`send_instruction` 只用 cid 寻址。

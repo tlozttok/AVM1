@@ -1,7 +1,7 @@
-# 计划（待实施）：事件模型 v1 —— 工具即事件、waterfall Python 处理器、owner 直录
+# 计划：事件模型 v1 —— 工具即事件、waterfall Python 处理器、owner 直录
 
 **时间**: 2026-08-15
-**状态**: 计划已形成，待用户确认后交给实施模型；本计划未开始写代码
+**状态**: 已实施（含 P0/P1/P2 收尾；266 个测试通过，见 docs/Agents/plan-event-v1-cleanup-2026-08-15.md）
 **标注**: 决策过程见 docs/Agents/plan-event-model-2026-08-15.md；设计讨论见 docs/record/12.md。实施者必须按本计划执行；遇到计划未覆盖的冲突或必要设计缺失，立即停止并回报 issue，不自行扩展。
 **背景**: 事件机制是调度状态机的缺失半边（record/9.md）。当前 Dormant → Active 只有 send_instruction 唤醒一条路径；对话无法监听内存访问、消息投递或生命周期事实。用户确定模型：每个工具调用对应一个事件，设备事件是设备对自身的更改，监听器用普通 Python 代码以 waterfall 管道处理事件，先注册者优先；内存创建时由 Core 直接记录所有者。
 **起因**: 用户要求形成详细计划，交给另一个成本较低的模型实施。
@@ -297,3 +297,22 @@ grep -n "ctrl.owner\|owner" avm/memory.py avm/events.py docs/system-image.md
   2. str 叶子无法直接携带 owner，需祖先容器所有权兜底；
   3. 设备代码实际仍可绕过 `emit_device_event` 直接改自身路径，信任边界需要设备规范约束；
   4. 事件没有条件（ECA 的 C）、没有持久化/重放、没有事件总线；后续计划处理。
+
+---
+
+## 实施记录（2026-08-15）
+
+- 由实施模型按本计划完成代码与文档改动（当前为未提交工作区改动）。
+- `pytest tests/` 254 个全部通过（P0 修复 +2）；三镜像加载正常；工具集 9 个。
+- 主要文件：新增 avm/events.py、tests/test_events.py；修改 avm/core.py、avm/memory.py、avm/info_devices.py、avm/monitor.py、main.py、CONTEXT.md、README.md、README_EN.md、docs/runtime.md、docs/system-image.md、images/tester.json。
+- 审计结果：主体按计划完成；P0 已直接修复，P1/P2 待收尾项详见 docs/Agents/audit-event-v1-2026-08-15.md 与 docs/Agents/plan-event-v1-cleanup-2026-08-15.md。收尾前不进入 AVM 软件与 OS 计划。
+
+---
+
+## 收尾实施记录（2026-08-15）
+
+- 按 `docs/Agents/plan-event-v1-cleanup-2026-08-15.md` 完成 P1/P2 收尾。
+- P1：禁止自我投递；before 处理器失败改为 `handler_error` 事件结果；保留已收集 notify；多播 `send_instruction` 允许部分投递；monitor 记录 `error` / `handler_errors`；stderr 去重。
+- P2：更新 `docs/programming-guide.md`、`AGENTS.md`、`avm/__init__.py`、`.gitignore`；`images/out/` 从跟踪移除；计划文件状态回填。
+- `pytest tests/` 266 个全部通过；三镜像加载正常；`compileall` 通过。
+- 主要改动文件：`avm/events.py`、`avm/core.py`、`avm/monitor.py`、`tests/test_events.py`、`README.md`、`README_EN.md`、`docs/programming-guide.md`、`AGENTS.md`、`avm/__init__.py`、`.gitignore`、`docs/Agents/*`。

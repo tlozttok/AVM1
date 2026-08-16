@@ -53,19 +53,20 @@ AVM 运行时不管"你是谁"——LLM 可以发指令，Python 也可以发指
 | 维度 | 选项 | 对应指令 |
 |------|------|---------|
 | 目标是否已存在？ | 否（新建对话） | `create_cmd` / `create_sub` |
-| 目标是否已存在？ | 是（已注册服务） | `call_service` / `transfer_service` |
-| 调用者是否等待结果？ | 是 | `create_cmd` / `create_sub` / `call_service` |
-| 调用者是否等待结果？ | 否 | `transfer_service` |
+| 目标是否已存在？ | 是（已有 cid） | `send_instruction` |
+| 调用者是否等待结果？ | 是（紧耦合） | `create_sub` |
+| 调用者是否等待结果？ | 否（投递后继续） | `create_cmd` / `send_instruction` |
+| 是否需要等待异步事实 | 是 | `listen_event` + Python 处理器 + `notify` |
 
 具体分类：
 
-- **子对话**（`create_cmd`）：类似 Linux 父子进程。父创建子后进入休眠，子独立执行完毕，其结论回传给父的 tool response。子对话**只对 AVM 整体记忆的目的负责，不对父对话负责**。父的角色应退化为"按图索骥的入口点"——分发信息、启动流程，而非创造和生成。
+- **子对话**（`create_cmd`）：类似 Linux 父子进程。父创建子后**继续执行（不休眠）**，子对话创建后休眠、等待 `send_instruction`；子对话**只对 AVM 整体记忆的目的负责，不对父对话负责**。父的角色应退化为"按图索骥的入口点"——分发信息、启动流程，而非创造和生成。
 
-- **亚对话**（`create_sub`）：这才是常见的 sub-agent 模式。父创建亚对话后不休眠，亚对话立刻激活执行，执行完毕输出写入父的 user_batch，父在就绪队列中恢复。亚对话**被父对话决定和控制**，属于父子紧耦合。
+- **亚对话**（`create_sub`）：这才是常见的 sub-agent 模式。父创建亚对话后休眠，亚对话立刻激活执行，执行完毕输出写入父的 user_batch，父恢复。亚对话**被父对话决定和控制**，属于父子紧耦合。
 
-- **服务调用**（`call_service`）：目标是**已注册的既存对话**（通过 `register_service` 注册）。调用者等待服务返回。双方都插入就绪队列。
+- **简单投递**（`send_instruction`）：向已有 cid 投递消息，内容原样进入目标 user_batch 并唤醒目标；调用者继续执行，不自动等待返回。支持多播，单个目标被事件拦截/处理失败不阻断其他目标；不允许自我投递。
 
-- **服务移交**（`transfer_service`）：调用者将控制权移交给已存在服务，**不等待返回**。调用者进入休眠。适用于无限循环或尾递归优化。
+- **事件监听**（`listen_event`）：注册/修改/取消事件监听。处理器是 `ctrl.type="python"` 节点中的普通 Python 代码；before 事件可拦截/改写，after 事件可通配监听；处理器可返回 `notify` 让 Core 内部投递并唤醒目标。禁止自我投递。
 
 核心原则不变：主对话"长就是好"的偏见会通过控制子对话而放大，必须通过提示词限制主对话的地位。亚对话反而需要主对话更主动的控制。
 
@@ -112,18 +113,16 @@ AI 阅读包含 AI 生成文本的文档时，会抛弃人类写的内容，不�
 
 ```bash
 pip install openai python-dotenv pytest
-# Web UI: pip install fastapi uvicorn
 ```
 
 需要 `.env` 文件设置 `OPENAI_API_KEY`。
 
-### 脚本
+### 运行
 
 ```bash
-python main.py                       # 主入口
-python simple_main.py                # 简易演示（单对话）
-python web/server.py                 # Web UI (端口 8080)
-bash scripts/run_dual_terminal.sh    # tmux 三面板
+python main.py                       # 调试入口（debug.json 或命令行参数）
+python -m avm.image <image.json>     # 加载并运行系统镜像
+python main.py <image.json> --frames # 运行后打印监测帧摘要
 ```
 
 ### 测试
@@ -131,10 +130,6 @@ bash scripts/run_dual_terminal.sh    # tmux 三面板
 ```bash
 pytest tests/                        # 全部（MockLMU，不调真实 API）
 ```
-
-### 配置
-
-`config.json` 控制: `prompt`、`log_level`、`debug`（STEP DEBUG）、`uuid`、`persist_level`、`restart`
 
 ## Agent skills
 

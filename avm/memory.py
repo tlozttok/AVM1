@@ -22,6 +22,19 @@ def _wrap_value(value: Any) -> Any:
     return value
 
 
+def _with_owner(node: Any, owner_cid: Optional[int]) -> Any:
+    """若节点是 MetaDict/MetaList 且提供了 owner_cid，则复制现有 ctrl 并写入 owner。
+
+    返回传入节点，方便链式调用。str 叶子没有 ctrl，不写。
+    """
+    if owner_cid is not None and isinstance(node, (MetaDict, MetaList)):
+        ctrl = dict(node.get_ctrl() or {})
+        ctrl["owner"] = str(owner_cid)
+        node.set_ctrl(ctrl)
+    return node
+
+
+
 class Memory:
     """
     内存类
@@ -160,10 +173,11 @@ class Memory:
         else:
             return value
 
-    def set_by_path(self, path: list, value: Any) -> None:
+    def set_by_path(self, path: list, value: Any, owner_cid: Optional[int] = None) -> None:
         """
         根据路径设置值
         :param path: 路径列表，如 ['key', 'subkey']
+        :param owner_cid: 新创建的 MetaDict/MetaList 节点的所有者 cid（可选）。
         特殊规则：如果 path 终点的现有值是 MetaList/MetaDict，
         则写入被解释为修改其元数据，而不是替换整个对象。
         """
@@ -204,7 +218,7 @@ class Memory:
                 exists = False
             if not exists:
                 try:
-                    temp[key] = MetaDict(data={})
+                    temp[key] = _with_owner(MetaDict(data={}), owner_cid)
                 except TypeError:
                     raise VMMemoryError(f"无法在 {type(temp).__name__} 类型下创建子路径")
             temp = temp[key]
@@ -230,7 +244,7 @@ class Memory:
                 raise MemoryTypeError(f"列表索引必须是数字：{last_key}")
             if idx < -len(temp) or idx >= len(temp):
                 raise MemoryIndexOutOfRangeError(f"索引越界：{idx}，列表长度：{len(temp)}")
-            temp[idx] = _wrap_value(value)
+            temp[idx] = _with_owner(_wrap_value(value), owner_cid)
             return
 
         # 如果终点已存在且是 MetaList/MetaDict，写入即修改元数据
@@ -240,13 +254,14 @@ class Memory:
                 existing.set_metadata(value)
                 return
 
-        temp[last_key] = _wrap_value(value)
+        temp[last_key] = _with_owner(_wrap_value(value), owner_cid)
 
-    def set(self, ref: str, value: Any) -> None:
+    def set(self, ref: str, value: Any, owner_cid: Optional[int] = None) -> None:
         """
         根据引用设置值
         :param ref: 引用字符串，如 '$MEM.key' 或 '$MEM.key.subkey'
         :param value: 要设置的值
+        :param owner_cid: 新创建容器节点的所有者 cid（可选）
         """
         if not ref.startswith("$"):
             raise ValueError(f"引用必须以 $ 开头：{ref}")
@@ -256,7 +271,7 @@ class Memory:
         if parts[0] == "MEM":
             parts = parts[1:]  # 移除 MEM 前缀，得到 ["user_output"]
 
-        self.set_by_path(parts, value)
+        self.set_by_path(parts, value, owner_cid=owner_cid)
 
     def mount(self, path: str, device: MemoryDevice) -> None:
         """
@@ -288,12 +303,34 @@ class Memory:
         path_str = ".".join(path)
         return self._devices.get(path_str)
 
-    def make(self, ref: str, key: str, mem_type: str) -> None:
+    def split_path(self, ref: str):
+        """把 $MEM 引用拆分为 memory 或 device 路径。
+
+        返回：
+        - ("memory", segments)
+        - ("device", mount_key, remainder)
+        段序列按最长设备挂载键匹配；`box` 不会错误匹配 `$MEM.box2`。
+        """
+        if not isinstance(ref, str) or not ref.startswith("$MEM"):
+            raise ValueError(f"split_path 只接受 $MEM 引用：{ref!r}")
+        parts = ref[1:].split(".")
+        if not parts or parts[0] != "MEM":
+            raise ValueError(f"split_path 只接受 $MEM 引用：{ref!r}")
+        rest = parts[1:]
+        # 最长挂载键优先：同时挂载 box 与 box.dev 时，$MEM.box.dev 命中 box.dev。
+        for i in range(len(rest), 0, -1):
+            prefix = ".".join(rest[:i])
+            if prefix in self._devices:
+                return ("device", prefix, rest[i:])
+        return ("memory", rest)
+
+    def make(self, ref: str, key: str, mem_type: str, owner_cid: Optional[int] = None) -> None:
         """
         在指定路径创建新的内存地址
         :param ref: 引用字符串，如 '$MEM.key' 或 '$MEM.key.subkey'
         :param key: 新地址的名字
         :param mem_type: 类型，'str' | 'dict' | 'list'
+        :param owner_cid: 新容器节点的所有者 cid（可选；str 节点不写 owner）
         """
         if not ref.startswith("$"):
             raise VMMemoryError(f"引用必须以 $ 开头：{ref}")
@@ -321,16 +358,16 @@ class Memory:
             if mem_type == 'str':
                 current[index] = ""
             elif mem_type == 'dict':
-                current[index] = MetaDict(data={})
+                current[index] = _with_owner(MetaDict(data={}), owner_cid)
             elif mem_type == 'list':
-                current[index] = MetaList(data=[])
+                current[index] = _with_owner(MetaList(data=[]), owner_cid)
         elif isinstance(current, (dict, MetaDict)):
             if mem_type == 'str':
                 current[key] = ""
             elif mem_type == 'dict':
-                current[key] = MetaDict(data={})
+                current[key] = _with_owner(MetaDict(data={}), owner_cid)
             elif mem_type == 'list':
-                current[key] = MetaList(data=[])
+                current[key] = _with_owner(MetaList(data=[]), owner_cid)
         else:
             raise VMMemoryError(f"不支持在类型 {type(current).__name__} 下创建新键")
 

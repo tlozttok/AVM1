@@ -36,25 +36,26 @@ Debug settings live in `debug.json` (`image` / `frames` / `transcript`) so the c
 
 Implemented:
 
-- 8 instructions (memory read/write/create, ctrl metadata editing, conversation creation, delivery, close);
+- 9 instructions (memory read/write/create, ctrl metadata editing, conversation creation, delivery, close, event listening);
 - Memory tree and persistence (write-back to file);
 - Scheduling state machine: active/dormant/ready, queue scheduling, core interrupt (instruction budget), call-chain budget inheritance;
 - Simple delivery (`send_instruction`: content delivered verbatim + wake + "delivered" confirmation, no ICC, no envelope);
 - `close_conversation` kernel-level close (end of an individual: PLM state release);
 - System image loading (explicit nodes, para, device plugins, init, persist_to, instruction_budget) and the `main.py` / `debug.json` debugging entry point;
 - Python executor (`plm.simple` / `plm.python`) and sandbox (messages executed directly as code/expression, no envelope parsing);
-- Info devices (conversations / scheduler / memory / monitor);
-- Monitor (frames / trail / diff / find / full-text transcript, including reasoning recording);
+- Info devices (conversations / scheduler / memory / monitor / listeners);
+- Event model v1 (Core publishes before request events; Memory/device/Core publish after fact events; phase=before/after/all; device `authorize_listener` / `after_event`; Python handlers, owner checks, notify delivery, `$MEM.listeners`);
+- Monitor (frames / trail / diff / find / full-text transcript, including reasoning and event summaries);
 - Reasoning content return (kept in history, always returned, recorded by monitor, not exposed internally);
 - Single-conversation checkpoint (`save_conversation` / `restore_conversation`, input `/save` debug command);
-- 220 tests passing (MockLMU, no real API calls).
+- 279 tests passing (MockLMU, no real API calls).
 
 Under design (not implemented):
 
 - Device-ification: service calls, registries, etc. become device access (`xx.xx.post` / `xx.xx.response` direction; see docs/record/9.md);
 - Kernel/user mode separation;
 - Link devices;
-- Event registration and dispatch (timers, memory changes, custom signals) and event bus (implemented by AI programs) — the carrier for "conversation-decided dormancy + expected-behavior listeners";
+- Event conditions (the C in ECA), event persistence/replay, event bus, timers, and other remaining event capabilities — later carriers for "conversation-decided dormancy + expected-behavior listeners";
 - Name-to-cid conversion tool;
 - File passwords and access callbacks;
 - Refined error-handling mechanism (json_error / unknown_tool response pairing);

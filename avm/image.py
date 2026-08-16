@@ -106,6 +106,7 @@ def _mount_devices(core: Core, image_path: str, devices: list, mem_device_paths:
         except TypeError as e:
             raise ImageError(f"设备 {path}: 实例化失败（args 与构造函数不匹配）: {e}")
         core.mem.mount(path, device)
+        device.mount_path = path
         # 调试用：把 Core 引用交给设备（检查点 /save 等调试命令需要访问运行时状态）
         device.attach_core(core)
         mounted.add(path)
