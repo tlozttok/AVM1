@@ -517,7 +517,7 @@ class TestEchoMineSubprocessWithFakeOpenAIAPI:
     通过 subprocess 运行 main.py，从终端输入驱动游戏。"""
 
     @staticmethod
-    def _run_game(tmp_path, player_input, guide_policy):
+    def _run_game(tmp_path, player_input, guide_policy, transcript_name=None):
         game_dir = tmp_path / "game"
         shutil.copytree(GAME_IMAGE.parent, game_dir)
         image_path = str(game_dir / GAME_IMAGE.name)
@@ -578,8 +578,12 @@ class TestEchoMineSubprocessWithFakeOpenAIAPI:
             env = os.environ.copy()
             env["OPENAI_API_KEY"] = "dummy"
             env["OPENAI_BASE_URL"] = f"http://127.0.0.1:{server.server_address[1]}/v1"
+            cmd = [sys.executable, "main.py"]
+            if transcript_name:
+                cmd += ["--transcript", str(game_dir / transcript_name)]
+            cmd.append(image_path)
             result = subprocess.run(
-                [sys.executable, "main.py", image_path],
+                cmd,
                 input=player_input,
                 text=True,
                 capture_output=True,
@@ -715,6 +719,7 @@ class TestEchoMineSubprocessWithFakeOpenAIAPI:
             tmp_path,
             "search\nsearch\nsearch\nsearch\nmove north\nmove east\nexit\n",
             policy,
+            transcript_name="api.txt",
         )
 
         assert result.returncode == 0, result.stderr
@@ -723,6 +728,10 @@ class TestEchoMineSubprocessWithFakeOpenAIAPI:
         assert "到达 vault" in result.stdout
         assert "你带着 10 gold 离开了回声矿洞" in result.stdout
         assert "内存已写回" in result.stderr
+        transcript = (game_dir / "api.txt").read_text(encoding="utf-8")
+        assert "===== FRAME" in transcript
+        assert "print(resolve_search(6))" in transcript
+        assert "print(next_room('cavern', 'east'))" in transcript
         mem = json.loads((game_dir / "out" / "mem.json").read_text(encoding="utf-8"))
         world = mem["value"]["world"]["value"]
         assert world["status"]["value"] == "won"
