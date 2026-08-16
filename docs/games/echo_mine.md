@@ -25,6 +25,7 @@ player -- $MEM.inputs / $MEM.outputs --> guide(GM, LLM, cid 0)
                                           | 初始化:
                                           |   listen_event(hp_guard, before, $MEM.world.player.hp)
                                           |   create_cmd(ghost) -> cid 1
+                                          |   listen_event(hp_watch, after, $MEM.world.player.hp)
                                           | 每轮结算:
                                           |   create_sub(mechanics, plm.python)
                                           v
@@ -109,7 +110,9 @@ def next_room(current, direction):
 
 搜索和移动的算术/图查找都不由 LLM 完成；LLM 只写请求、读响应、写回状态。
 
-## 4. 规则事件：HP 守卫
+## 4. 规则事件：HP 守卫与回声警报
+
+### before：hp_guard
 
 `$MEM.handlers.hp_guard` 是 Python 事件处理器，GM 在初始化时注册：
 
@@ -130,6 +133,20 @@ def handle(event):
 - 这是 before `memory_write` 守卫：GM 可以写任意数值，Core 执行前由规则钳到 0..3。
 - 非法内容被 `replace`，原写入不执行。
 - `$MEM.world` 预置 `ctrl.owner="0"`，guide 才有权注册该监听。
+
+### after：hp_watch
+
+`$MEM.handlers.hp_watch` 注册为 after 监听，actor 是 guide，notify 目标是 ghost（cid=1）：
+
+```python
+def handle(event):
+    return {"notify": [{"cid": 1, "content": "HP_CHANGED " + event["payload"].get("content", "")}]}
+```
+
+- guide 每次写 HP 后，Core 发布 after 事实事件；hp_watch 内部投递 `HP_CHANGED <n>` 唤醒 ghost。
+- ghost 收到 `HP_CHANGED 0` 时 `send_instruction` 回 `GHOST_ALERT`，guide 被唤醒后输出警报并关闭双方对话。
+- HP 非零时 ghost 不打扰玩家。
+- guide 个体结束后，它注册的监听器由 `close_conversation` 自动撤销。
 
 ## 5. 虚拟设备
 
@@ -152,6 +169,7 @@ def handle(event):
   2. HP 守卫钳制与 replace；
   3. DiceDevice 范围与 MapDevice 渲染；
   4. MockLMU 驱动完整回合：初始化、search（GOLD 结算）、move（cavern）、talk（ghost 回复），断言世界状态与调度终态；
-  5. 真实 `main.py` 入口 + 终端输入 + persist_to + 会话关闭；
-  6. subprocess + OpenAI 兼容假 API：从标准输入喂 look/quit，验证 OpenAI 客户端、终端设备与写回的全链路。
+  5. HP after 事件：TRAP 归零唤醒 ghost 发出 GHOST_ALERT，guide 关闭双方对话并撤销监听；
+  6. 真实 `main.py` 入口 + 终端输入 + persist_to + 会话关闭；
+  7. subprocess + OpenAI 兼容假 API：从标准输入喂 look/quit，验证 OpenAI 客户端、终端设备与写回的全链路。
 - 手工：`python main.py images/games/echo_mine/echo_mine.json`。

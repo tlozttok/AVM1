@@ -21,7 +21,7 @@
 2. 判定通过：
    - `python main.py images/games/echo_mine/echo_mine.json` 可启动并交互；
    - MockLMU 集成测试可完整跑通 搜索/移动/交谈/胜利 分支；
-   - 全量测试不回退（当前 299 个，含新增游戏测试 8 个）。
+   - 全量测试不回退（当前 300 个，含新增游戏测试 9 个）。
 3. 不通过即缺口：若游戏需要而 AVM 拒绝的能力，记录 issue；不在应用里用宿主 Python 绕过运行时边界。
 
 ## 二、游戏架构
@@ -43,6 +43,7 @@ dice(device) 读子路径 d6 返回 1..6
 
 规则事件：
 - `before memory_write $MEM.world.player.hp`：handler 把内容钳到 0..3，非法内容直接 replace；
+- `after memory_write $MEM.world.player.hp`：handler 通知 ghost（cid=1）；HP 归零时 ghost 发出 GHOST_ALERT 唤醒 GM；
 - HP 是 Core 执行前被规则修正的，GM 的叙事不能绕过。
 
 ## 三、LLM 式算法/控制流
@@ -71,4 +72,4 @@ dice(device) 读子路径 d6 返回 1..6
 2. DiceDevice 的宿主随机数绕过了 PLM 沙箱，这是设备接口的既定信任边界；镜像作者需自行保证设备不越权（与现有设备设计一致）。
 
 **实施记录（2026-08-16）**:
-- 新增游戏镜像、设备、文档、测试；全量 pytest 通过（299 个），测试计数见 README。
+- 新增游戏镜像、设备、文档、测试；全量 pytest 通过（300 个），测试计数见 README。

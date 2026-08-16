@@ -94,6 +94,7 @@ class TestEchoMineImage:
         assert core.unwrap("$MEM.programs.ghost", for_llm=False).get_ctrl()["type"] == "settingup"
         assert core.unwrap("$MEM.programs.mechanics", for_llm=False).get_ctrl()["type"] == "python"
         assert core.unwrap("$MEM.handlers.hp_guard", for_llm=False).get_ctrl()["type"] == "python"
+        assert core.unwrap("$MEM.handlers.hp_watch", for_llm=False).get_ctrl()["type"] == "python"
 
         assert "dice" in core.mem._devices
         assert "map" in core.mem._devices
@@ -183,6 +184,8 @@ class TestEchoMineFullTurn:
                     tool("s1", "listen_event", action="listen", event_type="memory_write",
                          target="$MEM.world.player.hp", handler_ref="$MEM.handlers.hp_guard", phase="before"),
                     tool("s2", "create_cmd", system_ref="$MEM.programs.ghost", para_ref="$MEM.para.llm"),
+                    tool("s2b", "listen_event", action="listen", event_type="memory_write",
+                         target="$MEM.world.player.hp", handler_ref="$MEM.handlers.hp_watch", phase="after"),
                     tool("s3", "memory_write", ref="$MEM.state.ghost_cid", content="1"),
                     tool("s4", "memory_write", ref="$MEM.world.status", content="playing"),
                     tool("s5", "memory_read", ref="$MEM.map"),
@@ -345,6 +348,73 @@ class TestEchoMineMainEntrypoint:
         assert "你站在回声矿洞的入口" in captured.out
         assert "内存已写回" in captured.err
         assert (game_dir / "out" / "mem.json").is_file()
+
+
+class TestEchoMineHPAfterEvent:
+    def test_trap_zero_hp_notifies_ghost_and_alert_wakes_guide(self, capsys):
+        core = load_image(str(GAME_IMAGE))
+        core.lmu = ScriptedLMU({
+            0: [
+                # 初始化：先建 ghost(cid=1)，再注册 hp before/after 监听
+                ("", [
+                    tool("h1", "listen_event", action="listen", event_type="memory_write",
+                         target="$MEM.world.player.hp", handler_ref="$MEM.handlers.hp_guard", phase="before"),
+                    tool("h2", "create_cmd", system_ref="$MEM.programs.ghost", para_ref="$MEM.para.llm"),
+                    tool("h3", "listen_event", action="listen", event_type="memory_write",
+                         target="$MEM.world.player.hp", handler_ref="$MEM.handlers.hp_watch", phase="after"),
+                    tool("h4", "memory_write", ref="$MEM.state.ghost_cid", content="1"),
+                    tool("h5", "memory_write", ref="$MEM.world.status", content="playing"),
+                ], None),
+                # search 得 TRAP 1
+                ("", [
+                    tool("h6", "memory_write", ref="$MEM.mechanics.request", content="print(resolve_search(1))"),
+                    tool("h7", "create_sub", system_ref="$MEM.programs.mechanics",
+                         user_ref="$MEM.mechanics.request", para_ref="$MEM.para.python"),
+                ], None),
+                # 结算：hp 3 -> 0，after 事件 notify ghost(cid=1)
+                ("", [
+                    tool("h8", "memory_read", ref="$MEM.world.player.hp"),
+                    tool("h9", "memory_write", ref="$MEM.world.player.hp", content="0"),
+                    tool("h10", "memory_write", ref="$MEM.world.last_event", content="search TRAP 1"),
+                    tool("h11", "memory_read", ref="$MEM.world.player.hp"),
+                    tool("h12", "memory_write", ref="$MEM.world.status", content="lost"),
+                    tool("h13", "memory_write", ref="$MEM.outputs.-1", content="你被落石击中，倒在了矿洞里"),
+                ], None),
+                # guide 结束交互，让 ghost 先运行
+                ("waiting", [], None),
+                # 被 GHOST_ALERT 唤醒后关闭 ghost 与自身
+                ("", [
+                    tool("h14", "memory_write", ref="$MEM.outputs.-1", content="GHOST_ALERT 回声正在消失，快离开矿洞"),
+                    tool("h15", "memory_read", ref="$MEM.world.status"),
+                    tool("h16", "close_conversation", cid=1),
+                    tool("h17", "close_conversation", cid=0),
+                ], None),
+            ],
+            1: [
+                ("", [
+                    tool("g1", "send_instruction", cid=0, content="GHOST_ALERT 回声正在消失，快离开矿洞"),
+                ], None),
+                ("done", [], None),
+            ],
+        })
+
+        core.run()
+        capsys.readouterr()
+
+        assert core.unwrap("$MEM.world.player.hp", for_llm=False) == "0"
+        assert core.unwrap("$MEM.world.status", for_llm=False) == "lost"
+        ghost_messages = core.get_conversation(1).messages
+        assert any(m.role == "user" and "HP_CHANGED 0" in m.content for m in ghost_messages)
+        assert core.mem._devices["outputs"]._data[-1] == "GHOST_ALERT 回声正在消失，快离开矿洞"
+
+        # guide 个体结束后，其注册的监听器按 close_conversation 语义自动撤销
+        assert "（无）" in core.unwrap("$MEM.listeners")
+
+        st = _state(core)
+        assert st["active"] is None
+        assert st["ready"] == []
+        assert set(st["finished"]) == {0, 1}
+        assert [cid for cid, _ in core.lmu.calls] == [0, 0, 0, 0, 1, 1, 0]
 
 
 class TestEchoMineSubprocessWithFakeOpenAIAPI:
