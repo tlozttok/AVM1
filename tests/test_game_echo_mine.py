@@ -4,9 +4,12 @@
 （初始化 -> search 结算 -> move 结算 -> 与 ghost 子对话交谈 -> 双方休眠）。
 """
 import json
+import shutil
 from pathlib import Path
 
 import pytest
+
+from main import main
 
 from avm.core import MemoryWriteInstruction
 from avm.image import load_image
@@ -275,3 +278,65 @@ class TestEchoMineFullTurn:
 
         # 调度轨迹：guide 7 次，ghost 2 次，guide 收尾 2 次
         assert [cid for cid, _ in core.lmu.calls] == [0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0]
+
+
+class TestEchoMineMainEntrypoint:
+    def test_main_runs_game_with_terminal_input_and_persist(self, tmp_path, capsys, monkeypatch):
+        """通过真实 main.py 入口跑一个 look/quit 会话：验证终端输入、输出设备、
+        镜像启动、persist_to 与 close_conversation 链路。LMU 用脚本替代，不调真实 API。"""
+        game_dir = tmp_path / "game"
+        shutil.copytree(GAME_IMAGE.parent, game_dir)
+        image_path = str(game_dir / GAME_IMAGE.name)
+
+        inputs = iter(["look", "quit"])
+        monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+
+        class MainLMU:
+            def __init__(self):
+                self.calls = []
+
+            def exec(self, conversation, para):
+                self.calls.append((conversation.cid, conversation.identity))
+                cid = conversation.cid
+                if cid != 0:
+                    return ("done", [], conversation)
+                n = len([c for c, _ in self.calls if c == 0])
+                if n == 1:
+                    return ("", [
+                        tool("i1", "listen_event", action="listen", event_type="memory_write",
+                             target="$MEM.world.player.hp", handler_ref="$MEM.handlers.hp_guard", phase="before"),
+                        tool("i2", "create_cmd", system_ref="$MEM.programs.ghost", para_ref="$MEM.para.llm"),
+                        tool("i3", "memory_write", ref="$MEM.state.ghost_cid", content="1"),
+                        tool("i4", "memory_write", ref="$MEM.world.status", content="playing"),
+                        tool("i5", "memory_read", ref="$MEM.map"),
+                        tool("i6", "memory_write", ref="$MEM.outputs.-1", content="欢迎来到回声矿洞"),
+                    ], conversation)
+                if n == 2:
+                    return ("", [tool("p1", "memory_read", ref="$MEM.inputs.-1")], conversation)
+                if n == 3:
+                    return ("", [
+                        tool("p2", "memory_read", ref="$MEM.world.player.room_id"),
+                        tool("p3", "memory_read", ref="$MEM.world.rooms.entrance.desc"),
+                        tool("p4", "memory_read", ref="$MEM.world.turn"),
+                        tool("p5", "memory_write", ref="$MEM.world.turn", content="1"),
+                        tool("p6", "memory_write", ref="$MEM.outputs.-1", content="你站在回声矿洞的入口"),
+                    ], conversation)
+                if n == 4:
+                    return ("", [tool("q1", "memory_read", ref="$MEM.inputs.-1")], conversation)
+                return ("", [
+                    tool("q2", "memory_read", ref="$MEM.state.ghost_cid"),
+                    tool("q3", "close_conversation", cid=1),
+                    tool("q4", "close_conversation", cid=0),
+                ], conversation)
+
+        lmu = MainLMU()
+        monkeypatch.setattr("avm.core.LMU.exec", lmu.exec)
+
+        rc = main([image_path])
+        captured = capsys.readouterr()
+
+        assert rc == 0
+        assert "欢迎来到回声矿洞" in captured.out
+        assert "你站在回声矿洞的入口" in captured.out
+        assert "内存已写回" in captured.err
+        assert (game_dir / "out" / "mem.json").is_file()
