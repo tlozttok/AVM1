@@ -16,6 +16,7 @@ Terminology is defined in [CONTEXT.md](CONTEXT.md).
 - [docs/philosophy.md](docs/philosophy.md) — design philosophy
 - [docs/system-image.md](docs/system-image.md) — system image format specification
 - [docs/apps](docs/apps) — AVM application suite (practical test images: courier_office / vault_guard / plm_ledger)
+- [docs/games](docs/games) — AVM games (echo_mine)
 - [docs/Agents](docs/Agents) — archived plans and design decisions
 - [docs/record](docs/record) — design notes (historical archive)
 
@@ -31,7 +32,7 @@ python main.py <image.json> --frames      # print monitor frame summary after ru
 python main.py <image.json> --transcript api.txt  # write full API calls to a file
 ```
 
-Debug settings live in `debug.json` (`image` / `frames` / `transcript`) so the command line does not need to change (VSCode runs `python main.py` fixed). Example images: `images/demo.json`, `images/calc_driver.json`; application suite: `images/apps/` (see [docs/apps](docs/apps) for how to start them). See the "System Images" section of [docs/runtime.md](docs/runtime.md) for the composition and key points.
+Debug settings live in `debug.json` (`image` / `frames` / `transcript`) so the command line does not need to change (VSCode runs `python main.py` fixed). Example images: `images/demo.json`, `images/calc_driver.json`; application suite: `images/apps/` (see [docs/apps](docs/apps) for how to start them); AI mini-game: `images/games/echo_mine/`. See the "System Images" section of [docs/runtime.md](docs/runtime.md) for the composition and key points.
 
 ## Current Status
 
@@ -50,7 +51,8 @@ Implemented:
 - Reasoning content return (kept in history, always returned, recorded by monitor, not exposed internally);
 - Single-conversation checkpoint (`save_conversation` / `restore_conversation`, input `/save` debug command);
 - AVM application suite (courier_office / vault_guard / plm_ledger: images + custom device + out-of-image custom PLM server);
-- 291 tests passing (MockLMU, no real API calls).
+- AVM mini-game echo_mine (GM conversation + ghost child conversation + dice/map devices + plm.python mechanics + HP event guard);
+- 297 tests passing (MockLMU, no real API calls).
 
 Under design (not implemented):
 

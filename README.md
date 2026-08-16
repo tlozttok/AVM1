@@ -16,6 +16,7 @@ AVM 不是 Agent 框架。它不预设编排模式，不提供业务提示词，
 - [docs/philosophy.md](docs/philosophy.md) — 设计哲学
 - [docs/system-image.md](docs/system-image.md) — 系统镜像格式规范
 - [docs/apps](docs/apps) — AVM 应用套件（实际性测试镜像：传令站 / 金库守卫 / 账本服务）
+- [docs/games](docs/games) — AVM 游戏（echo_mine 回声矿洞）
 - [docs/Agents](docs/Agents) — 计划与设计决策留档
 - [docs/record](docs/record) — 设计纪要（历史留档）
 
@@ -31,7 +32,7 @@ python main.py <image.json> --frames      # 运行后打印监测帧摘要（std
 python main.py <image.json> --transcript api.txt  # API 调用全文落盘
 ```
 
-调试参数写在 `debug.json`（`image` / `frames` / `transcript`），不需要改命令行（VSCode 固定运行 `python main.py`）。示例镜像见 `images/demo.json`、`images/calc_driver.json`；应用套件见 `images/apps/`（启动方式见 [docs/apps](docs/apps)）。系统镜像的组成与要点见 [docs/runtime.md](docs/runtime.md) 的「系统镜像」一节。
+调试参数写在 `debug.json`（`image` / `frames` / `transcript`），不需要改命令行（VSCode 固定运行 `python main.py`）。示例镜像见 `images/demo.json`、`images/calc_driver.json`；应用套件见 `images/apps/`（启动方式见 [docs/apps](docs/apps)）；AI 小游戏见 `images/games/echo_mine/`。系统镜像的组成与要点见 [docs/runtime.md](docs/runtime.md) 的「系统镜像」一节。
 
 ## 当前状态
 
@@ -50,7 +51,8 @@ python main.py <image.json> --transcript api.txt  # API 调用全文落盘
 - 思维链内容回传（历史保留、总是回传、monitor 记录、不内部暴露）；
 - 单对话检查点（`save_conversation` / `restore_conversation`，输入 `/save` 调试命令）；
 - AVM 应用套件（courier_office / vault_guard / plm_ledger：镜像 + 自定义设备 + 镜像外自定义 PLM 服务器）；
-- 测试 291 个全部通过（MockLMU，不调真实 API）。
+- AVM 小游戏 echo_mine（GM 对话 + ghost 子对话 + 骰子/地图设备 + plm.python 结算 + HP 事件守卫）；
+- 测试 297 个全部通过（MockLMU，不调真实 API）。
 
 设计中（未实现）：
 
