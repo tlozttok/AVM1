@@ -95,6 +95,7 @@ class TestEchoMineImage:
         assert core.unwrap("$MEM.world.rooms.cavern.links", for_llm=False) == "south:entrance,east:vault"
 
         assert core.unwrap("$MEM.programs.guide", for_llm=False).get_ctrl()["type"] == "settingup"
+        assert "初始化结束后不要输出纯文本结束交互" in core.unwrap("$MEM.programs.guide", for_llm=False)["content"]
         assert core.unwrap("$MEM.programs.ghost", for_llm=False).get_ctrl()["type"] == "settingup"
         assert core.unwrap("$MEM.programs.mechanics", for_llm=False).get_ctrl()["type"] == "python"
         assert core.unwrap("$MEM.handlers.hp_guard", for_llm=False).get_ctrl()["type"] == "python"

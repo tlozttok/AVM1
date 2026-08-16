@@ -174,4 +174,4 @@ def handle(event):
   7. 真实 `main.py` 入口 + 终端输入 + persist_to + 会话关闭；
   8. subprocess + OpenAI 兼容假 API：look/quit 会话验证终端与客户端链路；`/save game.conv.json` 调试命令写入 guide 检查点；完整胜利会话从标准输入跑 4 次 search、2 次 move、exit，断言持久化世界为 won/vault/gold=10，并打开 --transcript 验证监测器全文文件记录了结算请求。
 - 手工：`python main.py images/games/echo_mine/echo_mine.json`。
-- 真实 API 冒烟已实测：look/quit 会话，以及 search → move north → look → talk → quit 会话均按设计运行（记录见 docs/Agents/audit-game-echo-mine-2026-08-16.md）。
+- 真实 API 冒烟已实测：look/quit 会话、search → move north → look → talk → quit 会话，以及固定骰子完整胜利会话（search × 4 → move north → move east → exit，won/gold=10/vault/turn=6）均按设计运行（记录见 docs/Agents/audit-game-echo-mine-2026-08-16.md）。

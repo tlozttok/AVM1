@@ -56,6 +56,11 @@
    - `talk` 经 send_instruction 唤醒 ghost，ghost 读共享世界并回话；
    - 终态：status=playing，turn=3，room_id=cavern，last_event=MOVE entrance -> cavern。
 
+3. 固定骰子（6,6,6,5）完整胜利会话：`search × 4 / move north / move east / exit`。
+   - 终态：status=won，turn=6，gold=10，room_id=vault；
+   - 共 46 个 FRAME；
+   - 该会话还暴露并修复了一个初始化问题：旧提示词允许 GM 在欢迎信息后直接以纯文本结束交互，导致游戏停在大厅；提示词已改为「初始化最后一步同时读 inputs，结束后不得输出纯文本结束交互」。
+
 结论：游戏在真实 LLM 端点上的实际行为与设计一致。
 
 ## 四、遗留项（不阻塞本目标）
