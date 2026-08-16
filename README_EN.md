@@ -52,7 +52,7 @@ Implemented:
 - Single-conversation checkpoint (`save_conversation` / `restore_conversation`, input `/save` debug command);
 - AVM application suite (courier_office / vault_guard / plm_ledger: images + custom device + out-of-image custom PLM server);
 - AVM mini-game echo_mine (GM conversation + ghost child conversation + dice/map devices + plm.python mechanics + HP event guard);
-- 301 tests passing (MockLMU, no real API calls).
+- 302 tests passing (MockLMU, no real API calls).
 
 Under design (not implemented):
 

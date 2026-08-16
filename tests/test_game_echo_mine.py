@@ -27,6 +27,10 @@ def tool(call_id, name, **args):
     return {"call_id": call_id, "cmd_type": name, "args": args}
 
 
+def _tc(call_id, name, args):
+    return tool(call_id, name, **args)
+
+
 class ScriptedLMU:
     """按 cid 依次返回预设响应，并像 LMU.exec 一样提交对话历史。"""
 
@@ -510,9 +514,10 @@ class TestEchoMineFullWinPlaythrough:
 
 class TestEchoMineSubprocessWithFakeOpenAIAPI:
     """最接近真实运行的冒烟测试：起一个 OpenAI 兼容假 API，
-    通过 subprocess 运行 main.py，从终端输入 look/quit。"""
+    通过 subprocess 运行 main.py，从终端输入驱动游戏。"""
 
-    def test_real_entrypoint_talks_to_openai_client_and_terminal(self, tmp_path):
+    @staticmethod
+    def _run_game(tmp_path, player_input, guide_policy):
         game_dir = tmp_path / "game"
         shutil.copytree(GAME_IMAGE.parent, game_dir)
         image_path = str(game_dir / GAME_IMAGE.name)
@@ -530,47 +535,22 @@ class TestEchoMineSubprocessWithFakeOpenAIAPI:
                 messages = body.get("messages", [])
                 system = messages[0].get("content", "") if messages else ""
 
-                def tc(call_id, name, args):
-                    return {
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
-                    }
-
                 calls = []
                 if "游戏向导" in system:
                     with self.lock:
                         FakeAPI.guide_calls += 1
                         n = FakeAPI.guide_calls
-                    if n == 1:
-                        calls = [
-                            tc("i1", "listen_event", {"action": "listen", "event_type": "memory_write",
-                                                       "target": "$MEM.world.player.hp",
-                                                       "handler_ref": "$MEM.handlers.hp_guard", "phase": "before"}),
-                            tc("i2", "create_cmd", {"system_ref": "$MEM.programs.ghost", "para_ref": "$MEM.para.llm"}),
-                            tc("i3", "memory_write", {"ref": "$MEM.state.ghost_cid", "content": "1"}),
-                            tc("i4", "memory_write", {"ref": "$MEM.world.status", "content": "playing"}),
-                            tc("i5", "memory_read", {"ref": "$MEM.map"}),
-                            tc("i6", "memory_write", {"ref": "$MEM.outputs.-1", "content": "欢迎来到回声矿洞"}),
-                        ]
-                    elif n == 2:
-                        calls = [tc("p1", "memory_read", {"ref": "$MEM.inputs.-1"})]
-                    elif n == 3:
-                        calls = [
-                            tc("p2", "memory_read", {"ref": "$MEM.world.player.room_id"}),
-                            tc("p3", "memory_read", {"ref": "$MEM.world.rooms.entrance.desc"}),
-                            tc("p4", "memory_read", {"ref": "$MEM.world.turn"}),
-                            tc("p5", "memory_write", {"ref": "$MEM.world.turn", "content": "1"}),
-                            tc("p6", "memory_write", {"ref": "$MEM.outputs.-1", "content": "你站在回声矿洞的入口"}),
-                        ]
-                    elif n == 4:
-                        calls = [tc("q1", "memory_read", {"ref": "$MEM.inputs.-1"})]
-                    else:
-                        calls = [
-                            tc("q2", "memory_read", {"ref": "$MEM.state.ghost_cid"}),
-                            tc("q3", "close_conversation", {"cid": 1}),
-                            tc("q4", "close_conversation", {"cid": 0}),
-                        ]
+                    calls = list(guide_policy(n))
+
+                def api_tc(call):
+                    return {
+                        "id": call["call_id"],
+                        "type": "function",
+                        "function": {
+                            "name": call["cmd_type"],
+                            "arguments": json.dumps(call["args"], ensure_ascii=False),
+                        },
+                    }
 
                 response = {
                     "id": "chatcmpl-fake",
@@ -579,7 +559,7 @@ class TestEchoMineSubprocessWithFakeOpenAIAPI:
                     "model": body.get("model", "fake"),
                     "choices": [{
                         "index": 0,
-                        "message": {"role": "assistant", "content": "", "tool_calls": calls},
+                        "message": {"role": "assistant", "content": "", "tool_calls": [api_tc(c) for c in calls]},
                         "finish_reason": "tool_calls" if calls else "stop",
                     }],
                     "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
@@ -600,7 +580,7 @@ class TestEchoMineSubprocessWithFakeOpenAIAPI:
             env["OPENAI_BASE_URL"] = f"http://127.0.0.1:{server.server_address[1]}/v1"
             result = subprocess.run(
                 [sys.executable, "main.py", image_path],
-                input="look\nquit\n",
+                input=player_input,
                 text=True,
                 capture_output=True,
                 cwd=ROOT,
@@ -611,9 +591,141 @@ class TestEchoMineSubprocessWithFakeOpenAIAPI:
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+        return result, game_dir
+
+    def test_real_entrypoint_talks_to_openai_client_and_terminal(self, tmp_path):
+        def policy(n):
+            if n == 1:
+                return [
+                    _tc("i1", "listen_event", {"action": "listen", "event_type": "memory_write",
+                                                "target": "$MEM.world.player.hp",
+                                                "handler_ref": "$MEM.handlers.hp_guard", "phase": "before"}),
+                    _tc("i2", "create_cmd", {"system_ref": "$MEM.programs.ghost", "para_ref": "$MEM.para.llm"}),
+                    _tc("i2b", "listen_event", {"action": "listen", "event_type": "memory_write",
+                                                 "target": "$MEM.world.player.hp",
+                                                 "handler_ref": "$MEM.handlers.hp_watch", "phase": "after"}),
+                    _tc("i3", "memory_write", {"ref": "$MEM.state.ghost_cid", "content": "1"}),
+                    _tc("i4", "memory_write", {"ref": "$MEM.world.status", "content": "playing"}),
+                    _tc("i5", "memory_read", {"ref": "$MEM.map"}),
+                    _tc("i6", "memory_write", {"ref": "$MEM.outputs.-1", "content": "欢迎来到回声矿洞"}),
+                ]
+            if n == 2:
+                return [_tc("p1", "memory_read", {"ref": "$MEM.inputs.-1"})]
+            if n == 3:
+                return [
+                    _tc("p2", "memory_read", {"ref": "$MEM.world.player.room_id"}),
+                    _tc("p3", "memory_read", {"ref": "$MEM.world.rooms.entrance.desc"}),
+                    _tc("p4", "memory_read", {"ref": "$MEM.world.turn"}),
+                    _tc("p5", "memory_write", {"ref": "$MEM.world.turn", "content": "1"}),
+                    _tc("p6", "memory_write", {"ref": "$MEM.outputs.-1", "content": "你站在回声矿洞的入口"}),
+                ]
+            if n == 4:
+                return [_tc("q1", "memory_read", {"ref": "$MEM.inputs.-1"})]
+            return [
+                _tc("q2", "memory_read", {"ref": "$MEM.state.ghost_cid"}),
+                _tc("q3", "close_conversation", {"cid": 1}),
+                _tc("q4", "close_conversation", {"cid": 0}),
+            ]
+
+        result, game_dir = self._run_game(tmp_path, "look\nquit\n", policy)
 
         assert result.returncode == 0, result.stderr
         assert "欢迎来到回声矿洞" in result.stdout
         assert "你站在回声矿洞的入口" in result.stdout
         assert "内存已写回" in result.stderr
         assert (game_dir / "out" / "mem.json").is_file()
+
+    def test_real_entrypoint_full_win_session(self, tmp_path):
+        def search_turn(n, roll):
+            return [
+                _tc(f"sr{n}a", "memory_write", {"ref": "$MEM.mechanics.request",
+                                                 "content": f"print(resolve_search({roll}))"}),
+                _tc(f"sr{n}b", "create_sub", {"system_ref": "$MEM.programs.mechanics",
+                                               "user_ref": "$MEM.mechanics.request", "para_ref": "$MEM.para.python"}),
+            ]
+
+        def apply_search(n, gold, turn):
+            return [
+                _tc(f"sa{n}a", "memory_read", {"ref": "$MEM.world.player.gold"}),
+                _tc(f"sa{n}b", "memory_write", {"ref": "$MEM.world.player.gold", "content": gold}),
+                _tc(f"sa{n}c", "memory_write", {"ref": "$MEM.world.last_event", "content": f"search {n}"}),
+                _tc(f"sa{n}d", "memory_read", {"ref": "$MEM.world.turn"}),
+                _tc(f"sa{n}e", "memory_write", {"ref": "$MEM.world.turn", "content": turn}),
+                _tc(f"sa{n}f", "memory_write", {"ref": "$MEM.outputs.-1", "content": f"第 {n} 次搜索"}),
+            ]
+
+        def move_turn(n, current, direction):
+            return [
+                _tc(f"mr{n}a", "memory_read", {"ref": "$MEM.world.player.room_id"}),
+                _tc(f"mr{n}b", "memory_write", {"ref": "$MEM.mechanics.request",
+                                                 "content": f"print(next_room('{current}', '{direction}'))"}),
+                _tc(f"mr{n}c", "create_sub", {"system_ref": "$MEM.programs.mechanics",
+                                               "user_ref": "$MEM.mechanics.request", "para_ref": "$MEM.para.python"}),
+            ]
+
+        def apply_move(n, room, turn):
+            return [
+                _tc(f"ma{n}a", "memory_write", {"ref": "$MEM.world.player.room_id", "content": room}),
+                _tc(f"ma{n}b", "memory_write", {"ref": "$MEM.world.last_event", "content": f"move {room}"}),
+                _tc(f"ma{n}c", "memory_read", {"ref": "$MEM.world.turn"}),
+                _tc(f"ma{n}d", "memory_write", {"ref": "$MEM.world.turn", "content": turn}),
+                _tc(f"ma{n}e", "memory_read", {"ref": "$MEM.map"}),
+                _tc(f"ma{n}f", "memory_write", {"ref": "$MEM.outputs.-1", "content": f"到达 {room}"}),
+            ]
+
+        def policy(n):
+            if n == 1:
+                return [
+                    _tc("w0a", "listen_event", {"action": "listen", "event_type": "memory_write",
+                                                 "target": "$MEM.world.player.hp",
+                                                 "handler_ref": "$MEM.handlers.hp_guard", "phase": "before"}),
+                    _tc("w0b", "create_cmd", {"system_ref": "$MEM.programs.ghost", "para_ref": "$MEM.para.llm"}),
+                    _tc("w0c", "listen_event", {"action": "listen", "event_type": "memory_write",
+                                                 "target": "$MEM.world.player.hp",
+                                                 "handler_ref": "$MEM.handlers.hp_watch", "phase": "after"}),
+                    _tc("w0d", "memory_write", {"ref": "$MEM.state.ghost_cid", "content": "1"}),
+                    _tc("w0e", "memory_write", {"ref": "$MEM.world.status", "content": "playing"}),
+                    _tc("w0f", "memory_read", {"ref": "$MEM.map"}),
+                    _tc("w0g", "memory_write", {"ref": "$MEM.outputs.-1", "content": "欢迎来到回声矿洞"}),
+                ]
+            if n in (2, 5, 8, 11, 14, 17, 20):
+                return [_tc(f"in{n}", "memory_read", {"ref": "$MEM.inputs.-1"})]
+            if n == 3: return search_turn(1, 6)
+            if n == 4: return apply_search(1, "3", "1")
+            if n == 6: return search_turn(2, 6)
+            if n == 7: return apply_search(2, "6", "2")
+            if n == 9: return search_turn(3, 6)
+            if n == 10: return apply_search(3, "9", "3")
+            if n == 12: return search_turn(4, 5)
+            if n == 13: return apply_search(4, "10", "4")
+            if n == 15: return move_turn(1, "entrance", "north")
+            if n == 16: return apply_move(1, "cavern", "5")
+            if n == 18: return move_turn(2, "cavern", "east")
+            if n == 19: return apply_move(2, "vault", "6")
+            return [
+                _tc("wx1", "memory_read", {"ref": "$MEM.world.player.room_id"}),
+                _tc("wx2", "memory_read", {"ref": "$MEM.world.player.gold"}),
+                _tc("wx3", "memory_write", {"ref": "$MEM.world.status", "content": "won"}),
+                _tc("wx4", "memory_write", {"ref": "$MEM.outputs.-1", "content": "你带着 10 gold 离开了回声矿洞"}),
+                _tc("wx5", "close_conversation", {"cid": 1}),
+                _tc("wx6", "close_conversation", {"cid": 0}),
+            ]
+
+        result, game_dir = self._run_game(
+            tmp_path,
+            "search\nsearch\nsearch\nsearch\nmove north\nmove east\nexit\n",
+            policy,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "欢迎来到回声矿洞" in result.stdout
+        assert "到达 cavern" in result.stdout
+        assert "到达 vault" in result.stdout
+        assert "你带着 10 gold 离开了回声矿洞" in result.stdout
+        assert "内存已写回" in result.stderr
+        mem = json.loads((game_dir / "out" / "mem.json").read_text(encoding="utf-8"))
+        world = mem["value"]["world"]["value"]
+        assert world["status"]["value"] == "won"
+        assert world["player"]["value"]["gold"]["value"] == "10"
+        assert world["player"]["value"]["room_id"]["value"] == "vault"
+
