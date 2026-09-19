@@ -68,17 +68,40 @@ python -m avm.image <image.json>
 | 键 | 必填 | 说明 |
 |---|---|---|
 | `path` | 是 | 挂载键，访问方式 `$MEM.<path>` |
-| `file` | 是 | Python 模块路径，相对镜像文件所在目录（也允许绝对路径） |
-| `class` | 是 | 模块中的类名 |
+| `file` | 否* | Python 模块路径，相对镜像文件所在目录（也允许绝对路径） |
+| `class` | 是 | 模块中的类名（外层插件）或内建注册表类名（`builtin=true`） |
+| `builtin` | 否 | `true` 时使用内建设备注册表 `BUILTIN_DEVICE_CLASSES`，不允许提供 `file` |
 | `args` | 否 | 传给构造函数的对象，默认 `{}` |
 
-设备类**必须继承** `avm.memory_device.MemoryDevice`，否则报错。接口约定：
+- 外层设备插件：`builtin` 缺省或 `false`，必须提供 `file` + `class`，`class` 必须继承 `avm.memory_device.MemoryDevice`。
+- 内建设备：`builtin: true`，`class` 取内建注册表（当前包含 `LinkDevice`），参数走 `args`。
+
+接口约定：
 
 - `to_llm_string() -> str`：LLM 读取该设备时看到的表示（必实现）。
 - `resolve_path(path: list)`：子路径访问（可选覆盖，默认抛错）。
 - `set_value(value)`：写入（可选）。
+- `authorize_listener(event_type, remainder, owner_cid) -> bool`：是否允许监听该设备内路径（当前 `LinkDevice` 会委托给真实目标）。
+- `after_event(event_type, remainder, result) -> Optional[dict]`：操作成功后返回纯 payload 事实事件。
 
-参考 `avm/memory_device.py` 中的现有设备（`InputsListDevice`、`OutputsListDevice` 等）。
+参考 `avm/memory_device.py` 中的现有设备（`InputsListDevice`、`OutputsListDevice`、`LinkDevice` 等）。
+
+#### LinkDevice 示例
+
+```json
+{
+  "mem": {
+    "game": { "kind": "dict", "value": { "map": { "kind": "dict", "value": {
+      "rooms": { "kind": "dict", "meta": "房间列表", "value": {} }
+    }}}},
+    "rooms": { "kind": "device" }
+  },
+  "devices": [
+    { "path": "rooms", "class": "LinkDevice", "builtin": true,
+      "args": { "target": "$MEM.game.map.rooms" } }
+  ]
+}
+```
 
 ## init（启动对话）
 

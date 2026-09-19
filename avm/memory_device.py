@@ -44,6 +44,133 @@ class MemoryDevice:
         raise VMMemoryError(f"{type(self).__name__} 不支持子路径访问")
 
 
+class LinkDevice(MemoryDevice):
+    """链接设备：把 $MEM 下的真实路径挂载为别名。
+
+    对话只能看到别名；读取/写入/授权跟随真实目标。成环抛 MemoryCircularReferenceError，
+    错误信息只含别名链，不暴露真实路径。
+    """
+
+    is_link = True
+
+    def __init__(self, target: str):
+        if not isinstance(target, str) or not target.startswith("$MEM"):
+            raise ValueError(f"LinkDevice 目标必须是 $MEM 开头：{target!r}")
+        parts = target[1:].split(".")
+        if not parts or parts[0] != "MEM":
+            raise ValueError(f"LinkDevice 目标必须是 $MEM 开头：{target!r}")
+        self.target_ref = target
+        self._target_segments = parts[1:]
+        self._core = None
+
+    def attach_core(self, core) -> None:
+        self._core = core
+
+    # ------------------------------------------------------------------
+    # 内部跟随
+    # ------------------------------------------------------------------
+
+    def _follow_real(self, remainder, seen_links=None):
+        """跟随目标（含链式链接），返回 ("memory", segments) 或 ("device", mount, remainder)。"""
+        if self._core is None:
+            from .exceptions import VMMemoryError
+            raise VMMemoryError("LinkDevice 未接入 Core")
+        segments = self._target_segments + list(remainder or [])
+        return self._core.mem._follow_real(segments, seen_links or [])
+
+    def _real_mem_segments(self, suffix, seen_links=None):
+        """把别名后的剩余路径换算成真实 MEM 段（不含 MEM 根），供 set_by_path 委托。"""
+        follow = self._follow_real(suffix or [], seen_links=seen_links)
+        if follow[0] == "memory":
+            return follow[1]
+        _, mount, remainder = follow
+        return mount.split(".") + list(remainder or [])
+
+    def validate(self) -> None:
+        """镜像加载期校验：真实解析目标，确认可达；失败抛异常（面向运行者，可含真实路径）。"""
+        if self._core is None:
+            from .exceptions import VMMemoryError
+            raise VMMemoryError("LinkDevice 未接入 Core")
+        self._core.mem._resolve_path(
+            ["MEM"] + self._target_segments,
+            for_llm=False,
+            seen_links=[self.mount_path] if self.mount_path else [],
+        )
+
+    # ------------------------------------------------------------------
+    # MemoryDevice 接口
+    # ------------------------------------------------------------------
+
+    def pretend_as_type(self) -> str:
+        return "str"
+
+    def to_llm_string(self) -> str:
+        from .exceptions import VMMemoryError
+        if self._core is None:
+            raise VMMemoryError("LinkDevice 未接入 Core")
+        try:
+            return self._core.mem._resolve_path(
+                ["MEM"] + self._target_segments,
+                for_llm=True,
+                seen_links=[self.mount_path] if self.mount_path else [],
+            )
+        except Exception as e:
+            # 隐藏真实路径：只暴露别名；真实错误打 stderr 给运行者
+            alias = f"$MEM.{self.mount_path}" if self.mount_path else self.target_ref
+            print(f"[Link] {alias}: {type(e).__name__}: {e}", file=sys.stderr)
+            raise VMMemoryError(f"链接目标不可达：{alias}") from None
+
+    def resolve_path(self, path: list, seen_links=None) -> Any:
+        from .exceptions import VMMemoryError, MemoryCircularReferenceError
+        if self._core is None:
+            raise VMMemoryError("LinkDevice 未接入 Core")
+        target_segments = self._target_segments + list(path or [])
+        try:
+            return self._core.mem._resolve_path(
+                ["MEM"] + target_segments,
+                for_llm=False,
+                seen_links=seen_links or ([self.mount_path] if self.mount_path else []),
+            )
+        except MemoryCircularReferenceError:
+            raise
+        except Exception as e:
+            alias = "$MEM." + self.mount_path if self.mount_path else self.target_ref
+            if path:
+                alias += "." + ".".join(path)
+            print(f"[Link] {alias}: {type(e).__name__}: {e}", file=sys.stderr)
+            raise VMMemoryError(f"链接目标不可达：{alias}") from None
+
+    def set_value(self, value: Any, owner_cid: Optional[int] = None) -> None:
+        from .exceptions import VMMemoryError
+        if self._core is None:
+            raise VMMemoryError("LinkDevice 未接入 Core")
+        self._core.mem.set(self.target_ref, value, owner_cid=owner_cid)
+
+    def authorize_listener(self, event_type: str, remainder: list, owner_cid: int) -> bool:
+        from .exceptions import MemoryCircularReferenceError
+        try:
+            follow = self._follow_real(
+                list(remainder or []),
+                seen_links=[self.mount_path] if self.mount_path else [],
+            )
+        except MemoryCircularReferenceError:
+            return False
+        except Exception:
+            return False
+        if follow[0] == "memory":
+            _, segments = follow
+            ref = "$MEM" if not segments else "$MEM." + ".".join(segments)
+            owner = self._core.events._owner_of(self._core, ref)
+            return owner is not None and owner == owner_cid
+        _, mount, dev_remainder = follow
+        device = self._core.mem._devices[mount]
+        return device.authorize_listener(event_type, dev_remainder, owner_cid)
+
+    def after_event(self, event_type: str, remainder: list, result: dict) -> Optional[dict]:
+        # 链接自身不发布事实事件；真实执行组件由 Core 跟随链接后询问。
+        return None
+
+
 class StringDevice(MemoryDevice):
     """假装是字符串的设备"""
 
@@ -357,3 +484,7 @@ class MetaDictDevice(MemoryDevice):
 
     def __repr__(self) -> str:
         return f"MetaDictDevice(data={self._data}, metadata={self._metadata})"
+
+
+# 内建设备注册表：镜像 devices 条目可用 builtin=true 引用。
+BUILTIN_DEVICE_CLASSES = {"LinkDevice": LinkDevice}

@@ -45,7 +45,7 @@
       "value": {
         "overview": {
           "kind": "str",
-          "value": "# 概览\n\n本系统是一个以对话为执行单元的运行时。\n\n- 对话：由系统提示词和用户提示词启动。每一轮通过工具调用操作系统，系统执行指令并返回结果；当一轮返回不含工具调用的结果时，本轮结束，对话进入休眠（个体保留，可被再次调用）。\n- 内存：全局键值树，根为 $MEM。节点类型：字典（MetaDict）、列表（MetaList）、字符串（str）。路径用点号连接；列表用数字索引，-1 表示最后一个元素。\n- 有类型节点：节点的 ctrl.type 决定类型——settingup（LLM 程序）、python（Python 程序）、para（模型参数）。create_cmd / create_sub 的 system_ref 必须指向程序节点、para_ref 必须指向参数节点（详见 memory_model 节）。\n- 指令集（9 个）：memory_read / memory_write / memory_make / edit_metadata（内存读写、创建与 ctrl 元数据编辑）；create_cmd / create_sub（创建对话）；send_instruction（按 cid 投递指令，只确认投递成功、不保证对方返回）；close_conversation（内核级关闭）；listen_event（注册/修改/取消事件监听，phase=before/after/all）。\n- 事件发布者分工：before 请求事件由 Core 发布（source 含 initiator_cid）；after 事实事件由 Memory/设备/Core 发布（payload 含 actor_cid）。成功指令会额外产生 after 事件。\n- 调度：对话处于活跃/休眠/就绪三态，同时只有一个活跃对话。每次激活有指令预算（默认 50），同一调用链内达到预算会被中断让出，状态保留。\n- 设备：挂载在内存路径上的虚拟文件。$MEM.conversations、$MEM.scheduler、$MEM.memory、$MEM.monitor、$MEM.listeners 是只读信息设备；$MEM.inputs / $MEM.outputs 是用户输入输出设备。\n- 预置程序：$MEM.programs.helper（LLM 提示词程序，ctrl.type='settingup'）、$MEM.programs.probe_simple（plm.simple）与 $MEM.programs.probe_python（plm.python），参数库在 $MEM.para：llm（LLM 对话，deepseek-v4-flash）、simple（plm.simple）、python（plm.python）。\n\n本系统不直接访问操作系统、硬件或网络（宿主侧沙箱拦截）。"
+          "value": "# 概览\n\n本系统是一个以对话为执行单元的运行时。\n\n- 对话：由系统提示词和用户提示词启动。每一轮通过工具调用操作系统，系统执行指令并返回结果；当一轮返回不含工具调用的结果时，本轮结束，对话进入休眠（个体保留，可被再次调用）。\n- 内存：全局键值树，根为 $MEM。节点类型：字典（MetaDict）、列表（MetaList）、字符串（str）。路径用点号连接；列表用数字索引，-1 表示最后一个元素。\n- 有类型节点：节点的 ctrl.type 决定类型——settingup（LLM 程序）、python（Python 程序）、para（模型参数）。create_cmd / create_sub 的 system_ref 必须指向程序节点、para_ref 必须指向参数节点（详见 memory_model 节）。\n- 指令集（9 个）：memory_read / memory_write / memory_make / edit_metadata（内存读写、创建与 ctrl 元数据编辑）；create_cmd / create_sub（创建对话）；send_instruction（按 cid 投递指令，只确认投递成功、不保证对方返回）；close_conversation（内核级关闭）；listen_event（注册/修改/取消事件监听，phase=before/after/all）。\n- 事件发布者分工：before 请求事件由 Core 发布（source 含 initiator_cid）；after 事实事件由 Memory/设备/Core 发布（payload 含 actor_cid）。成功指令会额外产生 after 事件。\n- 调度：对话处于活跃/休眠/就绪三态，同时只有一个活跃对话。每次激活有指令预算（默认 50），同一调用链内达到预算会被中断让出，状态保留。\n- 设备：挂载在内存路径上的虚拟文件。$MEM.conversations、$MEM.scheduler、$MEM.memory、$MEM.monitor、$MEM.listeners 是只读信息设备；$MEM.inputs / $MEM.outputs 是用户输入输出设备。\n- 预置程序：$MEM.programs.helper（LLM 提示词程序，ctrl.type='settingup'）、$MEM.programs.probe_simple（plm.simple）、$MEM.programs.probe_python（plm.python）、$MEM.programs.probe_fn（plm.function）、$MEM.programs.probe_machine（plm.machine）；参数库在 $MEM.para：llm（LLM 对话，deepseek-v4-flash）、simple（plm.simple）、python（plm.python）、fn（plm.function）、machine（plm.machine）。\n\n本系统不直接访问操作系统、硬件或网络（宿主侧沙箱拦截）。"
         },
         "observe": {
           "kind": "str",
@@ -57,7 +57,7 @@
         },
         "memory_model": {
           "kind": "str",
-          "value": "# 内存模型\n\n- 全局根：$MEM。顶层键是显式节点；设备也是顶层键。\n- 类型：MetaDict（字典）、MetaList（列表）、str（字符串叶子）。str 永远是 str，不会被解引用。\n- 有类型节点：节点的 ctrl.type 决定 Core 如何解释它，三种取值：\n  - settingup：LLM 提示词程序。value 含 content（提示词文本）与可选 name（对话身份）、signature。create_cmd / create_sub 的 system_ref 必须指向它。\n  - python：Python 程序。value 含 content（代码）。同样可被 create_cmd / create_sub 用作 system_ref。\n  - para：模型参数。value 含 model（本镜像 API 只接受 deepseek-v4-pro 或 deepseek-v4-flash）与 temperature 等调用参数。create_cmd / create_sub 的 para_ref 必须指向它。本镜像预置参数库：$MEM.para.llm（LLM 对话）、$MEM.para.simple / $MEM.para.python（Python 对话），创建对话时优先复用。\n- 无类型节点（str、无 ctrl 的 dict/list）不是程序也不是参数；把它们当作 system_ref / para_ref 会在创建时被拒绝（工具响应 Error，对话保持活跃可自纠）。\n- 运行时用 edit_metadata 给节点设置 ctrl.type，可把普通节点变成有类型节点；owner 键由 Core 维护，edit_metadata 不允许 set/del。\n- 路径：$MEM.a.b.c；列表索引用数字，-1 是最后一个元素。\n- 读取语义：字典返回 meta+键列表，列表返回 meta+长度，str 返回内容；深入索引才展开子节点。写字符串到字典/列表路径 = 改 meta。\n- 设备（虚拟文件）：挂载在内存路径上，读取返回其字符串表示；部分支持子路径（如 $MEM.conversations.<cid>、$MEM.listeners.<listener_id>）。信息设备只读；$MEM.inputs 读 -1 请求用户输入；$MEM.outputs 写 -1 追加输出并打印到屏幕。\n- memory_write 到不存在的键会直接创建 str 叶子；创建 dict/list 节点用 memory_make。\n- 越界、不存在路径、字符串下创建子节点等错误会作为工具响应返回（Error: ...）。\n- $MEM.test 是预置的工作区（plans / results / notes 三个字典节点）。"
+          "value": "# 内存模型\n\n- 全局根：$MEM。顶层键是显式节点；设备也是顶层键。\n- 类型：MetaDict（字典）、MetaList（列表）、str（字符串叶子）。str 永远是 str，不会被解引用。\n- 有类型节点：节点的 ctrl.type 决定 Core 如何解释它，三种取值：\n  - settingup：LLM 提示词程序。value 含 content（提示词文本）与可选 name（对话身份）、signature。create_cmd / create_sub 的 system_ref 必须指向它。\n  - python：Python 程序。value 含 content（代码）。同样可被 create_cmd / create_sub 用作 system_ref。\n  - para：模型参数。value 含 model（本镜像 API 只接受 deepseek-v4-pro 或 deepseek-v4-flash）与 temperature 等调用参数。create_cmd / create_sub 的 para_ref 必须指向它。本镜像预置参数库：$MEM.para.llm（LLM 对话）、$MEM.para.simple / $MEM.para.python（Python 对话）、$MEM.para.fn（plm.function 纯函数）、$MEM.para.machine（plm.machine 状态机），创建对话时优先复用。\n- 无类型节点（str、无 ctrl 的 dict/list）不是程序也不是参数；把它们当作 system_ref / para_ref 会在创建时被拒绝（工具响应 Error，对话保持活跃可自纠）。\n- 运行时用 edit_metadata 给节点设置 ctrl.type，可把普通节点变成有类型节点；owner 键由 Core 维护，edit_metadata 不允许 set/del。\n- 路径：$MEM.a.b.c；列表索引用数字，-1 是最后一个元素。\n- 读取语义：字典返回 meta+键列表，列表返回 meta+长度，str 返回内容；深入索引才展开子节点。写字符串到字典/列表路径 = 改 meta。\n- 设备（虚拟文件）：挂载在内存路径上，读取返回其字符串表示；部分支持子路径（如 $MEM.conversations.<cid>、$MEM.listeners.<listener_id>）。信息设备只读；$MEM.inputs 读 -1 请求用户输入；$MEM.outputs 写 -1 追加输出并打印到屏幕。\n- memory_write 到不存在的键会直接创建 str 叶子；创建 dict/list 节点用 memory_make。\n- 越界、不存在路径、字符串下创建子节点等错误会作为工具响应返回（Error: ...）。\n- $MEM.test 是预置的工作区（plans / results / notes 三个字典节点）。"
         },
         "scheduling": {
           "kind": "str",
@@ -140,12 +140,46 @@
               "value": "你是 init 创建的辅助对话，等待指令。收到消息后按内容执行，把结论输出为你的回复（无工具调用）。"
             }
           }
+        },
+        "probe_fn": {
+          "kind": "dict",
+          "meta": "plm.function：system 定义 handle(input)，user 传 JSON，返回 JSON；无跨调用状态",
+          "ctrl": {
+            "type": "python"
+          },
+          "value": {
+            "name": {
+              "kind": "str",
+              "value": "probe_fn"
+            },
+            "content": {
+              "kind": "str",
+              "value": "def handle(input):\n    return {\"echo\": input}"
+            }
+          }
+        },
+        "probe_machine": {
+          "kind": "dict",
+          "meta": "plm.machine：system 是状态机 DSL（initial/state/on/if/set/action），user 传 {\"event\": ...}",
+          "ctrl": {
+            "type": "python"
+          },
+          "value": {
+            "name": {
+              "kind": "str",
+              "value": "probe_machine"
+            },
+            "content": {
+              "kind": "str",
+              "value": "initial: idle\n\nstate idle:\n  on start -> done | {\"content\": \"started\"}\n\nstate done:\n  on * -> done"
+            }
+          }
         }
       }
     },
     "para": {
       "kind": "dict",
-      "meta": "预置模型参数库：创建对话时使用（llm=LLM API 参数，simple/python=PLM 类型参数）",
+      "meta": "预置模型参数库：创建对话时使用（llm=LLM API 参数，simple/python/function/machine=PLM 类型参数）",
       "value": {
         "llm": {
           "kind": "dict",
@@ -183,6 +217,32 @@
             "model": {
               "kind": "str",
               "value": "plm.python"
+            }
+          }
+        },
+        "fn": {
+          "kind": "dict",
+          "meta": "plm.function 参数",
+          "ctrl": {
+            "type": "para"
+          },
+          "value": {
+            "model": {
+              "kind": "str",
+              "value": "plm.function"
+            }
+          }
+        },
+        "machine": {
+          "kind": "dict",
+          "meta": "plm.machine 参数",
+          "ctrl": {
+            "type": "para"
+          },
+          "value": {
+            "model": {
+              "kind": "str",
+              "value": "plm.machine"
             }
           }
         }

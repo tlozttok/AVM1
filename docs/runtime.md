@@ -79,7 +79,7 @@ MetaDict / MetaList 有两份元数据：
 
 **str 永远是 str**：字符串值不会被当作引用解引用。`$` 递归解引用与 `&` 单层解引用是已废弃的设计，不存在于当前代码中。
 
-**链接（Link）是设备**（设计中，未实现）：把真实路径挂载为别名，如 `$rooms` → `$MEM.game.map.rooms`。对话通过链接访问目标内容，但看不到真实路径，因此无法借链接访问兄弟节点——这是 capability 边界的实现方式。读取时跟随目标；链接成环报错。
+**链接（Link）是设备**（LinkDevice）：把真实 `$MEM` 路径挂载为别名，如 `$rooms` → `$MEM.game.map.rooms`。对话通过链接访问目标内容，但看不到真实路径，因此无法借链接访问兄弟节点——这是 capability 边界的实现方式。读取/写入/`memory_make`/`edit_metadata` 对链接透明；链接成环抛 `MemoryCircularReferenceError`；错误信息只暴露别名，真实错误详情输出到 stderr。v1 为静态链接（镜像 `builtin` 设备声明），运行期无创建/删除指令。
 
 ### 设备
 
@@ -90,6 +90,16 @@ MetaDict / MetaList 有两份元数据：
 - `set_value(value)`：写入（可选）。
 
 Core 内置只读信息设备：`$MEM.conversations`（对话列表与单对话详情）、`$MEM.scheduler`（活跃/就绪/休眠与预算）、`$MEM.memory`（内存树摘要）、`$MEM.monitor`（监测帧摘要）、`$MEM.listeners`（事件监听器列表）。镜像可挂载自己的设备，例如 `$inputs`、`$outputs`（见[系统镜像](#系统镜像)）。
+
+### 链接设备（LinkDevice）
+
+`LinkDevice` 是内建设备：把 `$MEM` 下的真实路径挂载为别名（如 `rooms` → `$MEM.game.map.rooms`）。
+
+- 读/写/`memory_make`/`edit_metadata` 对别名透明，等同于操作真实目标。
+- 链接目标 v1 只允许 `$MEM` 开头的路径；允许链接指向链接（链式跟随），成环抛 `MemoryCircularReferenceError`，错误只含别名链。
+- 错误隐藏：LLM 看到的错误只包含别名路径；真实路径/异常详情输出到 stderr 给运行者。镜像加载期校验失败属于运行者诊断，可显示真实路径。
+- 事件透明：注册监听 target 为别名时，权限检查跟随真实目标（memory 按 owner，device 走对方 `authorize_listener`）；after 事实事件由真实执行组件发布，但事件 target/payload 仍写别名。
+- 声明方式：`devices` 条目 `{"path": "rooms", "class": "LinkDevice", "builtin": true, "args": {"target": "$MEM.game.map.rooms"}}`。旧镜像不声明链接，行为不变。
 
 ## 对话间通信
 
@@ -122,10 +132,67 @@ Python 程序与 LLM 对话对等：都是 AVM 中的一等执行单元，通过
 
 | model | 行为 |
 |---|---|
-| `plm.simple` | 计算器：单行表达式求值。受限命名空间（安全 builtins + math），无状态。 |
-| `plm.python` | 图灵完备：Jupyter 笔记本式语义。系统消息与用户消息都执行进同一个持久命名空间（跨轮次保留）；多个 print 全部执行，输出按顺序拼接为整体返回。 |
+| `plm.simple` | 计算器：单行表达式求值。仅测试调试，暂存、不推荐、不维护。 |
+| `plm.function` | 纯函数：system 定义 `handle(input)`，user 传 JSON，返回可 JSON 序列化的值；每次调用全新受限命名空间，无副作用、无跨调用状态。 |
+| `plm.machine` | 状态机：system 是状态机 DSL，user 是 JSON 事件；状态/变量跨消息保留在 PLM 实例内，可输出全部 9 条指令的 tool calls。 |
+| `plm.command` | 字符串 IO 命令行：system 定义 `handle(cmd)`，user 是命令与参数（整行字符串）；`handle` 可用 `yield from` 调用注入的工具函数，工具响应回到断点继续执行。 |
+| `plm.python` | 图灵完备兜底：Jupyter 笔记本式语义。系统消息与用户消息都执行进同一个持久命名空间（跨轮次保留）；多个 print 全部执行，输出按顺序拼接为整体返回。 |
 
 Python 对话的 `model` 必须是注册表（`PLM_REGISTRY`）中的名字，否则报错，不静默回退到 LLM。
+
+### plm.function
+
+- system 消息是 Python 代码，需定义可调用 `handle(input)`；
+- user 消息是 JSON 文本，`json.loads` 的结果作为 `input`；
+- 代码编译一次；每次调用使用全新受限命名空间（可用 `math` / `json` / `re`），stdout 丢弃；
+- 返回值必须可 JSON 序列化，`json.dumps(..., ensure_ascii=False)` 作为 content；
+- 不产生 tool_calls，工具消息返回 `""`；错误以 `错误: FunctionPLM: <类型>: <信息>` 文本返回。
+
+### plm.machine
+
+system 消息是状态机定义：
+
+```text
+initial: idle
+
+state idle:
+  on start { set counter = 0 } -> running
+
+state running:
+  on tick if counter < 3 { set counter = counter + 1 } -> running
+  on stop -> idle | {"content": "stopped", "tools": [
+      {"name": "memory_write", "arguments": {"ref": "$MEM.log", "content": "stopped"}}
+  ]}
+```
+
+- user 消息是 JSON：`{"event": "<str>", "data": {...}}`；
+- 当前 state 的转移按定义顺序匹配 event（支持 `*` 默认）与可选 guard；
+- guard/set 表达式在受限沙箱中求值，可用 state 变量、`event_name`、`event_data`、`last`；
+- set 块事务化：全部求值成功才写回；
+- response JSON 的 `content` 与 `tools` 均可省略；`tools` 的 name 必须是 9 条指令之一；
+- tool calls 的 id 形如 `fsm-0`；tool 返回内容追加到 `last`；
+- 无匹配转移返回错误文本，状态与变量不变；定义解析错误不抛穿 Core。
+
+### plm.command
+
+system 消息是命令处理程序（Python），需定义 `handle(cmd)`；user 消息是整行命令字符串，程序自己解析命令与参数：
+
+```python
+def handle(cmd):
+    op, _, rest = cmd.partition(' ')
+    if op == 'bump':
+        cur = yield from memory_read('$MEM.n')
+        yield from memory_write('$MEM.n', str(int(cur) + 1))
+        return 'n=' + str(int(cur) + 1)
+    return 'unknown: ' + op
+```
+
+- `handle` 返回字符串即命令输出（返回 `None` 视为空输出，其它类型报错）；stdout 丢弃；
+- `handle` 可以是生成器：注入的工具函数用 `yield from` 产生工具调用，Core 执行后把工具响应字符串送回断点继续（一条命令内可完成「读→算→写」往返）；
+- 注入的工具函数有 5 个：`memory_read(ref)`、`memory_write(ref, content)`、`memory_make(ref, key, mem_type)`、`send_instruction(cid, content)`、`close_conversation(cid)`；工具响应原样返回（包括 `Error: ...` 文本），由程序决定如何处理；其它指令名不可调用；
+- 每条命令在全新受限命名空间中执行（程序与辅助代码重新执行），无跨命令状态——要持久化就写 `$MEM`；
+- tool calls 的 id 形如 `cmd-0`，每条命令内递增；一条命令最多挂起一个工具调用，命令未结束就投递新命令会丢弃旧生成器；
+- 错误以 `错误: CommandPLM: <类型>: <信息>` 文本返回。
 
 ### 确定性
 

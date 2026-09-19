@@ -39,18 +39,13 @@ def _publish_memory_after(
     memory 目标由 Core 直接以 source=memory 发布；device 目标询问 device.after_event，
     设备返回纯 payload，Core 统一加事件字段并强制 actor_cid/ref。
     """
-    split = core.mem.split_path(target)
-    kind = split[0]
-    if kind == "memory":
-        mount_key = None
-        remainder = []
-    else:
-        _, mount_key, remainder = split
-    if kind == "memory":
+    follow = core.mem.follow_link_target(target)
+    if follow[0] == "memory":
         core.events.publish_after_event(
             event_type, conv, target, payload, source_kind="memory"
         )
         return
+    _, mount_key, remainder = follow
     device = core.mem._devices[mount_key]
     extra = device.after_event(event_type, remainder, result or {})
     if extra is None:

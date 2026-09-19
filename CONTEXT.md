@@ -77,8 +77,8 @@ AVM 的指令分发层和调度器。不参与管理决策——只执行指令�
 叶子节点，无元数据，直接返回内容。需要元数据的字符串用 MetaDict 包装（如 Settingup 的 `content` 字段）。将来可选支持对字符串的特征查询（len、grep 等）。
 _Avoid_: 普通字符串
 
-**链接 (Link)**（设计中，未实现）:
-挂载在内存路径上的设备节点，指向真实路径的别名（如 `$rooms` → `$MEM.game.map.rooms`）。对话通过链接访问目标内容，但看不到真实路径，无法借链接访问兄弟节点——这是 capability 边界的实现方式。读取时跟随目标；链接成环抛 `MemoryCircularReferenceError`。
+**链接 (Link)**:
+挂载在内存路径上的设备节点（`LinkDevice`），指向真实路径的别名（如 `$rooms` → `$MEM.game.map.rooms`）。对话通过链接访问目标内容，但看不到真实路径，无法借链接访问兄弟节点——这是 capability 边界的实现方式。读取/写入/`memory_make`/`edit_metadata` 对链接透明；链接成环抛 `MemoryCircularReferenceError`；错误信息只暴露别名。v1 为静态链接，由系统镜像的 `builtin` 设备声明，运行期无创建/删除指令。
 _Avoid_: 解引用、符号、指针
 
 ### 调度

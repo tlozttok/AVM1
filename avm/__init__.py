@@ -11,5 +11,5 @@ from .types import MetaDict, MetaList, Conversation, UserMessageBatch, \
 from .exceptions import VMSyntaxError, VMMemoryError, VMResourceError, \
     MemoryKeyNotFoundError, MemoryIndexOutOfRangeError, MemoryTypeError, MemoryCircularReferenceError
 from .memory_device import MemoryDevice, StringDevice, MetaListDevice, MetaDictDevice, \
-    InputsListDevice, OutputsListDevice
+    InputsListDevice, OutputsListDevice, LinkDevice, BUILTIN_DEVICE_CLASSES
 from .monitor import Monitor, Frame

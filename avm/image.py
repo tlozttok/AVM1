@@ -20,7 +20,7 @@ from typing import Optional
 
 from .core import Core
 from .exceptions import VMMemoryError
-from .memory_device import MemoryDevice
+from .memory_device import MemoryDevice, BUILTIN_DEVICE_CLASSES
 from .types import MetaDict, MetaList
 
 IMAGE_VERSION = 1
@@ -87,20 +87,30 @@ def _mount_devices(core: Core, image_path: str, devices: list, mem_device_paths:
         path = dev.get("path")
         if not isinstance(path, str) or not path:
             raise ImageError("devices 条目必须包含非空 path")
-        file_rel = dev.get("file")
         class_name = dev.get("class")
-        if not isinstance(file_rel, str) or not isinstance(class_name, str):
-            raise ImageError(f"设备 {path}: 必须包含 file 和 class")
-        file_path = file_rel if os.path.isabs(file_rel) else os.path.join(base, file_rel)
-        if not os.path.isfile(file_path):
-            raise ImageError(f"设备 {path}: 设备文件不存在 {file_path}")
-        module = _load_device_module(file_path, path)
-        cls = getattr(module, class_name, None)
-        if not isinstance(cls, type) or not issubclass(cls, MemoryDevice):
-            raise ImageError(f"设备 {path}: {class_name} 必须是继承 MemoryDevice 的类")
         args = dev.get("args") or {}
         if not isinstance(args, dict):
             raise ImageError(f"设备 {path}: args 必须是对象")
+        builtin = bool(dev.get("builtin", False))
+        if builtin:
+            if not isinstance(class_name, str) or class_name not in BUILTIN_DEVICE_CLASSES:
+                raise ImageError(
+                    f"设备 {path}: builtin=true 时 class 必须是内建注册表中的类（{list(BUILTIN_DEVICE_CLASSES)}）"
+                )
+            if dev.get("file") is not None:
+                raise ImageError(f"设备 {path}: builtin=true 不允许提供 file")
+            cls = BUILTIN_DEVICE_CLASSES[class_name]
+        else:
+            if not isinstance(dev.get("file"), str) or not isinstance(class_name, str):
+                raise ImageError(f"设备 {path}: 必须包含 file 和 class")
+            file_rel = dev["file"]
+            file_path = file_rel if os.path.isabs(file_rel) else os.path.join(base, file_rel)
+            if not os.path.isfile(file_path):
+                raise ImageError(f"设备 {path}: 设备文件不存在 {file_path}")
+            module = _load_device_module(file_path, path)
+            cls = getattr(module, class_name, None)
+            if not isinstance(cls, type) or not issubclass(cls, MemoryDevice):
+                raise ImageError(f"设备 {path}: {class_name} 必须是继承 MemoryDevice 的类")
         try:
             device = cls(**args)
         except TypeError as e:
@@ -114,6 +124,14 @@ def _mount_devices(core: Core, image_path: str, devices: list, mem_device_paths:
     for mp in mem_device_paths:
         if mp not in mounted:
             raise ImageError(f"mem 中标记 kind=device 的路径 {mp} 未在 devices 段声明")
+
+    # 挂载完成后校验所有 LinkDevice 目标可达（面向运行者的诊断错误可含真实路径）。
+    for device in core.mem._devices.values():
+        if getattr(device, "is_link", False):
+            try:
+                device.validate()
+            except Exception as e:
+                raise ImageError(f"链接 {device.mount_path} 目标不可达: {e}")
 
 
 def _resolve_para(core: Core, para_ref: str) -> str:

@@ -613,6 +613,9 @@ class TestEchoMineSubprocessWithFakeOpenAIAPI:
             env = os.environ.copy()
             env["OPENAI_API_KEY"] = "dummy"
             env["OPENAI_BASE_URL"] = f"http://127.0.0.1:{server.server_address[1]}/v1"
+            # 部分宿主环境会设置含 IPv6 方括号的 no_proxy，httpx 可能误解析；测试只访问本机假 API。
+            env["no_proxy"] = "localhost,127.0.0.1,::1"
+            env["NO_PROXY"] = "localhost,127.0.0.1,::1"
             cmd = [sys.executable, "main.py"]
             if transcript_name:
                 cmd += ["--transcript", str(game_dir / transcript_name)]

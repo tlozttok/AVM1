@@ -1,7 +1,7 @@
 """AVM 内存系统定义"""
 from typing import Any, Optional
 from .types import MetaList, MetaDict
-from .exceptions import VMMemoryError, MemoryKeyNotFoundError, MemoryIndexOutOfRangeError, MemoryTypeError
+from .exceptions import VMMemoryError, MemoryKeyNotFoundError, MemoryIndexOutOfRangeError, MemoryTypeError, MemoryCircularReferenceError
 from .memory_device import MemoryDevice, StringDevice
 
 
@@ -90,6 +90,12 @@ class Memory:
         return self.resolve_path(path, for_llm=for_llm)
 
     def resolve_path(self, path: list, for_llm: bool = False) -> Any:
+        """公开入口：带空链接栈解析路径。"""
+        return self._resolve_path(path, for_llm=for_llm, seen_links=None)
+
+    def _resolve_path(self, path: list, for_llm: bool = False, seen_links: Optional[list] = None) -> Any:
+        if seen_links is None:
+            seen_links = []
         if not path:
             return self._convert_for_llm(self._data, for_llm)
 
@@ -100,7 +106,7 @@ class Memory:
                 if prefix_str in self._devices:
                     device = self._devices[prefix_str]
                     remaining = path[i + 1:]
-                    result = device.resolve_path(remaining) if remaining else device
+                    result = self._resolve_device(device, remaining, seen_links, prefix_str)
                     return self._convert_for_llm(result, for_llm)
             raise VMMemoryError(f"未知路径前缀：{path[0]}，只允许 MEM 或已挂载设备")
 
@@ -109,16 +115,31 @@ class Memory:
         if not path:
             return self._convert_for_llm(self._data, for_llm)
 
-        return self._resolve_mem_path(path, for_llm=for_llm)
+        return self._resolve_mem_path(path, for_llm=for_llm, seen_links=seen_links)
 
-    def _resolve_mem_path(self, path: list, for_llm: bool) -> Any:
+    def _resolve_device(self, device, remaining: list, seen_links: list, prefix: Optional[str] = None):
+        """解析设备命中。LinkDevice 即使 remaining 为空也透明跟随目标。"""
+        if getattr(device, "is_link", False):
+            if prefix is not None and prefix in seen_links:
+                chain = " -> ".join(seen_links + [prefix])
+                raise MemoryCircularReferenceError(f"链接成环: {chain}")
+            if prefix is not None:
+                seen_links.append(prefix)
+            return device.resolve_path(remaining or [], seen_links or ([prefix] if prefix else []))
+        if remaining:
+            return device.resolve_path(remaining)
+        return device
+
+    def _resolve_mem_path(self, path: list, for_llm: bool, seen_links: Optional[list] = None) -> Any:
+        if seen_links is None:
+            seen_links = []
         # 检查路径任意前缀是否命中设备
         for i in range(len(path)):
             prefix_str = ".".join(path[:i + 1])
             if prefix_str in self._devices:
                 device = self._devices[prefix_str]
                 remaining = path[i + 1:]
-                result = device.resolve_path(remaining) if remaining else device
+                result = self._resolve_device(device, remaining, seen_links, prefix_str)
                 return self._convert_for_llm(result, for_llm)
 
         # 普通数据访问
@@ -127,6 +148,38 @@ class Memory:
             self._check_access(current, key, path)
             current = current[key]
         return self._convert_for_llm(current, for_llm)
+
+    def _follow_real(self, segments: list, seen_links: Optional[list] = None) -> tuple:
+        """把 MEM 段（不含根）跟随链接，返回 ("memory", segments) 或 ("device", mount, remainder)。
+
+        不做数据访问副作用；只按挂载注册表决定最终目标。
+        """
+        if seen_links is None:
+            seen_links = []
+        for i in range(len(segments), 0, -1):
+            prefix = ".".join(segments[:i])
+            if prefix in self._devices:
+                device = self._devices[prefix]
+                if getattr(device, "is_link", False):
+                    if prefix in seen_links:
+                        chain = " -> ".join(seen_links + [prefix])
+                        raise MemoryCircularReferenceError(f"链接成环: {chain}")
+                    seen_links.append(prefix)
+                    return device._follow_real(segments[i:], seen_links)
+                return ("device", prefix, list(segments[i:]))
+        return ("memory", list(segments))
+
+    def follow_link_target(self, ref: str) -> tuple:
+        """返回链接后的真实目标：(kind, real_segments) 或 ("device", mount, remainder)。"""
+        split = self.split_path(ref)
+        kind = split[0]
+        if kind == "memory":
+            return ("memory", ref[1:].split(".")[1:])
+        _, mount, remainder = split
+        device = self._devices[mount]
+        if getattr(device, "is_link", False):
+            return device._follow_real(remainder, seen_links=[mount])
+        return ("device", mount, remainder)
 
     @staticmethod
     def _check_access(current, key: str, path: list):
@@ -191,7 +244,9 @@ class Memory:
         # 检查是否是设备路径
         if self.is_device_path(path):
             device = self.get_device(path)
-            if hasattr(device, 'set_value'):
+            if getattr(device, "is_link", False):
+                device.set_value(value, owner_cid=owner_cid)
+            elif hasattr(device, 'set_value'):
                 device.set_value(value)
             else:
                 raise VMMemoryError(f"设备 {type(device).__name__} 不支持直接写入")
@@ -202,6 +257,11 @@ class Memory:
             prefix = path[:i]
             if self.is_device_path(prefix):
                 device = self.get_device(prefix)
+                if getattr(device, "is_link", False):
+                    # 链接子路径写：委托到真实目标路径（含环检测）
+                    real_segments = device._real_mem_segments(path[i:])
+                    self.set_by_path(real_segments, value, owner_cid=owner_cid)
+                    return
                 current = device
                 for key in path[i:-1]:
                     current = current[key]

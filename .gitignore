@@ -6,3 +6,4 @@ log/*.tmp
 data/*.json
 images/out/
 docs/private/
+skills-generalization/
