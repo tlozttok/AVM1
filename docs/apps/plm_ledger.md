@@ -111,7 +111,7 @@ core = load_image("plm_ledger.json")
 core.run()
 ```
 
-`Core._get_executor` 对 Python 对话按 `para.model` 查 `PLM_REGISTRY`；注册发生在 `load_image` 之前即可。镜像本身没有 PLM 声明段，所以这一步必须在宿主完成（记录为 issue，见 docs/Agents/plan-app-suite-2026-08-16.md）。
+`Core._get_executor` 对 Python 对话按 `para.model` 查 `PLM_REGISTRY`；注册发生在 `load_image` 之前即可。镜像本身没有 PLM 声明段，所以这一步必须在宿主完成（记录为 issue）。
 
 ## 3. 持久化协议
 

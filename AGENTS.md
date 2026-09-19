@@ -13,7 +13,7 @@ AVM1是一个旨在构建以LLM对话为核心的通用计算模型架构的项�
 3.但是你需要从LLM的概率神经模型角度思考问题。
 
 为AVM做计划需要什么：
-1.当用户叫你计划的时候，不要立马给出结果，查找和创建docs/Agents文件夹下的记忆文件。
+1.当用户叫你计划的时候，不要立马给出结果，查找和创建docs/private/Agents文件夹下的记忆文件。
 2.这是一个宏观创新项目，你的每一个计划都需要留档，记录时间、背景、起因、行动、影响。记得及时对废弃的设计进行标记
 3.将详细的四部分计划给用户看，询问用户对各个方面的评分和改进建议。提示："只要、不是而是、很简单、足够"这样的词会让用户强烈反感，就像Linus看到一个不安全的内核代码一样
 
@@ -31,7 +31,7 @@ AVM1是一个旨在构建以LLM对话为核心的通用计算模型架构的项�
 5.计划的目标不能是违反项目宗旨的。给AVM加入Agent无异于给Linux内核的git仓库加入用户态程序——它最多用于测试。
 
 ---
-## 设计思路（从 docs/record 提炼）
+## 设计思路
 
 ### 核心命题：控制论与管理学取代软件工程
 
@@ -130,17 +130,3 @@ python main.py <image.json> --frames # 运行后打印监测帧摘要
 ```bash
 pytest tests/                        # 全部（MockLMU，不调真实 API）
 ```
-
-## Agent skills
-
-### Issue tracker
-
-Issues for this repo live as GitHub issues ([tlozttok/AVM1](https://github.com/tlozttok/AVM1)). See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Five canonical roles: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single-context: root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
