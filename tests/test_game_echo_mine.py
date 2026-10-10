@@ -67,7 +67,7 @@ class ScriptedLMU:
                     },
                 }
                 for rc in return_calls
-                if rc.get("cmd_type") not in ("json_error", "unknown_tool")
+                if rc.get("cmd_type") != "json_error"
             ] or None
         conversation.append_assistant_message(result or "", tool_calls=tc_list)
         return result, return_calls, conversation

@@ -5,6 +5,7 @@ except ImportError:
     readline = None  # Windows 无 readline，input() 仍可用
 import os
 import sys
+import threading
 from typing import Any, Optional, List
 
 
@@ -31,6 +32,21 @@ class MemoryDevice:
         Core 会统一加 event_id / phase / source / target，并强制合并 actor_cid / ref。
         """
         return None
+
+    def debug_actions(self) -> List[dict]:
+        """调试用：设备把自己的调试台附加到面板上。默认没有动作。
+
+        条目形状：
+            {"name": str,            # 操作员看到的按钮名
+             "description": str,     # 一句话说明
+             "parameters": dict,     # 可选，参数的 JSON Schema
+             "run": Callable[[dict], Any]}   # 操作员触发后由控制台调用
+
+        声明期无副作用：控制台渲染设备清单时现取一次，只有操作员触发才调用 run。
+        调用点在控制台，不在核心——设备调试是设备自己的事，不经指令集、不产生
+        事件，核心不知道它发生过。与 Core 推进并发时的一致性由 run 自己负责。
+        """
+        return []
 
     def pretend_as_type(self) -> str:
         raise NotImplementedError
@@ -257,6 +273,10 @@ class InputsListDevice(MetaListDevice):
     - 读取 $MEM.inputs 时返回列表元数据
     - 读取 $MEM.inputs.-1 时阻塞请求用户输入，追加到列表后返回
     - 读取其他索引时，像正常列表一样返回已有元素
+
+    输入源有两个：控制台的输入框（`debug_actions`）和终端。`_prompt_operator` 按启动标志
+    分派：队列里有货先取走；被控制台托管时（`host_flags["console"]`）只等队列，于是面板
+    能喂进正在等待的那一读；其余情况走终端。终端模式下控制台仍可先喂再用。
     """
 
     def __init__(self, data=None, metadata=None):
@@ -264,10 +284,61 @@ class InputsListDevice(MetaListDevice):
         self._pending_input = False
         self._core = None  # 调试用：Core 引用（/save 检查点命令需要），由镜像加载器注入
         self._encoding_warned = False
+        self._panel_inputs: list = []  # 控制台输入框喂进来的行，先进先出
+        self._panel_cv = threading.Condition()  # 队列的锁与唤醒：等队列的读靠它被喂醒
+        self._console_input = False  # 启动标志：本次运行被控制台托管，输入只从面板来
 
     def attach_core(self, core) -> None:
-        """调试用：接收 Core 引用（检查点 /save 调试命令使用）"""
+        """调试用：接收 Core 引用（检查点 /save 调试命令使用）。
+
+        同时读一次启动标志 `host_flags["console"]`：被控制台托管时不再碰终端。
+        标志在挂载设备之前由 load_image 写入，核心启动后不再变化，所以读一次即可。
+        """
         self._core = core
+        self._console_input = bool((getattr(core, "host_flags", None) or {}).get("console"))
+
+    def debug_actions(self) -> list:
+        """设备自己的调试台：给面板一个输入框。
+
+        这是设备注册的行为，不属于核心要调试设备——不经指令集、不产生事件、与 Core 无关。
+        `run` 把一行文本排进队列并唤醒等队列的读；消费它的是 `__getitem__(-1)`，即下一次
+        `$MEM.inputs.-1` 读取。被控制台托管时那一读正等在队列上，喂进来立刻生效；走终端的
+        运行时，喂输入要在读取发生之前。
+        """
+
+        def feed(args):
+            content = args.get("content")
+            if not isinstance(content, str):
+                raise ValueError("content 必须是字符串")
+            with self._panel_cv:
+                self._panel_inputs.append(content)
+                self._panel_cv.notify()
+            return {"queued": len(self._panel_inputs)}
+
+        def pending(args):
+            return {"queued": len(self._panel_inputs),
+                    "waiting": self._pending_input}
+
+        return [
+            {
+                "name": "投喂一行输入",
+                "description": "把一行文本排进输入队列；下一次 $MEM.inputs.-1 直接取走它，不碰终端。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string", "description": "要交给对话的一行文本"},
+                    },
+                    "required": ["content"],
+                },
+                "run": feed,
+            },
+            {
+                "name": "查询队列",
+                "description": "看队列里还有几行、设备当前是否正等着输入。",
+                "parameters": {"type": "object", "properties": {}},
+                "run": pending,
+            },
+        ]
 
     def _parse_index(self, index):
         if isinstance(index, str):
@@ -284,18 +355,44 @@ class InputsListDevice(MetaListDevice):
             # 伪列表语义：读最后一个元素 = 请求新用户输入
             self._pending_input = True
             try:
-                user_input = self._prompt_operator()
-            except EOFError:
-                user_input = ""
+                try:
+                    user_input = self._prompt_operator()
+                except EOFError:
+                    user_input = ""
             finally:
                 self._pending_input = False
-                self._data.append(user_input)
+            # 读取成功才追加：读失败（如被中断/报错）时列表不应多出一个元素
+            self._data.append(user_input)
             return user_input
         # 正常列表访问
         return super().__getitem__(index)
 
     def _prompt_operator(self) -> str:
-        """调试用：读取操作者输入；行首 /save 触发单对话检查点保存并继续等待真实输入。
+        """取一行操作员输入：面板队列优先；被控制台托管时只等队列；其余走终端。"""
+        if self._panel_inputs:
+            # 操作员已经喂过一行，这一读不碰终端（终端模式下也成立）
+            return self._panel_pop()
+        if self._console_input:
+            return self._panel_wait()
+        return self._terminal_prompt()
+
+    def _panel_pop(self) -> str:
+        with self._panel_cv:
+            return self._panel_inputs.pop(0)
+
+    def _panel_wait(self) -> str:
+        """被控制台托管时的等待：只等面板队列。
+
+        填队列的是控制台直接调用的设备调试动作，不经核心，所以正在等待的这一读也能被喂醒。
+        等待期间 `_pending_input` 为真，面板的「查询队列」动作据此显示正在等输入。
+        """
+        with self._panel_cv:
+            while not self._panel_inputs:
+                self._panel_cv.wait()
+            return self._panel_inputs.pop(0)
+
+    def _terminal_prompt(self) -> str:
+        """调试用：从终端读取操作者输入；行首 /save 触发单对话检查点保存并继续等待真实输入。
 
         对话感知不到 /save：命令只在设备层消费，返回给对话的永远是真实输入。
         显示等待输入的对话身份提示（避免黑屏裸等）；终端非 UTF-8 时警告一次

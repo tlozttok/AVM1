@@ -761,19 +761,120 @@ class CommandPLM(PLMServer):
         return self._drive(gen, content)
 
 
+class OperatorPLM(PLMServer):
+    """操作员执行器：这个对话的"推理"由操作员完成。
+
+    它不是模型：不产生内容，也不解释提示词。每次推理阻塞等待控制台提交一个
+    动作，把动作原样作为一次工具调用返回；收到结束动作时返回不带工具调用的
+    结果，对话据此结束本轮交互，Core 把执行权让回就绪队列。
+
+    动作形状（控制台保证）：
+        {"tool": <工具名>, "arguments": {...}}   一次工具调用
+        {"end": True}                            结束本轮交互
+
+    工具名原样透传，不在这里校验：面板要能造出模型造得出的各种输入，包括未知
+    工具名，以便观察 Core 的错误路径。
+    """
+
+    def __init__(self, channel=None):
+        super().__init__()
+        self._channel = channel  # 由控制台注入；鸭子类型，只需要 wait_action / publish
+        self._seq = 0
+
+    def handle_messages(self, raw_messages, params):
+        """覆写基类的"确定性程序"语义。
+
+        基类逐条执行新增消息、只保留最后一条的返回值，那套是给无状态程序用的。
+        操作员执行器的每轮动作只有一个：把新增消息转给控制台显示，然后等下一个
+        动作。逐个等待会让一次推理内的多条消息各等一次动作。
+        """
+        channel = self._require_channel()
+        new_messages = message_list_from_api_dict(self._new_input_messages(raw_messages))
+        self._prev_input = raw_messages
+        for msg in new_messages:
+            if isinstance(msg, ToolMessage):
+                channel.publish("tool_result", {
+                    "call_id": msg.tool_call_id,
+                    "content": msg.content,
+                })
+            elif isinstance(msg, UserMessage):
+                channel.publish("user_message", {"content": msg.content})
+        return self._next_action()
+
+    def _require_channel(self):
+        if self._channel is None:
+            raise ValueError(
+                "操作员对话必须由控制台创建：plm.operator 需要一个已绑定的操作员通道"
+                "（见 Core.start_operator_conversation）"
+            )
+        return self._channel
+
+    def _next_action(self):
+        """等一个形状合法的动作；形状不合法就报回控制台并继续等。"""
+        channel = self._require_channel()
+        while True:
+            action = channel.wait_action()
+            if not isinstance(action, dict):
+                channel.publish("action_error", {
+                    "reason": f"动作必须是对象，得到 {type(action).__name__}",
+                })
+                continue
+            if action.get("end"):
+                return {"content": ""}
+            tool = action.get("tool")
+            arguments = action.get("arguments", {})
+            if not isinstance(tool, str) or not tool:
+                channel.publish("action_error", {"reason": "动作缺少字符串字段 tool"})
+                continue
+            if not isinstance(arguments, dict):
+                channel.publish("action_error", {"reason": "arguments 必须是对象"})
+                continue
+            # TODO(issue): 计划 C1 原本要求在这里拒绝九条之外的工具名。实现时改成
+            # 原样透传——面板的意义是造出模型造得出的输入，包括未知工具名，用来观察
+            # Core 的错误路径；拒绝掉就测不到那条路径。未知名字的提示改由控制台给出。
+            self._seq += 1
+            call_id = f"op-{self._seq}"
+            channel.publish("tool_call", {
+                "call_id": call_id, "tool": tool, "arguments": arguments,
+            })
+            return {
+                "content": "",
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool,
+                        "arguments": json.dumps(arguments, ensure_ascii=False),
+                    },
+                }],
+            }
+
+    # handle_messages 已覆写，以下三条抽象方法不会被走到；实现为同样的动作等待。
+
+    def _execute_system_message(self, content):
+        return None
+
+    def _execute_user_message(self, content):
+        return self._next_action()
+
+    def _execute_tool_message(self, content, call_id):
+        return self._next_action()
+
+
 PLM_REGISTRY = {
     "plm.simple": SimplePLM,      # 仅测试调试，暂存；不推荐使用，不维护
     "plm.python": PythonPLM,      # 图灵完备兜底
     "plm.function": FunctionPLM,
     "plm.machine": StateMachinePLM,
     "plm.command": CommandPLM,    # 字符串 IO 命令行：setup 是程序，user 是命令与参数
+    "plm.operator": OperatorPLM,  # 操作员：调试控制台持有的假对话（需注入通道）
 }
 
 
-def create_plm(model: str) -> PLMServer:
+def create_plm(model: str, **kwargs) -> PLMServer:
     """按 model 参数创建 PLM 实例（注册表在本模块）。"""
-    try:
-        return PLM_REGISTRY[model]()
-    except KeyError:
+    cls = PLM_REGISTRY.get(model)
+    if cls is None:
         raise ValueError(f"未知 PLM 类型: {model}（可用: {list(PLM_REGISTRY)}）")
+    return cls(**kwargs)
         

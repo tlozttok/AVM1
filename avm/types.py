@@ -35,6 +35,12 @@ class MetaList:
     def __setitem__(self, index, value):
         self._data[index] = value
 
+    def __delitem__(self, index):
+        del self._data[index]
+
+    def insert(self, index, value):
+        self._data.insert(index, value)
+
     def append(self, value):
         self._data.append(value)
 

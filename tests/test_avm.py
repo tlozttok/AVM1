@@ -631,16 +631,19 @@ class TestToolCallErrorFeedback:
         assert _batch(core, conv.cid) == []  # 不喂回 LLM
 
     def test_unknown_tool_reported_to_stderr(self, capsys):
+        """解析器不查指令集：未知名字原样留在 cmd_type，由处理指令时判断。"""
         lmu = LMU()
-        message = SimpleNamespace(tool_calls=[self._fake_tool_call("definitely_not_a_tool", "{}")])
+        message = SimpleNamespace(tool_calls=[self._fake_tool_call("definitely_not_a_tool", '{"a": 1}')])
         return_calls = lmu._return_calls_from_message(message)
-        assert return_calls[0]["cmd_type"] == "unknown_tool"
+        assert return_calls[0]["cmd_type"] == "definitely_not_a_tool"
+        assert return_calls[0]["args"] == {"a": 1}
 
         core = make_core()
         conv = _new_root(core)
         core._process_return_calls(return_calls, conv)
         err = capsys.readouterr().err
-        assert "未知工具" in err
+        assert "未知工具 definitely_not_a_tool" in err
+        assert '{"a": 1}' in err
         assert _batch(core, conv.cid) == []
 
     def test_malformed_json_conversation_stays_active(self, capsys):

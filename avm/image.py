@@ -178,10 +178,14 @@ def _start_init(core: Core, init: dict):
     conv.name = name
 
 
-def load_image(image_path: str, checkpoint_in: Optional[str] = None) -> Core:
+def load_image(image_path: str, checkpoint_in: Optional[str] = None,
+               host_flags: Optional[dict] = None) -> Core:
     """加载系统镜像并完成全部启动配置（不运行）。
 
     checkpoint_in：调试用——启动时加载单对话检查点（跳过 init，恢复为就绪对话）。
+    host_flags：启动标志——本次运行由哪个宿主托管（如 {"console": True}）。宿主事实，
+    不属于镜像内容，不进 $MEM。在挂载设备之前写入 Core，设备可在 attach_core 里读；
+    核心启动后不再变化。不传则空，设备行为与从前一致。
     """
     if not os.path.isfile(image_path):
         raise ImageError(f"镜像文件不存在: {image_path}")
@@ -197,6 +201,13 @@ def load_image(image_path: str, checkpoint_in: Optional[str] = None) -> Core:
         raise ImageError("镜像必须包含 mem 段（对象）")
 
     core = Core()
+    if host_flags is not None and not isinstance(host_flags, dict):
+        raise ImageError("host_flags 必须是对象")
+    for key in (host_flags or {}):
+        if not isinstance(key, str) or not key:
+            raise ImageError("host_flags 的键必须是非空字符串")
+    # 启动标志：在挂载设备之前就位，这样每个设备的 attach_core 都读得到。
+    core.host_flags = dict(host_flags or {})
     core.image_dir = os.path.dirname(os.path.abspath(image_path))
     core.image_name = os.path.splitext(os.path.basename(image_path))[0]
     budget = meta.get("instruction_budget")

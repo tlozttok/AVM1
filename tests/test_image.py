@@ -23,6 +23,34 @@ class DummyDevice(MemoryDevice):
 '''
 
 
+FLAG_DEVICE_CODE = '''
+import json, os
+from avm.memory_device import MemoryDevice
+
+class FlagDevice(MemoryDevice):
+    """把 attach_core 那一刻读到的启动标志写进 devices/seen.json。"""
+
+    def attach_core(self, core):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(dict(core.host_flags), f)
+
+    def pretend_as_type(self):
+        return "str"
+
+    def to_llm_string(self):
+        return "flag-device"
+'''
+
+
+def _flag_image():
+    image = _sample_image()
+    image["devices"] = [
+        {"path": "inputs", "file": "devices/dummy.py", "class": "FlagDevice"},
+    ]
+    return image
+
+
 class MockLMU:
     def __init__(self, responses=None):
         self.responses = list(responses) if responses else []
@@ -83,6 +111,42 @@ def _sample_image():
         ],
         "init": {"name": "init", "system_ref": "$MEM.system", "user_ref": "$MEM.user"},
     }
+
+
+class TestHostFlags:
+    """启动标志：宿主事实，在挂载设备之前写入 Core，核心启动后不再变化。"""
+
+    def _seen(self, tmp_path):
+        return json.loads((tmp_path / "devices" / "seen.json").read_text(encoding="utf-8"))
+
+    def test_flags_are_visible_to_devices_at_attach(self, tmp_path):
+        path = _write(tmp_path, _flag_image(), devices_code=FLAG_DEVICE_CODE)
+        core = load_image(path, host_flags={"console": True})
+        assert core.host_flags == {"console": True}
+        assert self._seen(tmp_path) == {"console": True}, "attach_core 时标志已经就位"
+
+    def test_default_is_empty(self, tmp_path):
+        path = _write(tmp_path, _flag_image(), devices_code=FLAG_DEVICE_CODE)
+        core = load_image(path)
+        assert core.host_flags == {}
+        assert self._seen(tmp_path) == {}, "不传标志时设备看到的与改动前一致"
+
+    def test_flags_are_copied(self, tmp_path):
+        path = _write(tmp_path, _flag_image(), devices_code=FLAG_DEVICE_CODE)
+        given = {"console": True}
+        core = load_image(path, host_flags=given)
+        given["console"] = False
+        assert core.host_flags == {"console": True}, "调用方的字典进不来"
+
+    def test_flags_must_be_an_object(self, tmp_path):
+        path = _write(tmp_path, _flag_image(), devices_code=FLAG_DEVICE_CODE)
+        with pytest.raises(ImageError, match="host_flags 必须是对象"):
+            load_image(path, host_flags=["console"])
+
+    def test_flag_keys_must_be_non_empty_strings(self, tmp_path):
+        path = _write(tmp_path, _flag_image(), devices_code=FLAG_DEVICE_CODE)
+        with pytest.raises(ImageError, match="host_flags 的键"):
+            load_image(path, host_flags={"": True})
 
 
 class TestLoadImage:

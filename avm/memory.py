@@ -333,6 +333,96 @@ class Memory:
 
         self.set_by_path(parts, value, owner_cid=owner_cid)
 
+    # ------------------------------------------------------------------
+    # 调试原语：屏蔽与还原（宿主侧，不经指令、不产生事件）
+    # ------------------------------------------------------------------
+
+    def mounted_devices(self) -> dict:
+        """已挂载设备的只读视图（调试控制台扫描设备用）。"""
+        return dict(self._devices)
+
+    def _locate(self, ref: str):
+        """把 $MEM 引用解析成 (容器, 键)，跟随链接，但拒绝落在设备上。"""
+        split = self.split_path(ref)
+        if split[0] == "device":
+            raise VMMemoryError(
+                f"{ref} 落在设备上：调试原语只作用于数据节点，设备请用 unmount/mount"
+            )
+        segments = ref[1:].split(".")[1:]  # 去掉 $MEM
+        if not segments:
+            raise VMMemoryError("不能摘除 $MEM 根节点")
+        target = self._follow_real(segments)
+        if target[0] != "memory":
+            raise VMMemoryError(
+                f"{ref} 落在设备上：调试原语只作用于数据节点，设备请用 unmount/mount"
+            )
+        path = target[1]
+        container = self._data
+        for key in path[:-1]:
+            self._check_access(container, key, path)
+            container = container[key]
+        return container, path[-1]
+
+    @staticmethod
+    def _index_of(container, key):
+        """列表容器把键转成整数下标；字典容器原样返回键。"""
+        if isinstance(container, (list, MetaList)):
+            try:
+                return int(key)
+            except (TypeError, ValueError):
+                raise MemoryTypeError(f"列表索引必须是数字：{key}") from None
+        return key
+
+    def detach(self, ref: str) -> Any:
+        """调试用：按路径摘除节点并原样返回（meta / ctrl / owner 一并保留）。
+
+        与指令无关，不产生事件：屏蔽期间对话只会看到键不存在，注册在该路径上的
+        监听器不会被触发。还原用 attach。设备路径拒绝——先 unmount 设备。
+        """
+        container, key = self._locate(ref)
+        if isinstance(container, (dict, MetaDict)):
+            if key not in container:
+                raise MemoryKeyNotFoundError(f"键 {key!r} 不存在：{ref}")
+            node = container[key]
+            del container[key]
+            return node
+        if isinstance(container, (list, MetaList)):
+            idx = self._index_of(container, key)
+            if idx < 0 or idx >= len(container):
+                raise MemoryIndexOutOfRangeError(
+                    f"索引越界：{idx}，列表长度：{len(container)}"
+                )
+            node = container[idx]
+            del container[idx]
+            return node
+        raise MemoryTypeError(
+            f"无法摘除 {ref}：父节点是 {type(container).__name__}，没有子节点"
+        )
+
+    def attach(self, ref: str, node: Any) -> None:
+        """调试用：把 detach 摘下来的节点原样放回。
+
+        路径已存在时报还原冲突，不静默覆盖——屏蔽期间该路径可能已被对话重建，
+        由操作员决定丢弃哪一边。
+        """
+        container, key = self._locate(ref)
+        if isinstance(container, (dict, MetaDict)):
+            if key in container:
+                raise VMMemoryError(f"还原冲突：{ref} 已存在，不覆盖")
+            container[key] = node
+            return
+        if isinstance(container, (list, MetaList)):
+            idx = self._index_of(container, key)
+            if idx < 0 or idx > len(container):
+                raise VMMemoryError(
+                    f"还原冲突：{ref} 的下标 {idx} 越界（当前长度 {len(container)}）"
+                )
+            container.insert(idx, node)
+            return
+        raise MemoryTypeError(
+            f"无法还原 {ref}：父节点是 {type(container).__name__}，没有子节点"
+        )
+
     def mount(self, path: str, device: MemoryDevice) -> None:
         """
         挂载设备到指定路径

@@ -127,7 +127,8 @@ class ListenersDevice(MemoryDevice):
             lines.append(
                 f"  listener_id={l['listener_id']} owner_cid={l['owner_cid']} "
                 f"event_type={l['event_type']} phase={l.get('phase', 'all')} "
-                f"target={l['target']} handler_ref={l['handler_ref']}"
+                f"target={l['target']} handler_ref={l['handler_ref']} "
+                f"enabled={l.get('enabled', True)}"
             )
         return "监听器列表:\n" + ("\n".join(lines) if lines else "（无）")
 
@@ -143,7 +144,8 @@ class ListenersDevice(MemoryDevice):
                 return (
                     f"listener_id={l['listener_id']} owner_cid={l['owner_cid']} "
                     f"event_type={l['event_type']} phase={l.get('phase', 'all')} "
-                    f"target={l['target']} handler_ref={l['handler_ref']}"
+                    f"target={l['target']} handler_ref={l['handler_ref']} "
+                    f"enabled={l.get('enabled', True)}"
                 )
         raise VMMemoryError(f"监听器 {listener_id} 不存在")
 

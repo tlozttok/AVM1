@@ -1,4 +1,4 @@
-from typing import Optional, List, Dict, Type
+from typing import Optional, List, Dict, Type, Any
 
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -18,6 +18,14 @@ from .events import EventSystem, build_event, EVENT_TYPES
 from .info_devices import (
     ConversationsDevice, SchedulerDevice,
     ListenersDevice, MemorySummaryDevice, MonitorDevice,
+)
+from .interrupts import InterruptTable
+
+
+# 操作员对话的系统消息：说明这条对话的执行器是操作员而不是模型。
+_OPERATOR_SYSTEM_PROMPT = (
+    "这是操作员对话。执行器是控制台的操作员，不是模型：本对话不产生推理结果，"
+    "每轮由操作员提交一次工具调用；操作员选择继续时本对话结束本轮交互。"
 )
 
 
@@ -830,7 +838,6 @@ class LMU:
         if not message.tool_calls:
             return return_calls
 
-        registry = _instruction_registry()
         for tool_call in message.tool_calls:
             call_id = tool_call.id
             name = tool_call.function.name
@@ -838,10 +845,10 @@ class LMU:
             if args is None:
                 continue
 
-            if name in registry:
-                return_calls.append({"call_id": call_id, "cmd_type": name, "args": args})
-            else:
-                return_calls.append({"call_id": call_id, "cmd_type": "unknown_tool", "args": {"name": name, "raw": args}})
+            # 解析器不查指令集：名字原样进 cmd_type。认不认识这个名字由
+            # _process_return_calls 在处理指令时判断一次——查表只在一处发生，
+            # 解析器因此不必知道指令集，也不会把未知名字改写掉。
+            return_calls.append({"call_id": call_id, "cmd_type": name, "args": args})
 
         return return_calls
 
@@ -927,10 +934,15 @@ class Core:
         self._activation_instructions: int = 0
         self.image_dir: Optional[str] = None  # 调试用：镜像目录（检查点默认路径）
         self.image_name: Optional[str] = None  # 调试用：镜像名（不含扩展名，检查点默认路径）
+        # 启动标志：本次运行由哪个宿主托管（如 {"console": True}）。宿主事实，不属于镜像内容；
+        # 由 load_image 在挂载设备之前写入，核心启动后不再变化。设备在 attach_core 里读，
+        # 核心不读、不校验、不监督。
+        self.host_flags: Dict[str, Any] = {}
         self.debug: bool = False
         self.monitor: Monitor = Monitor()
         self.para_ref: str = "$MEM.model_params"
         self.events: EventSystem = EventSystem(self)
+        self.interrupts: InterruptTable = InterruptTable(self)  # 中断向量表：外部（控制台）发起的控制权转移
         self._turn_events: List[dict] = []
         self.mem.mount("conversations", ConversationsDevice(self))
         self.mem.mount("scheduler", SchedulerDevice(self))
@@ -1003,14 +1015,14 @@ class Core:
                     f"工具调用 {args.get('name', '')} 参数不是合法 JSON: {args.get('error', '')}，原始参数: {args.get('raw', '')}",
                 )
                 continue
-            if cmd_type == "unknown_tool":
-                args = rc.get("args", {})
+            if cmd_type not in registry:
+                # 未知工具名的唯一出口。两条解析路径（LMU 的 _return_calls_from_message、
+                # PLM 的 _parse_tool_calls）都只把真名放进 cmd_type，查表在这里做一次。
+                # 处置与 json_error 一致：报给运行者，不回工具响应。
                 _report_tool_error(
                     conv,
-                    f"未知工具 {args.get('name', '')}，参数: {args.get('raw', '')}",
+                    f"未知工具 {cmd_type}，参数: {json.dumps(rc.get('args', {}), ensure_ascii=False)}",
                 )
-                continue
-            if cmd_type not in registry:
                 continue
             instr_cls = registry[cmd_type]
             instr = instr_cls(call_id, conv.cid, rc.get("args", {}))
@@ -1171,12 +1183,43 @@ class Core:
         self._ready_cids.append(conv.cid)
         return conv
 
+    def start_operator_conversation(
+        self,
+        channel,
+        para_ref: str = "$MEM.model_params",
+    ) -> Conversation:
+        """调试用：建一条操作员对话，执行器是控制台持有的操作员。
+
+        - cid 真实，走正常调度，出现在 $MEM.conversations 里，不做特殊标记；
+        - 初始进休眠队列、不进就绪队列：它不主动抢占，只有中断能激活它；
+        - 执行器在这里建好并预置，使 _get_executor 直接命中缓存——plm.operator
+          需要注入通道，注册表无参构造出来的实例不能用；
+        - 不可存检查点（save_conversation 拒绝 Python 对话），不需要额外处理。
+        """
+        conv = Conversation(
+            messages=[SystemMessage(content=_OPERATOR_SYSTEM_PROMPT)],
+            cid=0,
+            is_sub=False,
+            parent=None,
+            is_root=False,
+        )
+        self._register(conv)
+        conv.para_ref = para_ref
+        conv.is_python = True
+        self._executors[conv.cid] = PLMExecutor(create_plm("plm.operator", channel=channel))
+        self._dormant_cids.append(conv.cid)
+        return conv
+
     def run(self):
         self._pick_next_active()
 
         self.monitor.record_baseline(self)
 
         while self._active_cid is not None:
+            # 安全点：上一轮推理（含该轮产生的全部指令）已执行完，是状态完整、可恢复
+            # 的边界——预算中断用的是同一个边界。中断在这里夺取执行权。
+            # 中断表为空时这一行没有副作用。
+            self.interrupts.dispatch()
             self.advance_conversation()
 
     def emit_device_event(self, device_path: str, target: str, payload: dict) -> dict:

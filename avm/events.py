@@ -90,6 +90,7 @@ class EventSystem:
         self.listeners: List[dict] = []
         self._next_listener_id = 1
         self._next_event_id = 1
+        self._observers: List[Any] = []  # 调试控制台用的事件观察者，见 add_observer
 
     # ------------------------------------------------------------------
     # 事件构造
@@ -189,6 +190,7 @@ class EventSystem:
             "handler_ref": handler_ref,
             "handler_code": handler_code,
             "phase": phase,
+            "enabled": True,
         })
         return listener_id
 
@@ -206,6 +208,81 @@ class EventSystem:
 
     def cancel_all_for_owner(self, owner_cid: int) -> None:
         self.listeners = [l for l in self.listeners if l.get("owner_cid") != owner_cid]
+
+    # ------------------------------------------------------------------
+    # 宿主侧就地编辑（调试控制台）
+    # ------------------------------------------------------------------
+
+    EDITABLE_FIELDS = ("event_type", "target", "phase", "handler_ref", "enabled")
+
+    def update(self, listener_id: int, **fields) -> dict:
+        """就地改写一条监听器，返回改写后的记录。
+
+        与 modify 的分工：modify 是对话指令（listen_event action=modify）走的路，
+        只能改 handler_ref，且必须由注册者调用。这里是宿主侧特权 API——控制台用来
+        编辑事件管线，可以改 event_type / target / phase / handler_ref / enabled，
+        与 cancel_all_for_owner 同级，不做 owner 检查。
+
+        owner_cid 不可改。无论是否给了 handler_ref，都按当前 handler_ref 重解析一次
+        handler_code：处理器代码是注册时抄进记录的副本，改内存里的节点不会自动生效，
+        想让新代码生效就必然要过一次重解析。
+        """
+        unknown = sorted(set(fields) - set(self.EDITABLE_FIELDS))
+        if unknown:
+            raise ValueError(
+                f"不可改写的监听器字段：{unknown}；允许：{list(self.EDITABLE_FIELDS)}"
+            )
+        listener = self._get_listener(listener_id)
+
+        event_type = fields.get("event_type", listener["event_type"])
+        target = fields.get("target", listener["target"])
+        phase = fields.get("phase", listener["phase"])
+        handler_ref = fields.get("handler_ref", listener["handler_ref"])
+        enabled = fields.get("enabled", listener.get("enabled", True))
+
+        if event_type not in EVENT_TYPES:
+            raise ValueError(f"未知事件类型：{event_type}，允许：{EVENT_TYPES}")
+        if phase not in ("before", "after", "all"):
+            raise ValueError("phase 必须是 before/after/all")
+        if not isinstance(target, str) or not target:
+            raise ValueError("target 必须是字符串")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled 必须是布尔值")
+
+        if event_type in AFTER_ONLY_TYPES:
+            if phase == "before":
+                raise ValueError(f"{event_type} 只有 after 事件，不能改 phase=before")
+        else:
+            if target == "*":
+                raise ValueError("该事件类型只支持精确 target，不支持 *")
+            self._check_target_permission(listener["owner_cid"], event_type, target, phase)
+
+        handler_code = self.resolve_handler(self._core, handler_ref)
+
+        listener["event_type"] = event_type
+        listener["target"] = target
+        listener["phase"] = phase
+        listener["handler_ref"] = handler_ref
+        listener["handler_code"] = handler_code
+        listener["enabled"] = enabled
+        return dict(listener)
+
+    # ------------------------------------------------------------------
+    # 事件观察（调试控制台）
+    # ------------------------------------------------------------------
+
+    def add_observer(self, observer) -> None:
+        """注册事件观察者：每次派发完一条事件后，收到那条完整事件。"""
+        if observer not in self._observers:
+            self._observers.append(observer)
+
+    def remove_observer(self, observer) -> None:
+        if observer in self._observers:
+            self._observers.remove(observer)
+
+    @property
+    def observers(self) -> List[Any]:
+        return list(self._observers)
 
     # ------------------------------------------------------------------
     # 权限
@@ -491,6 +568,8 @@ class EventSystem:
     def _match(self, event: dict) -> List[dict]:
         matched = []
         for listener in self.listeners:
+            if listener.get("enabled", True) is False:
+                continue  # 调试控制台的暂时屏蔽：记录留着，只是不参与匹配
             if listener["event_type"] != event["event_type"]:
                 continue
             listener_phase = listener.get("phase", "all")
@@ -560,6 +639,15 @@ class EventSystem:
         if event.get("handler_errors"):
             summary["handler_errors"] = event["handler_errors"]
         self._core._turn_events.append(summary)
+        for observer in list(self._observers):
+            try:
+                observer(event)
+            except Exception as e:
+                # 观察者只是旁听，失败不能影响派发
+                print(
+                    f"[AVM] 事件观察者处理失败: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
 
     def deliver_notifies(self, event: dict) -> None:
         """按 2.7 内部投递 notify：不经事件管道、不产生 send_instruction 事件。"""
