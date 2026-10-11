@@ -32,3 +32,17 @@ python main.py <image.json> --transcript api.txt  # write full API calls to a fi
 
 Debug settings live in `debug.json` (`image` / `frames` / `transcript`) so the command line does not need to change (VSCode runs `python main.py` fixed). Example images: `images/demo.json`, `images/calc_driver.json`; application suite: `images/apps/` (see [docs/apps](docs/apps) for how to start them); AI mini-game: `images/games/echo_mine/`. See the "System Images" section of [docs/runtime.md](docs/runtime.md) for the composition and key points.
 
+### Debug Panel
+
+The debug panel is a separate project under `web/` (Vite + React): it observes a running Core and intervenes through the panel conversation.
+
+```bash
+python scripts/run_console.py images/demo.json   # start the backend; / is the panel once built, otherwise a build hint
+cd web && npm install && npm run build   # build the panel into web/dist (not committed)
+cd web && npm run dev                    # development: Vite proxies /api to AVM_CONSOLE_URL (default http://127.0.0.1:8700)
+```
+
+`scripts/run_console.py` is equivalent to `python -m avm.console`, except that it first gives this process a cleaned `NO_PROXY` / `no_proxy`: on machines with a proxy tool, an already-bracketed IPv6 entry such as `[::1]` makes httpx unable to build a client, and the console dies before its first model call. The script only touches its own process environment; the parent shell and `.env` are left alone.
+
+The panel itself: `cd web && npm run test:unit` runs the pure-logic cases, and `cd web && npm run e2e` starts a scripted-MockLMU console and drives four scenarios in a browser (observation, three-step interaction, input feed, console-hosted build).
+

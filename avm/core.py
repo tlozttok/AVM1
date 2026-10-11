@@ -1251,6 +1251,11 @@ class Core:
     def unwrap(self, value, for_llm=True):
         if not value.startswith("$"):
             return value
+        # TODO(issue): 这里一次把整条引用按点号切分，设备拿到的是散开的段
+        # （$MEM.AVMRepo.read."avm/core.py".0 → ["read", '"avm/core', 'py"', "0"]），
+        # AVMRepo 因此要用引号把区间还原。是否改成逐步切分——逐段走内存树，命中设备时把
+        # 剩余的原字符串整段交给设备、由设备自己定义子路径语法——现在不能确定；
+        # 它与 split_path 的最长挂载键匹配、设备授权是同一件事，要一起想。
         value = [value[0], *value[1:].split(".")]
         if value[1] == "conv":
             assert value[0] == "$"

@@ -84,6 +84,13 @@ python -m avm.image <image.json>
 - `authorize_listener(event_type, remainder, owner_cid) -> bool`：是否允许监听该设备内路径（当前 `LinkDevice` 会委托给真实目标）。
 - `after_event(event_type, remainder, result) -> Optional[dict]`：操作成功后返回纯 payload 事实事件。
 
+**设备自述（帮助说明）**：镜像自带的设备对两类读取给出用法说明。
+
+- 读设备本身（`$MEM.<path>`）返回设备说明书：设备做什么、支持哪些动作及其语法、一个可照抄的例子。由 `to_llm_string()` 给出。
+- 读一个缺少必需参数的动作（如 `$MEM.<path>.ls`）返回该动作的用法说明；参数齐全时按动作执行，参数写错仍报错。由 `resolve_path()` 收到残缺段时给出；带缺省值的参数（如页码）不算缺参数。
+
+对话无法从路径形式判断自己跨过了挂载点，设备是这条边界的唯一信息来源；第一次接触设备的对话应当一次读取拿到完整接口。运行时不为此增加机制：根读已经走 `to_llm_string()`，残缺的段已经交给 `resolve_path()`。
+
 参考 `avm/memory_device.py` 中的现有设备（`InputsListDevice`、`OutputsListDevice`、`LinkDevice` 等）。
 
 #### LinkDevice 示例

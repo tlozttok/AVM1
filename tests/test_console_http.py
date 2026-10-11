@@ -3,6 +3,7 @@
 起真实服务、本地请求每个端点，断言状态码与关键字段。前端的契约变了这里会先红。
 """
 
+import http.client
 import json
 import threading
 import time
@@ -12,7 +13,7 @@ import urllib.request
 import pytest
 
 from avm.console import Console, serve
-from avm.core import Core
+from avm.core import Core, _build_tools
 from avm.memory_device import InputsListDevice, MemoryDevice
 from avm.types import MetaDict
 
@@ -67,7 +68,7 @@ def wait_for(predicate, timeout=5.0):
 
 
 @pytest.fixture
-def env():
+def env(tmp_path):
     core = Core()
     core.lmu = MockLMU()
     core.mem["note"] = MetaDict(data={"v": "hi"}, metadata="一条笔记", ctrl={"owner": "0"})
@@ -75,7 +76,8 @@ def env():
                              ctrl={"type": "python"})
     core.mem["own"] = MetaDict(data={"child": ""}, ctrl={"owner": "0"})
     core.mem.mount("echo", EchoDevice())
-    console = Console(core)
+    # web_root 指向一个空目录：这里断言「没构建」的分支，测试不依赖开发者是否跑过 npm build
+    console = Console(core, web_root=str(tmp_path / "no-dist"))
     listener_id = core.events.register(
         owner_cid=0, event_type="memory_write", target="$MEM.own.child",
         handler_ref="$MEM.h", phase="before",
@@ -91,9 +93,17 @@ def env():
 
 class TestReadEndpoints:
     def test_index_page(self, env):
+        """没有构建产物时，/ 给的是构建提示页，不是 404。"""
         code, body = request(env[2], "GET", "/")
         assert code == 200
         assert "调试控制台" in body
+        assert "npm run build" in body
+
+    def test_tools_endpoint(self, env):
+        code, body = request(env[2], "GET", "/api/tools")
+        assert code == 200
+        assert body["tools"] == _build_tools()
+        assert len(body["tools"]) == 9
 
     def test_state(self, env):
         core, console, base, _ = env
@@ -452,3 +462,66 @@ class TestEventStream:
             assert "event" in kinds
         finally:
             response.close()
+
+
+@pytest.fixture
+def web_env(tmp_path):
+    """构建产物齐全的控制台：/ 发面板，/web/<rel> 发静态文件。"""
+    core = Core()
+    core.lmu = MockLMU()
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text(
+        '<!doctype html><title>AVM 调试面板</title><div id="root"></div>', encoding="utf-8")
+    (dist / "assets" / "panel.js").write_text("console.log('panel')", encoding="utf-8")
+    (tmp_path / "secret.txt").write_text("不该被读到", encoding="utf-8")
+    console = Console(core, web_root=str(dist))
+    server = serve(console, port=0)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        yield console, base
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+class TestFrontendFiles:
+    def test_index_is_the_built_panel(self, web_env):
+        code, body = request(web_env[1], "GET", "/")
+        assert code == 200
+        assert "AVM 调试面板" in body
+        assert 'id="root"' in body
+
+    def test_asset_is_served_with_js_content_type(self, web_env):
+        with urllib.request.urlopen(web_env[1] + "/assets/panel.js", timeout=5) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("text/javascript")
+            assert resp.read().decode("utf-8") == "console.log('panel')"
+
+    def test_missing_asset_is_404(self, web_env):
+        code, body = request(web_env[1], "GET", "/assets/nope.js")
+        assert code == 404
+        assert "error" in body
+
+    def test_static_never_escapes_web_root(self, web_env):
+        """目录穿越要挡住：/../secret.txt 不能读到 dist 之外的文件。
+
+        用 http.client 直接发路径，避免客户端先做一次路径规范化。
+        """
+        host, port = web_env[1].removeprefix("http://").split(":")
+        conn = http.client.HTTPConnection(host, int(port), timeout=5)
+        try:
+            for path in ("/../secret.txt", "/assets/../../secret.txt"):
+                conn.request("GET", path)
+                resp = conn.getresponse()
+                body = resp.read().decode("utf-8", "replace")
+                assert resp.status == 404, path
+                assert "不该被读到" not in body, path
+        finally:
+            conn.close()
+
+    def test_api_still_wins_over_static(self, web_env):
+        """静态托管没把 /api/* 抢走。"""
+        code, body = request(web_env[1], "GET", "/api/state")
+        assert code == 200
+        assert body["schedule"]["panel_cid"] == web_env[0].panel.cid

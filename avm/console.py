@@ -28,10 +28,34 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
 
-from .core import _instruction_registry
+from .core import _build_tools, _instruction_registry
 from .exceptions import VMMemoryError
 from .memory_device import MemoryDevice
 from .types import MetaDict, MetaList
+
+
+# ----------------------------------------------------------------------
+# 前端产物
+# ----------------------------------------------------------------------
+
+# web/ 是 Vite 工程，构建产物 web/dist 不入库。没构建过时 / 给一段构建提示，
+# 而不是一个 404——面板是调试工具，缺产物要说清怎么补。
+_WEB_DIST = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web", "dist"
+)
+
+_MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".ico": "image/x-icon",
+    ".woff2": "font/woff2",
+    ".map": "application/json; charset=utf-8",
+}
 
 
 # ----------------------------------------------------------------------
@@ -165,8 +189,10 @@ class OperatorChannel:
 class Console:
     """调试控制台：面板对话 + 观测 + 介入 + 屏蔽账本。"""
 
-    def __init__(self, core):
+    def __init__(self, core, web_root: Optional[str] = None):
         self.core = core
+        # 前端构建产物目录（web/dist）。传 None 用仓库默认位置；测试传临时目录。
+        self.web_root = web_root if web_root is not None else _WEB_DIST
         self.channel = OperatorChannel()
         self.panel = core.start_operator_conversation(self.channel)
         core.interrupts.register("operator", self.panel.cid)
@@ -463,9 +489,13 @@ class Console:
 _INDEX_HTML = """<!doctype html>
 <meta charset="utf-8"><title>AVM 调试控制台</title>
 <h1>AVM 调试控制台后端</h1>
-<p>这里只有后端。前端是另一个工程，端点见 report 记录里的后端 API 说明。</p>
+<p>前端还没构建，这里先是后端说明。构建面板：</p>
+<pre>cd web &amp;&amp; npm install &amp;&amp; npm run build</pre>
+<p>构建后刷新本页即可看到面板（源码在 <code>web/</code>，产物 <code>web/dist</code> 不入库）。
+开发期也可以不走构建：<code>cd web &amp;&amp; npm run dev</code>，由 Vite 代理 <code>/api</code>。</p>
+<p>端点：</p>
 <ul>
-<li><code>GET /api/state</code></li>
+<li><code>GET /api/state</code> · <code>GET /api/tools</code></li>
 <li><code>GET /api/conversations/&lt;cid&gt;</code></li>
 <li><code>GET /api/memory?ref=$MEM.a.b</code></li>
 <li><code>GET /api/memory/diff?from=0&amp;to=1</code></li>
@@ -524,6 +554,37 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
     def _query(self) -> dict:
         return {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
 
+    # -- 前端产物 ------------------------------------------------------
+
+    def _static_path(self, url_path: str) -> Optional[str]:
+        """把 URL 路径映射到 web_root 下的真实文件；目录穿越与不存在都返回 None。"""
+        root = os.path.realpath(self.console.web_root)
+        rel = url_path.lstrip("/") or "index.html"
+        target = os.path.realpath(os.path.join(root, rel))
+        if target != root and not target.startswith(root + os.sep):
+            return None
+        return target if os.path.isfile(target) else None
+
+    def _send_file(self, fs_path: str):
+        try:
+            with open(fs_path, "rb") as f:
+                body = f.read()
+        except OSError as e:
+            self._error(500, f"读取静态文件失败：{e}")
+            return
+        ctype = _MIME.get(os.path.splitext(fs_path)[1].lower(), "application/octet-stream")
+        self._send(200, body, ctype)
+
+    def _send_static(self, path: str):
+        """非 /api/ 的 GET 都在产物目录里找。构建过就是面板，没构建就在 / 给构建提示。"""
+        target = self._static_path(path)
+        if target is not None:
+            self._send_file(target)
+        elif path == "/":
+            self._send(200, _INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+        else:
+            self._error(404, f"没有这个文件：{path}")
+
     # -- 方法 ----------------------------------------------------------
 
     def do_OPTIONS(self):
@@ -537,8 +598,11 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
         query = self._query()
         console = self.console
         try:
-            if path == "/":
-                self._send(200, _INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            if not path.startswith("/api/"):
+                # 非 API 的 GET 都是前端产物：/ 给面板（或构建提示），/assets/… 给静态文件
+                self._send_static(path)
+            elif path == "/api/tools":
+                self._send_json(200, {"tools": _build_tools()})
             elif path == "/api/state":
                 self._send_json(200, console.state())
             elif path == "/api/listeners":
@@ -711,6 +775,9 @@ def main(argv=None) -> int:
     print(f"[console] 面板对话 cid={console.panel.cid}，"
           f"中断向量 operator → {console.panel.cid}", file=sys.stderr)
     print(f"[console] http://{args.host}:{server.server_port}/", file=sys.stderr)
+    if not os.path.isfile(os.path.join(console.web_root, "index.html")):
+        print(f"[console] 前端未构建（{console.web_root} 里没有 index.html）："
+              f"cd web && npm install && npm run build；/ 会给出同样的提示", file=sys.stderr)
 
     console.running = True
     try:

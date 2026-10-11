@@ -7,3 +7,9 @@ data/*.json
 images/out/
 docs/private/
 skills-generalization/
+
+# 调试面板前端：依赖与构建产物不入库，源码在 web/
+web/node_modules/
+web/dist/
+web/test-results/
+web/playwright-report/
