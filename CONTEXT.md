@@ -22,6 +22,10 @@ _Avoid_: sub-agent
 通过 `create_sub` 指令创建的新对话。亚对话被父对话的提示词决定和控制，父子紧耦合。亚对话在功能上不可信（父可注入提示词导致过度附合或过度批判），仅用于父对话节省 token，非用于任务执行。
 _Avoid_: child conversation
 
+**操作员对话 (Operator conversation)**:
+由调试面板（控制台）创建的一种 Python 对话：执行器在创建时就注入并命中缓存（`PLM_REGISTRY` 里的 `plm.operator`），对话自己的 `para.model` 不被查询；"推理"等于等操作员提交下一个动作，提交的指令原样进入 Core（工具名不预先校验，未知工具名留给 Core 报错）。cid 真实、走正常调度、出现在 `$MEM.conversations` 里，不做特殊标记；创建后进休眠队列、不进就绪队列——只有中断能激活它；不能存检查点。只能由 `Core.start_operator_conversation` 创建：`plm.operator` 需要注入操作员通道，镜像里声明同名程序节点会在第一次推理时报错。
+_Avoid_: 人工对话、假对话
+
 ### 内存中的文件类型
 
 **Settingup**:
@@ -93,7 +97,11 @@ _Avoid_: 解引用、符号、指针
 等待被调度的对话队列。被唤醒的对话进入就绪队列末尾；`create_sub` 亚对话前插、立即执行（唯一例外）。
 
 **事件 (Event)**:
-每个工具调用对应一个瞬时事件，`listen_event` 可注册监听。事件按发布者分工：Core 发布 before 请求事件（source 含 `initiator_cid`），Memory/设备/Core 发布 after 事实事件（payload 含 `actor_cid`）。v1 实现 9 种工具事件：5 种 before 事件可被监听器拦截/改写（memory_read / memory_write / memory_make / edit_metadata / send_instruction），9 种 after 成功事件只产生通知。监听器是普通 Python 代码（`ctrl.type="python"` 节点的 `content`），每次事件在全新受限命名空间执行、无状态；`listen_event` 可指定 `phase=before/after/all`；先注册者优先，首个 `replace` 短路。处理器可返回 `notify` 由 Core 内部投递并唤醒目标，但禁止自我投递。before 处理器失败会以 `handler_error` 事件结果返回，原指令不执行、已收集 notify 仍投递。事件条件（ECA 的 C）、事件持久化/重放、事件总线、定时器等仍在设计/后续计划中。
+每个工具调用对应一个瞬时事件，`listen_event` 可注册监听。事件按发布者分工：Core 发布 before 请求事件（source 含 `initiator_cid`），Memory/设备/Core 发布 after 事实事件（payload 含 `actor_cid`）。v1 覆盖全部 9 条指令：5 条有 before 请求事件、可被监听器拦截/改写（memory_read / memory_write / memory_make / edit_metadata / send_instruction），9 条在成功后各产生一条 after 事实事件、只产生通知。监听器是普通 Python 代码（`ctrl.type="python"` 节点的 `content`），每次事件在全新受限命名空间执行、无状态；`listen_event` 可指定 `phase=before/after/all`；先注册者优先，首个 `replace` 短路。处理器可返回 `notify` 由 Core 内部投递并唤醒目标，但禁止自我投递。before 处理器失败会以 `handler_error` 事件结果返回，原指令不执行、已收集 notify 仍投递。事件条件（ECA 的 C）、事件持久化/重放、事件总线、定时器等仍在设计/后续计划中。
+
+**中断 (Interrupt)**:
+外部发起的控制权转移请求。与事件分工不同：**事件通知"发生了什么"，中断夺取"下一个执行谁"**。任意线程都可挂起中断（控制台后端线程即如此）；Core 在安全点（一轮推理含该轮产生的全部指令执行完之后，与预算中断用的是同一边界）派发：把执行权交给向量指向的对话，被打断的活跃对话插回就绪队列**队首**，让出后先跑。没有注册向量、目标不存在或已关闭 → 丢弃（原因记 stderr）；目标已是活跃对话 → 不动作；同类型已有未派发的挂起中断时去重。v1 只有这一层：优先级、屏蔽位，以及它与其他中断源（预算中断、事件 notify）的关系都未实现。
+_Avoid_: 事件、信号
 
 **名字 (Name)**:
 对话的身份标识，来自其 settingup 文件（name 是信息不是元信息，不放 meta/ctrl，放节点数据）。名字不唯一，冲突时用文件地址消歧（如 `MEM.math Analysis`）。带名字的对话必然有 settingup 文件（`create_cmd` 创建）；亚对话（直接传提示词）没有名字，其身份 = 父对话身份 + 亚对话 cid。名字↔cid 转换是内核职责，不是 VM 职责（简单内核字符串匹配，复杂内核可支持 AI 匹配）；`send_instruction` 只用 cid 寻址。
@@ -101,7 +109,7 @@ _Avoid_: 解引用、符号、指针
 ### 虚拟文件
 
 **虚拟文件 (Virtual file)**:
-挂载到内存路径上的伪节点，模拟文件读写但实际接入外部交互。如 `$inputs`（用户输入）、`$outputs`（用户输出）、`$time`（时钟）、`$random`（随机数）、`$sleep`（休眠）。与 Linux `/proc`、`/dev` 的伪文件对齐。
+挂载到内存路径上的伪节点，模拟文件读写但实际接入外部交互。已实现的是 `$inputs`（用户输入）与 `$outputs`（用户输出）；同一形态还可接入时钟、随机数、休眠（`$time` / `$random` / `$sleep`，未实现）。与 Linux `/proc`、`/dev` 的伪文件对齐。
 _Avoid_: Device、设备、挂载点
 
 **工作空间 (Workspace)**（设计中，未实现）:
@@ -120,3 +128,13 @@ AVM 的安全基础。对话不知道内存地址就无法访问——不存在�
 **文件安全性**（设计中，未实现）:
 对话可以为其拥有的文件设定访问密码，阻止其他对话访问。可注册回调：当其他对话尝试访问受保护文件时，所有者获得通知。
 _Avoid_: ACL、RBAC、权限位
+
+### 调试
+
+**调试面板 (Console)**:
+`web/` 下的独立工程（Vite + React）加 `python -m avm.console` 后端：观察运行中的 Core（对话、内存、设备、事件、调度），并经操作员对话介入。默认只绑回环地址、端口 8700；托管输入设备时不碰终端。面板对话的历史无界增长，面板对话不能存检查点。
+_Avoid_: 前端、UI
+
+**宿主标志 (host_flags)**:
+宿主在加载镜像时传入的启动标志（如 `{"console": True}`）——宿主事实，不属于镜像内容、不进 `$MEM`。在挂载设备之前写入 Core，设备在 `attach_core` 里读一次，核心启动后不再变化；不传则空，设备行为与从前一致。
+_Avoid_: 环境变量、配置

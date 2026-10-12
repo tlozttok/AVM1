@@ -16,7 +16,7 @@ python -m avm.image <image.json>
 
 | 键 | 必填 | 说明 |
 |---|---|---|
-| `meta` | 否 | 元信息，`version` 必须为 1 |
+| `meta` | 否 | 元信息：`version` 必须为 1；`instruction_budget` 可覆盖每轮指令预算（正整数，默认 50） |
 | `mem` | 是 | 内存树（对象，顶层键 → 显式节点） |
 | `para_ref` | 否 | para 节点路径，默认 `$MEM.model_params` |
 | `devices` | 否 | 设备挂载列表 |
@@ -32,12 +32,12 @@ python -m avm.image <image.json>
 | `kind` | `str` / `dict` / `list` / `device` |
 | `meta` | 可选字符串——元数据一，给 LLM 看的一句话描述 |
 | `ctrl` | 可选对象（`dict[str,str]`）——元数据二，给 Core 的结构化控制信息 |
-| `value` | `str` → 字符串；`dict` → 子节点对象；`list` → 子节点数组；`device` → 预留（结构未定） |
+| `value` | `str` → 字符串；`dict` → 子节点对象；`list` → 子节点数组；`device` → 不使用（`kind: "device"` 只作可读性标记，实际挂载由 `devices` 段完成） |
 
 规则：
 
 - `kind` 未知即报错；`ctrl` 必须是对象。
-- `kind=device` 可出现在**任意层级**，作为可读性标记；该节点从 mem 根到自身的点号路径（如 `game.map.rooms`）必须与 `devices` 段的 `path` 一一对应。device 节点不写入数据树，实际挂载由 `devices` 段完成。
+- `kind=device` 可出现在**任意层级**，作为可读性标记；该节点从 mem 根到自身的点号路径（如 `game.map.rooms`）必须在 `devices` 段的 `path` 里出现，否则加载报错。反向不要求：`devices` 段可以有 mem 里没有标记的挂载项，照样挂载。device 节点不写入数据树，实际挂载由 `devices` 段完成。
 - `ctrl.type` 目前定义的取值：`para`（模型调用参数）、`settingup`（LLM 提示词程序）、`python`（Python 程序）。
 - `ctrl.owner` 是 Core 维护的所有者标记（字符串 cid）。`memory_make` / `memory_write` 创建容器节点时会自动写入；镜像作者也可在 `ctrl` 中显式预置 `"owner": "0"` 来声明所有权。无主节点在事件模型 v1 中不可注册 before 内存监听。
 
@@ -53,12 +53,14 @@ python -m avm.image <image.json>
 
 运行期可用 `edit_metadata` 指令给节点补 ctrl（例如给运行时创建的 dict 节点设置 `type='settingup'` / `'python'`），配合 `memory_make` / `memory_write` 组合出可被 `create_cmd` 使用的程序节点——程序节点不一定只在镜像中预置。
 
+程序的 `para` 里 `model` 取 LLM 模型名，或 PLM 注册表（`PLM_REGISTRY`）中的名字（`plm.simple` / `plm.function` / `plm.machine` / `plm.command` / `plm.python`）。`plm.operator` 只能由调试面板的宿主创建（它需要注入操作员通道），镜像里声明同名程序节点会在第一次推理时报错。
+
 `init` 的 `system_ref` 仍指向 str 节点（入口对话的字面量提示词，不属于程序节点）。
 
 ## para（模型调用参数）
 
 - mem 中必须存在一个 `ctrl.type="para"` 的 dict 节点（默认路径 `$MEM.model_params`），否则加载报错。
-- 其 `value` 是 LLM API 参数（`model`、`temperature`、`use_tool` 等），均以 str 存储；数值型参数（temperature、max_tokens、top_p 等）加载后自动转回数值。
+- 其 `value` 是 LLM API 参数（`model`、`temperature`、`use_tool` 等），均以 str 存储；数值型参数（temperature、max_tokens、top_p 等）在每次调用 API 前由 LMU 转回数值，镜像加载本身不做转换。
 - `para_ref` 顶层声明 para 路径，覆盖默认值。
 
 ## devices（设备插件）
@@ -91,7 +93,7 @@ python -m avm.image <image.json>
 
 对话无法从路径形式判断自己跨过了挂载点，设备是这条边界的唯一信息来源；第一次接触设备的对话应当一次读取拿到完整接口。运行时不为此增加机制：根读已经走 `to_llm_string()`，残缺的段已经交给 `resolve_path()`。
 
-参考 `avm/memory_device.py` 中的现有设备（`InputsListDevice`、`OutputsListDevice`、`LinkDevice` 等）。
+参考现有设备：Core 内建的 `avm/memory_device.py`（`InputsListDevice`、`OutputsListDevice`、`LinkDevice` 等），以及镜像层的例子 `images/devices/`（`io.py`、`avm_repo.py`）和 `images/apps/*/devices/`。
 
 #### LinkDevice 示例
 
@@ -120,6 +122,7 @@ python -m avm.image <image.json>
 
 ## 启动流程
 
+0. 写入宿主标志（`host_flags`，缺省空——见下节）；
 1. 解析 mem（严格校验，任何格式错误抛 `ImageError`）；
 2. 按 `para_ref` 校验 para 节点（`ctrl.type == "para"`）并配置 Core；
 3. 加载设备插件文件（校验继承关系）并挂载；
@@ -128,6 +131,12 @@ python -m avm.image <image.json>
 6. 若声明 `persist_to`，在 `finally` 中写回内存（异常也写）。
 
 错误不吞：格式错误输出到 stderr，CLI 退出码 1。
+
+## 宿主标志（host_flags）
+
+`load_image(image_path, checkpoint_in=None, host_flags=None)` 的 `host_flags` 是**宿主在加载时**传入的启动标志（如 `{"console": True}`），不是镜像内容：镜像 JSON 里没有对应的键，标志也不进 `$MEM`。它在挂载设备之前写入 Core，设备可在 `attach_core` 里读一次；核心启动后不再变化。不传则空，设备行为与从前一致。必须是对象、键必须是非空字符串，否则抛 `ImageError`。
+
+当前唯一的标志是 `console`：调试面板以 `{"console": True}` 加载镜像，输入设备据此只从面板输入框取行、不再读终端（见[运行时详细介绍](runtime.md#调试面板console)）。
 
 ## 示例
 

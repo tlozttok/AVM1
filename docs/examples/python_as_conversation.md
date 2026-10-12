@@ -83,37 +83,44 @@ print(results)
 
 **对话格式（每个子任务是一个子对话）：**
 ```
-system:   你是并发协调器。可以启动子对话来并行处理任务。
-          子对话启动后进入"休眠"，完成后将结果写回你的 batch。
+system:   你是并发协调器。可用 create_cmd 建子对话、send_instruction 投递任务。
+          子对话创建后休眠，投递指令才运行；创建关系不是返回通道，
+          所以在指令里要求它们完成后用 send_instruction 把结果发回给你。
 
 user:     处理这 3 个 URL：url_a, url_b, url_c
           每个 URL 启动一个子对话，等全部完成后返回结果列表。
 
 assistant: (tool_calls:
-            create_cmd(system_ref="$MEM.agent.fetch", user_ref="url_a")
-            create_cmd(system_ref="$MEM.agent.fetch", user_ref="url_b")
-            create_cmd(system_ref="$MEM.agent.fetch", user_ref="url_c"))
+            create_cmd(system_ref="$MEM.agent.fetch") -> cid 1
+            send_instruction(cid=1, content="抓取 url_a；完成后 send_instruction(cid=0,
+                content='RESULT 1 <内容>')")
+            create_cmd(system_ref="$MEM.agent.fetch") -> cid 2
+            send_instruction(cid=2, content="抓取 url_b；完成后 send_instruction(cid=0,
+                content='RESULT 2 <内容>')")
+            create_cmd(system_ref="$MEM.agent.fetch") -> cid 3
+            send_instruction(cid=3, content="抓取 url_c；完成后 send_instruction(cid=0,
+                content='RESULT 3 <内容>')"))
 
---- 挂起，切换到子对话执行 ---
+assistant: （本轮不再输出工具调用 → 协调器交互结束进入休眠，让出执行权）
 
-# 子对话 1（$MEM.agent.fetch + url_a）
-assistant: (tool_calls:
-            memory_read("$MEM.url"))         → "url_a"
-            memory_read("$MEM.network"))     → 触发网络设备
-assistant: <html>result from url_a</html>
+--- 调度器依次运行 cid 1 / 2 / 3 ---
 
-# 子对话 2 类似，返回 url_b 的结果
-# 子对话 3 类似，返回 url_c 的结果
+# 子对话 1（$MEM.agent.fetch + 收到的指令）
+assistant: (tool_calls: memory_read("$MEM.network"))   → 触发网络设备
+assistant: <url_a 的内容>
+assistant: (tool_calls: send_instruction(cid=0, content="RESULT 1 <url_a 的内容>"))
 
---- 全部完成，唤醒父对话 ---
+# 其余两个子对话同理；每次投递把协调器放进就绪队列末尾
+
+--- 协调器被唤醒三次：每次只拿到已到的结果，数够三条才输出 ---
 
 assistant: 处理结果：[url_a_result, url_b_result, url_c_result]
 ```
 
-`ThreadPoolExecutor` → 调度器 `dormant/ready` 队列
+`ThreadPoolExecutor` → 调度器的就绪/休眠队列
+`pool.submit(task, url)` → `create_cmd` 建对话 + `send_instruction` 投递任务
 `task(url)` → 子对话
-`pool.map()` → `create_cmd` 批量创建
-`results` → 父对话被回调唤醒后从 `user_batch` 读取
+`future.result()` → 子对话用 `send_instruction` 投递回来的消息（创建关系不提供返回通道，父要结果就得在指令里要）
 
 ---
 
@@ -124,7 +131,7 @@ assistant: 处理结果：[url_a_result, url_b_result, url_c_result]
 | 模块导入/全局变量 | system prompt（setup） |
 | 函数调用 | 单次 `user → assistant` |
 | 副作用（I/O, 写文件） | `memory_read` / `memory_write` |
-| 多线程/并发 | `create_cmd` + 子对话调度 |
+| 多线程/并发 | `create_cmd` 建子对话 + `send_instruction` 投递 + 调度器就绪队列 |
 | 返回值/结果 | assistant 文本 或 `memory_write` |
 | 异常处理 | assistant 返回错误文本 + tool_calls 写入错误信息 |
 

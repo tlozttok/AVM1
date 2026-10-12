@@ -35,6 +35,16 @@
 
 为防止单个对话占用过多执行权，每轮激活有指令预算（`instruction_budget`，默认 50，镜像 `meta` 可配）。Core 在**工具返回加入批次之后**检查预算：达到预算就中断当前对话，把它放回就绪队列末尾，让出执行权。预算按调用链继承：亚对话与父对话共享同一预算（`is_sub` 且 parent 匹配），`create_cmd` 创建的子对话有独立预算。调用链断开（选中了另一个无关对话）时预算重新计数。
 
+### 中断（外部控制权转移）
+
+中断是**外部**发起的控制权转移请求，与事件是两回事：事件通知"发生了什么"，中断夺取"下一个执行谁"。v1 的中断源只有调试面板——面板的暂停按钮挂起 `operator` 类型中断，向量指向面板的操作员对话（`avm/interrupts.py` 的 `InterruptTable`）。
+
+- 任意线程都可挂起中断（控制台的后端线程就是这么做的）；同类型已有未派发的挂起中断时去重——连点两次暂停与点一次等价。
+- Core 在**安全点**派发：每轮推理（含该轮产生的全部指令）执行完之后、下一次推进之前——与预算中断用的是同一边界，状态完整、可恢复。
+- 派发把执行权交给向量指向的对话；被打断的活跃对话插回就绪队列**队首**，让出后先跑。目标从就绪/休眠队列中摘除；调用链断开时重置指令预算。
+- 没有注册向量、目标对话不存在或已关闭 → 丢弃，原因记 stderr；目标已是活跃对话 → 不动作。最近一次非空派发的记录留在 `InterruptTable.last_dispatch`，经 `GET /api/state` 给面板看（监测帧不含中断数据）。
+- 优先级、屏蔽位，以及它与其他中断源（预算中断、事件 `notify`）的关系都不在 v1。
+
 ### 交互结束与个体结束
 
 "对话结束"有两种含义，必须区分：
@@ -56,7 +66,7 @@ Core 只执行指令，不做业务决策。全部指令如下：
 | `create_sub` | 创建亚对话（立即执行；完成自动写回并唤醒父） | `system_ref`, `user_ref`, `para_ref` |
 | `send_instruction` | 按 cid 投递指令内容（支持多播；只确认投递成功，不保证返回；投递后本对话继续执行，不自动休眠） | `cid`(int/列表), `content` |
 | `close_conversation` | 内核级关闭：关闭指定 cid 的对话（自身或他人，不需要对方回应）；关闭后不可再调度、不可再被调用，其注册的事件监听自动撤销 | `cid` |
-| `listen_event` | 注册/修改/取消事件监听；监听器是 `ctrl.type="python"` 节点的 `content`，每次事件在受限沙箱中执行 | `action`, `event_type`?, `target`?, `handler_ref`?, `listener_id`? |
+| `listen_event` | 注册/修改/取消事件监听；监听器是 `ctrl.type="python"` 节点的 `content`，每次事件在受限沙箱中执行 | `action`, `event_type`?, `target`?, `handler_ref`?, `listener_id`?, `phase`? |
 
 ## 内存模型
 
@@ -139,6 +149,7 @@ Python 程序与 LLM 对话对等：都是 AVM 中的一等执行单元，通过
 | `plm.machine` | 状态机：system 是状态机 DSL，user 是 JSON 事件；状态/变量跨消息保留在 PLM 实例内，可输出全部 9 条指令的 tool calls。 |
 | `plm.command` | 字符串 IO 命令行：system 定义 `handle(cmd)`，user 是命令与参数（整行字符串）；`handle` 可用 `yield from` 调用注入的工具函数，工具响应回到断点继续执行。 |
 | `plm.python` | 图灵完备兜底：Jupyter 笔记本式语义。系统消息与用户消息都执行进同一个持久命名空间（跨轮次保留）；多个 print 全部执行，输出按顺序拼接为整体返回。 |
+| `plm.operator` | 操作员：执行器由调试面板持有而不是模型——每次"推理"等操作员提交一个动作，工具调用原样透传（未知工具名不在这里拦，留给 Core 报未知工具），或提交结束动作让本轮交互结束。只能由 `Core.start_operator_conversation` 创建（需要注入操作员通道）；镜像里声明同名程序节点会在第一次推理时报错。 |
 
 Python 对话的 `model` 必须是注册表（`PLM_REGISTRY`）中的名字，否则报错，不静默回退到 LLM。
 
@@ -259,7 +270,7 @@ before 语义：操作被请求，不保证到达执行组件；可被 `replace`
 
 ### 信息设备与设备自改
 
-- `$MEM.listeners` 只读列出 `listener_id / owner_cid / event_type / phase / target / handler_ref`；子路径 `<listener_id>` 返回单条详情；不暴露 handler 代码全文。
+- `$MEM.listeners` 只读列出 `listener_id / owner_cid / event_type / phase / target / handler_ref / enabled`；子路径 `<listener_id>` 返回单条详情；不暴露 handler 代码全文。宿主可用调试面板的 `PATCH /api/listeners/<id>` 就地启停（对话没有这条路径）。
 - 事件本身瞬时，不提供 `$MEM.events` 历史、不写盘。
 - `Core.emit_device_event(device_path, target, payload)` 是设备自改事件入口：只支持 `memory_write` before，source 为设备自身路径，target 必须属于 `$MEM.<device_path>`（用 `split_path` 判定，避免字符串前缀误匹配）；返回处理后的 event，设备据此决定是否执行自改。
 - 设备路径的 after 事件不由 `emit_device_event` 产生；设备可在操作成功后通过 `after_event(event_type, remainder, result)` 返回纯 payload，由 Core 统一包装成 after 事件。v1 不实现设备异步自发 after 事件。
@@ -269,7 +280,7 @@ before 语义：操作被请求，不保证到达执行组件；可被 `replace`
 一个 JSON 文件 + 若干设备 Python 文件 = 一个标准 AVM 系统镜像。规范见 [docs/system-image.md](system-image.md)，要点：
 
 - **显式节点**：内存每个节点都是 `{ "kind": "str"|"dict"|"list"|"device", "meta"?, "ctrl"?, "value" }`，无任何隐式转换（str 也必须显式包装）。`kind="device"` 是任意层级都可出现的可读性标记，实际挂载在 `devices` 段。
-- **para**：`ctrl.type="para"` 的 dict 节点存放模型调用参数（`model`、`temperature`、`use_tool`、`extra_body`、`reasoning_effort` 等），均以字符串存储，数值型加载时自动转回。
+- **para**：`ctrl.type="para"` 的 dict 节点存放模型调用参数（`model`、`temperature`、`use_tool`、`extra_body`、`reasoning_effort` 等），均以字符串存储，每次调用 API 前把数值型参数转回数值。
 - **devices**：数组，每项 `{ path, file, class, args }`。`file` 是相对镜像文件的 Python 模块路径，`class` 是其中的设备类，**必须继承** `MemoryDevice`，否则加载报错。这样"一个 JSON + 几个定义设备的 Python 文件"就是一个完整的系统镜像。
 - **init**：启动对话配置（`name` 默认 `"init"`，`system`/`system_ref`、`user`/`user_ref`）。`system_ref` 必须指向 `ctrl.type="settingup"` 的 LLM 程序节点（`system` 字面量可用于匿名入口程序）；`user_ref` 指向 str 节点。只启动 0 号对话，不预置其他对话；其他对话由对话运行期自己 `create_cmd` / `create_sub` 创建。
 - **persist_to**：运行结束后内存写回路径（异常也写）。
@@ -297,10 +308,20 @@ before 语义：操作被请求，不保证到达执行组件；可被 `replace`
 
 终端输入：等待输入时显示正在等待的对话身份提示（如 `[tester（cid=0）等待输入，/save 保存检查点]`），不再是黑屏裸等；已启用 readline 行编辑（历史/方向键，中文输入法组合友好）；终端非 UTF-8 编码会警告一次——中文乱码通常源于终端编码而不是程序。
 
+### 调试面板（Console）
+
+`python -m avm.console <image.json>`（等价入口 `scripts/run_console.py`，后者先清洗本进程的 `NO_PROXY` / `no_proxy`）起一个 HTTP 服务：默认 `127.0.0.1:8700`（`--port` / `--host` / `--checkpoint-in` 可改），只绑回环时是本机调试工具；无鉴权，响应带 `Access-Control-Allow-Origin: *`。非 `/api/` 的 GET 都按面板产物处理：`web/dist` 构建过就是面板，没构建时 `/` 给构建提示页。镜像以 `host_flags={"console": True}` 加载；被托管时 `$MEM.inputs` 只从面板输入框取行，不再读终端。
+
+- **操作员对话**：面板启动时另建一条对话（`plm.operator`），cid 真实、走正常调度、出现在 `$MEM.conversations`，不做特殊标记；初始进休眠队列、不进就绪队列——只有中断能激活。它活跃就等于全局暂停（其他对话都不推进）。`POST /api/interrupt` 挂起 `operator` 中断（在下一个安全点生效；`core.run()` 已返回时不再生效），`POST /api/resume` 让它结束本轮、让出执行权。`POST /api/action` 提交一条动作，未暂停时先自动中断；未知工具名有意允许（响应里有 `known_tool` 与提示）。
+- **读取端点**：`GET /api/state`（运行状态、调度、中断、屏蔽账本）、`/api/tools`（九条指令表）、`/api/conversations/<cid>`、`/api/memory`（可带 `ref`，整树无分页）、`/api/memory/diff?from=&to=`、`/api/listeners`、`/api/devices`、`/api/events`（SSE：面板输出与调度变化的有序流，按 `seq` 增量读）。
+- **介入端点**：`POST /api/device-action`（调设备自己声明的调试动作，如给 `$inputs` 投喂一行）、`/api/memory/snapshot`、`PATCH /api/listeners/<id>`（就地启停监听器）、`POST|DELETE /api/mask/memory`、`/api/mask/device`（临时摘下一个内存节点或卸载一台设备，`DELETE` 还原；调试原语不产生事件）。
+- **界面当前接的**：三栏界面（对话列表 / 内存索引与对话·内存·设备详情 / 暂停与动作·事件流）、暂停与继续、九条指令的结构化动作表单（下拉 +「其它（手输）」+ 原始 JSON 兜底）、事件流、`$inputs` 喂输入框。监听器编辑、屏蔽还原、快照与 diff 视图、设备动作全量都已有后端端点、界面未接。
+- **边界**：面板对话的消息随每次动作增长，且不能存检查点（v1 检查点不支持 Python 对话）；面板输出是容量 4000 条的有界环形缓冲，丢弃数记在状态里；`GET /api/devices` 的动作账本只留最近 50 条；阻塞读的路径末段是下标（如 `$MEM.inputs.-1`）时面板先标出、点击才发请求（8 秒超时）。
+
 ### 思维链内容
 
 LLM 响应中的 `reasoning_content`（思维链）被完整存入对话历史，并在后续请求中随 assistant 消息回传（无值则空字符串）——这是厂商协议的硬性要求，也是"回传所有推理内容"的既定策略。监测器记录它（与普通内容相同的截断策略）；`$MEM` 信息设备不暴露它（外泄控制靠禁止内部访问，不靠不记录）。
 
 ### 错误输出
 
-工具调用参数 JSON 解析失败、未知工具名等错误输出到 stderr，面向运行者，不喂回给 LLM 让它自纠。整体错误处理机制仍在设计中（见 [README 当前状态](../README.md#当前状态)）。
+工具调用参数 JSON 解析失败、未知工具名等错误输出到 stderr，面向运行者，不喂回给 LLM 让它自纠。整体错误处理机制仍在设计中（错误面向运行者、不喂回 LLM 是当前边界；面板提交未知工具名走的也是这条路径）。

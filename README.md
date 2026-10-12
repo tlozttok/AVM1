@@ -17,6 +17,7 @@ AVM 不是 Agent 框架。它不预设编排模式，不提供业务提示词，
 - [docs/system-image.md](docs/system-image.md) — 系统镜像格式规范
 - [docs/apps](docs/apps) — AVM 应用套件（实际性测试镜像：传令站 / 金库守卫 / 账本服务）
 - [docs/games](docs/games) — AVM 游戏（echo_mine 回声矿洞）
+- [docs/examples/python_as_conversation.md](docs/examples/python_as_conversation.md) — 示例：Python 程序如何无损表示为"对话 + 工具调用"
 
 ## 快速开始
 
@@ -30,11 +31,11 @@ python main.py <image.json> --frames      # 运行后打印监测帧摘要（std
 python main.py <image.json> --transcript api.txt  # API 调用全文落盘
 ```
 
-调试参数写在 `debug.json`（`image` / `frames` / `transcript`），不需要改命令行（VSCode 固定运行 `python main.py`）。示例镜像见 `images/demo.json`、`images/calc_driver.json`；应用套件见 `images/apps/`（启动方式见 [docs/apps](docs/apps)）；AI 小游戏见 `images/games/echo_mine/`。系统镜像的组成与要点见 [docs/runtime.md](docs/runtime.md) 的「系统镜像」一节。
+调试参数写在 `debug.json`（`image` / `frames` / `transcript` / `checkpoint_in`），不需要改命令行（VSCode 固定运行 `python main.py`；给 `--debug-config <file>` 就换一份配置）。示例镜像见 `images/demo.json`、`images/calc_driver.json`；应用套件见 `images/apps/`（启动方式见 [docs/apps](docs/apps)）；AI 小游戏见 `images/games/echo_mine/`；读本仓库自测的镜像见 `images/repo_tester.json`（对话经只读设备 `$MEM.AVMRepo` 读仓库跟踪文件，用法由设备自述给出）。系统镜像的组成与要点见 [docs/runtime.md](docs/runtime.md) 的「系统镜像」一节。
 
 ### 调试面板
 
-调试面板是 `web/` 下的另一个工程（Vite + React）：观察运行中的 Core，并经面板对话介入。
+调试面板是 `web/` 下的另一个工程（Vite + React）：观察运行中的 Core，并经面板对话介入。面板对话是一条**操作员对话**——执行器由面板持有而不是模型，手动提交的指令原样进入 Core；暂停经中断向量交给该对话（`POST /api/interrupt`），继续走 `POST /api/resume`；被面板托管时输入设备只从面板输入框取行，不碰终端。
 
 ```bash
 python scripts/run_console.py images/demo.json   # 起后端；前端构建过的话 / 就是面板，没构建则给出构建提示
@@ -44,5 +45,5 @@ cd web && npm run dev                    # 开发期：Vite 代理 /api 到 AVM_
 
 `scripts/run_console.py` 与 `python -m avm.console` 等价，只是先给这个进程一份清洗过的 `NO_PROXY` / `no_proxy`：装了代理工具的机器上，变量里已经带方括号的 IPv6 项（如 `[::1]`）会让 httpx 建不出客户端，控制台会在第一轮模型调用前崩掉。脚本只改自己进程的那份环境，父进程与 `.env` 都不动。
 
-面板自身：`cd web && npm run test:unit` 跑纯逻辑用例，`cd web && npm run e2e` 起一个脚本化 MockLMU 的控制台并在浏览器里跑四个场景（观测、三步交互、喂输入、产物由 console 托管）。
+面板自身：`cd web && npm run test:unit` 跑纯逻辑用例，`cd web && npm run e2e` 起一个脚本化 MockLMU 的控制台并在浏览器里跑五个场景（观测、工具选择、三步交互、喂输入、产物由 console 托管）。
 

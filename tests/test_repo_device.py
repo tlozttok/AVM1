@@ -5,6 +5,7 @@
 
 import importlib.util
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -252,7 +253,7 @@ class TestReadOnly:
 
 
 class TestRepoImage:
-    """出厂镜像 images/repo_tester.json：测试对话的接口从设备自述读出。"""
+    """出厂镜像 images/repo_tester.json：在用户指导下按 AVM 实际代码测整个系统；读文件接口从设备自述读出；镜像不规定步骤。"""
 
     def test_image_loads_device_and_terminal(self):
         core = load_image(str(IMAGE_FILE))
@@ -264,13 +265,15 @@ class TestRepoImage:
 
     def test_entry_prompt_points_at_device_without_teaching_syntax(self):
         image = json.loads(IMAGE_FILE.read_text(encoding="utf-8"))
-        prompt = "\n".join(
-            [
-                image["mem"]["system"]["value"]["content"]["value"],
-                image["mem"]["user"]["value"],
-            ]
-        )
+        system = image["mem"]["system"]["value"]["content"]["value"]
+        user = image["mem"]["user"]["value"]
+        prompt = system + "\n" + user
+        # 身份与判据在 system 里：按实际代码测这个系统，测什么由用户指令决定
         assert "$MEM.AVMRepo" in prompt
+        assert "实际代码" in prompt and "用户指令" in prompt
+        # 镜像不规定步骤：步骤由运行时的用户指令给出，改起来不用动镜像
+        assert "步骤" not in user and not re.search(r"\d\s*[.、]", user)
+        assert "$MEM.inputs.-1" in user and "$MEM.outputs.-1" in user
         # 接口由设备自述给出：提示词里不写动作语法与分页规则
         for token in ("ls", 'read."', 'search."', "每页", "双引号", "页码"):
             assert token not in prompt
@@ -354,4 +357,6 @@ class TestImage:
         device = _device_class()()
         assert device.resolve_path(["ls", '"avm"']).startswith('ls "avm"')
         assert "class" in device.resolve_path(["read", '"avm/core.py"', "0"])
-        assert "hits=0" not in device.resolve_path(["search", '"authorize_listener"', "0"])
+        # 只解析命中数：本测试自己的源码行也在跟踪集合里、也含有搜索词，子串判断会自己搜到自己
+        first_line = device.resolve_path(["search", '"authorize_listener"', "0"]).splitlines()[0]
+        assert int(first_line.split("hits=")[1]) > 0

@@ -2,7 +2,7 @@
   "meta": {
     "name": "repo_tester",
     "version": 1,
-    "description": "测试镜像：一个测试 AVMRepo 的对话。没有内置说明书，接口从设备自身读出，任务与交互方式由初始指令给出"
+    "description": "测试镜像：一个在用户指导下按 AVM 实际代码测试系统的对话。做什么由用户指令给出，镜像不规定步骤；读文件走 AVMRepo 设备，它的用法从设备自身读出"
   },
   "mem": {
     "system": {
@@ -18,13 +18,13 @@
         },
         "content": {
           "kind": "str",
-          "value": "你是这个系统中的一个对话。系统提供内存树和一组工具：memory_read、memory_write、memory_make、edit_metadata、create_cmd、create_sub、send_instruction、close_conversation、listen_event。你是一个测试对话，这次只测一台设备：内存里的 $MEM.AVMRepo。没有人为你准备它的说明书，它的接口由它自己说明——用 memory_read 读 $MEM.AVMRepo，照它写的用法用它。你的工作是核对自述与实测：先读懂它自述的接口，再按自述挑最小的例子逐条试，把实际返回与自述对照；自述没写清楚、看不懂、或者实际返回与自述不一致的地方，都是你要报的缺陷。判断只依据设备返回的内容，不要去读这台设备的实现代码（它也是仓库里的一个文件）；运行时的代码你读不到，这是设计之中的。只做这一件事，不要扩散到别的设备或别的任务。用户通过内存给你指令，不看终端输入。"
+          "value": "你是这个系统中的一个对话。系统提供内存树和一组工具：memory_read、memory_write、memory_make、edit_metadata、create_cmd、create_sub、send_instruction、close_conversation、listen_event。你是这个系统的测试者：在用户指导下，依据仓库里的实际代码，对这个系统做测试。内存里有一个只读设备 $MEM.AVMRepo，它自己能说明怎么用它读文件：用 memory_read 读 $MEM.AVMRepo，照它写的用法用它，你就能读到 AVM 的源码、规范与测试。。发现代码与行为不一致、代码没覆盖的边界、读不懂或设备自述没说清的地方，都报给用户。你只读代码、只测系统，不修改代码与镜像。"
         }
       }
     },
     "user": {
       "kind": "str",
-      "value": "这里不是用户指令。这里是初始指令的一部分。你在收到后需要执行如下步骤：1.用 memory_write 向\"$MEM.outputs.-1\"报到，一句话说明你开始测 $MEM.AVMRepo。2.用 memory_read 读 \"$MEM.AVMRepo\"，把它自述的接口读完，这是你唯一的接口来源。3.按它自述的用法挑一个最小的例子试一次，把实际返回原样写到 \"$MEM.outputs.-1\"，并写一句自述与实测是否对得上；这条对照记到 \"$MEM.tests.cases.1\"。\n4.memory_read(\"$MEM.inputs.-1\") 取用户指令，用户指令优先于你的自查。\n5.按用户指令继续测，结论写到 \"$MEM.tests.findings.1\"（序号从 1 起自增），摘要写到 \"$MEM.outputs.-1\"；\n6.回到步 4。"
+      "value": "这里不是用户指令，是初始指令的一部分。你的指令从 \"$MEM.inputs.-1\" 读，你的话写到 \"$MEM.outputs.-1\"。循环进行，一个完整的输出后，继续读取输入；做什么由用户指令决定。"
     },
     "model_params": {
       "kind": "dict",
@@ -41,7 +41,7 @@
     },
     "tests": {
       "kind": "dict",
-      "meta": "测试记录：自述与实测的对照",
+      "meta": "测试记录（写什么、怎么写由用户指令给出）",
       "value": {
         "cases": {
           "kind": "dict",
