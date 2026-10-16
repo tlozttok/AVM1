@@ -90,20 +90,44 @@ def test_llm_conversation_uses_core_lmu():
     assert core._active_cid is None
 
 
-def test_python_conversation_wrong_model_raises():
-    """Python 对话的 model 不在 PLM_REGISTRY 时报错，不静默回退到 lmu"""
+def test_python_conversation_wrong_model_rejected_at_creation():
+    """Python 程序的 model 不是 PLM 注册名：在创建时就报错，不静默回退到 lmu。
+
+    2026-10-16 起这条走模型目录的命名空间校验（输入边界），不再等第一次推理。
+    """
     core, root = _setup()
     core.mem["calc_params"] = MetaDict(data={"model": "not_a_plm"}, ctrl={"type": "para"})
     core.lmu = MockLMU([
         (None, [{"call_id": "cc", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.calc_program", "para_ref": "$MEM.calc_params"}}], None),
-        (None, [{"call_id": "si", "cmd_type": "send_instruction", "args": {"cid": 1, "content": "2 + 3"}}], None),
-        ("done", [], None),
     ])
 
     core.advance_conversation()  # root: create_cmd
+    assert core.get_conversation(1) is None, "校验失败不得创建对话"
+    (content, call_id), = _batch(core, root.cid)
+    assert content.startswith("Error:") and "不是 PLM 注册名" in content
+    assert call_id == "cc"
+
+
+def test_python_conversation_model_changed_after_creation_records_frame():
+    """漏网路径：创建后把 para 的 model 改成非法值，第一次推理仍会抛，但留监测帧。
+
+    两个查找已移进 advance_conversation 的 try（问题 1 的位置修复）。
+    """
+    core, root = _setup()
+    core.lmu = MockLMU([
+        (None, [{"call_id": "cc", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.calc_program", "para_ref": "$MEM.calc_params"}}], None),
+    ])
+    core.advance_conversation()  # root: create_cmd → 计算器就绪
     calc = core.get_conversation(1)
     assert calc.is_python is True
-    core.advance_conversation()  # root: send_instruction → 计算器就绪，root 继续
-    core.advance_conversation()  # root: 收尾 → 休眠，计算器被调度
+    # 创建时 para 是合法的 plm.simple；创建后把 model 改坏，执行器缓存还没建立
+    core.mem.set("$MEM.calc_params.model", "not_a_plm")
+
+    core.monitor.record_baseline(core)
+    before = len(core.monitor.frames())
+    core._active_cid = calc.cid
     with pytest.raises(ValueError, match="PLM_REGISTRY"):
-        core.advance_conversation()  # 计算器首轮执行 → model 错误 → 报错
+        core.advance_conversation()
+    frames = core.monitor.frames()
+    assert len(frames) == before + 1, "错误应当留下监测帧"
+    assert "PLM_REGISTRY" in frames[-1].lmu["error"]

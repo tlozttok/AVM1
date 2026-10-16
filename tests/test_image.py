@@ -4,9 +4,10 @@ import json
 
 import pytest
 
+from avm.core import Core
 from avm.image import load_image, ImageError
 from avm.memory import Memory
-from avm.types import MetaDict, MetaList
+from avm.types import MetaDict, MetaList, LinkNode
 
 DEVICE_CODE = '''
 from avm.memory_device import MemoryDevice
@@ -121,38 +122,38 @@ class TestHostFlags:
 
     def test_flags_are_visible_to_devices_at_attach(self, tmp_path):
         path = _write(tmp_path, _flag_image(), devices_code=FLAG_DEVICE_CODE)
-        core = load_image(path, host_flags={"console": True})
+        core = load_image(Core(), path, host_flags={"console": True})
         assert core.host_flags == {"console": True}
         assert self._seen(tmp_path) == {"console": True}, "attach_core 时标志已经就位"
 
     def test_default_is_empty(self, tmp_path):
         path = _write(tmp_path, _flag_image(), devices_code=FLAG_DEVICE_CODE)
-        core = load_image(path)
+        core = load_image(Core(), path)
         assert core.host_flags == {}
         assert self._seen(tmp_path) == {}, "不传标志时设备看到的与改动前一致"
 
     def test_flags_are_copied(self, tmp_path):
         path = _write(tmp_path, _flag_image(), devices_code=FLAG_DEVICE_CODE)
         given = {"console": True}
-        core = load_image(path, host_flags=given)
+        core = load_image(Core(), path, host_flags=given)
         given["console"] = False
         assert core.host_flags == {"console": True}, "调用方的字典进不来"
 
     def test_flags_must_be_an_object(self, tmp_path):
         path = _write(tmp_path, _flag_image(), devices_code=FLAG_DEVICE_CODE)
         with pytest.raises(ImageError, match="host_flags 必须是对象"):
-            load_image(path, host_flags=["console"])
+            load_image(Core(), path, host_flags=["console"])
 
     def test_flag_keys_must_be_non_empty_strings(self, tmp_path):
         path = _write(tmp_path, _flag_image(), devices_code=FLAG_DEVICE_CODE)
         with pytest.raises(ImageError, match="host_flags 的键"):
-            load_image(path, host_flags={"": True})
+            load_image(Core(), path, host_flags={"": True})
 
 
 class TestLoadImage:
     def test_load_mem_para_init(self, tmp_path):
         path = _write(tmp_path, _sample_image(), devices_code=DEVICE_CODE)
-        core = load_image(path)
+        core = load_image(Core(), path)
 
         system = core.mem["system"]
         assert isinstance(system, MetaDict)
@@ -179,7 +180,7 @@ class TestLoadImage:
         image = _sample_image()
         image["init"] = {"name": "boot", "system": "S", "user": "U"}
         path = _write(tmp_path, image, devices_code=DEVICE_CODE)
-        core = load_image(path)
+        core = load_image(Core(), path)
         conv = core.get_conversation(0)
         assert conv.name == "boot"
         assert conv.messages[0].content == "S"
@@ -187,7 +188,7 @@ class TestLoadImage:
 
     def test_run_uses_para_ref_and_mock_lmu(self, tmp_path):
         path = _write(tmp_path, _sample_image(), devices_code=DEVICE_CODE)
-        core = load_image(path)
+        core = load_image(Core(), path)
         lmu = MockLMU([("done", [], None)])
         core.lmu = lmu
         core.run()
@@ -199,28 +200,28 @@ class TestLoadImage:
         image["devices"][0]["class"] = "NotADevice"
         path = _write(tmp_path, image, devices_code=DEVICE_CODE + "\n\nclass NotADevice:\n    pass\n")
         with pytest.raises(ImageError, match="继承 MemoryDevice"):
-            load_image(path)
+            load_image(Core(), path)
 
     def test_para_must_be_typed(self, tmp_path):
         image = _sample_image()
         del image["mem"]["model_params"]["ctrl"]
         path = _write(tmp_path, image, devices_code=DEVICE_CODE)
         with pytest.raises(ImageError, match="ctrl.type='para'"):
-            load_image(path)
+            load_image(Core(), path)
 
     def test_unknown_kind_rejected(self, tmp_path):
         image = _sample_image()
         image["mem"]["bad"] = {"kind": "file", "value": "x"}
         path = _write(tmp_path, image, devices_code=DEVICE_CODE)
         with pytest.raises(ImageError, match="未知 kind"):
-            load_image(path)
+            load_image(Core(), path)
 
     def test_device_marker_requires_declaration(self, tmp_path):
         image = _sample_image()
         image["devices"] = []
         path = _write(tmp_path, image)
         with pytest.raises(ImageError, match="未在 devices 段声明"):
-            load_image(path)
+            load_image(Core(), path)
 
     def test_device_marker_nested_allowed(self, tmp_path):
         image = _sample_image()
@@ -237,24 +238,58 @@ class TestLoadImage:
             "path": "game.map.rooms", "file": "devices/dummy.py", "class": "DummyDevice", "args": {"label": "rooms"},
         })
         path = _write(tmp_path, image, devices_code=DEVICE_CODE)
-        core = load_image(path)
+        core = load_image(Core(), path)
         assert core.unwrap("$MEM.game.map.rooms") == "dummy:rooms"
-        # 设备不写入数据树
-        assert "rooms" not in core.mem["game"]["map"]
+        # 挂载点物化为链接节点：数据树里看得见挂载点，读它是进设备空间
+        link = core.mem["game"]["map"]["rooms"]
+        assert isinstance(link, LinkNode)
+        assert link.target == "game.map.rooms"
 
     def test_str_node_must_be_string(self, tmp_path):
         image = _sample_image()
         image["mem"]["system"] = {"kind": "str", "value": 123}
         path = _write(tmp_path, image, devices_code=DEVICE_CODE)
         with pytest.raises(ImageError, match="value 必须是字符串"):
-            load_image(path)
+            load_image(Core(), path)
+
+    def test_link_node_declared_in_mem(self, tmp_path):
+        """mem 段可以声明链接节点：target 为 $MEM 地址时按内存树地址解析。"""
+        image = _sample_image()
+        image["mem"]["alias"] = {"kind": "link", "target": "$MEM.system", "meta": "别名"}
+        path = _write(tmp_path, image, devices_code=DEVICE_CODE)
+        core = load_image(Core(), path)
+
+        link = core.mem._data["alias"]
+        assert isinstance(link, LinkNode)
+        assert link.get_metadata() == "别名"
+        assert core.unwrap("$MEM.alias") == core.unwrap("$MEM.system")
+
+    def test_link_node_requires_target(self, tmp_path):
+        image = _sample_image()
+        image["mem"]["alias"] = {"kind": "link", "value": None}
+        path = _write(tmp_path, image, devices_code=DEVICE_CODE)
+        with pytest.raises(ImageError, match="target"):
+            load_image(Core(), path)
+
+    def test_device_id_override(self, tmp_path):
+        """devices 条目的 id 覆盖缺省标识符（缺省取挂载地址）。"""
+        image = _sample_image()
+        image["devices"].append({
+            "path": "box", "file": "devices/dummy.py", "class": "DummyDevice",
+            "args": {"label": "box"}, "id": "box-1",
+        })
+        path = _write(tmp_path, image, devices_code=DEVICE_CODE)
+        core = load_image(Core(), path)
+
+        assert core.mem._data["box"].target == "box-1"
+        assert core.mem._device_ids["box-1"] is core.mem._devices["box"]
 
     def test_init_ref_must_be_ref(self, tmp_path):
         image = _sample_image()
         image["init"] = {"system_ref": "not_a_ref", "user_ref": "$MEM.user"}
         path = _write(tmp_path, image, devices_code=DEVICE_CODE)
         with pytest.raises(ImageError, match="开头的内存引用"):
-            load_image(path)
+            load_image(Core(), path)
 
     def test_init_system_ref_requires_settingup(self, tmp_path):
         """init 的 system_ref 指向 str 节点：与 create_cmd 一致，要求 settingup 程序节点"""
@@ -262,21 +297,21 @@ class TestLoadImage:
         image["mem"]["system"] = {"kind": "str", "value": "sys"}
         path = _write(tmp_path, image, devices_code=DEVICE_CODE)
         with pytest.raises(ImageError, match="settingup"):
-            load_image(path)
+            load_image(Core(), path)
 
     def test_init_system_ref_rejects_untyped_dict(self, tmp_path):
         image = _sample_image()
         image["mem"]["system"] = {"kind": "dict", "value": {"content": {"kind": "str", "value": "sys"}}}
         path = _write(tmp_path, image, devices_code=DEVICE_CODE)
         with pytest.raises(ImageError, match="settingup"):
-            load_image(path)
+            load_image(Core(), path)
 
     def test_init_settingup_requires_content(self, tmp_path):
         image = _sample_image()
         image["mem"]["system"] = {"kind": "dict", "ctrl": {"type": "settingup"}, "value": {}}
         path = _write(tmp_path, image, devices_code=DEVICE_CODE)
         with pytest.raises(ImageError, match="content"):
-            load_image(path)
+            load_image(Core(), path)
 
     def test_init_user_ref_must_be_str_node(self, tmp_path):
         image = _sample_image()
@@ -287,18 +322,18 @@ class TestLoadImage:
         }
         path = _write(tmp_path, image, devices_code=DEVICE_CODE)
         with pytest.raises(ImageError, match="str 节点"):
-            load_image(path)
+            load_image(Core(), path)
 
     def test_checkpoint_in_skips_init_and_restores_ready(self, tmp_path):
         """启动时加载检查点：跳过 init，恢复的对话为 cid 0 且就绪（直接续跑）"""
         path = _write(tmp_path, _sample_image(), devices_code=DEVICE_CODE)
-        core0 = load_image(path)
+        core0 = load_image(Core(), path)
         conv0 = core0.get_conversation(0)
         conv0.append_assistant_message("done")
         cp = tmp_path / "cp.json"
         core0.save_conversation(conv0.cid, str(cp))
 
-        core = load_image(path, checkpoint_in=str(cp))
+        core = load_image(Core(), path, checkpoint_in=str(cp))
 
         assert len(core._conv_by_cid) == 1  # init 被跳过，只有恢复的对话
         restored = core.get_conversation(0)
@@ -309,14 +344,14 @@ class TestLoadImage:
     def test_checkpoint_in_missing_file(self, tmp_path):
         path = _write(tmp_path, _sample_image(), devices_code=DEVICE_CODE)
         with pytest.raises(ImageError, match="检查点"):
-            load_image(path, checkpoint_in=str(tmp_path / "nope.json"))
+            load_image(Core(), path, checkpoint_in=str(tmp_path / "nope.json"))
 
     def test_device_file_missing(self, tmp_path):
         image = _sample_image()
         image["devices"] = [{"path": "inputs", "file": "devices/nope.py", "class": "X", "args": {}}]
         path = _write(tmp_path, image)
         with pytest.raises(ImageError, match="设备文件不存在"):
-            load_image(path)
+            load_image(Core(), path)
 
 
 class TestParaCoercion:

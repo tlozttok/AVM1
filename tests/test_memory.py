@@ -3,7 +3,7 @@
 import pytest
 from avm.memory import Memory, _wrap_value
 from avm.memory_device import StringDevice, MetaListDevice, MetaDictDevice, InputsListDevice, OutputsListDevice, MemoryDevice
-from avm.types import MetaDict, MetaList
+from avm.types import MetaDict, MetaList, LinkNode
 from avm.exceptions import VMMemoryError, MemoryKeyNotFoundError, MemoryIndexOutOfRangeError, MemoryTypeError
 
 
@@ -90,6 +90,30 @@ class TestUnwrap:
         mem["s"] = "hello"
         with pytest.raises(MemoryTypeError):
             mem.unwrap(["$", "MEM", "s", "child"])
+
+    def test_mem_list_element_by_index(self):
+        """树里的普通 MetaList 也能按引用下标读。
+
+        设备列表一直可以（设备自己把字符串转成下标）；树里的列表之前少了这一步转换，
+        `$MEM.x.0` 会抛 TypeError。2026-10-16 修。
+        """
+        mem = Memory()
+        mem["plain"] = MetaList(data=["a", "b"])
+        assert mem.unwrap(["$", "MEM", "plain", "0"], for_llm=False) == "a"
+        assert mem.unwrap(["$", "MEM", "plain", "-1"], for_llm=False) == "b"
+
+    def test_mem_list_index_errors_stay_typed(self):
+        mem = Memory()
+        mem["plain"] = MetaList(data=["a"])
+        with pytest.raises(MemoryIndexOutOfRangeError):
+            mem.unwrap(["$", "MEM", "plain", "5"], for_llm=False)
+        with pytest.raises(MemoryTypeError):
+            mem.unwrap(["$", "MEM", "plain", "x"], for_llm=False)
+
+    def test_mem_list_nested_index(self):
+        mem = Memory()
+        mem["outer"] = MetaList(data=[MetaList(data=["deep"])])
+        assert mem.unwrap(["$", "MEM", "outer", "0", "0"], for_llm=False) == "deep"
 
     def test_non_mem_device(self):
         mem = Memory()
@@ -217,8 +241,9 @@ class TestMemorySet:
         assert mem["a"]["b"]["c"] == "val"
 
     def test_set_without_dollar_raises(self):
+        """写入引用的语法错误是 VMMemoryError（可返回给调用者），不是裸 ValueError。"""
         mem = Memory()
-        with pytest.raises(ValueError):
+        with pytest.raises(VMMemoryError):
             mem.set("no_dollar", "val")
 
     def test_set_by_path_device_root(self):
@@ -230,11 +255,21 @@ class TestMemorySet:
 
     def test_set_device_nested_through_data(self):
         mem = Memory()
-        mem["cfg"] = MetaDict(data={"inner": "old"})
+        mem["cfg"] = MetaDict(data={})
         dev = StringDevice("device_val")
         mem.mount("cfg.inner", dev)
+        # 父段是数据容器：挂载点物化为链接节点，写在数据路径上也能落到设备
+        assert isinstance(mem["cfg"]["inner"], LinkNode)
         mem.set_by_path(["cfg", "inner"], "overwritten")
         assert dev.get_value() == "overwritten"
+
+    def test_mount_over_existing_data_node_rejected(self):
+        """挂载点已有数据节点时报错，不静默遮盖。"""
+        mem = Memory()
+        mem["cfg"] = MetaDict(data={"inner": "old"})
+        with pytest.raises(VMMemoryError):
+            mem.mount("cfg.inner", StringDevice("device_val"))
+        assert "cfg.inner" not in mem._devices
 
 
 class TestMemoryMake:

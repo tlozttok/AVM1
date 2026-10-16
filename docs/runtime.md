@@ -70,11 +70,12 @@ Core 只执行指令，不做业务决策。全部指令如下：
 
 ## 内存模型
 
-内存是全局共享的键值树，路径形如 `$MEM.a.b.c`。三种数据类型：
+内存是全局共享的键值树，路径形如 `$MEM.a.b.c`。四种数据类型：
 
 - **str**：叶子节点，直接返回内容。
 - **MetaDict / MetaList**：带双元数据的复合类型。
-- **设备（device）**：挂载到路径上的伪节点（见下文）。
+- **链接节点（LinkNode）**：`target` 以 `$` 开头是内存树地址，否则是设备唯一标识符；寻址遇到它即进入目标（见下文）。
+- **设备（device）**：挂载到路径上的伪节点（见下文）。挂载点本身在树里就是一个链接节点。
 
 ### 双元数据
 
@@ -89,7 +90,7 @@ MetaDict / MetaList 有两份元数据：
 
 **str 永远是 str**：字符串值不会被当作引用解引用。`$` 递归解引用与 `&` 单层解引用是已废弃的设计，不存在于当前代码中。
 
-**链接（Link）是设备**（LinkDevice）：把真实 `$MEM` 路径挂载为别名，如 `$rooms` → `$MEM.game.map.rooms`。对话通过链接访问目标内容，但看不到真实路径，因此无法借链接访问兄弟节点——这是 capability 边界的实现方式。读取/写入/`memory_make`/`edit_metadata` 对链接透明；链接成环抛 `MemoryCircularReferenceError`；错误信息只暴露别名，真实错误详情输出到 stderr。v1 为静态链接（镜像 `builtin` 设备声明），运行期无创建/删除指令。
+**链接（Link）是内存树节点**（`LinkNode`）：寻址遇到它就进入 `target` 指向的地址。`target` 以 `$` 开头（`$MEM.a.b`）是内存树地址，否则是设备唯一标识符；被指向的设备登记在设备表里。读、写、`memory_make`、`edit_metadata` 都进入目标，链接自身不返回描述；成环抛 `MemoryCircularReferenceError`，访问集合是本次解析的，错误只含链接路径链。链接只由内核侧创建（镜像 `mem` 段声明、设备挂载物化、调试原语），运行期没有创建/删除链接的指令。
 
 ### 设备
 
@@ -101,17 +102,46 @@ MetaDict / MetaList 有两份元数据：
 
 读设备本身（`$MEM.<dev>`）得到的是设备自述（`to_llm_string()`）；镜像自带的设备对缺少必需参数的动作返回该动作的用法说明。约定见[系统镜像规范](system-image.md)的 devices 一节。
 
-Core 内置只读信息设备：`$MEM.conversations`（对话列表与单对话详情）、`$MEM.scheduler`（活跃/就绪/休眠与预算）、`$MEM.memory`（内存树摘要）、`$MEM.monitor`（监测帧摘要）、`$MEM.listeners`（事件监听器列表）。镜像可挂载自己的设备，例如 `$inputs`、`$outputs`（见[系统镜像](#系统镜像)）。
+Core 内置只读信息设备：`$MEM.conversations`（对话列表与单对话详情）、`$MEM.scheduler`（活跃/就绪/休眠与预算）、`$MEM.memory`（内存树摘要）、`$MEM.monitor`（监测帧摘要）、`$MEM.listeners`（事件监听器列表）。镜像可挂载自己的设备，例如 `$inputs`、`$outputs`（见[系统镜像](#系统镜像)）。这些挂载点和镜像设备一样在内存树里有链接节点，因此读 `$MEM` 根目录能看到它们。
 
-### 链接设备（LinkDevice）
+### 挂载与链接节点
 
-`LinkDevice` 是内建设备：把 `$MEM` 下的真实路径挂载为别名（如 `rooms` → `$MEM.game.map.rooms`）。
+挂载设备（`Memory.mount`）做三件事：把地址写进设备表、按设备唯一标识符登记设备、在挂载路径物化一个链接节点。标识符缺省取挂载地址，镜像 `devices` 条目可用 `"id"` 覆盖；标识符重复或以 `$` 开头报错。
 
-- 读/写/`memory_make`/`edit_metadata` 对别名透明，等同于操作真实目标。
-- 链接目标 v1 只允许 `$MEM` 开头的路径；允许链接指向链接（链式跟随），成环抛 `MemoryCircularReferenceError`，错误只含别名链。
+- 挂载路径的父段不存在时自动物化空 `MetaDict`；父段是链接节点、或该路径已有数据节点时报错（挂载点与数据节点不能同名）。
+- 卸载（`Memory.unmount`）同时清掉地址、标识符与链接节点；控制台的设备屏蔽走的就是卸载与重新挂载。
+- 整树替换（镜像装载 `core.mem._data = root`）会抹掉先前物化的链接，装载器随后按设备表重建（`Memory.materialize_mount_links`）。
+- 读 `$MEM` 根目录列出全部挂载点：键就是链接节点，不再出现"根目录列出了键、读到的却是别的东西"的遮盖。
+- 解析权威是内存树遍历：按地址前缀命中设备表只用于事件边界、调试原语（`mounted_devices`、屏蔽）与 `split_path` 的段序列规则。
+- `save` 把链接节点按 `{"kind": "link", "target": ...}` 写出（设备本身不落盘）；重载后若没有同名设备，读该链接报"设备标识符未知"。`MetaDict.to_dict` / `MetaList.to_list` 不跟随链接，写 `{"$link": target}` 占位。
+- 报错只含请求路径：寻址按链接目标走，错误信息（键不存在、类型不符）用对话请求的原段序列，不暴露真实目标路径；成环错误只含链接路径链。
+
+### 链接设备（LinkDevice，保留兼容）
+
+`LinkDevice` 是设备层的别名（把 `$MEM` 下的真实路径挂载为别名），在内存树节点链接落地后**不要用于新设计**，只保留兼容与既有测试：`devices` 条目 `{"path": "rooms", "class": "LinkDevice", "builtin": true, "args": {"target": "$MEM.game.map.rooms"}}`。
+
+- 读/写/`memory_make`/`edit_metadata` 对别名透明，等同于操作真实目标；挂载它时同样会在挂载点物化链接节点。
+- 链接目标只允许 `$MEM` 开头的路径；允许链接指向链接（链式跟随），成环抛 `MemoryCircularReferenceError`，错误只含别名链。
 - 错误隐藏：LLM 看到的错误只包含别名路径；真实路径/异常详情输出到 stderr 给运行者。镜像加载期校验失败属于运行者诊断，可显示真实路径。
 - 事件透明：注册监听 target 为别名时，权限检查跟随真实目标（memory 按 owner，device 走对方 `authorize_listener`）；after 事实事件由真实执行组件发布，但事件 target/payload 仍写别名。
-- 声明方式：`devices` 条目 `{"path": "rooms", "class": "LinkDevice", "builtin": true, "args": {"target": "$MEM.game.map.rooms"}}`。旧镜像不声明链接，行为不变。
+
+### 模型目录（`$MEM.model_catalog`）
+
+启动自带的普通内存节点（不是设备、不产生事件），由 `Core.install_model_catalog()` 在 `Core()` 与镜像装载之后安装，镜像或检查点里已有的字段不覆盖。作用是让对话读得到"有哪些模型可用、各自要什么参数"，并给 `create_cmd` / `create_sub` 的命名空间校验提供依据。
+
+- `llm`：`source`（`"api"` 已从上游 `/models` 取到 / `"unavailable"` 没取到 / `"image"` 镜像自带）、`reason`（取不到时的原因）、`required`（`"model"`）、`params`（可写进 para 的 API 参数，来自 `LMU._API_PARAM_KEYS`，标注数值型或字符串型）、`models`（列表，每项 `id` 加可选的上游元数据 `context_window` / `max_output_tokens` / 输入输出模态）。
+- `plm`：列表，每项 `name`（`plm.simple` 等）、`required`、`params`（`只有 model 有效；tools 由内核注入；LLM 参数无效`）与来自类文档串首行的说明；`plm.operator` 标为只能由宿主创建。
+- 名字（`plm.*` 与带点的模型 id）装在列表项的 `name` / `id` 字段里，不当键——`$MEM` 寻址按点号切段，带点的键读不回来。
+- `Core.refresh_model_catalog(timeout)` 拉一次上游 `GET {base_url}/models` 填充 `models`：自己校验信封（`object="list"` 且 `data` 是数组）、除 `id` 外全部按可选字段读、任何失败都收敛成 `source="unavailable"` 并只打一行 stderr。清单只当参考：取不到时不拦启动，也不拦模型名。宿主在启动时调一次（`avm/boot.py` 的 `start_core`）。
+
+### 命名空间校验（输入边界）
+
+`model` 一个字段承载两种命名：LLM 模型名与 PLM 注册表名。`create_cmd` / `create_sub` 在建对话前交叉校验：
+
+- `system_ref` 指向 `python` 程序 → `model` 必须是 `plm` 列表里的注册名，否则 Error 工具响应、不创建对话；
+- `system_ref` 指向 `settingup` 程序 → `llm.source == "api"` 时 `model` 必须在 `models` 里，取不到清单时只记 stderr 不拦。
+
+漏网的错配（例如创建后把 para 的 `model` 改坏）由 `_get_executor` 兜底：它现在在 `advance_conversation` 的 `try` 之内，会留下监测帧再上抛。
 
 ## 对话间通信
 
@@ -279,9 +309,11 @@ before 语义：操作被请求，不保证到达执行组件；可被 `replace`
 
 一个 JSON 文件 + 若干设备 Python 文件 = 一个标准 AVM 系统镜像。规范见 [docs/system-image.md](system-image.md)，要点：
 
-- **显式节点**：内存每个节点都是 `{ "kind": "str"|"dict"|"list"|"device", "meta"?, "ctrl"?, "value" }`，无任何隐式转换（str 也必须显式包装）。`kind="device"` 是任意层级都可出现的可读性标记，实际挂载在 `devices` 段。
+**生命周期三段**（`avm/boot.py` 是加载区，把三段串起来给宿主用）：**创建空核心**（`Core()`）→ **加载镜像**（`load_image(core, path)`，要求核心还没有对话）→ **启动核心**（`start_core(core)`：刷新模型目录、装 API 失败的运行者策略）。宿主通常只调 `boot(image_path)`。
+
+- **显式节点**：内存每个节点都是 `{ "kind": "str"|"dict"|"list"|"device"|"link", "meta"?, "ctrl"?, "value" }`，无任何隐式转换（str 也必须显式包装）。`kind="device"` 是任意层级都可出现的可读性标记，实际挂载在 `devices` 段；`kind="link"` 用 `target` 声明链接（`$MEM` 地址或设备标识符），不写 `value`。
 - **para**：`ctrl.type="para"` 的 dict 节点存放模型调用参数（`model`、`temperature`、`use_tool`、`extra_body`、`reasoning_effort` 等），均以字符串存储，每次调用 API 前把数值型参数转回数值。
-- **devices**：数组，每项 `{ path, file, class, args }`。`file` 是相对镜像文件的 Python 模块路径，`class` 是其中的设备类，**必须继承** `MemoryDevice`，否则加载报错。这样"一个 JSON + 几个定义设备的 Python 文件"就是一个完整的系统镜像。
+- **devices**：数组，每项 `{ path, file, class, args, id? }`。`file` 是相对镜像文件的 Python 模块路径，`class` 是其中的设备类，**必须继承** `MemoryDevice`，否则加载报错；`id` 可选，覆盖缺省的设备标识符（缺省取 `path`）。这样"一个 JSON + 几个定义设备的 Python 文件"就是一个完整的系统镜像。
 - **init**：启动对话配置（`name` 默认 `"init"`，`system`/`system_ref`、`user`/`user_ref`）。`system_ref` 必须指向 `ctrl.type="settingup"` 的 LLM 程序节点（`system` 字面量可用于匿名入口程序）；`user_ref` 指向 str 节点。只启动 0 号对话，不预置其他对话；其他对话由对话运行期自己 `create_cmd` / `create_sub` 创建。
 - **persist_to**：运行结束后内存写回路径（异常也写）。
 - **meta**：`version` 必须为 1；`instruction_budget` 可配核心中断预算。
@@ -315,7 +347,7 @@ before 语义：操作被请求，不保证到达执行组件；可被 `replace`
 - **操作员对话**：面板启动时另建一条对话（`plm.operator`），cid 真实、走正常调度、出现在 `$MEM.conversations`，不做特殊标记；初始进休眠队列、不进就绪队列——只有中断能激活。它活跃就等于全局暂停（其他对话都不推进）。`POST /api/interrupt` 挂起 `operator` 中断（在下一个安全点生效；`core.run()` 已返回时不再生效），`POST /api/resume` 让它结束本轮、让出执行权。`POST /api/action` 提交一条动作，未暂停时先自动中断；未知工具名有意允许（响应里有 `known_tool` 与提示）。
 - **读取端点**：`GET /api/state`（运行状态、调度、中断、屏蔽账本）、`/api/tools`（九条指令表）、`/api/conversations/<cid>`、`/api/memory`（可带 `ref`，整树无分页）、`/api/memory/diff?from=&to=`、`/api/listeners`、`/api/devices`、`/api/events`（SSE：面板输出与调度变化的有序流，按 `seq` 增量读）。
 - **介入端点**：`POST /api/device-action`（调设备自己声明的调试动作，如给 `$inputs` 投喂一行）、`/api/memory/snapshot`、`PATCH /api/listeners/<id>`（就地启停监听器）、`POST|DELETE /api/mask/memory`、`/api/mask/device`（临时摘下一个内存节点或卸载一台设备，`DELETE` 还原；调试原语不产生事件）。
-- **界面当前接的**：三栏界面（对话列表 / 内存索引与对话·内存·设备详情 / 暂停与动作·事件流）、暂停与继续、九条指令的结构化动作表单（下拉 +「其它（手输）」+ 原始 JSON 兜底）、事件流、`$inputs` 喂输入框。监听器编辑、屏蔽还原、快照与 diff 视图、设备动作全量都已有后端端点、界面未接。
+- **界面当前接的**：三栏界面（对话列表 / 内存索引与对话·内存·设备详情 / 暂停与动作·事件流）、暂停与继续、九条指令的结构化动作表单（下拉 +「其它（手输）」+ 原始 JSON 兜底）、事件流、`$inputs` 喂输入框。内存索引照树画：链接节点一行，没有子节点可展开；挂载点那行标出设备类型（`device InputsListDevice`），点它打开设备视图，描述与动作来自 `GET /api/devices`。监听器编辑、屏蔽还原、快照与 diff 视图、设备动作全量都已有后端端点、界面未接。
 - **边界**：面板对话的消息随每次动作增长，且不能存检查点（v1 检查点不支持 Python 对话）；面板输出是容量 4000 条的有界环形缓冲，丢弃数记在状态里；`GET /api/devices` 的动作账本只留最近 50 条；阻塞读的路径末段是下标（如 `$MEM.inputs.-1`）时面板先标出、点击才发请求（8 秒超时）。
 
 ### 思维链内容
@@ -324,4 +356,14 @@ LLM 响应中的 `reasoning_content`（思维链）被完整存入对话历史�
 
 ### 错误输出
 
-工具调用参数 JSON 解析失败、未知工具名等错误输出到 stderr，面向运行者，不喂回给 LLM 让它自纠。整体错误处理机制仍在设计中（错误面向运行者、不喂回 LLM 是当前边界；面板提交未知工具名走的也是这条路径）。
+错误的落点按"能否由调用者输入决定"分四类（依据见 `docs/private/Agents/proposed/discussion-kernel-stability-2026-10-15.md`）：
+
+- **非法操作**：参数在指令入口可判定为不合法（缺必填、类型不符、枚举外、`ref` 不带 `$`、地址语法错误）→ 在构造指令对象之前拦下，回一条 `Error: ...` 工具响应，状态不动，对话继续。schema 只有一个来源（`Instruction.tool_def`），仲裁层从它派生校验。
+- **异常返回**：操作合法而世界与期望不符（键不存在、越界、链接成环、设备拒绝）→ 返回 `Error: ...` 工具响应。
+- **协议层拒绝**：工具名未知、参数不是合法 JSON、`call_id` 不可用 → 细节只写给运行者（stderr），对话侧回一条中性占位（`（该工具调用未执行）`），保住 assistant 的 `tool_calls` 与 tool 消息一一配对。
+- **内核恐慌**：六条具名不变量（调度互斥、活跃有来源、历史配对、值域、设备表一致、预算计数）在每轮安全点自检，违反即 `KernelPanic` 并留监测帧。可判定的输入不该走到这里——出现说明某条边界少了一条判定。
+- **内核缺陷**：约定错误类之外的异常不再被读路径吞掉；记录监测帧后向上抛，进程退出。
+
+API 调用失败（缺 key、断网、超时）不再结束进程：内核记帧后停下问运行者，终端给三个选择——更新环境（重建客户端后重试本轮）、继续（直接重试）、退出（写回内存后干净退出）。宿主通过 `Core.api_error_policy` 安装策略，默认实现见 `avm/runner_prompt.py`；EOF 与非终端输入按退出处理。
+
+Python 程序（PLM 代码、事件处理器）手里的"紧急停止"按钮已收掉：沙箱不再发 `BaseException`，`raise BaseException("x")` 变成普通错误文本；停机信号只来自宿主（Ctrl+C 写回内存后退出）。

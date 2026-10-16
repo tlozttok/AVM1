@@ -891,13 +891,22 @@ class TestSplitPath:
 
         mem = Memory()
         mem.mount("box", _DummyDevice())
-        mem.mount("box.dev", _DummyDevice())
+        mem.mount("box2", _DummyDevice())
 
         assert mem.split_path("$MEM.box") == ("device", "box", [])
-        assert mem.split_path("$MEM.box2") == ("memory", ["box2"])
-        assert mem.split_path("$MEM.box.dev") == ("device", "box.dev", [])
-        assert mem.split_path("$MEM.box.dev.sub") == ("device", "box.dev", ["sub"])
+        assert mem.split_path("$MEM.box2") == ("device", "box2", [])
+        assert mem.split_path("$MEM.box.x") == ("device", "box", ["x"])
         assert mem.split_path("$MEM.a.b") == ("memory", ["a", "b"])
+
+    def test_mount_under_existing_mount_rejected(self):
+        """链接节点里放不下第二个挂载点：box 已挂载时不能再挂 box.dev。"""
+        from avm.memory import Memory
+
+        mem = Memory()
+        mem.mount("box", _DummyDevice())
+        with pytest.raises(VMMemoryError):
+            mem.mount("box.dev", _DummyDevice())
+        assert "box.dev" not in mem._devices
 
 
 class TestMemoryAfterEvents:

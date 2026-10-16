@@ -72,6 +72,8 @@ class MetaList:
                 result.append(v.to_dict())
             elif isinstance(v, MetaList):
                 result.append(v.to_list())
+            elif isinstance(v, LinkNode):
+                result.append(v.to_placeholder())
             else:
                 result.append(v)
         return result
@@ -155,6 +157,8 @@ class MetaDict:
                 result[k] = v.to_dict()
             elif isinstance(v, MetaList):
                 result[k] = v.to_list()
+            elif isinstance(v, LinkNode):
+                result[k] = v.to_placeholder()
             else:
                 result[k] = v
         return result
@@ -168,6 +172,49 @@ class MetaDict:
 
     def __repr__(self):
         return f"MetaDict(data={self._data}, metadata={self._metadata}, ctrl={self._ctrl})"
+
+
+class LinkNode:
+    """内存树链接节点：寻址遇到它时进入 target 指向的地址。
+
+    target 以 `$` 开头 → 内存树地址（`$MEM.a.b`）；否则 → 设备唯一标识符。
+    链接的读写与元数据编辑都进入目标；target 只在创建时写入，运行期不改写。
+    跟随过程由 Memory 记访问集合，成环抛 MemoryCircularReferenceError。
+    """
+
+    def __init__(self, target: str, metadata=None, ctrl=None):
+        self.target = target
+        self._metadata: Optional[str] = metadata
+        self._ctrl: Optional[Dict[str, str]] = ctrl
+
+    def get_metadata(self):
+        return self._metadata
+
+    def set_metadata(self, metadata: str):
+        self._metadata = metadata
+
+    def get_ctrl(self):
+        """元数据二：给 Core/内核态的结构化控制信息"""
+        return self._ctrl
+
+    def set_ctrl(self, ctrl: Dict[str, str]):
+        self._ctrl = ctrl
+
+    def to_llm_string(self):
+        """链接自身的 LLM 表示（寻址会进入目标，这个表示只在直接展示节点时用到）"""
+        return f"link[target={self.target},metadata={self._metadata!r}]"
+
+    def to_placeholder(self):
+        """纯 JSON 结构里的占位（不跟随目标，避免只读转换产生寻址副作用）"""
+        return {"$link": self.target}
+
+    def __eq__(self, other):
+        if isinstance(other, LinkNode):
+            return self.target == other.target
+        return NotImplemented
+
+    def __repr__(self):
+        return f"LinkNode(target={self.target!r}, metadata={self._metadata!r}, ctrl={self._ctrl!r})"
 
 """AVM 消息类型定义"""
 from dataclasses import dataclass, field
@@ -455,7 +502,15 @@ class UserMessageBatch:
     user_contents: List[str] = field(default_factory=list)
 
     def add_tool_response(self, content: str, tool_call_id: str) -> None:
-        """添加工具响应。"""
+        """添加工具响应。
+
+        内容与配对 id 都必须是字符串：非字符串以 TypeError 拒绝（不静默 str()），
+        由指令边界翻成 Error 工具响应，避免活对象流进对话历史后在下一次 API 调用炸掉。
+        """
+        if not isinstance(content, str):
+            raise TypeError(f"工具响应内容必须是字符串，得到 {type(content).__name__}")
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            raise TypeError(f"工具响应的 tool_call_id 必须是非空字符串，得到 {tool_call_id!r}")
         self.tool_responses.append(ToolMessage(content=content, tool_call_id=tool_call_id))
 
     def add_user_content(self, content: str) -> None:
@@ -494,6 +549,7 @@ class UserMessageBatch:
 __all__ = [
     'MetaList',
     'MetaDict',
+    'LinkNode',
     'Role',
     'ToolCall',
     'Message',

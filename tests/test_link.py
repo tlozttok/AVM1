@@ -10,7 +10,7 @@ from avm.exceptions import MemoryCircularReferenceError, VMMemoryError
 from avm.image import ImageError, load_image
 from avm.memory import Memory
 from avm.memory_device import LinkDevice, BUILTIN_DEVICE_CLASSES
-from avm.types import MetaDict, MetaList
+from avm.types import MetaDict, MetaList, LinkNode
 
 
 def _python_node(code):
@@ -178,7 +178,7 @@ class TestImageBuiltin:
     def test_builtin_load_success(self, tmp_path):
         path = tmp_path / "link.json"
         path.write_text(json.dumps(self._image()), encoding="utf-8")
-        core = load_image(str(path))
+        core = load_image(Core(), str(path))
         assert isinstance(core.mem._devices["rooms"], LinkDevice)
         assert core.unwrap("$MEM.rooms", for_llm=True) == "dict[keys=[],metadata='rooms']"
 
@@ -186,20 +186,20 @@ class TestImageBuiltin:
         path = tmp_path / "link.json"
         path.write_text(json.dumps(self._image(extra={"file": "foo.py"})), encoding="utf-8")
         with pytest.raises(ImageError, match="builtin=true 不允许提供 file"):
-            load_image(str(path))
+            load_image(Core(), str(path))
 
     def test_unreachable_target_fails_load(self, tmp_path):
         path = tmp_path / "link.json"
         path.write_text(json.dumps(self._image(rooms_target="$MEM.nope")), encoding="utf-8")
         with pytest.raises(ImageError, match="目标不可达"):
-            load_image(str(path))
+            load_image(Core(), str(path))
 
     def test_builtin_class_registry(self):
         assert "LinkDevice" in BUILTIN_DEVICE_CLASSES
 
 
 class TestPersistence:
-    def test_save_does_not_include_link(self, tmp_path):
+    def test_save_persists_mount_link_not_device(self, tmp_path):
         core = Core()
         core.mem["deep"] = {"x": "1"}
         _mount(core, "alias", "$MEM.deep")
@@ -207,9 +207,11 @@ class TestPersistence:
         core.mem.save(out)
 
         loaded = Memory.load(out)
-        # 设备不持久化；alias 不应出现在数据中
-        assert "alias" not in loaded._data
+        # 设备不持久化；挂载点以链接节点形式持久化（target 是设备标识符，重载后没有该设备）
         assert loaded._devices == {}
+        link = loaded._data["alias"]
+        assert isinstance(link, LinkNode)
+        assert link.target == "alias"
 
 
 class TestEventTransparency:

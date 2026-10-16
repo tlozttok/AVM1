@@ -74,6 +74,10 @@ def build(port: int, host: str, tick: float) -> None:
     core.mem["note"] = MetaDict(data={"v": "hi"}, metadata="一条笔记", ctrl={"owner": "0"})
     # 脚本执行器写这里：$MEM.note 的元数据留给 e2e 断言，别被 tick 覆盖
     core.mem["state"] = MetaDict(data={"tick": ""}, metadata="脚本执行器的计数", ctrl={"owner": "0"})
+    # 内存树链接节点（非挂载）：左栏要画成一行 link，读它进入 $MEM.note
+    from avm.types import LinkNode  # noqa: PLC0415
+
+    core.mem._data["alias"] = LinkNode(target="$MEM.note", metadata="指向 note 的链接")
 
     # 启动标志要在 attach_core 之前就位：被控制台托管时输入设备只等面板队列
     core.host_flags = {"console": True}
@@ -81,6 +85,10 @@ def build(port: int, host: str, tick: float) -> None:
     core.mem.mount("inputs", inputs)
     inputs.mount_path = "inputs"
     inputs.attach_core(core)
+    # 嵌套挂载：左栏那行的位置由树给出（$MEM.state 展开后是 log 一行），不靠父段算法另注入
+    from avm.memory_device import StringDevice  # noqa: PLC0415
+
+    core.mem.mount("state.log", StringDevice("最后一行"))
     core.lmu = ScriptedLMU(inputs, tick)
 
     init = core.start("你是 init 对话，按脚本行动。", "开始", "$MEM.model_params")

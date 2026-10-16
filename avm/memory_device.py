@@ -13,6 +13,7 @@ class MemoryDevice:
     """设备基类"""
 
     mount_path: Optional[str] = None  # 挂载键（不含 $MEM 前缀），由镜像加载器设置
+    device_id: Optional[str] = None  # 设备唯一标识符；缺省取挂载地址，镜像 devices 条目可用 "id" 覆盖
 
     def attach_core(self, core) -> None:
         """调试用：可选钩子，把 Core 引用交给设备（设备需要访问运行时状态时覆写）。"""
@@ -62,6 +63,9 @@ class MemoryDevice:
 
 class LinkDevice(MemoryDevice):
     """链接设备：把 $MEM 下的真实路径挂载为别名。
+
+    **不要用于新设计**（2026-10-12 标记）：别名机制改由内存树节点类 `LinkNode` 承担
+    （链接节点计划中）。本类暂时保留兼容与既有测试，不再扩展。
 
     对话只能看到别名；读取/写入/授权跟随真实目标。成环抛 MemoryCircularReferenceError，
     错误信息只含别名链，不暴露真实路径。

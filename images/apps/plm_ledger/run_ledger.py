@@ -15,6 +15,7 @@ for path in (HERE, ROOT):
         sys.path.insert(0, path)
 
 from avm.exceptions import VMMemoryError
+from avm.core import Core
 from avm.image import ImageError, load_image
 from avm.python_server import PLM_REGISTRY
 from plm_ledger_server import LedgerPLM
@@ -29,7 +30,7 @@ def main(argv=None) -> int:
     PLM_REGISTRY["plm.ledger"] = LedgerPLM
 
     try:
-        core = load_image(args.image)
+        core = load_image(Core(), args.image)
     except (ImageError, VMMemoryError, OSError, ValueError) as e:
         print(f"[plm_ledger] 镜像错误: {e}", file=sys.stderr)
         return 1

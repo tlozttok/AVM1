@@ -224,6 +224,14 @@ class Monitor:
 
     def _write_transcript(self, seq: int, call: dict) -> None:
         # TODO(issue): 全文文件写入失败（OSError）当前被静默吞掉；需要决定错误如何暴露
+        # 序列化先做：观测面不得成为内核退出路径（丁3）。失败降级为占位并报 stderr。
+        try:
+            request = json.dumps(call.get("messages"), ensure_ascii=False, indent=2)
+            tool_calls = json.dumps(call["tool_calls"], ensure_ascii=False, indent=2)
+        except (TypeError, ValueError) as e:
+            print(f"[AVM] 监测全文序列化失败（{type(e).__name__}: {e}），该帧降级为占位", file=sys.stderr)
+            request = f"<序列化失败：{type(e).__name__}: {e}>"
+            tool_calls = None
         try:
             with open(self._transcript_path, "a", encoding="utf-8") as f:
                 f.write(f"===== FRAME {seq} =====\n")
@@ -231,12 +239,12 @@ class Monitor:
                 if call.get("error"):
                     f.write(f"--- error ---\n{call['error']}\n")
                 f.write("--- request ---\n")
-                f.write(json.dumps(call.get("messages"), ensure_ascii=False, indent=2) + "\n")
+                f.write(request + "\n")
                 f.write("--- response ---\n")
                 if call.get("result") is not None:
                     f.write(str(call["result"]) + "\n")
-                if call.get("tool_calls"):
-                    f.write(json.dumps(call["tool_calls"], ensure_ascii=False, indent=2) + "\n")
+                if tool_calls:
+                    f.write(tool_calls + "\n")
                 f.write("\n")
         except OSError:
             pass

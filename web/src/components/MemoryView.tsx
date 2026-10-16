@@ -27,6 +27,29 @@ function NodeBody({ node, depth }: { node: MemoryNode; depth: number }) {
       </div>
     )
   }
+  if (node.kind === 'link') {
+    return (
+      <div className="kv">
+        <div>
+          <span className="key">链接目标</span>
+          <span className="mono">{node.target}</span>
+        </div>
+        <div>
+          <span className="key">metadata</span>
+          <span>
+            {node.metadata === null || node.metadata === undefined ? '—' : String(node.metadata)}
+          </span>
+        </div>
+        <div>
+          <span className="key">ctrl</span>
+          <span>{node.ctrl ? JSON.stringify(node.ctrl) : '—'}</span>
+        </div>
+        <div className="hint">
+          树里的链接节点没有子节点；读写这个引用会进入目标（$ 开头是内存地址，否则是设备标识符）。
+        </div>
+      </div>
+    )
+  }
   const entries: [string, MemoryNode][] =
     node.kind === 'dict'
       ? Object.entries((node as DictNode).children)

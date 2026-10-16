@@ -29,9 +29,9 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
 
 from .core import _build_tools, _instruction_registry
-from .exceptions import VMMemoryError
+from .exceptions import VMMemoryError, RunnerStop
 from .memory_device import MemoryDevice
-from .types import MetaDict, MetaList
+from .types import MetaDict, MetaList, LinkNode
 
 
 # ----------------------------------------------------------------------
@@ -96,6 +96,14 @@ def _jsonable(value: Any) -> Any:
             "ctrl": value.get_ctrl(),
             "children": [_jsonable(v) for v in value],
         }
+    if isinstance(value, LinkNode):
+        # 链接节点：只报 target 与元数据，不跟随（面板展示的是树本身）
+        return {
+            "kind": "link",
+            "target": value.target,
+            "metadata": value.get_metadata(),
+            "ctrl": value.get_ctrl(),
+        }
     if isinstance(value, MemoryDevice):
         return _describe_device(value)
     if isinstance(value, dict):
@@ -117,6 +125,8 @@ def _walk(node: Any, path: str = "", out: Optional[Dict[str, Any]] = None) -> Di
         out[path or "$MEM"] = {"kind": "list", "ctrl": node.get_ctrl(), "count": len(node)}
         for i in range(len(node)):
             _walk(node[i], f"{path}.{i}", out)
+    elif isinstance(node, LinkNode):
+        out[path] = {"kind": "link", "target": node.target}
     elif isinstance(node, MemoryDevice):
         out[path] = {"kind": "device", "type": type(node).__name__}
     else:
@@ -760,12 +770,13 @@ def main(argv=None) -> int:
         print("[console] 需要一个镜像路径", file=sys.stderr)
         return 1
 
+    from .boot import boot
     from .exceptions import VMMemoryError
-    from .image import ImageError, load_image
+    from .image import ImageError
 
     try:
-        core = load_image(args.image, checkpoint_in=args.checkpoint_in,
-                          host_flags={"console": True})
+        core = boot(args.image, checkpoint_in=args.checkpoint_in,
+                    host_flags={"console": True})
     except (ImageError, VMMemoryError, OSError, ValueError) as e:
         print(f"[console] 镜像错误: {e}", file=sys.stderr)
         return 1
@@ -780,8 +791,15 @@ def main(argv=None) -> int:
               f"cd web && npm install && npm run build；/ 会给出同样的提示", file=sys.stderr)
 
     console.running = True
+    # API 失败停下问运行者：策略由加载区（avm/boot.py）统一安装，面板宿主一样走终端
+    status = 0
     try:
         core.run()
+    except RunnerStop as e:
+        print(f"[console] {e}", file=sys.stderr)
+    except KeyboardInterrupt:
+        print("[console] 收到中断，写回后退出", file=sys.stderr)
+        status = 130
     finally:
         console.running = False
         persist_to = getattr(core, "persist_to", None)
@@ -792,7 +810,7 @@ def main(argv=None) -> int:
                 print(f"[console] 内存已写回 {persist_to}", file=sys.stderr)
             except OSError as e:
                 print(f"[console] 写回失败: {e}", file=sys.stderr)
-    return 0
+    return status
 
 
 if __name__ == "__main__":

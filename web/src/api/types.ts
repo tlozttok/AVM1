@@ -89,7 +89,7 @@ export interface State {
   snapshots: number
 }
 
-/** `/api/memory` 的节点：dict / list / str / device 四种 kind。 */
+/** `/api/memory` 的节点：dict / list / str / device / link 五种 kind。 */
 export interface DictNode {
   kind: 'dict'
   metadata: unknown
@@ -113,7 +113,20 @@ export interface DeviceNode {
   error?: string
 }
 
-export type MemoryNode = DictNode | ListNode | DeviceNode | string
+/**
+ * 链接节点：树里的一个键，寻址遇到它就进入 target（`$MEM` 地址或设备标识符）。
+ *
+ * 面板看到的是树本身，所以这里不跟随：没有 children。设备挂载点也是链接节点，
+ * 它们在左栏由设备行（`GET /api/devices`）呈现，不再重复画一行。
+ */
+export interface LinkNode {
+  kind: 'link'
+  target: string
+  metadata: unknown
+  ctrl: Record<string, unknown> | null
+}
+
+export type MemoryNode = DictNode | ListNode | DeviceNode | LinkNode | string
 
 export interface MemoryResponse {
   ref: string

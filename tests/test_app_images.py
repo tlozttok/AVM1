@@ -13,8 +13,10 @@ from pathlib import Path
 import pytest
 
 from avm.exceptions import MemoryTypeError
+from avm.core import Core
 from avm.image import load_image
 from avm.python_server import PLM_REGISTRY
+from avm.types import LinkNode
 
 ROOT = Path(__file__).resolve().parents[1]
 APPS = ROOT / "images" / "apps"
@@ -88,13 +90,15 @@ def _state(core):
 
 class TestCourierOfficeImage:
     def test_image_loads_and_mounts_board(self):
-        core = load_image(str(COURIER_IMAGE))
+        core = load_image(Core(), str(COURIER_IMAGE))
         conv = core.get_conversation(0)
         assert conv.name == "dispatcher"
         assert conv.is_root
 
-        # 设备是挂载点，不进入数据树
-        assert "board" not in core.mem._data
+        # 设备挂载点物化为链接节点，设备表保留地址
+        link = core.mem._data["board"]
+        assert isinstance(link, LinkNode)
+        assert link.target == "board"
         assert "board" in core.mem._devices
         assert core.unwrap("$MEM.board") == (
             "list[len=0,metadata='courier_office 完工记录板（只追加）']"
@@ -106,7 +110,7 @@ class TestCourierOfficeImage:
         assert core.unwrap("$MEM.para.simple", for_llm=False).get_ctrl()["type"] == "para"
 
     def test_board_device_append_and_index_semantics(self):
-        core = load_image(str(COURIER_IMAGE))
+        core = load_image(Core(), str(COURIER_IMAGE))
         board = core.mem._devices["board"]
 
         # 追加走显式 append 路径
@@ -130,7 +134,7 @@ class TestCourierOfficeImage:
             board["append"] = 123
 
     def test_full_scripted_run(self, capsys):
-        core = load_image(str(COURIER_IMAGE))
+        core = load_image(Core(), str(COURIER_IMAGE))
         core.lmu = ScriptedLMU({
             0: [
                 ("", [
@@ -188,7 +192,7 @@ class TestCourierOfficeImage:
 
 
     def test_close_conversation_ends_individual(self):
-        core = load_image(str(COURIER_IMAGE))
+        core = load_image(Core(), str(COURIER_IMAGE))
         core.lmu = ScriptedLMU({
             0: [("", [tool("x1", "close_conversation", cid=0)], None)],
         })
@@ -206,7 +210,7 @@ class TestCourierOfficeImage:
 
 class TestVaultGuardImage:
     def _run_task(self, task):
-        core = load_image(str(VAULT_IMAGE))
+        core = load_image(Core(), str(VAULT_IMAGE))
         core.lmu = ScriptedLMU({
             0: [
                 ("", [
@@ -242,7 +246,7 @@ class TestVaultGuardImage:
         return core
 
     def test_image_loads_owner_and_handlers(self):
-        core = load_image(str(VAULT_IMAGE))
+        core = load_image(Core(), str(VAULT_IMAGE))
         vault = core.unwrap("$MEM.vault", for_llm=False)
         assert vault.get_ctrl()["owner"] == "0"
         assert core.unwrap("$MEM.vault.deposit", for_llm=False) == "EMPTY"
@@ -314,7 +318,7 @@ class TestPlmLedger:
             sys.path.remove(sys_path)
 
     def test_image_loads(self):
-        core = load_image(str(LEDGER_IMAGE))
+        core = load_image(Core(), str(LEDGER_IMAGE))
         assert core.unwrap("$MEM.programs.ledger", for_llm=False).get_ctrl()["type"] == "python"
         assert core.unwrap("$MEM.para.ledger", for_llm=False)["model"] == "plm.ledger"
 
@@ -358,7 +362,7 @@ class TestPlmLedger:
         assert server.handle_messages(messages, params)["content"] == "5.0"
 
     def test_full_scripted_run(self, _ledger_registry, capsys):
-        core = load_image(str(LEDGER_IMAGE))
+        core = load_image(Core(), str(LEDGER_IMAGE))
         core.lmu = ScriptedLMU({
             0: [
                 ("", [
@@ -389,10 +393,14 @@ class TestPlmLedger:
         assert [cid for cid, _ in core.lmu.calls] == [0, 0, 0]
 
     def test_python_conversation_rejects_unregistered_plm(self, monkeypatch):
-        # 模拟镜像已加载但宿主忘了注册：创建 Python 亚对话时 Core 必须报错，不静默回退 LLM
+        """镜像已加载但宿主忘了注册：创建 Python 亚对话时就在输入边界报错，不静默回退 LLM。
+
+        2026-10-16 起这条走模型目录的命名空间校验（create_sub 收 Error 工具响应），
+        不再等到亚对话第一次推理。
+        """
         import avm.core as core_module
         monkeypatch.delitem(core_module.PLM_REGISTRY, "plm.ledger", raising=False)
-        core = load_image(str(LEDGER_IMAGE))
+        core = load_image(Core(), str(LEDGER_IMAGE))
         core.lmu = ScriptedLMU({
             0: [
                 ("", [
@@ -402,5 +410,8 @@ class TestPlmLedger:
                 ], None),
             ],
         })
-        with pytest.raises(ValueError, match="PLM_REGISTRY"):
-            core.run()
+        core._active_cid = core._ready_cids.pop(0)
+        core.advance_conversation()
+        responses = [r.content for r in core._conv_by_cid[0].user_batch.tool_responses]
+        assert any("不是 PLM 注册名" in r for r in responses), responses
+        assert core.get_conversation(1) is None, "校验失败不得创建对话"

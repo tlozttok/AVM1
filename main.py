@@ -16,8 +16,9 @@ import json
 import os
 import sys
 
-from avm.exceptions import VMMemoryError
-from avm.image import ImageError, load_image
+from avm.boot import boot
+from avm.exceptions import VMMemoryError, RunnerStop
+from avm.image import ImageError
 from avm.monitor import Monitor
 
 
@@ -95,7 +96,7 @@ def main(argv=None) -> int:
         checkpoint_in = os.path.join(config_dir, checkpoint_in)
 
     try:
-        core = load_image(image, checkpoint_in=checkpoint_in)
+        core = boot(image, checkpoint_in=checkpoint_in)
     except (ImageError, VMMemoryError, OSError, ValueError) as e:
         print(f"[AVM] 镜像错误: {e}", file=sys.stderr)
         return 1
@@ -103,8 +104,14 @@ def main(argv=None) -> int:
     if transcript:
         core.monitor = Monitor(max_frames=2000, transcript_path=transcript)
 
+    status = 0
     try:
         core.run()
+    except RunnerStop as e:
+        print(f"[AVM] {e}", file=sys.stderr)
+    except KeyboardInterrupt:
+        print("[AVM] 收到中断，写回后退出", file=sys.stderr)
+        status = 130
     finally:
         persist_to = getattr(core, "persist_to", None)
         if persist_to:
@@ -116,7 +123,7 @@ def main(argv=None) -> int:
                 print(f"[AVM] 写回失败: {e}", file=sys.stderr)
         if frames:
             _print_frames(core)
-    return 0
+    return status
 
 
 if __name__ == "__main__":

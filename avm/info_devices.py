@@ -88,10 +88,10 @@ class MemorySummaryDevice(MemoryDevice):
         return "str"
 
     def to_llm_string(self):
-        from .types import MetaDict, MetaList
+        from .types import MetaDict, MetaList, LinkNode
 
         root = self._core.mem._data
-        counts = {"dict": 0, "list": 0, "str": 0}
+        counts = {"dict": 0, "list": 0, "str": 0, "link": 0}
 
         def walk(v):
             if isinstance(v, MetaDict):
@@ -102,6 +102,9 @@ class MemorySummaryDevice(MemoryDevice):
                 counts["list"] += 1
                 for x in v:
                     walk(x)
+            elif isinstance(v, LinkNode):
+                # 链接只计数，不跟随：摘要是只读展示，跟随会带来寻址副作用
+                counts["link"] += 1
             else:
                 counts["str"] += 1
 

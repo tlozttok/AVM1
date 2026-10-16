@@ -17,7 +17,9 @@ import pytest
 from main import main
 
 from avm.core import MemoryWriteInstruction
+from avm.core import Core
 from avm.image import load_image
+from avm.types import LinkNode
 
 ROOT = Path(__file__).resolve().parents[1]
 GAME_IMAGE = ROOT / "images" / "games" / "echo_mine" / "echo_mine.json"
@@ -84,7 +86,7 @@ def _state(core):
 
 class TestEchoMineImage:
     def test_image_loads_world_programs_and_devices(self):
-        core = load_image(str(GAME_IMAGE))
+        core = load_image(Core(), str(GAME_IMAGE))
 
         conv = core.get_conversation(0)
         assert conv.name == "guide"
@@ -103,11 +105,13 @@ class TestEchoMineImage:
 
         assert "dice" in core.mem._devices
         assert "map" in core.mem._devices
-        assert "dice" not in core.mem._data
-        assert "map" not in core.mem._data
+        # 挂载点在数据树里是链接节点（指向设备标识符），不是设备内容
+        assert isinstance(core.mem._data["dice"], LinkNode)
+        assert core.mem._data["dice"].target == "dice"
+        assert core.mem._data["map"].target == "map"
 
     def test_dice_device_returns_d6(self):
-        core = load_image(str(GAME_IMAGE))
+        core = load_image(Core(), str(GAME_IMAGE))
         dice = core.mem._devices["dice"]
         assert "d6" in core.unwrap("$MEM.dice")
         for _ in range(30):
@@ -115,7 +119,7 @@ class TestEchoMineImage:
             assert 1 <= value <= 6
 
     def test_map_device_renders_player_position_from_memory(self):
-        core = load_image(str(GAME_IMAGE))
+        core = load_image(Core(), str(GAME_IMAGE))
         text = core.unwrap("$MEM.map")
         assert "[entrance]  *你在这里*" in text
         assert "[cavern]" in text and "[vault]" in text
@@ -126,7 +130,7 @@ class TestEchoMineImage:
         assert "[entrance]  *你在这里*" not in text
 
     def test_hp_guard_clamps_and_replaces(self):
-        core = load_image(str(GAME_IMAGE))
+        core = load_image(Core(), str(GAME_IMAGE))
         core.events.register(
             0, "memory_write", "$MEM.world.player.hp", "$MEM.handlers.hp_guard", phase="before"
         )
@@ -149,7 +153,7 @@ class TestEchoMineImage:
 
 class TestEchoMineVictory:
     def test_victory_branch_closes_ghost_and_guide(self, capsys):
-        core = load_image(str(GAME_IMAGE))
+        core = load_image(Core(), str(GAME_IMAGE))
         core.mem.set("$MEM.world.player.room_id", "vault")
         core.mem.set("$MEM.world.player.gold", "10")
         core.lmu = ScriptedLMU({
@@ -181,7 +185,7 @@ class TestEchoMineVictory:
 
 class TestEchoMineFullTurn:
     def test_scripted_game_turn_search_move_talk(self, capsys):
-        core = load_image(str(GAME_IMAGE))
+        core = load_image(Core(), str(GAME_IMAGE))
         core.lmu = ScriptedLMU({
             0: [
                 # 初始化：注册 HP 守卫、创建 ghost、进入 playing、打印开场白
@@ -357,7 +361,7 @@ class TestEchoMineMainEntrypoint:
 
 class TestEchoMineHPAfterEvent:
     def test_trap_zero_hp_notifies_ghost_and_alert_wakes_guide(self, capsys):
-        core = load_image(str(GAME_IMAGE))
+        core = load_image(Core(), str(GAME_IMAGE))
         core.lmu = ScriptedLMU({
             0: [
                 # 初始化：先建 ghost(cid=1)，再注册 hp before/after 监听
@@ -425,7 +429,7 @@ class TestEchoMineHPAfterEvent:
 class TestEchoMineFullWinPlaythrough:
     def test_four_searches_two_moves_and_exit_win(self, capsys):
         """从初始状态自然打完整局：4 次 search 攒满 10 gold，2 次 move 到达 vault，exit 胜利。"""
-        core = load_image(str(GAME_IMAGE))
+        core = load_image(Core(), str(GAME_IMAGE))
 
         def search_turn(search_no):
             return [

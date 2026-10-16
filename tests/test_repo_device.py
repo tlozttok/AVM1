@@ -256,7 +256,7 @@ class TestRepoImage:
     """出厂镜像 images/repo_tester.json：在用户指导下按 AVM 实际代码测整个系统；读文件接口从设备自述读出；镜像不规定步骤。"""
 
     def test_image_loads_device_and_terminal(self):
-        core = load_image(str(IMAGE_FILE))
+        core = load_image(Core(), str(IMAGE_FILE))
         conv = core.get_conversation(0)
         assert conv.name == "repo_tester" and conv.is_root
         assert {"AVMRepo", "inputs", "outputs"} <= set(core.mem._devices)
@@ -279,7 +279,7 @@ class TestRepoImage:
             assert token not in prompt
 
     def test_manual_reaches_conversation_through_memory_read(self):
-        core = load_image(str(IMAGE_FILE))
+        core = load_image(Core(), str(IMAGE_FILE))
         conv = core.get_conversation(0)
         MemoryReadInstruction("tc1", conv.cid, {"ref": "$MEM.AVMRepo"}).execute(core, conv)
         manual = conv.user_batch.tool_responses[-1].content
@@ -323,7 +323,7 @@ class TestImage:
         }
         image_path = tmp_path / "image.json"
         image_path.write_text(json.dumps(image, ensure_ascii=False), encoding="utf-8")
-        core = load_image(str(image_path))
+        core = load_image(Core(), str(image_path))
         assert "alpha" in core.unwrap('$MEM.AVMRepo.read."pkg/mod.py".0', for_llm=True)
 
     def test_non_repo_root_fails_at_load(self, tmp_path):

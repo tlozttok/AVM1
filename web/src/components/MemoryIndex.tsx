@@ -5,11 +5,11 @@ import type { DeviceInfo, DictNode, ListNode, MemoryNode } from '../api/types'
 interface Props {
   root: MemoryNode | null
   /**
-   * 已挂载设备。整树读取不含设备（它们在 Memory._devices 表里，不在数据树上），这里合并进来。
+   * 已挂载设备（按作者 2026-10-13 的定夺：设备显示在树里，行上标出类型）。
    *
-   * TODO(issue)：`GET /api/memory` 的整树输出没有设备行，前端只能另取 `GET /api/devices` 补齐。
-   * 三条路——保持前端合并（当前做法）、让整树带上设备行（改这个端点的响应形状）、
-   * 另开一个只读的树端点——留给作者定夺；选定前不改后端。
+   * 树里的挂载点就是链接节点，左栏照树画：挂载点那行的位置来自树，类型取这里的 `type`
+   * （取不到就退回链接本身的信息），`看` 打开设备视图——描述与动作由 `GET /api/devices` 提供。
+   * 不再按 `devices` 往树里注入行：那样位置来自挂载键的父段，与树里的位置是两套算法。
    */
   devices: DeviceInfo[]
   busy: boolean
@@ -32,18 +32,16 @@ function kindLabel(node: MemoryNode): string {
 function preview(node: MemoryNode): string {
   if (typeof node === 'string') return node.length > 40 ? `${node.slice(0, 40)}…` : node
   if (node.kind === 'device') return node.preview ?? ''
+  // 链接节点没有 children：它是树里的一个键，读它才进入 target
+  if (node.kind === 'link') return `→ ${node.target}`
   const count = node.kind === 'dict' ? Object.keys(node.children).length : node.children.length
   return `${count} 项`
 }
 
-/** 挂在这一层下面的设备（挂载键 'sys.log' 挂在 $MEM.sys 下）。 */
-function devicesUnder(ref: string, devices: DeviceInfo[]): DeviceInfo[] {
-  const prefix = ref === '$MEM' ? '' : ref.slice('$MEM.'.length)
-  return devices.filter((device) => {
-    const mount = device.mount
-    const parent = mount.includes('.') ? mount.slice(0, mount.lastIndexOf('.')) : ''
-    return parent === prefix
-  })
+/** 挂在这个引用上的设备（挂载点也是链接节点，行由树给出）。 */
+function deviceAt(ref: string, devices: DeviceInfo[]): DeviceInfo | undefined {
+  const mount = ref === '$MEM' ? '' : ref.slice('$MEM.'.length)
+  return devices.find((device) => device.mount === mount)
 }
 
 export default function MemoryIndex({
@@ -113,29 +111,35 @@ export default function MemoryIndex({
     setReadState((prev) => ({ ...prev, pending: false, message: '已取消等待' }))
   }
 
-  const renderDevice = (device: DeviceInfo, depth: number) => {
-    const ref = `$MEM.${device.mount}`
-    return (
-      <div key={ref} className="tree-node" style={{ paddingLeft: depth * 12 }}>
-        <div className="tree-row" data-ref={ref}>
-          <button
-            type="button"
-            className="tree-toggle"
-            title={ref}
-            onClick={() => onSelect(ref, device.description)}
-          >
-            · {device.mount}
-          </button>
-          <span className="muted small">device {device.type}</span>
-          <button type="button" className="link" onClick={() => onSelect(ref, device.description)}>
-            看
-          </button>
-        </div>
-      </div>
-    )
-  }
-
   const renderNode = (ref: string, name: string, node: MemoryNode, depth: number) => {
+    // 链接节点：树里的键，没有子节点（读它才进入 target）。挂载点上就是设备行——
+    // 位置来自树，行上标出设备类型，`看` 打开设备视图。
+    if (typeof node !== 'string' && node.kind === 'link') {
+      const device = deviceAt(ref, devices)
+      const label = device ? `device ${device.type}` : `link → ${node.target}`
+      return (
+        <div key={ref} className="tree-node" style={{ paddingLeft: depth * 12 }}>
+          <div className="tree-row" data-ref={ref}>
+            <button
+              type="button"
+              className="tree-toggle"
+              title={ref}
+              onClick={() => onSelect(ref, device ? device.description : node)}
+            >
+              · {name}
+            </button>
+            <span className="muted small">{label}</span>
+            <button
+              type="button"
+              className="link"
+              onClick={() => onSelect(ref, device ? device.description : node)}
+            >
+              看
+            </button>
+          </div>
+        </div>
+      )
+    }
     const isContainer = typeof node !== 'string' && node.kind !== 'device'
     const open = expanded.has(ref)
     return (
@@ -165,7 +169,6 @@ export default function MemoryIndex({
               : (node as ListNode).children.map((child, index) =>
                   renderNode(`${ref}.${index}`, String(index), child, depth + 1),
                 )}
-            {devicesUnder(ref, devices).map((device) => renderDevice(device, depth + 1))}
           </div>
         ) : null}
       </div>

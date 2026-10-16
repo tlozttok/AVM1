@@ -19,12 +19,13 @@ import sys
 from typing import Optional
 
 from .core import Core
-from .exceptions import VMMemoryError
+from .exceptions import VMMemoryError, RunnerStop
 from .memory_device import MemoryDevice, BUILTIN_DEVICE_CLASSES
-from .types import MetaDict, MetaList
+from .runner_prompt import prompt_api_error
+from .types import MetaDict, MetaList, LinkNode
 
 IMAGE_VERSION = 1
-KINDS = ("str", "dict", "list", "device")
+KINDS = ("str", "dict", "list", "device", "link")
 
 
 class ImageError(ValueError):
@@ -65,6 +66,12 @@ def _parse_node(value, path, markers):
             data=[_parse_node(v, path + [str(i)], markers) for i, v in enumerate(node_value)],
             metadata=meta, ctrl=ctrl,
         )
+    if kind == "link":
+        # 链接节点：target 以 $ 开头是内存树地址，否则是设备标识符（内核侧声明，不开放指令创建）
+        target = value.get("target")
+        if not isinstance(target, str) or not target:
+            raise ImageError(f"{path}: link 节点的 target 必须是非空字符串")
+        return LinkNode(target=target, metadata=meta, ctrl=ctrl)
     # kind == "device"
     markers.append(".".join(path))
     return None
@@ -84,6 +91,9 @@ def _mount_devices(core: Core, image_path: str, devices: list, mem_device_paths:
     base = os.path.dirname(os.path.abspath(image_path))
     mounted = set()
     for dev in devices:
+        if not isinstance(dev, dict):
+            # devices 段是数组但条目不是对象（如 ["a"]）时，dev.get 抛 AttributeError
+            raise ImageError(f"devices 条目必须是对象，得到 {type(dev).__name__}")
         path = dev.get("path")
         if not isinstance(path, str) or not path:
             raise ImageError("devices 条目必须包含非空 path")
@@ -115,6 +125,11 @@ def _mount_devices(core: Core, image_path: str, devices: list, mem_device_paths:
             device = cls(**args)
         except TypeError as e:
             raise ImageError(f"设备 {path}: 实例化失败（args 与构造函数不匹配）: {e}")
+        device_id = dev.get("id")
+        if device_id is not None:
+            if not isinstance(device_id, str) or not device_id:
+                raise ImageError(f"设备 {path}: id 必须是非空字符串")
+            device.device_id = device_id
         core.mem.mount(path, device)
         device.mount_path = path
         # 调试用：把 Core 引用交给设备（检查点 /save 等调试命令需要访问运行时状态）
@@ -178,29 +193,41 @@ def _start_init(core: Core, init: dict):
     conv.name = name
 
 
-def load_image(image_path: str, checkpoint_in: Optional[str] = None,
+def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
                host_flags: Optional[dict] = None) -> Core:
-    """加载系统镜像并完成全部启动配置（不运行）。
+    """把系统镜像加载进一个空核心并完成全部装载配置（不运行）。
+
+    生命周期三段里的第二段：创建空核心（Core()）→ 加载镜像（本函数）→ 启动核心
+    （avm/boot.py 的 start_core；宿主通常直接用加载区的 boot() 走完三段）。
 
     checkpoint_in：调试用——启动时加载单对话检查点（跳过 init，恢复为就绪对话）。
     host_flags：启动标志——本次运行由哪个宿主托管（如 {"console": True}）。宿主事实，
     不属于镜像内容，不进 $MEM。在挂载设备之前写入 Core，设备可在 attach_core 里读；
     核心启动后不再变化。不传则空，设备行为与从前一致。
     """
+    if core._conv_by_cid:
+        raise ImageError(
+            f"load_image 需要一个空核心（当前已有 {len(core._conv_by_cid)} 个对话）："
+            f"先用 Core() 建空核心，再往里装载"
+        )
     if not os.path.isfile(image_path):
         raise ImageError(f"镜像文件不存在: {image_path}")
     with open(image_path, "r", encoding="utf-8") as f:
         image = json.load(f)
     if not isinstance(image, dict):
         raise ImageError("镜像根节点必须是对象")
-    meta = image.get("meta") or {}
+    meta = image.get("meta")
+    if meta is None:
+        meta = {}
+    elif not isinstance(meta, dict):
+        # `or {}` 会放过真值非对象（如 1、"x"、[1]），随后 meta.get 抛 AttributeError
+        raise ImageError(f"meta 必须是对象，得到 {type(meta).__name__}")
     version = meta.get("version", 1)
     if version != IMAGE_VERSION:
         raise ImageError(f"不支持的镜像版本 {version}（当前支持 {IMAGE_VERSION}）")
     if not isinstance(image.get("mem"), dict):
         raise ImageError("镜像必须包含 mem 段（对象）")
 
-    core = Core()
     if host_flags is not None and not isinstance(host_flags, dict):
         raise ImageError("host_flags 必须是对象")
     for key in (host_flags or {}):
@@ -221,8 +248,16 @@ def load_image(image_path: str, checkpoint_in: Optional[str] = None,
             continue
         root[key] = parsed
     core.mem._data = root
+    # Core 的内建设备在 __init__ 里挂载，早于这次整树替换；按设备表把挂载点链接重新物化
+    core.mem.materialize_mount_links()
+    # 启动自带的模型目录同样会被整树替换冲掉，这里重装（幂等，镜像已有的字段不覆盖）
+    core.install_model_catalog()
 
-    core.para_ref = _resolve_para(core, image.get("para_ref", "$MEM.model_params"))
+    para_ref = image.get("para_ref", "$MEM.model_params")
+    if not isinstance(para_ref, str) or not para_ref:
+        # 显式 null / 数字 / 空串都会让 core.unwrap 抛 AttributeError（不是 ImageError）
+        raise ImageError(f"para_ref 必须是非空字符串，得到 {para_ref!r}")
+    core.para_ref = _resolve_para(core, para_ref)
     _mount_devices(core, image_path, image.get("devices") or [], device_markers)
 
     init = image.get("init")
@@ -238,6 +273,12 @@ def load_image(image_path: str, checkpoint_in: Optional[str] = None,
         if not isinstance(init, dict):
             raise ImageError("init 段必须是对象")
         _start_init(core, init)
+    else:
+        # 静默的"空镜像"：没有对话会被启动，run() 立即返回、退出码 0、persist_to 照写
+        print(
+            "[AVM] 警告：镜像没有 init 段（或为空），不会有对话启动，run() 将立即返回",
+            file=sys.stderr,
+        )
 
     persist_to = image.get("persist_to")
     if persist_to is not None:
@@ -254,13 +295,21 @@ def main(argv=None) -> int:
     parser.add_argument("--checkpoint-in", metavar="PATH",
                         help="调试用：启动时加载单对话检查点（跳过 init，恢复为就绪对话）")
     args = parser.parse_args(argv)
+    # 局部导入：boot 依赖本模块的 load_image，模块级导入会成环
+    from .boot import boot
     try:
-        core = load_image(args.image, checkpoint_in=args.checkpoint_in)
+        core = boot(args.image, checkpoint_in=args.checkpoint_in)
     except (ImageError, VMMemoryError, OSError, json.JSONDecodeError) as e:
         print(f"[AVM] 镜像错误: {e}", file=sys.stderr)
         return 1
+    status = 0
     try:
         core.run()
+    except RunnerStop as e:
+        print(f"[AVM] {e}", file=sys.stderr)
+    except KeyboardInterrupt:
+        print("[AVM] 收到中断，写回后退出", file=sys.stderr)
+        status = 130
     finally:
         persist_to = getattr(core, "persist_to", None)
         if persist_to:
@@ -270,7 +319,7 @@ def main(argv=None) -> int:
                 print(f"[AVM] 内存已写回 {persist_to}")
             except OSError as e:
                 print(f"[AVM] 写回失败: {e}", file=sys.stderr)
-    return 0
+    return status
 
 
 if __name__ == "__main__":

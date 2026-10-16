@@ -203,7 +203,11 @@ class TestExceptionPath:
         assert f.sched["active_cid"] == 0  # 崩溃点状态保留
 
     def test_real_lmu_last_call_captured_on_api_error(self):
-        """真实 LMU.exec：API 抛异常 → last_call 记录请求全文 + 异常传播"""
+        """真实 LMU.exec：API 抛异常 → last_call 记录请求全文；没装策略时按退出处理
+
+        API 失败不再直接结束进程：记帧后问运行者。没装 api_error_policy（无人值守或
+        测试）按退出处理，抛 RunnerStop 由宿主干净收尾。
+        """
         class FakeCompletions:
             @staticmethod
             def create(**kwargs):
@@ -216,6 +220,7 @@ class TestExceptionPath:
             chat = FakeChat
 
         from avm.core import LMU
+        from avm.exceptions import RunnerStop
 
         lmu = LMU()
         lmu._client = FakeClient
@@ -225,8 +230,9 @@ class TestExceptionPath:
         core._active_cid = core._ready_cids.pop(0)
         core.monitor.record_baseline(core)
 
-        with pytest.raises(ConnectionError):
+        with pytest.raises(RunnerStop) as excinfo:
             core.advance_conversation()
+        assert "ConnectionError: network down" in str(excinfo.value)
 
         assert lmu.last_call["error"] == "ConnectionError: network down"
         assert lmu.last_call["messages"][-1]["role"] == "user"

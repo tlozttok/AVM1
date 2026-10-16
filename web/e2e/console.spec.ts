@@ -31,11 +31,26 @@ test('观测：调度、对话详情、内存索引与设备信息', async ({ pa
   await tree.locator('[data-ref="$MEM.note"]').getByRole('button', { name: '看' }).click()
   await expect(page.getByTestId('memory-view')).toContainText('一条笔记')
 
-  // 设备节点 → 设备信息（第一轮只读）
-  await tree.locator('[data-ref="$MEM.inputs"]').getByRole('button', { name: '看' }).click()
+  // 链接节点：一行 link，报出 target，不展开（曾经的 bug：前端把 link 当 list，整棵面板崩掉）
+  await expect(tree.locator('[data-ref="$MEM.alias"]')).toContainText('link')
+  await expect(tree.locator('[data-ref="$MEM.alias"]')).toContainText('→ $MEM.note')
+  await tree.locator('[data-ref="$MEM.alias"]').getByRole('button', { name: '看' }).click()
+  await expect(page.getByTestId('memory-view')).toContainText('$MEM.note')
+
+  // 挂载点：行来自内存树（链接节点），标出设备类型，`看` 进设备视图；只画一行
+  const inputs = tree.locator('[data-ref="$MEM.inputs"]')
+  await expect(inputs).toHaveCount(1)
+  await expect(inputs).toContainText('device InputsListDevice')
+  await inputs.getByRole('button', { name: '看' }).click()
   const device = page.getByTestId('device-view')
   await expect(device).toContainText('InputsListDevice')
   await expect(device).toContainText('投喂一行输入')
+
+  // 嵌套挂载：$MEM.state 展开后，log 那行也在树里（不是父段算法另注入的行）
+  await tree.locator('[data-ref="$MEM.state"]').getByRole('button', { name: /state/ }).click()
+  const nested = tree.locator('[data-ref="$MEM.state.log"]')
+  await expect(nested).toHaveCount(1)
+  await expect(nested).toContainText('device StringDevice')
 
   // 读一个具体路径：ref 输入框
   await page.getByTestId('ref-input').fill('$MEM.note.v')
@@ -126,4 +141,8 @@ test('构建产物由 console 自己托管：同一个面板从 8791 打开', as
   await expect(page.getByTestId('status-banner')).toContainText('运行中')
   await expect(page.getByTestId('action-tools-source')).toContainText('GET /api/tools')
   await expect(page.getByTestId('event-log-connected')).toContainText('SSE 已连接')
+  // 内存树在构建产物里也要能画链接节点（崩溃是渲染期的，产物同样中招）
+  const tree = page.getByTestId('memory-tree')
+  await expect(tree.locator('[data-ref="$MEM.alias"]')).toContainText('→ $MEM.note')
+  await expect(tree.locator('[data-ref="$MEM.inputs"]')).toHaveCount(1)
 })

@@ -607,7 +607,7 @@ class TestLMUExecCalled:
 
 
 # ------------------------------------------------------------------
-# 工具调用错误反馈（原来被静默丢弃）
+# 工具调用错误反馈（错误面向运行者；协议层另回一条中性占位保住配对）
 # ------------------------------------------------------------------
 
 class TestToolCallErrorFeedback:
@@ -628,7 +628,8 @@ class TestToolCallErrorFeedback:
         core._process_return_calls(return_calls, conv)
         err = capsys.readouterr().err
         assert "不是合法 JSON" in err
-        assert _batch(core, conv.cid) == []  # 不喂回 LLM
+        # 错误细节只给运行者；对话侧只拿到中性占位，保住 tool_calls 与 tool 消息的配对
+        assert _batch(core, conv.cid) == [("（该工具调用未执行）", "tc-bad")]
 
     def test_unknown_tool_reported_to_stderr(self, capsys):
         """解析器不查指令集：未知名字原样留在 cmd_type，由处理指令时判断。"""
@@ -644,7 +645,7 @@ class TestToolCallErrorFeedback:
         err = capsys.readouterr().err
         assert "未知工具 definitely_not_a_tool" in err
         assert '{"a": 1}' in err
-        assert _batch(core, conv.cid) == []
+        assert _batch(core, conv.cid) == [("（该工具调用未执行）", "tc-bad")]
 
     def test_malformed_json_conversation_stays_active(self, capsys):
         """json_error 不结束对话：错误面向运行者输出，对话继续"""
@@ -657,7 +658,7 @@ class TestToolCallErrorFeedback:
 
         core.advance_conversation()
         assert core._active_cid == 0  # 仍活跃
-        assert _batch(core, 0) == []  # 没有工具响应进 batch
+        assert _batch(core, 0) == [("（该工具调用未执行）", "tc1")]  # 只有中性占位
         assert "不是合法 JSON" in capsys.readouterr().err
 
         core.advance_conversation()

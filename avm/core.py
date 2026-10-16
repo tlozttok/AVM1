@@ -8,8 +8,8 @@ import sys
 import time
 
 from .types import MetaList, MetaDict
-from .exceptions import VMSyntaxError, VMMemoryError
-from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, message_to_api_dict
+from .exceptions import VMSyntaxError, VMMemoryError, APIError, RunnerStop, KernelPanic
+from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, message_to_api_dict, LinkNode
 from .memory import Memory
 from .memory_device import MemoryDevice
 from .monitor import Monitor
@@ -66,6 +66,110 @@ def _publish_memory_after(
     )
 
 
+# 指令执行体约定的错误类：可判定、可返回给对话的一类。九条指令共用同一套，
+# 不在这套之内的异常是内核缺陷，由 advance_conversation 记帧后向上抛（不在这里吞）。
+_INSTRUCTION_ERRORS = (VMMemoryError, KeyError, IndexError, TypeError, ValueError)
+
+
+# 启动自带的内存节点：模型目录。普通内存节点，不是设备——不产生事件、不参与调度。
+# 名字里的点号是禁的（$MEM 寻址按点切段），所以 plm.* 与带点的模型 id 一律装进列表项的字段。
+MODEL_CATALOG_KEY = "model_catalog"
+_CATALOG_META = "模型目录：可用的 LLM 模型与本地 PLM；两侧都写明各自接受的参数"
+_PLM_PARAMS_NOTE = "只有 model 有效；tools 由内核注入；LLM 参数无效"
+_PLM_OPERATOR_NOTE = "只能由宿主创建（plm.operator 需要注入操作员通道）；不能由镜像声明"
+
+
+def _first_line(text: str, limit: int = 72) -> str:
+    """取文档串首行，超长截断——目录里的说明要能一眼看完。"""
+    line = (text or "").strip().split("\n", 1)[0].strip()
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+# 协议层拒绝（JSON 解析失败、未知工具名、缺少可配对的 call_id）时回给对话的占位文本。
+# 内容不携带错误细节：错误面向运行者（_report_tool_error），这里只为保住
+# 「assistant 的 tool_calls 与 tool 消息一一配对」这条协议不变量。
+_UNEXECUTED_TOOL_RESPONSE = "（该工具调用未执行）"
+
+
+def _parameters_of(instr_cls) -> dict:
+    """指令的参数规格。tool_def 是唯一来源，仲裁层不维护第二份 schema。"""
+    return (instr_cls.tool_def.get("function") or {}).get("parameters") or {}
+
+
+def _value_matches(value, spec: dict) -> bool:
+    """按 tool_def 实际用到的 JSON Schema 子集校验一个值。未声明的形状不做假设。"""
+    if not isinstance(spec, dict):
+        return True
+    if "anyOf" in spec:
+        return any(_value_matches(value, sub) for sub in spec["anyOf"])
+    if "enum" in spec:
+        return value in spec["enum"]
+    kind = spec.get("type")
+    if kind == "integer":
+        # bool 是 int 的子类，但 JSON 里是两种类型
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if kind == "boolean":
+        return isinstance(value, bool)
+    if kind == "array":
+        if not isinstance(value, list):
+            return False
+        items = spec.get("items")
+        return all(_value_matches(v, items) for v in value) if items else True
+    if kind == "object":
+        return isinstance(value, dict)
+    if kind == "string":
+        return isinstance(value, str)
+    return True
+
+
+def _validate_instruction_args(instr_cls, args) -> Optional[str]:
+    """指令参数仲裁：返回错误说明，None 表示通过。
+
+    可判定的参数错误在进入指令对象之前拦下（非法操作），由调用方回一条工具响应。
+    未知键不在这里拒绝：它们不进指令对象（见 Instruction.__init__ 的白名单），
+    白名单之外的键不构成错误，避免把提示词里常见的多余字段变成硬失败。
+    """
+    if not isinstance(args, dict):
+        return f"参数必须是对象，得到 {type(args).__name__}"
+    params = _parameters_of(instr_cls)
+    properties = params.get("properties") or {}
+    for name in params.get("required") or []:
+        if name not in args or args[name] is None:
+            return f"缺少必填参数 {name}"
+    for name, value in args.items():
+        spec = properties.get(name)
+        if spec is None:
+            continue
+        if not _value_matches(value, spec):
+            return f"参数 {name} 不合法：{value!r}"
+    tool = instr_cls.tool_name
+    if tool == "memory_write" and not args["ref"].startswith("$"):
+        return f"ref 必须是 $ 开头的内存引用，得到 {args['ref']!r}"
+    if tool == "edit_metadata":
+        op = args.get("type")
+        if op not in ("set", "get", "del"):
+            return f"type 必须是 set/get/del，得到 {op!r}"
+        if op == "set" and ("key" not in args or "value" not in args):
+            return "type=set 时 key 和 value 都必需"
+        if op == "del" and "key" not in args:
+            return "type=del 时 key 必需"
+    if tool == "listen_event":
+        action = args.get("action")
+        if action == "listen" and any(
+            args.get(k) is None for k in ("event_type", "target", "handler_ref")
+        ):
+            return "action=listen 时必须提供 event_type、target、handler_ref"
+        if action == "modify" and any(
+            args.get(k) is None for k in ("listener_id", "handler_ref")
+        ):
+            return "action=modify 时必须提供 listener_id、handler_ref"
+        if action == "cancel" and args.get("listener_id") is None:
+            return "action=cancel 时必须提供 listener_id"
+    return None
+
+
 class Instruction:
     tool_name: str = ""
     tool_def: dict = {}
@@ -76,8 +180,12 @@ class Instruction:
     def __init__(self, call_id: str, caller_id: int, args: dict):
         self.call_id = call_id
         self.caller_id = caller_id
+        # 键名白名单：只接受 tool_def 声明过的键。参数里的 call_id / execute 之类
+        # 名字不能改写指令对象自己的属性（否则 tool_call_id 可被伪造、方法可被遮蔽）。
+        allowed = set((_parameters_of(type(self)).get("properties") or {}))
         for k, v in args.items():
-            setattr(self, k, v)
+            if k in allowed:
+                setattr(self, k, v)
 
     def execute(self, core: 'Core', conv: Conversation):
         raise NotImplementedError
@@ -119,10 +227,8 @@ class MemoryReadInstruction(Instruction):
                 {"ref": self.ref, "actor_cid": conv.cid, "result": content},
                 result={"result": content},
             )
-        except (VMMemoryError, KeyError, IndexError, TypeError, ValueError) as e:
+        except _INSTRUCTION_ERRORS as e:
             conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
-        except Exception as e:
-            conv.user_batch.add_tool_response(f"Internal Error: {type(e).__name__}: {e}", self.call_id)
 
 
 class MemoryWriteInstruction(Instruction):
@@ -173,7 +279,7 @@ class MemoryWriteInstruction(Instruction):
                 {"ref": self.ref, "content": content, "actor_cid": conv.cid},
                 result={"content": content},
             )
-        except VMMemoryError as e:
+        except _INSTRUCTION_ERRORS as e:
             conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
 
 
@@ -233,7 +339,7 @@ class MemoryMakeInstruction(Instruction):
                 },
                 result={"key": self.key, "mem_type": self.mem_type, "path": target},
             )
-        except VMMemoryError as e:
+        except _INSTRUCTION_ERRORS as e:
             conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
 
 
@@ -286,7 +392,7 @@ class EditMetadataInstruction(Instruction):
             return
         try:
             node = core.unwrap(self.ref, for_llm=False)
-        except (VMMemoryError, KeyError, IndexError, TypeError, ValueError) as e:
+        except _INSTRUCTION_ERRORS as e:
             conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
             return
         if not isinstance(node, (MetaDict, MetaList)):
@@ -676,6 +782,10 @@ class ListenEventInstruction(Instruction):
 
 
 def _instruction_registry() -> Dict[str, Type[Instruction]]:
+    # TODO(issue): 内存节点有四个操作（创建 / 读写 / 编辑元数据 / 删除），指令集只覆盖前三个：
+    # 没有删除内存节点的工具，Memory.__delitem__ 现在只有 Python 侧与调试原语在用。
+    # 删除指令的形态未定——删节点还是删列表元素、删链接节点要不要连带处理目标、
+    # owner 检查与 before/after 事件如何参与，都需要先想清。
     return {
         cls.tool_name: cls
         for cls in [
@@ -749,6 +859,46 @@ class PLMExecutor:
         return out
 
 
+def _check_model_namespace(core: 'Core', program_type: str, para: MetaDict, para_ref: str) -> None:
+    """输入边界的命名空间交叉校验：程序类型与 model 必须配套。
+
+    python 程序 → model 必须是 PLM 注册名；settingup 程序 → model 必须是上游 LLM 模型名。
+    上游清单没取到时只警告不拦：`/models` 只是参考，取不到不该让镜像起不来（讨论案第五节）。
+    """
+    catalog = core.mem._data.get(MODEL_CATALOG_KEY)
+    if not isinstance(catalog, MetaDict):
+        return
+    model = para.get("model")
+    if program_type == "python":
+        names = sorted(
+            e.get("name") for e in (catalog.get("plm") or []) if isinstance(e, MetaDict)
+        )
+        if not isinstance(model, str) or not model:
+            raise VMMemoryError(
+                f"{para_ref} 缺少 model：python 程序的 model 必须是 PLM 注册名（可用：{names}）"
+            )
+        if model not in names:
+            raise VMMemoryError(
+                f"{para_ref} 的 model {model!r} 不是 PLM 注册名（可用：{names}）；"
+                f"LLM 模型名只能配 settingup 程序"
+            )
+        return
+    llm = catalog.get("llm")
+    if not isinstance(llm, MetaDict) or llm.get("source") != "api":
+        print(
+            f"[AVM] 模型目录未取到上游清单，跳过 LLM 模型名校验：{para_ref} 的 model {model!r}",
+            file=sys.stderr,
+        )
+        return
+    listed = sorted(
+        e.get("id") for e in (llm.get("models") or []) if isinstance(e, MetaDict)
+    )
+    if isinstance(model, str) and model and model not in listed:
+        raise VMMemoryError(
+            f"{para_ref} 的 model {model!r} 不在上游模型清单里（可用：{listed}）"
+        )
+
+
 def _build_conversation(core: 'Core', system_ref: str, para_ref: str, parent: Conversation, is_sub: bool) -> Conversation:
     node = core.unwrap(system_ref, for_llm=False)
     # 程序节点校验：与 Python 对话要求 ctrl.type='python' 对等，LLM 对话要求 ctrl.type='settingup'。
@@ -769,6 +919,7 @@ def _build_conversation(core: 'Core', system_ref: str, para_ref: str, parent: Co
         raise VMMemoryError(
             f"{para_ref} 不是参数节点：para_ref 必须指向 ctrl.type='para' 的 dict 节点"
         )
+    _check_model_namespace(core, node_type, para_node, para_ref)
     conv = Conversation(
         messages=messages,
         cid=0,
@@ -795,6 +946,15 @@ class LMU:
             load_dotenv()
             self._client = OpenAI()
         return self._client
+
+    def reset_client(self) -> None:
+        """丢弃缓存的客户端，按当前环境重建。
+
+        运行者选"更新环境"后调用：光重建客户端不够——load_dotenv 默认不覆盖已存在的
+        环境变量，第二次读 .env 不会生效，这里显式 override。
+        """
+        self._client = None
+        load_dotenv(override=True)
 
     _API_PARAM_KEYS: set = {
         "temperature", "max_tokens", "top_p", "frequency_penalty",
@@ -883,7 +1043,9 @@ class LMU:
                 "elapsed_ms": (time.time() - start) * 1000,
                 "error": f"{type(e).__name__}: {e}",
             }
-            raise
+            # 失败时历史与输入批次都没动过（追加在下面、clear 在 exec 返回之后），
+            # 所以从这里重试同一轮是干净的，不需要检查点或回退。
+            raise APIError(f"{type(e).__name__}: {e}") from e
 
         choice = response.choices[0]
         message = choice.message
@@ -941,6 +1103,9 @@ class Core:
         self.debug: bool = False
         self.monitor: Monitor = Monitor()
         self.para_ref: str = "$MEM.model_params"
+        # API 失败时的运行者策略：callable(error, attempt) -> "retry" | "reload" | "exit"。
+        # 宿主安装（终端提示见 avm/runner_prompt.py）；没装时按退出处理。
+        self.api_error_policy = None
         self.events: EventSystem = EventSystem(self)
         self.interrupts: InterruptTable = InterruptTable(self)  # 中断向量表：外部（控制台）发起的控制权转移
         self._turn_events: List[dict] = []
@@ -949,6 +1114,8 @@ class Core:
         self.mem.mount("memory", MemorySummaryDevice(self))
         self.mem.mount("monitor", MonitorDevice(self))
         self.mem.mount("listeners", ListenersDevice(self))
+        # 启动自带的内存节点：模型目录（静态部分；LLM 清单由宿主 refresh_model_catalog 填）
+        self.install_model_catalog()
 
     def _register(self, conv: Conversation) -> Conversation:
         conv.cid = self._next_cid
@@ -1003,29 +1170,47 @@ class Core:
             self._dormant_cids.append(conv.cid)
         return conv
 
+    @staticmethod
+    def _respond_unexecuted(conv: Conversation, call_id):
+        """协议层拒绝：写一条中性工具响应保住配对；call_id 不可用时无法配对，只记 stderr。"""
+        if isinstance(call_id, str) and call_id:
+            conv.user_batch.add_tool_response(_UNEXECUTED_TOOL_RESPONSE, call_id)
+
     def _process_return_calls(self, return_calls: list, conv: Conversation):
         registry = _instruction_registry()
         for rc in return_calls:
             cmd_type = rc.get("cmd_type", "")
             call_id = rc.get("call_id", "")
+            args = rc.get("args", {})
             if cmd_type == "json_error":
-                args = rc.get("args", {})
+                detail = args if isinstance(args, dict) else {}
                 _report_tool_error(
                     conv,
-                    f"工具调用 {args.get('name', '')} 参数不是合法 JSON: {args.get('error', '')}，原始参数: {args.get('raw', '')}",
+                    f"工具调用 {detail.get('name', '')} 参数不是合法 JSON: {detail.get('error', '')}，原始参数: {detail.get('raw', '')}",
                 )
+                self._respond_unexecuted(conv, call_id)
                 continue
             if cmd_type not in registry:
                 # 未知工具名的唯一出口。两条解析路径（LMU 的 _return_calls_from_message、
                 # PLM 的 _parse_tool_calls）都只把真名放进 cmd_type，查表在这里做一次。
-                # 处置与 json_error 一致：报给运行者，不回工具响应。
+                # 处置与 json_error 一致：报给运行者，回一条中性占位保住配对。
                 _report_tool_error(
                     conv,
-                    f"未知工具 {cmd_type}，参数: {json.dumps(rc.get('args', {}), ensure_ascii=False)}",
+                    f"未知工具 {cmd_type}，参数: {json.dumps(args, ensure_ascii=False)}",
                 )
+                self._respond_unexecuted(conv, call_id)
+                continue
+            if not isinstance(call_id, str) or not call_id:
+                # 没有 call_id 就无法写配对响应，也不能伪造一个（assistant 那侧的 id 不是它）
+                _report_tool_error(conv, f"工具 {cmd_type} 缺少可配对的 call_id，跳过")
                 continue
             instr_cls = registry[cmd_type]
-            instr = instr_cls(call_id, conv.cid, rc.get("args", {}))
+            error = _validate_instruction_args(instr_cls, args)
+            if error is not None:
+                _report_tool_error(conv, f"工具 {cmd_type} 参数不合法：{error}")
+                conv.user_batch.add_tool_response(f"Error: {error}", call_id)
+                continue
+            instr = instr_cls(call_id, conv.cid, args)
             instr.execute(self, conv)
 
     def _on_conversation_finished(self, conv: Conversation, result: str):
@@ -1101,41 +1286,83 @@ class Core:
     def advance_conversation(self):
         self._turn_events.clear()
         conv = self._conv_by_cid[self._active_cid]
-        para = self._get_para(conv)
-        executor = self._get_executor(conv, para)
-        try:
-            result, return_calls, _ = executor.exec(conv, para)
-            conv.user_batch.clear()
+        executor = None
+        attempt = 0
+        while True:
+            try:
+                # 取 para 与选执行器也放进 try：它们会因为配置错配抛错，
+                # 原先在 try 之外，逃出去连监测帧都没有（问题 1）。
+                para = self._get_para(conv)
+                executor = self._get_executor(conv, para)
+                result, return_calls, _ = executor.exec(conv, para)
+                conv.user_batch.clear()
 
-            if return_calls:
-                self._process_return_calls(return_calls, conv)
-                self._activation_instructions += len(return_calls)
-                if conv.cid in self._finished:
-                    # 内核级关闭（个体结束）：本轮结束后选择下一个活跃对话
-                    self._active_cid = None
-                    self._pick_next_active()
-                elif conv.cid in self._dormant_cids:
-                    # 对话自己让出（等待返回/子完成）
-                    self._pick_next_active()
-                elif self._activation_instructions >= self._instruction_budget:
-                    # 核心中断：工具返回已加入 batch、状态完整；让出执行权，进就绪队列末尾
-                    self._activation_instructions = 0  # 链被中断，重新计数
-                    if conv.cid not in self._ready_cids:
-                        self._ready_cids.append(conv.cid)
-                    self._pick_next_active()
+                if return_calls:
+                    self._process_return_calls(return_calls, conv)
+                    self._activation_instructions += len(return_calls)
+                    if conv.cid in self._finished:
+                        # 内核级关闭（个体结束）：本轮结束后选择下一个活跃对话
+                        self._active_cid = None
+                        self._pick_next_active()
+                    elif conv.cid in self._dormant_cids:
+                        # 对话自己让出（等待返回/子完成）
+                        self._pick_next_active()
+                    elif self._activation_instructions >= self._instruction_budget:
+                        # 核心中断：工具返回已加入 batch、状态完整；让出执行权，进就绪队列末尾
+                        self._activation_instructions = 0  # 链被中断，重新计数
+                        if conv.cid not in self._ready_cids:
+                            self._ready_cids.append(conv.cid)
+                        self._pick_next_active()
+                else:
+                    self._on_conversation_finished(conv, result)
+            except APIError as e:
+                # 外部失败：记帧，然后停下问运行者。失败时历史与输入批次都没动过，
+                # 选 retry/reload 就重跑本轮（attempt 只用于提示，不自动放弃）。
+                attempt += 1
+                self.monitor.record(self, error=e, last_call=self._last_call_for(executor))
+                if self._resolve_api_error(e, conv, attempt, executor) == "exit":
+                    raise RunnerStop(f"API 调用失败，运行者选择退出：{e}") from e
+                continue
+            except Exception as e:
+                self.monitor.record(self, error=e, last_call=self._last_call_for(executor))
+                raise
             else:
-                self._on_conversation_finished(conv, result)
+                self.monitor.record(self, last_call=self._last_call_for(executor))
+                return
+
+    def _last_call_for(self, executor):
+        """最近一次 API 调用的全文；本轮事件挂在它上面给监测帧。"""
+        last_call = getattr(executor, "last_call", None)
+        if last_call is not None and self._turn_events:
+            last_call = {**last_call, "events": list(self._turn_events)}
+        return last_call
+
+    def _resolve_api_error(self, error: APIError, conv: Conversation, attempt: int, executor) -> str:
+        """问运行者 API 失败怎么办，返回 retry / reload / exit。
+
+        没装回调、回调自己出错、返回未知动作，一律按退出处理：停下等一个不会来的
+        选择比退出更糟。策略的落点是宿主（终端提示见 avm/runner_prompt.py）。
+        """
+        policy = self.api_error_policy
+        if policy is None:
+            print(f"[AVM] API 调用失败且没有安装 api_error_policy，按退出处理：{error}", file=sys.stderr)
+            return "exit"
+        try:
+            action = policy(error, attempt)
         except Exception as e:
-            last_call = getattr(executor, "last_call", None)
-            if last_call is not None and self._turn_events:
-                last_call = {**last_call, "events": list(self._turn_events)}
-            self.monitor.record(self, error=e, last_call=last_call)
-            raise
-        else:
-            last_call = getattr(executor, "last_call", None)
-            if last_call is not None and self._turn_events:
-                last_call = {**last_call, "events": list(self._turn_events)}
-            self.monitor.record(self, last_call=last_call)
+            print(
+                f"[AVM] api_error_policy 自身异常（{type(e).__name__}: {e}），按退出处理",
+                file=sys.stderr,
+            )
+            return "exit"
+        if action not in ("retry", "reload", "exit"):
+            print(f"[AVM] api_error_policy 返回未知动作 {action!r}，按退出处理", file=sys.stderr)
+            return "exit"
+        if action == "reload":
+            reset = getattr(executor, "reset_client", None)
+            if callable(reset):
+                reset()
+        return action
 
     def _get_executor(self, conv: Conversation, para: MetaDict):
         """按对话的程序类型选择执行器（由 Core 管理，不挂在对话上）。
@@ -1210,6 +1437,228 @@ class Core:
         self._dormant_cids.append(conv.cid)
         return conv
 
+    # ------------------------------------------------------------------
+    # 安全点自检（六条具名不变量）
+    # ------------------------------------------------------------------
+
+    def _check_invariants(self) -> None:
+        """六条具名不变量的结构自检。违反即 KernelPanic：出现说明某条边界少了一条判定。
+
+        只在安全点调用（run 的每轮推理之前）。成本是常数级遍历，加上活跃对话的一小段历史。
+        """
+        # 1 调度互斥：就绪与休眠不相交，就绪队列无重复
+        both = set(self._ready_cids) & set(self._dormant_cids)
+        if both:
+            raise KernelPanic(f"调度互斥被破坏：cid {sorted(both)} 同时在就绪与休眠队列")
+        if len(set(self._ready_cids)) != len(self._ready_cids):
+            raise KernelPanic(f"就绪队列有重复 cid：{self._ready_cids}")
+        # 6 预算计数：非负整数
+        if not isinstance(self._activation_instructions, int) or self._activation_instructions < 0:
+            raise KernelPanic(f"指令预算计数不合法：{self._activation_instructions!r}")
+        # 2 活跃有来源
+        if self._active_cid is not None:
+            conv = self._conv_by_cid.get(self._active_cid)
+            if conv is None:
+                raise KernelPanic(f"活跃 cid {self._active_cid} 不在对话表里")
+            if self._active_cid in self._finished:
+                raise KernelPanic(f"活跃 cid {self._active_cid} 已 finished")
+            # 3 历史配对、4 值域：只查正要发出去的那条对话
+            self._check_pairing(conv)
+            self._check_value_domain(conv)
+        # 5 设备表一致
+        self._check_device_table()
+
+    @staticmethod
+    def _check_pairing(conv: Conversation) -> None:
+        """调用 API 前，带 tool_calls 的 assistant 消息要与 tool 消息一一配对。
+
+        待发批次（user_batch）也算数：工具响应先入批次，下一轮推理才写进历史。
+        没有 id 的工具调用两边都配不上，不在这里判定。
+        """
+        messages = conv.messages
+        last = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].role == "assistant" and getattr(messages[i], "tool_calls", None):
+                last = i
+                break
+        if last is None:
+            return
+        wanted = []
+        for tc in messages[last].tool_calls or []:
+            call_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+            if isinstance(call_id, str) and call_id:
+                wanted.append(call_id)
+        if not wanted:
+            return
+        got = [m.tool_call_id for m in messages[last + 1:] if m.role == "tool"]
+        got += [r.tool_call_id for r in conv.user_batch.tool_responses]
+        if sorted(wanted) != sorted(got):
+            raise KernelPanic(
+                f"对话 {conv.cid} 的历史配对被破坏：assistant 声明 {sorted(wanted)}，"
+                f"现存 tool 消息 {sorted(got)}"
+            )
+
+    @staticmethod
+    def _check_value_domain(conv: Conversation) -> None:
+        """进入 LLM 可见通道的值必须是字符串。查待发批次与最后一条消息。"""
+        for resp in conv.user_batch.tool_responses:
+            if not isinstance(resp.content, str) or not isinstance(resp.tool_call_id, str):
+                raise KernelPanic(
+                    f"对话 {conv.cid} 的工具响应值域不合法："
+                    f"content={type(resp.content).__name__} tool_call_id={type(resp.tool_call_id).__name__}"
+                )
+        for content in conv.user_batch.user_contents:
+            if not isinstance(content, str):
+                raise KernelPanic(f"对话 {conv.cid} 的待发用户内容不是字符串：{type(content).__name__}")
+        if conv.messages:
+            content = conv.messages[-1].content
+            if content is not None and not isinstance(content, str):
+                raise KernelPanic(
+                    f"对话 {conv.cid} 最后一条消息的内容不是字符串：{type(content).__name__}"
+                )
+
+    def _check_device_table(self) -> None:
+        """设备表与挂载点一致：每个挂载地址有链接节点；每个标识符至少有一个挂载地址。"""
+        mounted_ids = set()
+        for address, device in list(self.mem._devices.items()):
+            mounted_ids.add(getattr(device, "device_id", None) or address)
+            node = self.mem._data
+            for seg in address.split("."):
+                node = node.get(seg) if isinstance(node, (dict, MetaDict)) else None
+                if node is None:
+                    break
+            if not isinstance(node, LinkNode):
+                raise KernelPanic(f"设备表不一致：{address} 没有挂载点链接节点")
+        for device_id in list(self.mem._device_ids):
+            if device_id not in mounted_ids:
+                raise KernelPanic(f"设备表不一致：标识符 {device_id!r} 没有挂载地址")
+
+    # ------------------------------------------------------------------
+    # 模型目录（$MEM.model_catalog）
+    # ------------------------------------------------------------------
+
+    def install_model_catalog(self) -> None:
+        """安装/补齐模型目录的静态部分。幂等；镜像或检查点里已有的字段不覆盖。
+
+        整树替换（load_image）之后必须重装一次，否则镜像会把启动节点冲掉。
+        静态部分不依赖网络：PLM 注册表、para 能用的 API 参数、必填字段。
+        """
+        root = self.mem._data
+        catalog = root.get(MODEL_CATALOG_KEY)
+        if not isinstance(catalog, MetaDict):
+            catalog = MetaDict(data={}, metadata=_CATALOG_META)
+            root[MODEL_CATALOG_KEY] = catalog
+        llm = catalog.get("llm")
+        if not isinstance(llm, MetaDict):
+            llm = MetaDict(data={}, metadata="可用的 LLM 模型；source 说明这份清单的来源")
+            catalog["llm"] = llm
+        llm.setdefault("source", "unavailable")
+        llm.setdefault("required", "model")
+        params = llm.get("params")
+        if not isinstance(params, MetaDict):
+            params = MetaDict(data={}, metadata="可以写进 para 的 API 参数（model 之外全部可选）")
+            llm["params"] = params
+        for name in sorted(LMU._API_PARAM_KEYS):
+            if name not in params:
+                params[name] = "数值型" if name in LMU._NUMERIC_API_PARAMS else "字符串/原样"
+        if not isinstance(llm.get("models"), MetaList):
+            llm["models"] = MetaList(data=[], metadata="上游模型清单；每项一个 id")
+        if not isinstance(catalog.get("plm"), MetaList):
+            catalog["plm"] = MetaList(
+                data=[
+                    Core._plm_catalog_entry(name, cls)
+                    for name, cls in PLM_REGISTRY.items()
+                ],
+                metadata="PLM 注册表：本地实现，不需要网络",
+            )
+
+    @staticmethod
+    def _plm_catalog_entry(name: str, cls) -> MetaDict:
+        entry = MetaDict(
+            data={"name": name, "required": "model"},
+            metadata=_first_line(getattr(cls, "__doc__", "")) or name,
+        )
+        entry["params"] = _PLM_OPERATOR_NOTE if name == "plm.operator" else _PLM_PARAMS_NOTE
+        return entry
+
+    def refresh_model_catalog(self, timeout: float = 10.0) -> dict:
+        """拉一次上游 `/models` 写进目录。任何失败都收敛成 source="unavailable"，不抛。
+
+        防御按讨论案第五节：自己校验信封、除 id 外全部按可选字段读、忽略未知字段。
+        清单只当参考——取不到不拦启动，也不拦模型名（后者见 _check_model_namespace）。
+        """
+        self.install_model_catalog()
+        llm = self.mem._data[MODEL_CATALOG_KEY]["llm"]
+
+        def _unavailable(reason: str) -> dict:
+            llm["source"] = "unavailable"
+            llm["reason"] = reason
+            print(
+                f"[AVM] 模型目录：没能取到上游清单（{reason}），本轮不校验 LLM 模型名",
+                file=sys.stderr,
+            )
+            return {"source": "unavailable", "reason": reason}
+
+        try:
+            # 用原始响应自己解析：SDK 默认模式对非 OpenAI 信封抛的是 AttributeError/TypeError，
+            # 分不清"这家不是 OpenAI 形状"与"SDK 有 bug"；自己校验信封才有确定的诊断。
+            raw = self.lmu.client.models.with_raw_response.list(timeout=timeout)
+            payload = raw.json()
+        except Exception as e:
+            return _unavailable(f"{type(e).__name__}: {e}")
+        if (
+            not isinstance(payload, dict)
+            or payload.get("object") != "list"
+            or not isinstance(payload.get("data"), list)
+        ):
+            return _unavailable("上游 /models 的信封不是 OpenAI 形状（object=list 且 data 是数组）")
+        entries = []
+        skipped = 0
+        for item in payload["data"]:
+            if not isinstance(item, dict):
+                skipped += 1
+                continue
+            model_id = item.get("id")
+            if not isinstance(model_id, str) or not model_id:
+                skipped += 1
+                continue
+            entry = MetaDict(data={"id": model_id}, metadata="上游模型 id")
+            for key in ("context_window", "max_output_tokens", "input_modalities", "output_modalities"):
+                value = item.get(key)
+                if value is None:
+                    continue
+                # 内存约定：para 与目录里的值都以 str 存储
+                entry[key] = ", ".join(str(v) for v in value) if isinstance(value, list) else str(value)
+            entries.append(entry)
+        llm["models"] = MetaList(data=entries, metadata="上游模型清单；每项一个 id")
+        llm["source"] = "api"
+        if "reason" in llm:
+            del llm["reason"]
+        print(
+            f"[AVM] 模型目录：从上游取到 {len(entries)} 个模型"
+            + (f"（跳过 {skipped} 条形状不合法的条目）" if skipped else ""),
+            file=sys.stderr,
+        )
+        self._warn_unlisted_para_model(llm)
+        return {"source": "api", "count": len(entries), "skipped": skipped}
+
+    def _warn_unlisted_para_model(self, llm: MetaDict) -> None:
+        """默认 para 的 model 不在清单里时提醒运行者（例如用着已退役的别名）。"""
+        try:
+            para = self.unwrap(self.para_ref, for_llm=False)
+        except Exception:
+            return
+        model = para.get("model") if isinstance(para, MetaDict) else None
+        if not isinstance(model, str) or not model:
+            return
+        listed = {e.get("id") for e in (llm.get("models") or []) if isinstance(e, MetaDict)}
+        if model not in listed:
+            print(
+                f"[AVM] 模型目录：para {self.para_ref} 的 model {model!r} 不在上游清单里"
+                f"（可能是拼写错误或已退役的别名）",
+                file=sys.stderr,
+            )
+
     def run(self):
         self._pick_next_active()
 
@@ -1220,6 +1669,11 @@ class Core:
             # 的边界——预算中断用的是同一个边界。中断在这里夺取执行权。
             # 中断表为空时这一行没有副作用。
             self.interrupts.dispatch()
+            try:
+                self._check_invariants()
+            except KernelPanic as e:
+                self.monitor.record(self, error=e)
+                raise
             self.advance_conversation()
 
     def emit_device_event(self, device_path: str, target: str, payload: dict) -> dict:

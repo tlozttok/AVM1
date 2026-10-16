@@ -6,7 +6,7 @@ from .core import Core, LMU, \
 from .events import EventSystem, EVENT_TYPES
 from .info_devices import ListenersDevice
 from .memory import Memory
-from .types import MetaDict, MetaList, Conversation, UserMessageBatch, \
+from .types import MetaDict, MetaList, LinkNode, Conversation, UserMessageBatch, \
     SystemMessage, UserMessage, AssistantMessage, ToolMessage, message_to_api_dict
 from .exceptions import VMSyntaxError, VMMemoryError, VMResourceError, \
     MemoryKeyNotFoundError, MemoryIndexOutOfRangeError, MemoryTypeError, MemoryCircularReferenceError

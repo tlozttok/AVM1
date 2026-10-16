@@ -209,7 +209,7 @@ class TestThroughCore:
         """面板能造出模型造得出的输入，包括未知工具名。
 
         两条解析路径共用一个出口：未知名字在 `cmd_type not in registry` 分支报给
-        运行者（stderr），与 json_error 同一套处置——不回工具响应。
+        运行者（stderr），对话侧只回一条中性占位——配对不破，错误细节不外传。
         """
         core, panel, channel = self._panel([
             {"tool": "no_such_tool", "arguments": {"a": 1}},
@@ -217,8 +217,10 @@ class TestThroughCore:
         ])
         core.advance_conversation()
         assert core._active_cid == panel.cid, "有工具调用，对话保持活跃"
-        assert channel.kinds() == ["tool_call"], "没有工具响应回到操作员手里"
-        assert panel.user_batch.tool_responses == []
+        assert channel.kinds() == ["tool_call"], "本轮没有工具响应回到操作员手里"
+        assert [(r.content, r.tool_call_id) for r in panel.user_batch.tool_responses] == [
+            ("（该工具调用未执行）", "op-1")
+        ]
         err = capsys.readouterr().err
         assert f"对话 {panel.cid}: 未知工具 no_such_tool" in err
         assert '{"a": 1}' in err
