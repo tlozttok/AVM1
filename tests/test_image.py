@@ -5,6 +5,7 @@ import json
 import pytest
 
 from avm.core import Core
+from avm.exceptions import VMMemoryError
 from avm.image import load_image, ImageError
 from avm.memory import Memory
 from avm.types import MetaDict, MetaList, LinkNode
@@ -75,6 +76,33 @@ def _write(tmp_path, image, devices_code=None):
     path = tmp_path / "image.json"
     path.write_text(json.dumps(image, ensure_ascii=False), encoding="utf-8")
     return str(path)
+
+
+COMMAND_PROGRAM = '''
+def handle(cmd):
+    return 'echo: ' + cmd
+'''
+
+
+def _plm_init_image():
+    """init 指向 python 程序节点：0 号是 plm.command 对话，para 写在程序节点的 para_ref 里。"""
+    image = _sample_image()
+    image["mem"]["speaker"] = {
+        "kind": "dict",
+        "meta": "PLM 入口程序",
+        "ctrl": {"type": "python"},
+        "value": {
+            "content": {"kind": "str", "value": COMMAND_PROGRAM},
+            "para_ref": {"kind": "str", "value": "$MEM.plm_params"},
+        },
+    }
+    image["mem"]["plm_params"] = {
+        "kind": "dict",
+        "ctrl": {"type": "para"},
+        "value": {"model": {"kind": "str", "value": "plm.command"}},
+    }
+    image["init"] = {"name": "speaker", "system_ref": "$MEM.speaker", "user_ref": "$MEM.user"}
+    return image
 
 
 def _sample_image():
@@ -185,6 +213,75 @@ class TestLoadImage:
         assert conv.name == "boot"
         assert conv.messages[0].content == "S"
         assert conv.messages[1].content == "U"
+
+    # ---- init 指向 python 程序节点：0 号对话是 PLM（Python 对话） ----
+
+    def test_init_python_program_runs_as_plm(self, tmp_path):
+        """init 可以是 PLM：0 号建 Python 对话，程序是 system、user_ref 是首条用户消息。"""
+        image = _plm_init_image()
+        path = _write(tmp_path, image, devices_code=DEVICE_CODE)
+        core = load_image(Core(), path)
+
+        conv = core.get_conversation(0)
+        assert conv.is_python is True
+        assert conv.name == "speaker"
+        assert conv.para_ref == "$MEM.plm_params"
+        assert conv.is_root is True
+        assert conv.messages[0].content == COMMAND_PROGRAM
+        assert conv.messages[1].content == "hello"
+        assert core._ready_cids == [0]
+
+        # 跑到底：镜像里没有 LLM 对话，这一跑不碰 API
+        core.run()
+        assert conv.messages[-1].content == "echo: hello"
+        assert 0 in core._dormant_cids
+
+    def test_init_python_requires_para_ref(self, tmp_path):
+        """python 入口没有 para 引用：早报错，不拿顶层 LLM para 去撞命名空间校验。"""
+        image = _plm_init_image()
+        image["mem"]["speaker"]["value"].pop("para_ref")
+        path = _write(tmp_path, image, devices_code=DEVICE_CODE)
+        with pytest.raises(ImageError, match="para 引用"):
+            load_image(Core(), path)
+
+    def test_init_para_ref_overrides_program_node(self, tmp_path):
+        image = _plm_init_image()
+        image["mem"]["other_params"] = {
+            "kind": "dict",
+            "ctrl": {"type": "para"},
+            "value": {"model": {"kind": "str", "value": "plm.command"}},
+        }
+        image["init"]["para_ref"] = "$MEM.other_params"
+        path = _write(tmp_path, image, devices_code=DEVICE_CODE)
+        core = load_image(Core(), path)
+        assert core.get_conversation(0).para_ref == "$MEM.other_params"
+
+    def test_init_python_model_must_be_plm(self, tmp_path):
+        """python 程序配 LLM 模型名：模型命名空间交叉校验拦住。"""
+        image = _plm_init_image()
+        image["mem"]["plm_params"]["value"]["model"] = {"kind": "str", "value": "test-model"}
+        path = _write(tmp_path, image, devices_code=DEVICE_CODE)
+        with pytest.raises(VMMemoryError, match="PLM"):
+            load_image(Core(), path)
+
+    def test_init_settingup_para_ref_field(self, tmp_path):
+        """LLM 入口也能用 init.para_ref 指定自己的 para。"""
+        image = _sample_image()
+        image["mem"]["system"]["value"]["para_ref"] = {"kind": "str", "value": "$MEM.model_params"}
+        image["mem"]["other_params"] = {
+            "kind": "dict",
+            "ctrl": {"type": "para"},
+            "value": {"model": {"kind": "str", "value": "test-model"}},
+        }
+        image["init"] = {
+            "system_ref": "$MEM.system",
+            "user_ref": "$MEM.user",
+            "para_ref": "$MEM.other_params",
+        }
+        path = _write(tmp_path, image, devices_code=DEVICE_CODE)
+        core = load_image(Core(), path)
+        assert core.get_conversation(0).para_ref == "$MEM.other_params"
+        assert core.get_conversation(0).is_python is False
 
     def test_run_uses_para_ref_and_mock_lmu(self, tmp_path):
         path = _write(tmp_path, _sample_image(), devices_code=DEVICE_CODE)

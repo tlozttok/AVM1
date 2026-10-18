@@ -356,7 +356,9 @@ class TestImage:
         # 自述里的三个例子必须真的能跑通，否则测试对话会照着例子撞墙
         device = _device_class()()
         assert device.resolve_path(["ls", '"avm"']).startswith('ls "avm"')
-        assert "class" in device.resolve_path(["read", '"avm/core.py"', "0"])
+        page0 = device.resolve_path(["read", '"avm/core.py"', "0"])
+        # 不写死"第一页里有 class"：core.py 的头部会随改动增长，这里只断言分页元信息与内容都在
+        assert "lines=1-200/" in page0 and "下一页" in page0
         # 只解析命中数：本测试自己的源码行也在跟踪集合里、也含有搜索词，子串判断会自己搜到自己
         first_line = device.resolve_path(["search", '"authorize_listener"', "0"]).splitlines()[0]
         assert int(first_line.split("hits=")[1]) > 0

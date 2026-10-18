@@ -31,7 +31,7 @@ python main.py <image.json> --frames      # 运行后打印监测帧摘要（std
 python main.py <image.json> --transcript api.txt  # API 调用全文落盘
 ```
 
-调试参数写在 `debug.json`（`image` / `frames` / `transcript` / `checkpoint_in`），不需要改命令行（VSCode 固定运行 `python main.py`；给 `--debug-config <file>` 就换一份配置）。示例镜像见 `images/demo.json`、`images/calc_driver.json`；应用套件见 `images/apps/`（启动方式见 [docs/apps](docs/apps)）；AI 小游戏见 `images/games/echo_mine/`；读本仓库自测的镜像见 `images/repo_tester.json`（对话经只读设备 `$MEM.AVMRepo` 读仓库跟踪文件，用法由设备自述给出）。系统镜像的组成与要点见 [docs/runtime.md](docs/runtime.md) 的「系统镜像」一节。
+调试参数写在 `debug.json`（`image` / `frames` / `transcript` / `checkpoint_in`），不需要改命令行（VSCode 固定运行 `python main.py`；给 `--debug-config <file>` 就换一份配置）。示例镜像见 `images/demo.json`、`images/calc_driver.json`；应用套件见 `images/apps/`（启动方式见 [docs/apps](docs/apps)）；AI 小游戏见 `images/games/echo_mine/`；读本仓库自测的镜像见 `images/repo_tester.json`（对话经只读设备 `$MEM.AVMRepo` 读仓库跟踪文件，用法由设备自述给出），打包版见 `images/repo_tester_packed.json`（0 号是 `plm.python` 打包器，启动时按 `$MEM.file_list` 给出的清单读文档、把系统提示词组装好再建并启动测试对话，测试者不必再读这些文档；程序与清单在 `images/repo_tester_packed/`）。系统镜像的组成与要点见 [docs/runtime.md](docs/runtime.md) 的「系统镜像」一节。
 
 ### 调试面板
 

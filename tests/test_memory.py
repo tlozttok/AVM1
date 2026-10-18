@@ -297,6 +297,32 @@ class TestMemoryMake:
         mem.make("$MEM.base", "0", "str")
         assert mem["base"][0] == ""
 
+    def test_make_rejects_empty_key(self):
+        mem = Memory()
+        mem["base"] = {}
+        with pytest.raises(VMMemoryError):
+            mem.make("$MEM.base", "", "str")
+
+    def test_make_rejects_dotted_key(self):
+        mem = Memory()
+        mem["base"] = {}
+        with pytest.raises(VMMemoryError):
+            mem.make("$MEM.base", "a.b", "str")
+        assert "a.b" not in mem["base"]
+
+    def test_make_does_not_overwrite_existing_key(self):
+        mem = Memory()
+        mem["base"] = {"child": "keep"}
+        with pytest.raises(VMMemoryError):
+            mem.make("$MEM.base", "child", "dict")
+        assert mem["base"]["child"] == "keep"
+
+    def test_make_rejects_empty_segment_in_ref(self):
+        mem = Memory()
+        mem["base"] = {}
+        with pytest.raises(VMMemoryError):
+            mem.make("$MEM..base", "k", "str")
+
     def test_make_on_string_raises(self):
         mem = Memory()
         mem["base"] = "hello"

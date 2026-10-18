@@ -9,6 +9,20 @@ _MAX_PATH_SEGMENTS = 64  # 单条引用的段数上限（戊4）
 _MAX_VALUE_DEPTH = 64  # 写入值的嵌套深度上限（戊4）
 
 
+def check_new_key(key) -> None:
+    """新建地址的键语法（指令边界与 Memory.make 共用一套）。
+
+    键是路径的一段，点号是段分隔符——带点的键建得出来但永远读不回来（模板：`$MEM.a.b`
+    会被切成 a、b 两段）。空键同理，还会让 `$MEM.` 与读根混淆。
+    """
+    if not isinstance(key, str):
+        raise VMMemoryError(f"新地址的键必须是字符串，得到 {type(key).__name__}")
+    if key == "":
+        raise VMMemoryError("新地址的键不能为空字符串")
+    if "." in key:
+        raise VMMemoryError(f"新地址的键不能包含点号（点号是路径分隔符，该地址将无法寻址）：{key!r}")
+
+
 def _device_child(node: Any, key: Any) -> Any:
     """设备空间的只读下钻：把设备自己的异常类型统一翻成 VMMemoryError。
 
@@ -134,6 +148,9 @@ class Memory:
     def _resolve_path(self, path: list, for_llm: bool = False, seen_links: Optional[list] = None) -> Any:
         if seen_links is None:
             seen_links = []
+        if any(seg == "" for seg in path):
+            # 读侧与写侧用同一套语法：空段是语法错误，不是"键 '' 不存在"
+            raise VMMemoryError(f"引用不能有空段：{'.'.join(str(s) for s in path)}")
         if not path:
             return self._convert_for_llm(self._data, for_llm)
 
@@ -777,6 +794,7 @@ class Memory:
         if mem_type not in ('str', 'dict', 'list'):
             raise VMMemoryError(f"不支持的类型：{mem_type}，必须是 'str', 'dict', 'list' 之一")
 
+        check_new_key(key)
         parts = ref[1:].split(".")
 
         # 获取 ref 指向的值
@@ -801,6 +819,12 @@ class Memory:
             elif mem_type == 'list':
                 current[index] = _with_owner(MetaList(data=[]), owner_cid)
         elif isinstance(current, (dict, MetaDict)):
+            # 只创建、不覆盖：同键覆盖会丢掉整棵子树、meta/ctrl，且能覆写设备挂载点的
+            # 链接节点（设备表随之不一致，下一个安全点内核恐慌）。
+            if key in current:
+                raise VMMemoryError(
+                    f"地址已存在：{ref}.{key}——memory_make 只创建新地址，不覆盖"
+                )
             if mem_type == 'str':
                 current[key] = ""
             elif mem_type == 'dict':
@@ -814,11 +838,11 @@ class Memory:
         """返回底层字典的副本"""
         return self._data.copy()
 
-    def save(self, filepath: str) -> None:
-        """将内存数据持久化到 JSON 文件（仅 _data，不含设备）。
-        格式与系统镜像 mem 段一致：显式节点 {kind, meta, ctrl, value}。"""
-        import json
+    def to_image_dict(self) -> dict:
+        """内存树的显式节点表示（与镜像 mem 段、persist_to、内核转储同格式）。
 
+        不可 JSON 化的值降级为 `str(value)`（与既有行为一致）。
+        """
         def _serialize(value):
             if isinstance(value, MetaDict):
                 node = {"kind": "dict", "value": {k: _serialize(v) for k, v in value.items()}}
@@ -836,8 +860,15 @@ class Memory:
                 node["ctrl"] = ctrl
             return node
 
+        return _serialize(self._data)
+
+    def save(self, filepath: str) -> None:
+        """将内存数据持久化到 JSON 文件（仅 _data，不含设备）。
+        格式与系统镜像 mem 段一致：显式节点 {kind, meta, ctrl, value}。"""
+        import json
+
         with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(_serialize(self._data), f, ensure_ascii=False, indent=2)
+            json.dump(self.to_image_dict(), f, ensure_ascii=False, indent=2)
 
     @classmethod
     def load(cls, filepath: str) -> "Memory":

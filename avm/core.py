@@ -1,3 +1,5 @@
+import dataclasses
+import traceback
 from typing import Optional, List, Dict, Type, Any
 
 from openai import OpenAI
@@ -10,7 +12,7 @@ import time
 from .types import MetaList, MetaDict
 from .exceptions import VMSyntaxError, VMMemoryError, APIError, RunnerStop, KernelPanic
 from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, message_to_api_dict, LinkNode
-from .memory import Memory
+from .memory import Memory, check_new_key
 from .memory_device import MemoryDevice
 from .monitor import Monitor
 from .python_server import PLM_REGISTRY, create_plm
@@ -145,8 +147,13 @@ def _validate_instruction_args(instr_cls, args) -> Optional[str]:
         if not _value_matches(value, spec):
             return f"参数 {name} 不合法：{value!r}"
     tool = instr_cls.tool_name
-    if tool == "memory_write" and not args["ref"].startswith("$"):
+    if tool in ("memory_read", "memory_write") and not args["ref"].startswith("$"):
         return f"ref 必须是 $ 开头的内存引用，得到 {args['ref']!r}"
+    if tool == "memory_make":
+        try:
+            check_new_key(args["key"])
+        except VMMemoryError as e:
+            return str(e)
     if tool == "edit_metadata":
         op = args.get("type")
         if op not in ("set", "get", "del"):
@@ -168,6 +175,34 @@ def _validate_instruction_args(instr_cls, args) -> Optional[str]:
         if action == "cancel" and args.get("listener_id") is None:
             return "action=cancel 时必须提供 listener_id"
     return None
+
+
+def _publish_after_safely(conv: Conversation, label: str, publish) -> None:
+    """执行一次 after 事实事件发布，失败只记 stderr（fail-open）。
+
+    发布属于观测面：它失败不该改调用者看到的工具响应，更不该让同一个工具调用出现
+    第二条响应——那会破坏 assistant 的 tool_calls 与 tool 消息一一配对（配对不变量）。
+    """
+    try:
+        publish()
+    except Exception as e:
+        _report_tool_error(conv, f"{label} 的 after 事件发布失败（{type(e).__name__}: {e}），已忽略")
+
+
+def _publish_core_after_safely(core: 'Core', event_type: str, conv: Conversation, target: str,
+                               payload: dict, source_kind: str = "core") -> None:
+    """发布一条 Core / 内存侧 after 事实事件，失败只记 stderr（fail-open）。
+
+    与 `_publish_after_safely` 同一件事，只是把 `core.events.publish_after_event`
+    的参数原样接过来，省掉每处一层 lambda。
+    """
+    _publish_after_safely(
+        conv,
+        event_type,
+        lambda: core.events.publish_after_event(
+            event_type, conv, target, payload, source_kind=source_kind
+        ),
+    )
 
 
 class Instruction:
@@ -218,17 +253,29 @@ class MemoryReadInstruction(Instruction):
             return
         try:
             content = core.unwrap(self.ref, for_llm=True)
-            conv.user_batch.add_tool_response(content, self.call_id)
-            _publish_memory_after(
+        except _INSTRUCTION_ERRORS as e:
+            conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
+            return
+        if not isinstance(content, str):
+            # 值域：进 LLM 可见通道的必须是字符串。$conv.N 这类伪地址会返回活对象；
+            # 内存里也可能留着非字符串的叶子（早期写入或镜像预置）。
+            conv.user_batch.add_tool_response(
+                f"Error: {self.ref} 的值是 {type(content).__name__}，不能作为工具响应", self.call_id
+            )
+            return
+        conv.user_batch.add_tool_response(content, self.call_id)
+        _publish_after_safely(
+            conv,
+            "memory_read",
+            lambda: _publish_memory_after(
                 core,
                 "memory_read",
                 conv,
                 self.ref,
                 {"ref": self.ref, "actor_cid": conv.cid, "result": content},
                 result={"result": content},
-            )
-        except _INSTRUCTION_ERRORS as e:
-            conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
+            ),
+        )
 
 
 class MemoryWriteInstruction(Instruction):
@@ -270,17 +317,22 @@ class MemoryWriteInstruction(Instruction):
         content = event["payload"]["content"]
         try:
             core.mem.set(self.ref, content, owner_cid=conv.cid)
-            conv.user_batch.add_tool_response(f"Success set: {self.ref}", self.call_id)
-            _publish_memory_after(
+        except _INSTRUCTION_ERRORS as e:
+            conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
+            return
+        conv.user_batch.add_tool_response(f"Success set: {self.ref}", self.call_id)
+        _publish_after_safely(
+            conv,
+            "memory_write",
+            lambda: _publish_memory_after(
                 core,
                 "memory_write",
                 conv,
                 self.ref,
                 {"ref": self.ref, "content": content, "actor_cid": conv.cid},
                 result={"content": content},
-            )
-        except _INSTRUCTION_ERRORS as e:
-            conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
+            ),
+        )
 
 
 class MemoryMakeInstruction(Instruction):
@@ -324,8 +376,14 @@ class MemoryMakeInstruction(Instruction):
             return
         try:
             core.mem.make(self.ref, self.key, self.mem_type, owner_cid=conv.cid)
-            conv.user_batch.add_tool_response(f"Success created {self.mem_type} at {self.ref}.{self.key}", self.call_id)
-            _publish_memory_after(
+        except _INSTRUCTION_ERRORS as e:
+            conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
+            return
+        conv.user_batch.add_tool_response(f"Success created {self.mem_type} at {self.ref}.{self.key}", self.call_id)
+        _publish_after_safely(
+            conv,
+            "memory_make",
+            lambda: _publish_memory_after(
                 core,
                 "memory_make",
                 conv,
@@ -338,9 +396,8 @@ class MemoryMakeInstruction(Instruction):
                     "actor_cid": conv.cid,
                 },
                 result={"key": self.key, "mem_type": self.mem_type, "path": target},
-            )
-        except _INSTRUCTION_ERRORS as e:
-            conv.user_batch.add_tool_response(f"Error: {e}", self.call_id)
+            ),
+        )
 
 
 class EditMetadataInstruction(Instruction):
@@ -415,7 +472,7 @@ class EditMetadataInstruction(Instruction):
             ctrl[key] = value
             node.set_ctrl(ctrl)
             conv.user_batch.add_tool_response(f"ctrl.{key} = {value!r} 已写入", self.call_id)
-            core.events.publish_after_event(
+            _publish_core_after_safely(core, 
                 "edit_metadata",
                 conv,
                 self.ref,
@@ -427,7 +484,7 @@ class EditMetadataInstruction(Instruction):
                 conv.user_batch.add_tool_response(
                     json.dumps(ctrl, ensure_ascii=False) if ctrl else "{}", self.call_id
                 )
-                core.events.publish_after_event(
+                _publish_core_after_safely(core, 
                     "edit_metadata",
                     conv,
                     self.ref,
@@ -436,7 +493,7 @@ class EditMetadataInstruction(Instruction):
                 )
             elif key in ctrl:
                 conv.user_batch.add_tool_response(str(ctrl[key]), self.call_id)
-                core.events.publish_after_event(
+                _publish_core_after_safely(core, 
                     "edit_metadata",
                     conv,
                     self.ref,
@@ -462,7 +519,7 @@ class EditMetadataInstruction(Instruction):
             del ctrl[key]
             node.set_ctrl(ctrl)
             conv.user_batch.add_tool_response(f"ctrl.{key} 已删除", self.call_id)
-            core.events.publish_after_event(
+            _publish_core_after_safely(core, 
                 "edit_metadata",
                 conv,
                 self.ref,
@@ -507,7 +564,7 @@ class CreateInstruction(Instruction):
         # 子对话创建后进入休眠，等待 send_instruction 投递指令
         if child.cid not in core._dormant_cids:
             core._dormant_cids.append(child.cid)
-        core.events.publish_after_event(
+        _publish_core_after_safely(core, 
             "create_cmd",
             conv,
             f"cid:{child.cid}",
@@ -553,7 +610,7 @@ class CreateSubInstruction(Instruction):
         core._ready_cids.insert(0, sub.cid)
         if conv.cid not in core._dormant_cids:
             core._dormant_cids.append(conv.cid)
-        core.events.publish_after_event(
+        _publish_core_after_safely(core, 
             "create_sub",
             conv,
             f"cid:{sub.cid}",
@@ -641,7 +698,7 @@ class SendInstruction(Instruction):
                 core._ready_cids.remove(target.cid)
             core._ready_cids.append(target.cid)  # 排队调度：被唤醒者进队列末尾
             # TODO(issue): send_instruction 事实事件的语义需进一步研究
-            core.events.publish_after_event(
+            _publish_core_after_safely(core, 
                 "send_instruction",
                 conv,
                 f"cid:{target.cid}",
@@ -694,7 +751,7 @@ class CloseInstruction(Instruction):
             conv.user_batch.add_tool_response(f"Error: 对话 {self.cid} 已是 finished", self.call_id)
             return
         core._close_conversation(self.cid)
-        core.events.publish_after_event(
+        _publish_core_after_safely(core, 
             "close_conversation",
             conv,
             f"cid:{self.cid}",
@@ -769,7 +826,7 @@ class ListenEventInstruction(Instruction):
                 response = f"listener_id={listener_id} 已取消"
                 after_payload = {"listener_id": listener_id, "action": "cancel", "actor_cid": conv.cid}
 
-            core.events.publish_after_event(
+            _publish_core_after_safely(core, 
                 "listen_event",
                 conv,
                 f"listener:{listener_id}",
@@ -1106,6 +1163,9 @@ class Core:
         # API 失败时的运行者策略：callable(error, attempt) -> "retry" | "reload" | "exit"。
         # 宿主安装（终端提示见 avm/runner_prompt.py）；没装时按退出处理。
         self.api_error_policy = None
+        # 内核转储：镜像可用 core_dump_to / core_dump 覆盖（见 load_image）
+        self.core_dump_to: Optional[str] = None
+        self.core_dump_enabled: bool = True
         self.events: EventSystem = EventSystem(self)
         self.interrupts: InterruptTable = InterruptTable(self)  # 中断向量表：外部（控制台）发起的控制权转移
         self._turn_events: List[dict] = []
@@ -1217,14 +1277,26 @@ class Core:
         if conv.is_sub:
             parent = conv.parent
             if parent is not None and parent.cid not in self._finished:
-                # 亚对话紧耦合：完成即自动写回并唤醒父
-                call_id = conv.metadata.get("call_id", "direct_output")
-                parent.user_batch.add_tool_response(result, call_id)
-                if conv.cid not in self._dormant_cids:
-                    self._dormant_cids.append(conv.cid)
-                self._resume(parent.cid)
-                return
-            # 父已关闭：无处写回，亚对话按普通交互结束进入休眠
+                # TODO(issue): 亚对话应该用完就删掉（作者 2026-10-16）——现在写回后只是休眠，
+                # 再次唤醒会走到下面的 returned 分支。删除的语义（记 finished 还是移出对话表）、
+                # 时机（写回后立即还是安全点）、$MEM.conversations 里留不留痕迹都未定，
+                # 见 docs/private/Agents/proposed/question-sub-conversation-deletion-2026-10-16.md。
+                if conv.metadata.get("returned"):
+                    # 返回通道只在第一次完成时使用：父的那次 create_sub 已经答复过了。
+                    # 再写一条同 call_id 的响应会让历史出现"一个 tool_call 两条 tool 消息"，
+                    # 下一次请求会被 API 拒绝（配对不变量会先停机）。亚对话本不该被再次
+                    # 唤醒，这里是兜底：只记 stderr，不写回、不唤醒父。
+                    _report_tool_error(conv, "亚对话已完成过一次，本次完成不再写回父对话")
+                else:
+                    # 亚对话紧耦合：完成即自动写回并唤醒父
+                    call_id = conv.metadata.get("call_id", "direct_output")
+                    parent.user_batch.add_tool_response(result, call_id)
+                    conv.metadata["returned"] = True
+                    if conv.cid not in self._dormant_cids:
+                        self._dormant_cids.append(conv.cid)
+                    self._resume(parent.cid)
+                    return
+            # 父已关闭、或已经写回过：亚对话按普通交互结束进入休眠
         # 交互结束：对话进入休眠（个体保留，等待事件/再次被调用）。
         # "finished" 是概念态（被内核级关闭指令关闭的对话），Core 调度状态只有活跃/休眠/就绪。
         if conv.cid not in self._dormant_cids:
@@ -1658,6 +1730,163 @@ class Core:
                 f"（可能是拼写错误或已退役的别名）",
                 file=sys.stderr,
             )
+
+    # ------------------------------------------------------------------
+    # 内核转储（诊断快照，不是恢复输入）
+    # ------------------------------------------------------------------
+
+    def core_dump_path(self) -> str:
+        """默认转储落点：<镜像目录>/out/<镜像名>.core.json；无镜像上下文时用 cwd 下的 core.<pid>.json。"""
+        if self.image_dir and self.image_name:
+            return os.path.join(self.image_dir, "out", f"{self.image_name}.core.json")
+        return os.path.join(os.getcwd(), f"core.{os.getpid()}.json")
+
+    def dump_core(
+        self,
+        path: Optional[str] = None,
+        error: Optional[BaseException] = None,
+        *,
+        messages_per_conversation: int = 200,
+        max_frames: int = 200,
+        max_bytes: int = 8 * 1024 * 1024,
+    ) -> Optional[str]:
+        """把死亡现场写成一个 JSON，返回写入路径；失败返回 None。
+
+        诊断快照，**不是恢复输入**（恢复只走检查点）。全程不抛：任何一段序列化失败
+        都降级为占位——转储绝不能成为新的内核退出路径。
+        """
+        target = path or self.core_dump_to or self.core_dump_path()
+        try:
+            doc = self._build_core_dump(error, messages_per_conversation, max_frames)
+            text = json.dumps(doc, ensure_ascii=False, indent=2)
+            if len(text.encode("utf-8")) > max_bytes:
+                # 内存树按作者决定不截断，先砍对话正文，再砍对话本身（旧的先砍）
+                for brief in doc["conversations"]:
+                    if brief.get("messages"):
+                        brief["messages"] = []
+                        brief["messages_truncated"] = True
+                        doc["truncated"]["conversations"].append(brief["cid"])
+                text = json.dumps(doc, ensure_ascii=False, indent=2)
+            if len(text.encode("utf-8")) > max_bytes:
+                for brief in doc["conversations"][:-1]:
+                    brief.pop("messages", None)
+                    if brief["cid"] not in doc["truncated"]["conversations"]:
+                        doc["truncated"]["conversations"].append(brief["cid"])
+                text = json.dumps(doc, ensure_ascii=False, indent=2)
+            doc["truncated"]["total_bytes"] = len(text.encode("utf-8"))
+            text = json.dumps(doc, ensure_ascii=False, indent=2)
+            os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(text)
+            return target
+        except Exception as e:
+            print(
+                f"[AVM] 内核转储写入失败（{type(e).__name__}: {e}），原始错误不受影响",
+                file=sys.stderr,
+            )
+            return None
+
+    def _build_core_dump(self, error: Optional[BaseException], limit: int, max_frames: int) -> dict:
+        truncated = {"conversations": [], "frames": False, "total_bytes": 0}
+        err = None
+        if error is not None:
+            try:
+                tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            except Exception as e:  # traceback 都可能失败：降级
+                tb = f"<traceback 不可用：{type(e).__name__}: {e}>"
+            err = {
+                "type": type(error).__name__,
+                "message": str(error),
+                "traceback": tb,
+                "panicked": isinstance(error, KernelPanic),
+            }
+        frames = []
+        try:
+            all_frames = self.monitor.frames()
+            if len(all_frames) > max_frames:
+                truncated["frames"] = True
+                all_frames = all_frames[-max_frames:]
+            frames = [dataclasses.asdict(f) for f in all_frames]
+        except Exception as e:
+            frames = [{"error": f"帧序列化失败：{type(e).__name__}: {e}"}]
+        try:
+            listeners = [dict(x) for x in self.events.listeners]
+        except Exception as e:
+            listeners = [{"error": f"{type(e).__name__}: {e}"}]
+        try:
+            memory = self.mem.to_image_dict()
+        except Exception as e:
+            memory = {"kind": "dict", "value": {}, "meta": f"<内存树序列化失败：{type(e).__name__}: {e}>"}
+        return {
+            "format": "avm.core_dump",
+            "version": 1,
+            "when": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "image": os.path.join(self.image_dir or "", self.image_name or "") or None,
+            "host_flags": dict(self.host_flags or {}),
+            "para_ref": self.para_ref,
+            "note": "诊断快照，不是恢复输入；memory 段与 persist_to 同格式",
+            "error": err,
+            "scheduler": {
+                "active": self._active_cid,
+                "ready": list(self._ready_cids),
+                "dormant": list(self._dormant_cids),
+                "finished": sorted(self._finished),
+                "instruction_budget": self._instruction_budget,
+                "activation_instructions": self._activation_instructions,
+            },
+            "memory": memory,
+            "conversations": [
+                self._conversation_dump(self._conv_by_cid[cid], limit)
+                for cid in sorted(self._conv_by_cid)
+            ],
+            "listeners": listeners,
+            "devices": [
+                {"mount": mount, "type": type(dev).__name__, "id": getattr(dev, "device_id", None)}
+                for mount, dev in list(self.mem._devices.items())
+            ],
+            "interrupts": {"last_dispatch": list(self.interrupts.last_dispatch)},
+            "frames": frames,
+            "truncated": truncated,
+        }
+
+    def _conversation_dump(self, conv: Conversation, limit: int) -> dict:
+        """单个对话的现场：状态、身份、历史（保最后 limit 条）、待发批次。"""
+        state = "?"
+        if conv.cid == self._active_cid:
+            state = "active"
+        elif conv.cid in self._finished:
+            state = "finished"
+        elif conv.cid in self._ready_cids:
+            state = "ready"
+        elif conv.cid in self._dormant_cids:
+            state = "dormant"
+        try:
+            messages = conv.to_checkpoint().get("messages", [])
+        except Exception as e:
+            messages = [{"error": f"历史序列化失败：{type(e).__name__}: {e}"}]
+        total = len(messages)
+        brief = {
+            "cid": conv.cid,
+            "identity": conv.identity,
+            "name": getattr(conv, "name", None),
+            "state": state,
+            "is_python": conv.is_python,
+            "is_sub": conv.is_sub,
+            "parent": conv.parent.cid if conv.parent is not None else None,
+            "para_ref": conv.para_ref,
+            "metadata": dict(conv.metadata or {}),
+            "message_count": total,
+            "messages": messages[-limit:] if limit else [],
+            "messages_truncated": total > limit,
+            "batch": {
+                "tool_responses": [
+                    {"content": r.content, "tool_call_id": r.tool_call_id}
+                    for r in conv.user_batch.tool_responses
+                ],
+                "user_contents": list(conv.user_batch.user_contents),
+            },
+        }
+        return brief
 
     def run(self):
         self._pick_next_active()

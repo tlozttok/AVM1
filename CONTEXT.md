@@ -37,7 +37,7 @@ _Avoid_: system prompt、系统提示词
 _Avoid_: plugin、tool、function
 
 **Para**:
-LLM API 参数文件。type = `"para"`。存储模型名、temperature 等 API 调用参数配置。
+LLM API 参数文件。type = `"para"`。存储模型名、temperature 等 API 调用参数配置。`model` 一个字段承载两种命名：settingup 程序配 LLM 模型名，python 程序配 PLM 注册名（`plm.simple` 等）；两种命名由 `create_cmd` / `create_sub` 在建对话前按模型目录交叉校验。
 
 **Conversation**:
 对话序列化文件。type = `"conversation"`。存储持久化的对话记录。
@@ -55,7 +55,7 @@ AVM 的指令分发层和调度器。不参与管理决策——只执行指令�
 ### 指令集
 
 **内存指令 (Memory instructions)**:
-`memory_read`、`memory_write`、`memory_make`、`edit_metadata`——读写内存、创建新内存地址、编辑节点的 ctrl 元数据（set/get/del）。
+`memory_read`、`memory_write`、`memory_make`、`edit_metadata`——读写内存、创建新内存地址（只创建、不覆盖；键非空且不含点号）、编辑节点的 ctrl 元数据（set/get/del）。四条的引用/键语法在指令边界统一校验：引用以 `$` 开头、路径不能有空段。
 
 **对话程序指令 (Conversation program instructions)**:
 `create_cmd`、`create_sub`——创建子对话或亚对话以启动 Settingup 程序。`create_cmd` 只创建并返回 cid（父不休眠、子对话休眠等待指令）；`create_sub` 保留 user_ref、立即执行。
@@ -120,6 +120,14 @@ _Avoid_: workdir、工作目录
 AVM 的使用者，通过虚拟文件或指令操作 AVM。不是任何 LLM 对话的聊天对象。AVM 中的对话优先处理内存中设定的目的，用户输入只是外部信息源之一。
 _Avoid_: 聊天对象、对话伙伴
 
+**模型目录 (Model catalog)**:
+启动自带的普通内存节点 `$MEM.model_catalog`（不是设备、不产生事件），由内核在 `Core()` 与镜像装载之后安装，镜像里已有的字段不覆盖。两侧分别列出可用的 LLM 模型（`llm`：来源 `source`、上游清单 `models`、可写进 para 的 API 参数 `params`）与本地 PLM 注册表（`plm`：注册名、固定行为说明、参数要求）。名字（`plm.*` 与带点的模型 id）装在列表项的 `name` / `id` 字段里，不当键。宿主启动时拉一次上游 `GET /models` 填充；取不到时标为 `unavailable`，只警告、不拦启动也不拦模型名——清单只当参考。
+_Avoid_: 模型注册表、白名单
+
+**生命周期三段**:
+内核启动的显式三步：**创建空核心**（`Core()`）→ **加载镜像**（`load_image(core, path)`，要求核心还没有对话）→ **启动核心**（`start_core(core)`：刷新模型目录、装 API 失败的运行者策略）。`avm/boot.py` 是加载区，三段都收在那里，宿主通常只调 `boot(image_path)`。
+_Avoid_: 引导、初始化
+
 ### 安全
 
 **Capability 模型**（设计中，未实现）:
@@ -128,6 +136,30 @@ AVM 的安全基础。对话不知道内存地址就无法访问——不存在�
 **文件安全性**（设计中，未实现）:
 对话可以为其拥有的文件设定访问密码，阻止其他对话访问。可注册回调：当其他对话尝试访问受保护文件时，所有者获得通知。
 _Avoid_: ACL、RBAC、权限位
+
+### 错误与停机
+
+分类判据是"这个错误能否由调用者输入决定"，处置分四处（机制细节见 [docs/runtime.md](docs/runtime.md) 的"错误输出"一节）。
+
+**非法操作 (Illegal operation)**:
+调用者输入在边界上可判定为不合法：缺必填参数、类型不符、枚举外、引用不带 `$`、地址语法错误、程序类型与 `model` 命名空间不配。处置：拒绝并回一条 `Error: ...` 工具响应，状态不动，对话继续。参数 schema 只有一个来源（`Instruction.tool_def`）。
+_Avoid_: 异常、报错、抛错
+
+**异常返回 (Abnormal return)**:
+操作合法而世界与期望不符：键不存在、索引越界、类型不符、链接成环、设备拒绝、事件处理器失败。处置：容许异常值，返回带说明的结果。
+_Avoid_: 容错、兜底、吞掉
+
+**内核恐慌 (Kernel panic)**:
+六条具名内核不变量（调度互斥、活跃有来源、历史配对、值域、设备表一致、预算计数）之一被破坏。处置：记录监测帧后终止。出现即说明某条边界少了一条判定——可判定的输入不该走到这里。
+_Avoid_: 崩溃、报错退出
+
+**API 失败 (API failure)**:
+外部 API 调用失败（缺 key、断网、超时、协议错误）。处置：记帧后停下等运行者选择——更新环境 / 继续 / 退出；选择由宿主装的 `api_error_policy` 收（终端提示见 `avm/runner_prompt.py`），内核自身不含终端逻辑。
+_Avoid_: 重试、降级、自愈
+
+**内核转储 (Core dump)**:
+内核死亡（不变量被破坏，或未捕获缺陷逃出 `run()`）时落一份现场快照：异常类型/消息/栈、调度队列、内存树、每个对话的状态与历史及待发批次、监听器、设备表、中断记录、监测帧。默认落 `<镜像目录>/out/<镜像名>.core.json`，镜像 `core_dump_to` / `core_dump` 与宿主 `--core-dump` / `--no-core-dump` 可覆盖。**它是诊断快照，不是恢复输入**——恢复只走检查点。转储自身不抛，写失败只记 stderr。
+_Avoid_: 快照恢复、崩溃存档
 
 ### 调试
 

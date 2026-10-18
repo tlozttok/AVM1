@@ -11,10 +11,10 @@ import pytest
 from avm.core import Core
 from avm.exceptions import APIError, KernelPanic, RunnerStop, VMMemoryError
 from avm.image import ImageError, load_image
-from avm.memory_device import OutputsListDevice
+from avm.memory_device import MemoryDevice, OutputsListDevice
 from avm.python_server import create_plm
 from avm.sandbox import exec_safe, safe_globals
-from avm.types import AssistantMessage, ToolMessage
+from avm.types import AssistantMessage, MetaDict, ToolMessage
 
 
 def _core():
@@ -282,6 +282,136 @@ class TestNoEmergencyStopInSandbox:
 
     def test_exception_class_still_available(self):
         exec_safe("try:\n    raise ValueError('v')\nexcept Exception:\n    ok = 1", safe_globals())
+
+
+# ----------------------------------------------------------------------
+# 一个工具调用只写一条响应（两条会让配对不变量停机）
+# ----------------------------------------------------------------------
+
+class TestSingleResponsePerCall:
+    def test_publish_failure_does_not_write_a_second_response(self, capsys, monkeypatch):
+        """memory_make：落笔成功 → 写成功响应 → 发布失败只记 stderr，不再写 Error。
+
+        2026-10-16 之前这里会出两条同 call_id 的响应（Success + Error），
+        下一次 API 请求因此被拒（配对不变量会先停机）。发布失败用注入制造：
+        指令语法补完之后，正常输入已经走不到这条失败路径了。
+        """
+        def boom(*args, **kwargs):
+            raise ValueError("发布坏了")
+
+        monkeypatch.setattr("avm.core._publish_memory_after", boom)
+        core, conv = _core()
+        _call(core, conv, "memory_make", {"ref": "$MEM", "key": "b", "mem_type": "str"})
+        assert [r.tool_call_id for r in conv.user_batch.tool_responses] == ["c1"]
+        assert _responses(conv)[0][0].startswith("Success created")
+        assert "after 事件发布失败" in capsys.readouterr().err
+        Core._check_pairing(conv)  # 不抛
+
+    def test_publish_failure_on_read_stays_one_response(self, monkeypatch):
+        def boom(*args, **kwargs):
+            raise ValueError("发布坏了")
+
+        monkeypatch.setattr("avm.core._publish_memory_after", boom)
+        core, conv = _core()
+        core.mem["x"] = "value"
+        _call(core, conv, "memory_read", {"ref": "$MEM.x"})
+        assert [r.tool_call_id for r in conv.user_batch.tool_responses] == ["c1"]
+        assert _responses(conv)[0][0] == "value"
+
+    def test_sub_completes_twice_writes_back_once(self, capsys):
+        """亚对话的返回通道只用一次：再次完成不写工具响应（同 id 两条会破坏配对）。"""
+        core = Core()
+        parent = core.start("sys", "hello")
+        core.mem["model_params"] = MetaDict(data={"model": "m"}, ctrl={"type": "para"})
+        core.mem["prog"] = MetaDict(data={"content": "x"}, ctrl={"type": "settingup"})
+        core.mem["u"] = "任务"
+        core._active_cid = parent.cid
+        _call(core, parent, "create_sub",
+              {"system_ref": "$MEM.prog", "user_ref": "$MEM.u", "para_ref": "$MEM.model_params"})
+        sub = [c for c in core._conv_by_cid.values() if c.is_sub][0]
+
+        class _Done:
+            def exec(self, conversation, para):
+                return "子结果", [], conversation
+
+        core._executors[sub.cid] = _Done()
+        for _ in range(2):
+            core._active_cid = sub.cid
+            core.advance_conversation()
+
+        assert [r.tool_call_id for r in parent.user_batch.tool_responses] == ["c1"]
+        assert "不再写回父对话" in capsys.readouterr().err
+        Core._check_pairing(parent)  # 不抛
+
+
+# ----------------------------------------------------------------------
+# 指令语法与创建语义：键语法、只创建不覆盖、读侧引用语法
+# ----------------------------------------------------------------------
+
+class TestMemoryGrammarAndCreateOnly:
+    """2026-10-17 契约审查的一组输入边界修复（作者在 AVM 内用对话测试得到）。"""
+
+    def test_read_ref_must_start_with_dollar(self):
+        core, conv = _core()
+        _call(core, conv, "memory_read", {"ref": "MEM"})
+        assert _responses(conv)[0][0].startswith("Error: ref 必须是 $ 开头")
+
+    def test_read_ref_rejects_empty_segment(self):
+        core, conv = _core()
+        _call(core, conv, "memory_read", {"ref": "$MEM..x"})
+        assert "空段" in _responses(conv)[0][0]
+
+    def test_make_key_must_be_non_empty(self):
+        core, conv = _core()
+        _call(core, conv, "memory_make", {"ref": "$MEM", "key": "", "mem_type": "str"})
+        assert "不能为空" in _responses(conv)[0][0]
+        assert "" not in core.mem._data._data
+
+    def test_make_key_must_not_contain_dot(self):
+        core, conv = _core()
+        _call(core, conv, "memory_make", {"ref": "$MEM", "key": "a.b", "mem_type": "str"})
+        assert "点号" in _responses(conv)[0][0]
+        assert "a.b" not in core.mem._data._data  # 不再造出不可寻址的字面键
+
+    def test_make_does_not_overwrite_existing_dict(self):
+        """静默覆盖会丢掉整棵子树；现在拒绝并保留原内容。"""
+        core, conv = _core()
+        _call(core, conv, "memory_make", {"ref": "$MEM", "key": "loss", "mem_type": "dict"})
+        _call(core, conv, "memory_write", {"ref": "$MEM.loss.child", "content": "keep"})
+        _call(core, conv, "memory_make", {"ref": "$MEM", "key": "loss", "mem_type": "dict"})
+        assert "已存在" in _responses(conv)[-1][0]
+        assert core.mem["loss"]["child"] == "keep"
+
+    def test_make_does_not_overwrite_across_types(self):
+        core, conv = _core()
+        _call(core, conv, "memory_make", {"ref": "$MEM", "key": "t", "mem_type": "str"})
+        _call(core, conv, "memory_make", {"ref": "$MEM", "key": "t", "mem_type": "dict"})
+        assert "已存在" in _responses(conv)[-1][0]
+        assert isinstance(core.mem["t"], str)
+
+    def test_make_cannot_clobber_a_device_mount_link(self):
+        """键与设备挂载点名冲突：此前会覆写链接节点 → 设备表不一致 → 内核恐慌。"""
+        class _Dev(MemoryDevice):
+            def to_llm_string(self):
+                return "dev"
+
+        core, conv = _core()
+        core.mem.mount("a", _Dev())
+        _call(core, conv, "memory_make", {"ref": "$MEM", "key": "a", "mem_type": "str"})
+        assert "已存在" in _responses(conv)[0][0]
+        assert core.unwrap("$MEM.a") == "dev"
+        core._check_invariants()  # 不抛：设备表一致
+
+    def test_write_path_still_rejects_empty_segment(self):
+        core, conv = _core()
+        _call(core, conv, "memory_write", {"ref": "$MEM..x", "content": "v"})
+        assert "空段" in _responses(conv)[0][0]
+
+    def test_valid_make_still_works(self):
+        core, conv = _core()
+        _call(core, conv, "memory_make", {"ref": "$MEM", "key": "ok", "mem_type": "dict"})
+        assert _responses(conv)[0][0].startswith("Success created dict at $MEM.ok")
+        assert type(core.mem["ok"]).__name__ == "MetaDict"
 
 
 # ----------------------------------------------------------------------

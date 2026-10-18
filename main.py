@@ -16,7 +16,7 @@ import json
 import os
 import sys
 
-from avm.boot import boot
+from avm.boot import add_core_dump_args, boot, dump_on_death
 from avm.exceptions import VMMemoryError, RunnerStop
 from avm.image import ImageError
 from avm.monitor import Monitor
@@ -67,6 +67,7 @@ def main(argv=None) -> int:
                         help="调试用：启动时加载单对话检查点（跳过 init，恢复为就绪对话）")
     parser.add_argument("--debug-config", metavar="PATH", default="debug.json",
                         help="无 image 参数时的配置文件（默认 debug.json）")
+    add_core_dump_args(parser)
     args = parser.parse_args(argv)
 
     frames = args.frames
@@ -103,6 +104,8 @@ def main(argv=None) -> int:
 
     if transcript:
         core.monitor = Monitor(max_frames=2000, transcript_path=transcript)
+    if args.no_core_dump:
+        core.core_dump_enabled = False
 
     status = 0
     try:
@@ -112,6 +115,10 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print("[AVM] 收到中断，写回后退出", file=sys.stderr)
         status = 130
+    except BaseException as e:
+        # 内核死亡（不变量被破坏或未捕获缺陷）：先落现场快照，再保留原始 traceback 往上抛
+        dump_on_death(core, e, args.core_dump)
+        raise
     finally:
         persist_to = getattr(core, "persist_to", None)
         if persist_to:

@@ -7,7 +7,7 @@
 一个程序由两部分组成：
 
 - **Settingup 节点**：`content` 是程序文本（提示词，或 type=`python` 的代码）。节点的 `name` 字段是对话的身份。
-- **para 节点**：`model`、`temperature`、`use_tool` 等调用参数。
+- **para 节点**：`model`、`temperature`、`use_tool` 等调用参数。`model` 有两种命名：配 settingup 程序时是 LLM 模型名，配 python 程序时是 PLM 注册名（`plm.simple` 等）。两种命名由 `create_cmd` / `create_sub` 在建对话前按 `$MEM.model_catalog` 交叉校验，配错会得到 Error 工具响应而不是等第一次推理报错。
 
 对话由 `system_ref` 指向的程序节点（或入口对话的字面量）和一条用户消息启动。`create_cmd` / `create_sub` 的 `system_ref` 必须指向 `ctrl.type="settingup"` 或 `"python"` 的程序节点，指向 str 节点或无类型节点会报错。程序文本在内存中，对话可以读取、检查、修改其他节点——AVM 的元编程基础在这里。
 

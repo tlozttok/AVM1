@@ -15,6 +15,7 @@
 只负责顺序与默认值，不吞错。
 """
 
+import sys
 from typing import Optional
 
 from .core import Core
@@ -38,6 +39,33 @@ def start_core(
     if refresh_models:
         core.refresh_model_catalog(timeout=timeout)
     return core
+
+
+def dump_on_death(core: Core, error, path: Optional[str] = None) -> Optional[str]:
+    """宿主在死亡路径上调一次：把现场写进内核转储。
+
+    诊断快照，不是恢复输入。`core_dump_enabled` 为假（镜像 `core_dump: false` 或
+    宿主 `--no-core-dump`）时什么都不做。写入失败只记 stderr，不改变调用方的异常。
+    """
+    if not getattr(core, "core_dump_enabled", True):
+        return None
+    target = path or getattr(core, "core_dump_to", None) or core.core_dump_path()
+    written = core.dump_core(target, error)
+    if written:
+        print(f"[AVM] 内核转储已写入 {written}", file=sys.stderr)
+    return written
+
+
+def add_core_dump_args(parser) -> None:
+    """三个宿主共用的转储开关：--core-dump <path> / --no-core-dump。"""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--core-dump", metavar="PATH",
+        help="内核死亡（不变量被破坏或未捕获缺陷）时把现场写入该路径（缺省 镜像目录/out/<镜像名>.core.json）",
+    )
+    group.add_argument(
+        "--no-core-dump", action="store_true", help="关闭内核转储",
+    )
 
 
 def boot(

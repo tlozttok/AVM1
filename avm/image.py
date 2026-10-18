@@ -6,7 +6,7 @@
 1. 解析 mem 段为显式节点树（kind/meta/ctrl/value），kind=device 为可读性标记（可出现在任意层级）；
 2. 按 para_ref 校验 para 节点（ctrl.type == "para"）并配置 Core；
 3. 按 devices 段加载设备插件文件（必须继承 MemoryDevice）并挂载；
-4. 启动 init 对话（0 号，默认名 "init"）；
+4. 启动 init 对话（0 号，默认名 "init"；入口可以是 settingup LLM 程序，也可以是 python PLM 程序）；
 5. run() 执行；若镜像声明 persist_to，结束后写回内存。
 """
 
@@ -18,7 +18,7 @@ import os
 import sys
 from typing import Optional
 
-from .core import Core
+from .core import Core, _build_conversation
 from .exceptions import VMMemoryError, RunnerStop
 from .memory_device import MemoryDevice, BUILTIN_DEVICE_CLASSES
 from .runner_prompt import prompt_api_error
@@ -159,6 +159,29 @@ def _resolve_para(core: Core, para_ref: str) -> str:
     return para_ref
 
 
+def _init_para_ref(core: Core, init: dict, node: Optional[MetaDict], node_type: Optional[str]) -> str:
+    """init 的 para 引用：init.para_ref → 程序节点的 para_ref 字段 → 镜像顶层 para_ref。
+
+    python 程序（PLM 入口）在三个来源都缺时报错：顶层 para 按约定是 LLM para，
+    拿它建 Python 对话只会在模型命名空间校验上撞墙，这里早报更清楚。
+    """
+    for where, value in (
+        ("init.para_ref", init.get("para_ref")),
+        ("程序节点的 para_ref", node.get("para_ref") if isinstance(node, MetaDict) else None),
+    ):
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.startswith("$"):
+            raise ImageError(f"{where} 必须是 $ 开头的内存引用，得到 {value!r}")
+        return value
+    if node_type == "python":
+        raise ImageError(
+            "init 指向 python 程序节点时必须有 para 引用：在 init 段写 para_ref，"
+            "或在程序节点里写 para_ref（顶层 para_ref 是 LLM 参数，不能建 Python 对话）"
+        )
+    return core.para_ref
+
+
 def _start_init(core: Core, init: dict):
     name = init.get("name", "init")
     system_ref, user_ref = init.get("system_ref"), init.get("user_ref")
@@ -167,18 +190,21 @@ def _start_init(core: Core, init: dict):
         raise ImageError("init 必须且只能提供 system 与 system_ref 之一")
     if (user is None) == (user_ref is None):
         raise ImageError("init 必须且只能提供 user 与 user_ref 之一")
+    node: Optional[MetaDict] = None
+    node_type: Optional[str] = None
     if system_ref is not None:
         if not isinstance(system_ref, str) or not system_ref.startswith("$"):
             raise ImageError("system_ref 必须是 $ 开头的内存引用（字面量请用 system 字段）")
         node = core.unwrap(system_ref, for_llm=False)
-        if not isinstance(node, MetaDict) or (node.get_ctrl() or {}).get("type") != "settingup":
+        node_type = (node.get_ctrl() or {}).get("type") if isinstance(node, MetaDict) else None
+        if node_type not in ("settingup", "python"):
             raise ImageError(
-                f"system_ref {system_ref} 必须指向 ctrl.type='settingup' 的 LLM 程序节点"
-                "（str 节点、无类型 dict 节点不接受）"
+                f"system_ref {system_ref} 必须指向 ctrl.type='settingup'（LLM 程序）或 "
+                "'python'（Python 程序）的 dict 节点（str 节点、无类型 dict 节点不接受）"
             )
         content = node.get("content")
         if not isinstance(content, str):
-            raise ImageError(f"settingup 节点 {system_ref} 必须有字符串 content 字段")
+            raise ImageError(f"程序节点 {system_ref} 必须有字符串 content 字段")
         system = content
     if user_ref is not None:
         if not isinstance(user_ref, str) or not user_ref.startswith("$"):
@@ -186,10 +212,21 @@ def _start_init(core: Core, init: dict):
         user = core.unwrap(user_ref, for_llm=False)
     if not isinstance(system, str) or not isinstance(user, str):
         raise ImageError(
-            "init 的 system/user 必须是字符串（system 字面量或 settingup 节点的 content；"
+            "init 的 system/user 必须是字符串（system 字面量或程序节点的 content；"
             "user_ref 需指向 str 节点）"
         )
-    conv = core.start(system, user, core.para_ref)
+    para_ref = _init_para_ref(core, init, node, node_type)
+    if node_type == "python":
+        # PLM 入口：0 号对话是 Python 对话。分派与模型命名空间校验复用 _build_conversation，
+        # 它建好 SystemMessage（程序代码）、注册对话、设 para_ref 与 is_python；
+        # 这里补用户消息与"0 号 + 就绪"语义（与 Core.start 对齐，区别只在执行器是 PLM）。
+        conv = _build_conversation(core, system_ref, para_ref, parent=None, is_sub=False)
+        conv.append_user_message(user)
+        conv.is_root = True
+        conv.name = name
+        core._ready_cids.append(conv.cid)
+        return
+    conv = core.start(system, user, para_ref)
     conv.name = name
 
 
@@ -286,6 +323,17 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
             raise ImageError("persist_to 必须是字符串路径")
         core.persist_to = persist_to if os.path.isabs(persist_to) else os.path.join(
             os.path.dirname(os.path.abspath(image_path)), persist_to)
+    # 内核转储（诊断快照，不是恢复输入）：core_dump 开关、core_dump_to 落点，与 persist_to 同为顶层字段
+    core_dump = image.get("core_dump")
+    if core_dump is not None and not isinstance(core_dump, bool):
+        raise ImageError("core_dump 必须是布尔值")
+    core.core_dump_enabled = True if core_dump is None else core_dump
+    core_dump_to = image.get("core_dump_to")
+    if core_dump_to is not None:
+        if not isinstance(core_dump_to, str) or not core_dump_to:
+            raise ImageError("core_dump_to 必须是非空字符串路径")
+        core.core_dump_to = core_dump_to if os.path.isabs(core_dump_to) else os.path.join(
+            os.path.dirname(os.path.abspath(image_path)), core_dump_to)
     return core
 
 
@@ -294,14 +342,18 @@ def main(argv=None) -> int:
     parser.add_argument("image", help="系统镜像 JSON 文件路径")
     parser.add_argument("--checkpoint-in", metavar="PATH",
                         help="调试用：启动时加载单对话检查点（跳过 init，恢复为就绪对话）")
+    from .boot import add_core_dump_args
+    add_core_dump_args(parser)
     args = parser.parse_args(argv)
     # 局部导入：boot 依赖本模块的 load_image，模块级导入会成环
-    from .boot import boot
+    from .boot import boot, dump_on_death
     try:
         core = boot(args.image, checkpoint_in=args.checkpoint_in)
     except (ImageError, VMMemoryError, OSError, json.JSONDecodeError) as e:
         print(f"[AVM] 镜像错误: {e}", file=sys.stderr)
         return 1
+    if args.no_core_dump:
+        core.core_dump_enabled = False
     status = 0
     try:
         core.run()
@@ -310,6 +362,10 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print("[AVM] 收到中断，写回后退出", file=sys.stderr)
         status = 130
+    except BaseException as e:
+        # 内核死亡：先落现场快照，再保留原始 traceback 往上抛
+        dump_on_death(core, e, args.core_dump)
+        raise
     finally:
         persist_to = getattr(core, "persist_to", None)
         if persist_to:

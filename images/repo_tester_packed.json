@@ -1,0 +1,138 @@
+{
+  "meta": {
+    "name": "repo_tester_packed",
+    "version": 1,
+    "description": "测试镜像的打包版：0 号是 plm.python 打包器，启动时经 AVMRepo 读核心 md 文档、拼进测试对话的系统提示词，再建并启动测试对话；测试者不必再读这些文档。"
+  },
+  "mem": {
+    "system": {
+      "kind": "dict",
+      "meta": "repo_tester 的 LLM 提示词程序（settingup）",
+      "ctrl": {
+        "type": "settingup"
+      },
+      "value": {
+        "name": {
+          "kind": "str",
+          "value": "repo_tester"
+        },
+        "content": {
+          "kind": "str",
+          "value": "（启动时由 $MEM.packer 组装写入）"
+        }
+      }
+    },
+    "user": {
+      "kind": "str",
+      "value": "这里不是用户指令，是初始指令的一部分。你的指令从 \"$MEM.inputs.-1\" 读，你的话写到 \"$MEM.outputs.-1\"。循环进行，一个完整的输出后，继续读取输入；做什么由用户指令决定。"
+    },
+    "model_params": {
+      "kind": "dict",
+      "meta": "测试对话的 LLM API 参数",
+      "ctrl": {
+        "type": "para"
+      },
+      "value": {
+        "model": {
+          "kind": "str",
+          "value": "deepseek-v4-flash"
+        }
+      }
+    },
+    "tests": {
+      "kind": "dict",
+      "meta": "测试记录（写什么、怎么写由用户指令给出）",
+      "value": {
+        "cases": {
+          "kind": "dict",
+          "value": {}
+        },
+        "findings": {
+          "kind": "dict",
+          "value": {}
+        }
+      }
+    },
+    "AVMRepo": {
+      "kind": "device"
+    },
+    "inputs": {
+      "kind": "device"
+    },
+    "outputs": {
+      "kind": "device"
+    },
+    "packer": {
+      "kind": "dict",
+      "meta": "打包器程序（plm.python）：读文档、写系统提示词、建并启动测试对话",
+      "ctrl": {
+        "type": "python"
+      },
+      "value": {
+        "content": {
+          "kind": "str",
+          "value": "\"\"\"repo_tester_packed 的打包器程序（plm.python）。\n\n这份源码的正文就是镜像里 `$MEM.packer` 节点的 content：0 号对话是 plm.python，system 是它，\nuser 消息是文件列表（`images/repo_tester_packed/file_list.txt`），也就是最后一行那句调用。\n\n流程：逐页经 `$MEM.AVMRepo` 读文档 → 拼系统提示词 → 写 `$MEM.system.content` →\n`create_cmd` 出测试对话 → `send_instruction` 把 `$MEM.user` 投给它 → 写打包报告 → 关闭自己。\n\n沙箱约束（见 avm/sandbox.py）：禁 import / open / 双下划线属性；工具函数由 plm.python 注入，\n名字与参数同 9 条指令。写入类调用在重放时按记录返回，不会重复执行。\n\"\"\"\n\nSKELETON = \"\"\"你是这个系统中的一个对话。系统提供内存树和一组工具：memory_read、memory_write、memory_make、edit_metadata、create_cmd、create_sub、send_instruction、close_conversation、listen_event。你是这个系统的测试者：在用户指导下，依据仓库里的实际代码，对这个系统做测试。内存里有一个只读设备 $MEM.AVMRepo，它自己能说明怎么用它读文件：用 memory_read 读 $MEM.AVMRepo，照它写的用法用它，你就能读到 AVM 的源码、规范与测试。发现代码与行为不一致、代码没覆盖的边界、读不懂或设备自述没说清的地方，都报给用户。你只读代码、只测系统，不修改代码与镜像。\n\n你的提示词里已经打包了这些仓库文档（启动时组装好，不要再用 $MEM.AVMRepo 读一遍；清单见 $MEM.packed_docs）：{files}。docs/runtime.md 不在打包里，机制细节需要时用 $MEM.AVMRepo 读它。\"\"\"\n\n# 打包器自己的 cid：它是镜像的 init（0 号对话）\nPACKER_CID = 0\n\n\ndef read_doc(path):\n    \"\"\"经设备逐页读一份文档，只留正文（去掉页头与\"下一页/末页\"提示）。\"\"\"\n    page = 0\n    parts = []\n    while True:\n        ref = '$MEM.AVMRepo.read.\"%s\".%d' % (path, page)\n        resp = str(memory_read(ref))\n        if not resp.startswith(\"read \"):\n            raise RuntimeError(\"读 %s 失败：%s\" % (path, resp))\n        lines = resp.split(\"\\n\")\n        parts.append(\"\\n\".join(lines[1:-1]))\n        if \"（末页）\" in resp:\n            return \"\\n\".join(parts)\n        page = page + 1\n\n\ndef pack(*files):\n    \"\"\"组装提示词、建测试对话、启动它，然后关闭打包器自己。\"\"\"\n    parts = []\n    report = []\n    for path in files:\n        text = read_doc(path)\n        parts.append(\"### \" + path)\n        parts.append(text)\n        report.append(\"%s（%d 字符）\" % (path, len(text)))\n    content = SKELETON.replace(\"{files}\", \"、\".join(files)) + \"\\n\\n\" + \"\\n\".join(parts)\n\n    memory_write(\"$MEM.system.content\", content)\n    memory_write(\"$MEM.packed_docs\", \"\\n\".join(report))\n\n    created = str(create_cmd(\"$MEM.system\", \"$MEM.model_params\"))\n    tester_cid = int(created.rsplit(\"=\", 1)[1])\n    start = str(memory_read(\"$MEM.user\"))\n    send_instruction(tester_cid, start)\n\n    memory_write(\n        \"$MEM.packer_report\",\n        \"已把 %d 份文档（%d 字符）写进 $MEM.system.content，测试对话 cid=%d 已启动，打包器关闭\"\n        % (len(files), len(content), tester_cid),\n    )\n    close_conversation(PACKER_CID)\n"
+        },
+        "para_ref": {
+          "kind": "str",
+          "value": "$MEM.packer_params"
+        }
+      }
+    },
+    "packer_params": {
+      "kind": "dict",
+      "meta": "打包器的模型参数（plm.python）",
+      "ctrl": {
+        "type": "para"
+      },
+      "value": {
+        "model": {
+          "kind": "str",
+          "value": "plm.python"
+        }
+      }
+    },
+    "file_list": {
+      "kind": "str",
+      "meta": "打包器的 user 消息：要打包的文件列表",
+      "value": "pack(\"CONTEXT.md\", \"README.md\", \"AGENTS.md\", \"docs/system-image.md\", \"docs/philosophy.md\", \"docs/programming-guide.md\")"
+    },
+    "packed_docs": {
+      "kind": "str",
+      "meta": "启动时写入：系统提示词里打包了哪些文档",
+      "value": ""
+    },
+    "packer_report": {
+      "kind": "str",
+      "meta": "启动时写入：打包器的完成报告",
+      "value": ""
+    }
+  },
+  "para_ref": "$MEM.model_params",
+  "devices": [
+    {
+      "path": "AVMRepo",
+      "file": "devices/avm_repo.py",
+      "class": "RepoDevice",
+      "args": {}
+    },
+    {
+      "path": "inputs",
+      "file": "devices/io.py",
+      "class": "InputsListDevice",
+      "args": {}
+    },
+    {
+      "path": "outputs",
+      "file": "devices/io.py",
+      "class": "OutputsListDevice",
+      "args": {}
+    }
+  ],
+  "init": {
+    "name": "packer",
+    "system_ref": "$MEM.packer",
+    "user_ref": "$MEM.file_list"
+  },
+  "persist_to": "out/repo_tester_packed_mem.json"
+}

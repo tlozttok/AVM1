@@ -60,13 +60,23 @@ Core 只执行指令，不做业务决策。全部指令如下：
 |---|---|---|
 | `memory_read` | 读取内存，返回给 LLM 的表示 | `ref` |
 | `memory_write` | 写入内存 | `ref`, `content` |
-| `memory_make` | 创建新内存地址 | `ref`, `key`, `mem_type`(str/dict/list) |
+| `memory_make` | 创建新内存地址（只创建、不覆盖已有地址） | `ref`, `key`, `mem_type`(str/dict/list) |
 | `edit_metadata` | 编辑节点的 ctrl 元数据：set 写入 / get 读取（key 省略返回整个 ctrl）/ del 删除 | `ref`, `type`(set/get/del), `key`?, `value`? |
 | `create_cmd` | 创建子对话（`system_ref` 必须指向 settingup 或 python 程序节点；只创建，返回 cid；子对话休眠等待指令；本对话保持活跃） | `system_ref`, `para_ref` |
 | `create_sub` | 创建亚对话（立即执行；完成自动写回并唤醒父） | `system_ref`, `user_ref`, `para_ref` |
 | `send_instruction` | 按 cid 投递指令内容（支持多播；只确认投递成功，不保证返回；投递后本对话继续执行，不自动休眠） | `cid`(int/列表), `content` |
 | `close_conversation` | 内核级关闭：关闭指定 cid 的对话（自身或他人，不需要对方回应）；关闭后不可再调度、不可再被调用，其注册的事件监听自动撤销 | `cid` |
 | `listen_event` | 注册/修改/取消事件监听；监听器是 `ctrl.type="python"` 节点的 `content`，每次事件在受限沙箱中执行 | `action`, `event_type`?, `target`?, `handler_ref`?, `listener_id`?, `phase`? |
+
+### 地址与键的语法（指令边界校验）
+
+指令在落笔前先校验引用与键的语法；不合法输入得到 `Error: ...` 工具响应，内存与事件都不动：
+
+- **引用**（`memory_read` / `memory_write` 的 `ref`）必须以 `$` 开头。不以 `$` 开头的字符串不是内存引用，直接拒绝（此前 `memory_read` 会把 `"MEM"` 当值原样回显）。
+- **路径不能有空段**：`$MEM..x` 一类输入报"引用不能有空段"，读侧与写侧同一套语法；`$MEM` 本身是合法的根。
+- **键**（`memory_make` 的 `key`）必须是非空字符串、不能含点号——点号是路径分隔符，带点的键建得出来却永远读不回来。空键同样拒绝（它会让 `$MEM.` 与读根混淆）。
+- **`memory_make` 只创建、不覆盖**：目标键已存在（包括设备挂载点物化的链接节点）时返回 `Error: 地址已存在…`，原内容与 ctrl 不变。覆盖会丢整棵子树；覆写设备挂载点还会让设备表与内存树不一致（下一个安全点内核恐慌）。
+- 列表的 `memory_make` 仍要求下标在 `[0, len)` 内，覆盖已有下标的行为未变——list 的追加语义另议（见 `discussion-instruction-contract-audit-2026-10-17.md`）。
 
 ## 内存模型
 
@@ -178,7 +188,7 @@ Python 程序与 LLM 对话对等：都是 AVM 中的一等执行单元，通过
 | `plm.function` | 纯函数：system 定义 `handle(input)`，user 传 JSON，返回可 JSON 序列化的值；每次调用全新受限命名空间，无副作用、无跨调用状态。 |
 | `plm.machine` | 状态机：system 是状态机 DSL，user 是 JSON 事件；状态/变量跨消息保留在 PLM 实例内，可输出全部 9 条指令的 tool calls。 |
 | `plm.command` | 字符串 IO 命令行：system 定义 `handle(cmd)`，user 是命令与参数（整行字符串）；`handle` 可用 `yield from` 调用注入的工具函数，工具响应回到断点继续执行。 |
-| `plm.python` | 图灵完备兜底：Jupyter 笔记本式语义。系统消息与用户消息都执行进同一个持久命名空间（跨轮次保留）；多个 print 全部执行，输出按顺序拼接为整体返回。 |
+| `plm.python` | 图灵完备兜底：Jupyter 笔记本式语义。系统消息与用户消息都执行进同一个持久命名空间（跨轮次保留）；多个 print 全部执行，输出按顺序拼接为整体返回；命名空间注入 9 条指令对应的工具函数，程序按普通函数调用（见下文）。 |
 | `plm.operator` | 操作员：执行器由调试面板持有而不是模型——每次"推理"等操作员提交一个动作，工具调用原样透传（未知工具名不在这里拦，留给 Core 报未知工具），或提交结束动作让本轮交互结束。只能由 `Core.start_operator_conversation` 创建（需要注入操作员通道）；镜像里声明同名程序节点会在第一次推理时报错。 |
 
 Python 对话的 `model` 必须是注册表（`PLM_REGISTRY`）中的名字，否则报错，不静默回退到 LLM。
@@ -237,6 +247,24 @@ def handle(cmd):
 - tool calls 的 id 形如 `cmd-0`，每条命令内递增；一条命令最多挂起一个工具调用，命令未结束就投递新命令会丢弃旧生成器；
 - 错误以 `错误: CommandPLM: <类型>: <信息>` 文本返回。
 
+### plm.python
+
+system 消息是 setup 代码，user 消息也是代码，两者执行进同一个持久命名空间（跨轮次保留），stdout 按顺序拼接为一个整体作为返回。命名空间注入 9 条指令对应的工具函数，程序按普通 Python 函数调用：
+
+```python
+def pack():
+    text = memory_read('$MEM.AVMRepo.read."CONTEXT.md".0')
+    memory_write('$MEM.system.content', text)
+    print('完成：' + str(len(text)) + ' 字符')
+```
+
+- 注入的工具：`memory_read(ref)`、`memory_write(ref, content)`、`memory_make(ref, key, mem_type)`、`edit_metadata(ref, type, key=?, value=?)`、`create_cmd(system_ref, para_ref)`、`create_sub(system_ref, user_ref, para_ref)`、`send_instruction(cid, content)`、`close_conversation(cid)`、`listen_event(action, …)`——名字与参数同指令，返回工具响应字符串（包括 `Error: ...` 文本），由程序自己处理；
+- **调用即挂起 + 重放**：一次工具调用返回 `tool_calls`（id 形如 `py-<n>`，一次只挂起一个）；工具响应回来后，从同一条用户消息重新执行，已记录的调用按序返回响应——**写入类调用不会重复执行**。重放会重跑前缀代码，但重跑产生的 stdout 不会重复返回；
+- 因此程序必须确定性（沙箱已禁时钟、随机、文件、网络）；同一段消息序列重放出的调用序列必须一致，不一致会以 `错误: RuntimeError: 重放与记录不一致…` 结束本轮；
+- setup 代码（system 消息）里不能调用工具，只能在用户消息的代码里调用；setup 出错与其它 PLM 一致，是加载/运行错误；
+- 挂起信号继承 `BaseException`：程序里的 `except Exception` 吞不掉它；用裸 `except:` 会把挂起当成程序错误（参数不匹配一类的报错），这是不该用裸 except 的地方；
+- 程序不直接触碰系统：沙箱只多了这些工具函数，文件/网络/进程仍被封锁。
+
 ### 确定性
 
 Python 程序输出是确定性的：执行器通过比较上一次输入与本次输入，只处理新增的消息；只有最后一条消息的返回被保留（对同样的输入序列，只有同样的输出）。消息内容直接作为代码/表达式执行，不解析信封。
@@ -244,6 +272,8 @@ Python 程序输出是确定性的：执行器通过比较上一次输入与本�
 ### 沙箱
 
 PLM 代码运行在受限环境：安全 builtins 白名单 + AST 检查（禁止 import、禁止双下划线属性访问、禁止危险调用名如 open/eval/exec）。它防止 Python 程序访问宿主系统（文件、网络、进程、时钟、熵源）；AVM 内部行为不受限。真正强隔离（子进程 + OS 级隔离）超出 VM 范围。
+
+白名单**不包含 `BaseException`**：Python 程序（PLM 代码、事件处理器）不能触发"紧急停止"——`raise BaseException("x")` 只是一句普通的 `NameError`。停机信号只来自宿主：人按 Ctrl+C、宿主主动退出，宿主在 `finally` 里写回 `persist_to` 之后退出。
 
 ## 事件模型 v1
 
@@ -314,7 +344,7 @@ before 语义：操作被请求，不保证到达执行组件；可被 `replace`
 - **显式节点**：内存每个节点都是 `{ "kind": "str"|"dict"|"list"|"device"|"link", "meta"?, "ctrl"?, "value" }`，无任何隐式转换（str 也必须显式包装）。`kind="device"` 是任意层级都可出现的可读性标记，实际挂载在 `devices` 段；`kind="link"` 用 `target` 声明链接（`$MEM` 地址或设备标识符），不写 `value`。
 - **para**：`ctrl.type="para"` 的 dict 节点存放模型调用参数（`model`、`temperature`、`use_tool`、`extra_body`、`reasoning_effort` 等），均以字符串存储，每次调用 API 前把数值型参数转回数值。
 - **devices**：数组，每项 `{ path, file, class, args, id? }`。`file` 是相对镜像文件的 Python 模块路径，`class` 是其中的设备类，**必须继承** `MemoryDevice`，否则加载报错；`id` 可选，覆盖缺省的设备标识符（缺省取 `path`）。这样"一个 JSON + 几个定义设备的 Python 文件"就是一个完整的系统镜像。
-- **init**：启动对话配置（`name` 默认 `"init"`，`system`/`system_ref`、`user`/`user_ref`）。`system_ref` 必须指向 `ctrl.type="settingup"` 的 LLM 程序节点（`system` 字面量可用于匿名入口程序）；`user_ref` 指向 str 节点。只启动 0 号对话，不预置其他对话；其他对话由对话运行期自己 `create_cmd` / `create_sub` 创建。
+- **init**：启动对话配置（`name` 默认 `"init"`，`system`/`system_ref`、`user`/`user_ref`、可选 `para_ref`）。`system_ref` 指向 `ctrl.type="settingup"` 的 LLM 程序节点，或 `ctrl.type="python"` 的 Python 程序节点（PLM 入口：0 号是 Python 对话）；`system` 字面量仍只表示 LLM 入口。入口的 para 按 `init.para_ref` → 程序节点 `value.para_ref` → 镜像顶层 `para_ref` 取，Python 入口在前两者都缺时报错（顶层 para 是 LLM 参数）；`user_ref` 指向 str 节点。只启动 0 号对话，不预置其他对话；其他对话由对话运行期自己 `create_cmd` / `create_sub` 创建。
 - **persist_to**：运行结束后内存写回路径（异常也写）。
 - **meta**：`version` 必须为 1；`instruction_budget` 可配核心中断预算。
 
@@ -328,7 +358,17 @@ before 语义：操作被请求，不保证到达执行组件；可被 `replace`
 - `sched`：活跃 cid、就绪队列、休眠队列、下一个 cid；
 - `conversations`：每个对话的状态、消息条数、输入批次内容。
 
-提供 `trail()`（单变量跨帧轨迹）、`diff()`（两帧间变化）、`find()`（按谓词找帧）等查询；`--transcript` 把每次 API 调用全文写入文件。
+提供 `trail()`（单变量跨帧轨迹）、`diff()`（两帧间变化）、`find()`（按谓词找帧）等查询；`--transcript` 把每次 API 调用全文写入文件（写完一帧就落盘；全文序列化失败时该帧降级为占位并在 stderr 报一行，观测面不会因为不可序列化的值终止内核）。
+
+### 内核转储（core dump）
+
+内核死亡时落一份现场快照，**只作诊断，不是恢复输入**（恢复只走检查点）。
+
+- **触发**：`KernelPanic`（不变量被破坏）与未捕获异常逃出 `run()`；`RunnerStop`（运行者选退出）与 Ctrl+C 不转储。
+- **落点**：`<镜像目录>/out/<镜像名>.core.json`；镜像顶层 `core_dump_to` 可覆盖，`core_dump: false` 关闭；宿主 `--core-dump <path>` / `--no-core-dump` 优先。
+- **内容**：`format`/`when`/`image`/`host_flags`、`error`（类型、消息、traceback、`panicked`）、`scheduler`、`memory`（与 `persist_to` 同格式，不截断）、每个对话的状态与历史（保最后 200 条，`messages_truncated` 标出）与待发批次、`listeners`、`devices`、`interrupts`、监测帧（保最后 200 帧）、`truncated`。
+- **转储自身不抛**：任何一段序列化失败降级为占位；写文件失败只记 stderr，不改变原始异常与退出码。
+- 文件含提示词与 API 参数等敏感内容：只落在本机镜像目录，不自动上传。
 
 ### 单对话检查点（调试用）
 
@@ -365,5 +405,7 @@ LLM 响应中的 `reasoning_content`（思维链）被完整存入对话历史�
 - **内核缺陷**：约定错误类之外的异常不再被读路径吞掉；记录监测帧后向上抛，进程退出。
 
 API 调用失败（缺 key、断网、超时）不再结束进程：内核记帧后停下问运行者，终端给三个选择——更新环境（重建客户端后重试本轮）、继续（直接重试）、退出（写回内存后干净退出）。宿主通过 `Core.api_error_policy` 安装策略，默认实现见 `avm/runner_prompt.py`；EOF 与非终端输入按退出处理。
+
+**一个工具调用只写一条工具响应**。after 事实事件的发布失败只记 stderr（fail-open），不改调用者看到的返回值——发布属于观测面，让它再写一条同 `call_id` 的响应会破坏"assistant 的 `tool_calls` 与 tool 消息一一配对"，下一次请求会被 API 拒绝。同理，亚对话的返回通道只在第一次完成时使用：再次完成不写回父对话（亚对话本不该被再次唤醒，这条是兜底）。
 
 Python 程序（PLM 代码、事件处理器）手里的"紧急停止"按钮已收掉：沙箱不再发 `BaseException`，`raise BaseException("x")` 变成普通错误文本；停机信号只来自宿主（Ctrl+C 写回内存后退出）。

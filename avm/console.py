@@ -764,13 +764,15 @@ def main(argv=None) -> int:
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认只绑回环）")
     parser.add_argument("--checkpoint-in", metavar="PATH",
                         help="调试用：启动时加载单对话检查点（跳过 init）")
+    from .boot import add_core_dump_args
+    add_core_dump_args(parser)
     args = parser.parse_args(argv)
 
     if not args.image:
         print("[console] 需要一个镜像路径", file=sys.stderr)
         return 1
 
-    from .boot import boot
+    from .boot import boot, dump_on_death
     from .exceptions import VMMemoryError
     from .image import ImageError
 
@@ -792,6 +794,8 @@ def main(argv=None) -> int:
 
     console.running = True
     # API 失败停下问运行者：策略由加载区（avm/boot.py）统一安装，面板宿主一样走终端
+    if args.no_core_dump:
+        core.core_dump_enabled = False
     status = 0
     try:
         core.run()
@@ -800,6 +804,10 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print("[console] 收到中断，写回后退出", file=sys.stderr)
         status = 130
+    except BaseException as e:
+        # 内核死亡：先落现场快照，再保留原始 traceback 往上抛
+        dump_on_death(core, e, args.core_dump)
+        raise
     finally:
         console.running = False
         persist_to = getattr(core, "persist_to", None)

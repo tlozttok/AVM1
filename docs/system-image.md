@@ -51,7 +51,7 @@ python -m avm.image <image.json>
 }
 ```
 
-**程序节点（settingup / python）**：`create_cmd` / `create_sub` 的 `system_ref` 必须指向这类节点（运行时校验；指向 str 节点、无类型 dict 节点或其他类型会报错，不创建对话）。`settingup` 节点的 `value` 含 `name`（对话身份）与 `content`（提示词文本）；`python` 节点的 `value` 含 `content`（Python 代码）。两者均可带可选的 `signature`（预期输入/输出描述）。`para_ref` 指向该程序使用的模型参数节点。
+**程序节点（settingup / python）**：`create_cmd` / `create_sub` 的 `system_ref` 必须指向这类节点（运行时校验；指向 str 节点、无类型 dict 节点或其他类型会报错，不创建对话）。`settingup` 节点的 `value` 含 `name`（对话身份）与 `content`（提示词文本）；`python` 节点的 `value` 含 `content`（Python 代码）。两者均可带可选的 `signature`（预期输入/输出描述）与 `para_ref`（该程序使用的模型参数节点，`init` 指向它时按这个字段取 para；`create_cmd` / `create_sub` 的 para 由指令参数给出）。
 
 运行期可用 `edit_metadata` 指令给节点补 ctrl（例如给运行时创建的 dict 节点设置 `type='settingup'` / `'python'`），配合 `memory_make` / `memory_write` 组合出可被 `create_cmd` 使用的程序节点——程序节点不一定只在镜像中预置。
 
@@ -59,7 +59,7 @@ python -m avm.image <image.json>
 
 两个命名空间由 `create_cmd` / `create_sub` 在输入边界交叉校验，依据是启动自带的 `$MEM.model_catalog`（结构见 [docs/runtime.md](runtime.md) 的"模型目录"一节）：`python` 程序的 `model` 必须是 `plm` 注册名；`settingup` 程序的 `model` 在上游清单取到时必须在 `llm.models` 里，取不到时只警告不拦。清单来自宿主启动时的一次 `GET /models`，失败不影响加载。
 
-`init` 的 `system_ref` 仍指向 str 节点（入口对话的字面量提示词，不属于程序节点）。
+`init` 的入口也是程序节点（`settingup` 或 `python`），校验与 `create_cmd` 一致；`init.system` 字面量那条路不注册节点，只用于 LLM 入口。
 
 ## para（模型调用参数）
 
@@ -135,26 +135,34 @@ python -m avm.image <image.json>
 ## init（启动对话）
 
 - `name`：0 号对话名，默认 `"init"`。
-- `system` / `system_ref`：二选一。`system` 是字面量提示词（匿名入口程序，不注册为节点）；`system_ref` 是 `$` 开头的内存引用，**必须指向 `ctrl.type="settingup"` 的 LLM 程序节点**（`value` 含 `content` 提示词文本，可选 `name`）；指向 str 节点或无类型 dict 节点会报错（与 `create_cmd` / `create_sub` 的校验一致）。
-- `user` / `user_ref`：二选一。`user` 是字面量；`user_ref` 是 `$` 开头的内存引用，必须指向 str 节点（启动用户消息）。
+- `system` / `system_ref`：二选一。`system` 是字面量提示词（匿名 LLM 入口程序，不注册为节点）；`system_ref` 是 `$` 开头的内存引用，指向程序节点：`ctrl.type="settingup"` 是 LLM 入口（`value` 含 `content` 提示词文本，可选 `name`），`ctrl.type="python"` 是 PLM 入口（`value` 含 `content` 程序代码，0 号建为 Python 对话，与 `create_cmd` 指向 python 节点时同义）。指向 str 节点或无类型 dict 节点会报错（与 `create_cmd` / `create_sub` 的校验一致）。
+- `para_ref`：可选，`$` 开头的内存引用，指定入口对话的 para 节点。缺省时取程序节点 `value.para_ref`，再缺省取镜像顶层 `para_ref`；PLM 入口在前两者都没有时报错（顶层 para 按约定是 LLM 参数）。
+- `user` / `user_ref`：二选一。`user` 是字面量；`user_ref` 是 `$` 开头的内存引用，必须指向 str 节点（启动用户消息）。PLM 入口的首条用户消息就是这条（`plm.function` 的 JSON 输入、`plm.command` 的整行命令都从这里来）。
 
-只启动 0 号对话；**不预置其他对话**（其他对话由对话运行期自己 `create_cmd` / `create_sub` 创建）。
+只启动 0 号对话；**不预置其他对话**（其他对话由对话运行期自己 `create_cmd` / `create_sub` 创建）。PLM 入口的典型用法：0 号程序先做确定性的准备工作（读设备、组装提示词、写内存），再 `create_cmd` 出真正跑推理的 LLM 对话并 `send_instruction` 启动它，自己 `close_conversation`。
 
 ## 启动流程
 
+生命周期显式三段（`avm/boot.py` 是加载区）：**创建空核心**（`Core()`）→ **加载镜像**（`load_image(core, image_path)`，要求核心还没有对话，否则抛 `ImageError`）→ **启动核心**（`start_core(core)`：刷新模型目录、装 API 失败的运行者策略）。宿主通常只调 `boot(image_path)`，三段串在一起。
+
+**加载镜像**依次做：
+
 0. 写入宿主标志（`host_flags`，缺省空——见下节）；
-1. 解析 mem（严格校验，任何格式错误抛 `ImageError`）；
+1. 解析 mem（严格校验：结构错误与类型滑档都抛 `ImageError`——`meta` 必须是对象、`para_ref` 必须是非空字符串、`devices` 条目必须是对象）；
 2. 按 `para_ref` 校验 para 节点（`ctrl.type == "para"`）并配置 Core；
-3. 加载设备插件文件（校验继承关系）并挂载；
-4. 启动 init 对话（cid 0，`name`）；
-5. `core.run()`；
-6. 若声明 `persist_to`，在 `finally` 中写回内存（异常也写）。
+3. 加载设备插件文件（校验继承关系与挂载路径唯一）并挂载；
+4. 安装启动自带的模型目录 `$MEM.model_catalog`（镜像或检查点里已有的字段不覆盖，只补缺失）；
+5. 启动 init 对话（cid 0，`name`；LLM 入口或 PLM 入口）。`init` 缺失或为空时给一行 stderr 诊断，不启动任何对话。
+
+**启动核心**依次做：拉一次上游 `GET /models` 填模型目录（失败只警告，不拦启动）；装 API 失败的运行者策略（终端三选项：更新环境 / 继续 / 退出）。
+
+之后 `core.run()`；若声明 `persist_to`，在 `finally` 中写回内存（异常也写）。
 
 错误不吞：格式错误输出到 stderr，CLI 退出码 1。
 
 ## 宿主标志（host_flags）
 
-`load_image(image_path, checkpoint_in=None, host_flags=None)` 的 `host_flags` 是**宿主在加载时**传入的启动标志（如 `{"console": True}`），不是镜像内容：镜像 JSON 里没有对应的键，标志也不进 `$MEM`。它在挂载设备之前写入 Core，设备可在 `attach_core` 里读一次；核心启动后不再变化。不传则空，设备行为与从前一致。必须是对象、键必须是非空字符串，否则抛 `ImageError`。
+`load_image(core, image_path, checkpoint_in=None, host_flags=None)` 的 `host_flags` 是**宿主在加载时**传入的启动标志（如 `{"console": True}`），不是镜像内容：镜像 JSON 里没有对应的键，标志也不进 `$MEM`。它在挂载设备之前写入 Core，设备可在 `attach_core` 里读一次；核心启动后不再变化。不传则空，设备行为与从前一致。必须是对象、键必须是非空字符串，否则抛 `ImageError`。
 
 当前唯一的标志是 `console`：调试面板以 `{"console": True}` 加载镜像，输入设备据此只从面板输入框取行、不再读终端（见[运行时详细介绍](runtime.md#调试面板console)）。
 
