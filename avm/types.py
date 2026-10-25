@@ -60,9 +60,27 @@ class MetaList:
     def __contains__(self, key):
         return key in self._data
 
+    def _elem_kind(self) -> str:
+        """元素类型自描述：空列表默认 str（追加的默认类型），混合列表给出各类型。"""
+        kinds = set()
+        for value in self._data:
+            if isinstance(value, (MetaDict, dict)):
+                kinds.add("dict")
+            elif isinstance(value, (MetaList, list)):
+                kinds.add("list")
+            elif isinstance(value, LinkNode):
+                kinds.add("link")
+            else:
+                kinds.add("str")
+        if not kinds:
+            return "str"
+        if len(kinds) == 1:
+            return kinds.pop()
+        return "mixed(" + ",".join(sorted(kinds)) + ")"
+
     def to_llm_string(self):
-        """返回给 LLM 的字符串表示"""
-        return f"list[len={len(self._data)},metadata={self._metadata!r}]"
+        """返回给 LLM 的字符串表示（含元素类型，便于判断追加是否同类）"""
+        return f"list[len={len(self._data)},elem={self._elem_kind()},metadata={self._metadata!r}]"
 
     def to_list(self):
         """递归转换为普通 list（用于 API 参数等需要纯 JSON 结构的场景）"""

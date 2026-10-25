@@ -56,7 +56,7 @@ def test_calc_driver_flow():
     core.advance_conversation()
     assert core._active_cid == 0
     assert root.cid not in core._dormant_cids
-    assert ("已投递到 calc", "si") in _batch(core, 0)
+    assert ("已投递到 calc（cid=1）", "si") in _batch(core, 0)
     assert calc.cid in core._ready_cids
 
     # root: 无工具收尾 → 休眠，计算器被调度
@@ -104,7 +104,7 @@ def test_python_conversation_wrong_model_rejected_at_creation():
     core.advance_conversation()  # root: create_cmd
     assert core.get_conversation(1) is None, "校验失败不得创建对话"
     (content, call_id), = _batch(core, root.cid)
-    assert content.startswith("Error:") and "不是 PLM 注册名" in content
+    assert content.startswith("Illegal:") and "不是 PLM 注册名" in content
     assert call_id == "cc"
 
 

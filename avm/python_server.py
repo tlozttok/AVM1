@@ -5,6 +5,7 @@ import io
 import json
 import math
 import re
+import sys
 from typing import List
 from abc import ABC, abstractmethod
 
@@ -192,12 +193,13 @@ class _PythonToolSuspension(BaseException):
         self.arguments = arguments
 
 
-# 注入 Python 程序的工具：与 9 条指令同名同参，程序按普通函数调用。
+# 注入 Python 程序的工具：与指令同名同参，程序按普通函数调用。
 # 每项是（必填参数, 可选参数），顺序即位置参数的顺序。
 PYTHON_TOOL_SPECS = {
     "memory_read": (("ref",), ()),
     "memory_write": (("ref", "content"), ()),
     "memory_make": (("ref", "key", "mem_type"), ()),
+    "memory_delete": (("ref",), ()),
     "edit_metadata": (("ref", "type"), ("key", "value")),
     "create_cmd": (("system_ref", "para_ref"), ()),
     "create_sub": (("system_ref", "user_ref", "para_ref"), ()),
@@ -733,6 +735,10 @@ def _tool_memory_make(ref, key, mem_type):
     return (yield ("memory_make", {"ref": ref, "key": key, "mem_type": mem_type}))
 
 
+def _tool_memory_delete(ref):
+    return (yield ("memory_delete", {"ref": ref}))
+
+
 def _tool_send_instruction(cid, content):
     return (yield ("send_instruction", {"cid": cid, "content": content}))
 
@@ -746,6 +752,7 @@ COMMAND_TOOLS = {
     "memory_read": _tool_memory_read,
     "memory_write": _tool_memory_write,
     "memory_make": _tool_memory_make,
+    "memory_delete": _tool_memory_delete,
     "send_instruction": _tool_send_instruction,
     "close_conversation": _tool_close_conversation,
 }
@@ -931,8 +938,15 @@ class OperatorPLM(PLMServer):
         基类逐条执行新增消息、只保留最后一条的返回值，那套是给无状态程序用的。
         操作员执行器的每轮动作只有一个：把新增消息转给控制台显示，然后等下一个
         动作。逐个等待会让一次推理内的多条消息各等一次动作。
+
+        没有通道（不该发生：宿主独占 PLM 已在创建边界拒绝）时给对话一条通用错误，
+        真实原因只写 stderr——对话不应看到宿主/调试实现细节。
         """
-        channel = self._require_channel()
+        try:
+            channel = self._require_channel()
+        except ValueError as e:
+            print(f"[AVM] {e}", file=sys.stderr)
+            return {"content": "错误: 操作被外部原因拒绝"}
         new_messages = message_list_from_api_dict(self._new_input_messages(raw_messages))
         self._prev_input = raw_messages
         for msg in new_messages:
@@ -1013,6 +1027,9 @@ PLM_REGISTRY = {
     "plm.command": CommandPLM,    # 字符串 IO 命令行：setup 是程序，user 是命令与参数
     "plm.operator": OperatorPLM,  # 操作员：调试控制台持有的假对话（需注入通道）
 }
+
+# 宿主独占的 PLM：需要宿主注入外部资源，对话既看不到（模型目录不列）也创建不了。
+HOST_ONLY_PLMS = frozenset({"plm.operator"})
 
 
 def create_plm(model: str, **kwargs) -> PLMServer:

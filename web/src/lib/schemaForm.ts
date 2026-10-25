@@ -3,7 +3,7 @@ import type { JsonSchemaProp, ToolDef } from '../api/types'
 /**
  * schema → 表单的纯映射。
  *
- * 输入是九条指令各自的 `tool_def.parameters`（`_build_tools()` 的原样导出），
+ * 输入是指令表里每条指令的 `tool_def.parameters`（`_build_tools()` 的原样导出），
  * 因此这里不硬编码任何一条指令的参数名。`anyOf` / `oneOf`（例如 `send_instruction.cid`
  * 的「整数或整数列表」）交给 JSON 文本域，由用户写成 `2` 或 `[0,1]`。
  */

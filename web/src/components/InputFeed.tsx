@@ -10,6 +10,10 @@ interface Props {
 /**
  * `$MEM.inputs` 的喂输入框。
  *
+ * 输入框是多行的：设备把 `content` 整段排进队列（下一次 `$MEM.inputs.next` 整段取走），
+ * 所以多行文本原样作为**一段**内容交给对话，不拆成多行排队。
+ * 回车留给换行，投喂用 Ctrl+Enter 或按钮。
+ *
  * 动作编号不硬编码：从 `GET /api/devices` 的清单里按设备类型与动作名找。被控制台托管时
  * （host_flags["console"]）设备的那一读正等在面板队列上，喂进来立刻生效。
  */
@@ -74,20 +78,27 @@ export default function InputFeed({ devices, onDevicesChanged }: Props) {
       {!inputs || !feed ? (
         <div className="hint warn">清单里没有找到输入设备，或它没有声明「投喂一行输入」动作</div>
       ) : (
-        <div className="row">
-          <input
-            data-testid="input-feed-field"
-            value={text}
-            placeholder="给对话的一行文本"
-            onChange={(e) => setText(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') send()
-            }}
-          />
-          <button type="button" data-testid="input-feed-send" onClick={send} disabled={busy || text === ''}>
-            投喂
-          </button>
-        </div>
+        <>
+          <div className="row">
+            <textarea
+              data-testid="input-feed-field"
+              rows={4}
+              value={text}
+              placeholder="给对话的一段文本（回车换行，Ctrl+Enter 投喂）"
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                  e.preventDefault()
+                  send()
+                }
+              }}
+            />
+            <button type="button" data-testid="input-feed-send" onClick={send} disabled={busy || text === ''}>
+              投喂
+            </button>
+          </div>
+          <div className="hint muted small">多行原样排成一段（不拆行），下一次 $MEM.inputs.next 整段取走</div>
+        </>
       )}
       {error ? <div className="hint error">{error}</div> : null}
       {result ? (

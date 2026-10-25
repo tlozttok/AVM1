@@ -4,7 +4,7 @@
 起真后端（`avm.console` 的 `Console` + `serve`），执行器是脚本化的 MockLMU：
 
 - init 对话（cid 0）每轮写一次 `$MEM.note`，产出可观测的内存变化与事件；
-- 面板输入队列里有货时改读 `$MEM.inputs.-1`，把喂进来的那一行取走。
+- 面板输入队列里有货时改读 `$MEM.inputs.next`，把喂进来的那一段取走。
 
 它不在 `avm/` 里改任何东西，也不给 `python -m avm.console` 加标志：这是测试基建。
 由 `playwright.config.ts` 的 webServer 拉起，端口由 `--port` 指定。
@@ -50,7 +50,8 @@ class ScriptedLMU:
         self.rounds[conversation.cid] = n
 
         if self._queued() > 0:
-            tool, args = "memory_read", {"ref": "$MEM.inputs.-1"}
+            # 阻塞读取的命名接口：队列里已有货，这一读立即返回并把内容追加进列表
+            tool, args = "memory_read", {"ref": "$MEM.inputs.next"}
         else:
             tool, args = "memory_write", {"ref": "$MEM.state.tick", "content": f"tick {n}"}
 

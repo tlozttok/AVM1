@@ -255,7 +255,7 @@ class TestInputsDevicePanelInput:
         assert record["error"] is None
         assert record["result"] == {"queued": 1}
 
-        assert core.mem["inputs"][-1] == "从面板来的"
+        assert core.mem["inputs"]["next"] == "从面板来的"
         assert list(device) == ["从面板来的"], "取走之后追加进设备列表"
         assert device._panel_inputs == [], "取走即出队"
 
@@ -271,7 +271,7 @@ class TestInputsDevicePanelInput:
             return "从终端来的"
 
         monkeypatch.setattr(device, "_terminal_prompt", fake_terminal)
-        assert core.mem["inputs"][-1] == "从终端来的"
+        assert core.mem["inputs"]["next"] == "从终端来的"
         assert calls == [1]
         assert device._console_input is False
 
@@ -284,8 +284,8 @@ class TestInputsDevicePanelInput:
         console = Console(core)
         for line in ("一", "二"):
             console.invoke_device_action("inputs", 0, {"content": line})
-        assert core.mem["inputs"][-1] == "一"
-        assert core.mem["inputs"][-1] == "二"
+        assert core.mem["inputs"]["next"] == "一"
+        assert core.mem["inputs"]["next"] == "二"
 
     def _console_device(self):
         """托管设备：host_flags 在 attach_core 之前就位，与 load_image 的顺序一致。"""
@@ -306,7 +306,7 @@ class TestInputsDevicePanelInput:
         got = []
 
         def reader():
-            got.append(core.mem["inputs"][-1])
+            got.append(core.mem["inputs"]["next"])
 
         thread = threading.Thread(target=reader)
         thread.start()
@@ -328,7 +328,7 @@ class TestInputsDevicePanelInput:
         monkeypatch.setattr(device, "_terminal_prompt",
                             lambda: pytest.fail("托管时不该碰终端"))
         console = Console(core)
-        thread = threading.Thread(target=lambda: core.mem["inputs"][-1])
+        thread = threading.Thread(target=lambda: core.mem["inputs"]["next"])
         thread.start()
         for _ in range(300):
             if device._pending_input:
@@ -359,7 +359,7 @@ class TestInputsDevicePanelInput:
 
         monkeypatch.setattr(device, "_terminal_prompt", boom)
         with pytest.raises(RuntimeError, match="读失败"):
-            core.mem["inputs"][-1]
+            core.mem["inputs"]["next"]
         assert list(device) == []
         assert device._pending_input is False
 
@@ -370,7 +370,7 @@ class TestInputsDevicePanelInput:
         core.events.add_observer(seen.append)
         console = Console(core)
         console.invoke_device_action("inputs", 0, {"content": "x"})
-        core.mem["inputs"][-1]
+        core.mem["inputs"]["next"]
         assert seen == [], "设备自己的调试台不产生事件"
         assert core._turn_events == []
 

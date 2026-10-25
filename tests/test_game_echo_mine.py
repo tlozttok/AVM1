@@ -165,7 +165,7 @@ class TestEchoMineVictory:
                 ], None),
                 ("", [
                     tool("v4", "memory_write", ref="$MEM.world.status", content="won"),
-                    tool("v5", "memory_write", ref="$MEM.outputs.-1", content="你带着 10 gold 离开了回声矿洞"),
+                    tool("v5", "memory_write", ref="$MEM.outputs.out", content="你带着 10 gold 离开了回声矿洞"),
                     tool("v6", "close_conversation", cid=1),
                     tool("v7", "close_conversation", cid=0),
                 ], None),
@@ -198,7 +198,7 @@ class TestEchoMineFullTurn:
                     tool("s3", "memory_write", ref="$MEM.state.ghost_cid", content="1"),
                     tool("s4", "memory_write", ref="$MEM.world.status", content="playing"),
                     tool("s5", "memory_read", ref="$MEM.map"),
-                    tool("s6", "memory_write", ref="$MEM.outputs.-1", content="欢迎来到回声矿洞"),
+                    tool("s6", "memory_write", ref="$MEM.outputs.out", content="欢迎来到回声矿洞"),
                 ], None),
                 # search：读骰子，把 resolve_search(6) 交给 plm.python
                 ("", [
@@ -214,7 +214,7 @@ class TestEchoMineFullTurn:
                     tool("p6", "memory_write", ref="$MEM.world.last_event", content="search GOLD 3"),
                     tool("p7", "memory_read", ref="$MEM.world.turn"),
                     tool("p8", "memory_write", ref="$MEM.world.turn", content="1"),
-                    tool("p9", "memory_write", ref="$MEM.outputs.-1", content="搜索：找到 3 gold"),
+                    tool("p9", "memory_write", ref="$MEM.outputs.out", content="搜索：找到 3 gold"),
                 ], None),
                 # move north：交给 next_room
                 ("", [
@@ -231,7 +231,7 @@ class TestEchoMineFullTurn:
                     tool("m6", "memory_read", ref="$MEM.world.turn"),
                     tool("m7", "memory_write", ref="$MEM.world.turn", content="2"),
                     tool("m8", "memory_read", ref="$MEM.map"),
-                    tool("m9", "memory_write", ref="$MEM.outputs.-1", content="移动：到达 cavern"),
+                    tool("m9", "memory_write", ref="$MEM.outputs.out", content="移动：到达 cavern"),
                 ], None),
                 # talk：投递给 ghost 后等待
                 ("", [
@@ -241,7 +241,7 @@ class TestEchoMineFullTurn:
                 ], None),
                 ("waiting", [], None),
                 # 被 ghost 唤醒
-                ("", [tool("w1", "memory_write", ref="$MEM.outputs.-1", content="GHOST_REPLY 风里有金子的味道")], None),
+                ("", [tool("w1", "memory_write", ref="$MEM.outputs.out", content="GHOST_REPLY 风里有金子的味道")], None),
                 ("ready", [], None),
             ],
             1: [
@@ -290,7 +290,7 @@ class TestEchoMineFullTurn:
         st = _state(core)
         assert st["active"] is None
         assert st["ready"] == []
-        assert set(st["dormant"]) == {0, 1, 2, 3}
+        assert set(st["dormant"]) == {0, 1}  # 亚对话用完即删（2/3 不再保留）
         assert st["finished"] == []
 
         # 调度轨迹：guide 7 次，ghost 2 次，guide 收尾 2 次
@@ -326,20 +326,20 @@ class TestEchoMineMainEntrypoint:
                         tool("i3", "memory_write", ref="$MEM.state.ghost_cid", content="1"),
                         tool("i4", "memory_write", ref="$MEM.world.status", content="playing"),
                         tool("i5", "memory_read", ref="$MEM.map"),
-                        tool("i6", "memory_write", ref="$MEM.outputs.-1", content="欢迎来到回声矿洞"),
+                        tool("i6", "memory_write", ref="$MEM.outputs.out", content="欢迎来到回声矿洞"),
                     ], conversation)
                 if n == 2:
-                    return ("", [tool("p1", "memory_read", ref="$MEM.inputs.-1")], conversation)
+                    return ("", [tool("p1", "memory_read", ref="$MEM.inputs.next")], conversation)
                 if n == 3:
                     return ("", [
                         tool("p2", "memory_read", ref="$MEM.world.player.room_id"),
                         tool("p3", "memory_read", ref="$MEM.world.rooms.entrance.desc"),
                         tool("p4", "memory_read", ref="$MEM.world.turn"),
                         tool("p5", "memory_write", ref="$MEM.world.turn", content="1"),
-                        tool("p6", "memory_write", ref="$MEM.outputs.-1", content="你站在回声矿洞的入口"),
+                        tool("p6", "memory_write", ref="$MEM.outputs.out", content="你站在回声矿洞的入口"),
                     ], conversation)
                 if n == 4:
-                    return ("", [tool("q1", "memory_read", ref="$MEM.inputs.-1")], conversation)
+                    return ("", [tool("q1", "memory_read", ref="$MEM.inputs.next")], conversation)
                 return ("", [
                     tool("q2", "memory_read", ref="$MEM.state.ghost_cid"),
                     tool("q3", "close_conversation", cid=1),
@@ -387,13 +387,13 @@ class TestEchoMineHPAfterEvent:
                     tool("h10", "memory_write", ref="$MEM.world.last_event", content="search TRAP 1"),
                     tool("h11", "memory_read", ref="$MEM.world.player.hp"),
                     tool("h12", "memory_write", ref="$MEM.world.status", content="lost"),
-                    tool("h13", "memory_write", ref="$MEM.outputs.-1", content="你被落石击中，倒在了矿洞里"),
+                    tool("h13", "memory_write", ref="$MEM.outputs.out", content="你被落石击中，倒在了矿洞里"),
                 ], None),
                 # guide 结束交互，让 ghost 先运行
                 ("waiting", [], None),
                 # 被 GHOST_ALERT 唤醒后关闭 ghost 与自身
                 ("", [
-                    tool("h14", "memory_write", ref="$MEM.outputs.-1", content="GHOST_ALERT 回声正在消失，快离开矿洞"),
+                    tool("h14", "memory_write", ref="$MEM.outputs.out", content="GHOST_ALERT 回声正在消失，快离开矿洞"),
                     tool("h15", "memory_read", ref="$MEM.world.status"),
                     tool("h16", "close_conversation", cid=1),
                     tool("h17", "close_conversation", cid=0),
@@ -449,7 +449,7 @@ class TestEchoMineFullWinPlaythrough:
                 tool(f"sa{search_no}c", "memory_write", ref="$MEM.world.last_event", content=f"search GOLD {search_no}"),
                 tool(f"sa{search_no}d", "memory_read", ref="$MEM.world.turn"),
                 tool(f"sa{search_no}e", "memory_write", ref="$MEM.world.turn", content=str(search_no)),
-                tool(f"sa{search_no}f", "memory_write", ref="$MEM.outputs.-1", content=f"第 {search_no} 次搜索"),
+                tool(f"sa{search_no}f", "memory_write", ref="$MEM.outputs.out", content=f"第 {search_no} 次搜索"),
             ], None)
 
         def move_turn(move_no, current, direction):
@@ -468,7 +468,7 @@ class TestEchoMineFullWinPlaythrough:
                 tool(f"ma{move_no}c", "memory_read", ref="$MEM.world.turn"),
                 tool(f"ma{move_no}d", "memory_write", ref="$MEM.world.turn", content=turn),
                 tool(f"ma{move_no}e", "memory_read", ref="$MEM.map"),
-                tool(f"ma{move_no}f", "memory_write", ref="$MEM.outputs.-1", content=f"到达 {room}"),
+                tool(f"ma{move_no}f", "memory_write", ref="$MEM.outputs.out", content=f"到达 {room}"),
             ], None)
 
         cid0_script = [
@@ -481,7 +481,7 @@ class TestEchoMineFullWinPlaythrough:
                 tool("w0d", "memory_write", ref="$MEM.state.ghost_cid", content="1"),
                 tool("w0e", "memory_write", ref="$MEM.world.status", content="playing"),
                 tool("w0f", "memory_read", ref="$MEM.map"),
-                tool("w0g", "memory_write", ref="$MEM.outputs.-1", content="欢迎来到回声矿洞"),
+                tool("w0g", "memory_write", ref="$MEM.outputs.out", content="欢迎来到回声矿洞"),
             ], None),
             search_turn(1)[0], apply_search(1, "3"),
             search_turn(2)[0], apply_search(2, "6"),
@@ -493,7 +493,7 @@ class TestEchoMineFullWinPlaythrough:
                 tool("wx1", "memory_read", ref="$MEM.world.player.room_id"),
                 tool("wx2", "memory_read", ref="$MEM.world.player.gold"),
                 tool("wx3", "memory_write", ref="$MEM.world.status", content="won"),
-                tool("wx4", "memory_write", ref="$MEM.outputs.-1", content="你带着 10 gold 离开了回声矿洞"),
+                tool("wx4", "memory_write", ref="$MEM.outputs.out", content="你带着 10 gold 离开了回声矿洞"),
                 tool("wx5", "close_conversation", cid=1),
                 tool("wx6", "close_conversation", cid=0),
             ], None),
@@ -513,7 +513,7 @@ class TestEchoMineFullWinPlaythrough:
         assert st["active"] is None
         assert st["ready"] == []
         assert set(st["finished"]) == {0, 1}
-        assert set(st["dormant"]) == {2, 3, 4, 5, 6, 7}  # 6 个短命结算亚对话
+        assert set(st["dormant"]) == set()  # 6 个短命结算亚对话用完即删
         assert [cid for cid, _ in core.lmu.calls] == [0] * 14
 
 
@@ -535,20 +535,20 @@ class TestEchoMineSubprocessWithFakeOpenAIAPI:
                 _tc("i3", "memory_write", {"ref": "$MEM.state.ghost_cid", "content": "1"}),
                 _tc("i4", "memory_write", {"ref": "$MEM.world.status", "content": "playing"}),
                 _tc("i5", "memory_read", {"ref": "$MEM.map"}),
-                _tc("i6", "memory_write", {"ref": "$MEM.outputs.-1", "content": "欢迎来到回声矿洞"}),
+                _tc("i6", "memory_write", {"ref": "$MEM.outputs.out", "content": "欢迎来到回声矿洞"}),
             ]
         if n == 2:
-            return [_tc("p1", "memory_read", {"ref": "$MEM.inputs.-1"})]
+            return [_tc("p1", "memory_read", {"ref": "$MEM.inputs.next"})]
         if n == 3:
             return [
                 _tc("p2", "memory_read", {"ref": "$MEM.world.player.room_id"}),
                 _tc("p3", "memory_read", {"ref": "$MEM.world.rooms.entrance.desc"}),
                 _tc("p4", "memory_read", {"ref": "$MEM.world.turn"}),
                 _tc("p5", "memory_write", {"ref": "$MEM.world.turn", "content": "1"}),
-                _tc("p6", "memory_write", {"ref": "$MEM.outputs.-1", "content": "你站在回声矿洞的入口"}),
+                _tc("p6", "memory_write", {"ref": "$MEM.outputs.out", "content": "你站在回声矿洞的入口"}),
             ]
         if n == 4:
-            return [_tc("q1", "memory_read", {"ref": "$MEM.inputs.-1"})]
+            return [_tc("q1", "memory_read", {"ref": "$MEM.inputs.next"})]
         return [
             _tc("q2", "memory_read", {"ref": "$MEM.state.ghost_cid"}),
             _tc("q3", "close_conversation", {"cid": 1}),
@@ -680,7 +680,7 @@ class TestEchoMineSubprocessWithFakeOpenAIAPI:
                 _tc(f"sa{n}c", "memory_write", {"ref": "$MEM.world.last_event", "content": f"search {n}"}),
                 _tc(f"sa{n}d", "memory_read", {"ref": "$MEM.world.turn"}),
                 _tc(f"sa{n}e", "memory_write", {"ref": "$MEM.world.turn", "content": turn}),
-                _tc(f"sa{n}f", "memory_write", {"ref": "$MEM.outputs.-1", "content": f"第 {n} 次搜索"}),
+                _tc(f"sa{n}f", "memory_write", {"ref": "$MEM.outputs.out", "content": f"第 {n} 次搜索"}),
             ]
 
         def move_turn(n, current, direction):
@@ -699,7 +699,7 @@ class TestEchoMineSubprocessWithFakeOpenAIAPI:
                 _tc(f"ma{n}c", "memory_read", {"ref": "$MEM.world.turn"}),
                 _tc(f"ma{n}d", "memory_write", {"ref": "$MEM.world.turn", "content": turn}),
                 _tc(f"ma{n}e", "memory_read", {"ref": "$MEM.map"}),
-                _tc(f"ma{n}f", "memory_write", {"ref": "$MEM.outputs.-1", "content": f"到达 {room}"}),
+                _tc(f"ma{n}f", "memory_write", {"ref": "$MEM.outputs.out", "content": f"到达 {room}"}),
             ]
 
         def policy(n):
@@ -715,10 +715,10 @@ class TestEchoMineSubprocessWithFakeOpenAIAPI:
                     _tc("w0d", "memory_write", {"ref": "$MEM.state.ghost_cid", "content": "1"}),
                     _tc("w0e", "memory_write", {"ref": "$MEM.world.status", "content": "playing"}),
                     _tc("w0f", "memory_read", {"ref": "$MEM.map"}),
-                    _tc("w0g", "memory_write", {"ref": "$MEM.outputs.-1", "content": "欢迎来到回声矿洞"}),
+                    _tc("w0g", "memory_write", {"ref": "$MEM.outputs.out", "content": "欢迎来到回声矿洞"}),
                 ]
             if n in (2, 5, 8, 11, 14, 17, 20):
-                return [_tc(f"in{n}", "memory_read", {"ref": "$MEM.inputs.-1"})]
+                return [_tc(f"in{n}", "memory_read", {"ref": "$MEM.inputs.next"})]
             if n == 3: return search_turn(1, 6)
             if n == 4: return apply_search(1, "3", "1")
             if n == 6: return search_turn(2, 6)
@@ -735,7 +735,7 @@ class TestEchoMineSubprocessWithFakeOpenAIAPI:
                 _tc("wx1", "memory_read", {"ref": "$MEM.world.player.room_id"}),
                 _tc("wx2", "memory_read", {"ref": "$MEM.world.player.gold"}),
                 _tc("wx3", "memory_write", {"ref": "$MEM.world.status", "content": "won"}),
-                _tc("wx4", "memory_write", {"ref": "$MEM.outputs.-1", "content": "你带着 10 gold 离开了回声矿洞"}),
+                _tc("wx4", "memory_write", {"ref": "$MEM.outputs.out", "content": "你带着 10 gold 离开了回声矿洞"}),
                 _tc("wx5", "close_conversation", {"cid": 1}),
                 _tc("wx6", "close_conversation", {"cid": 0}),
             ]

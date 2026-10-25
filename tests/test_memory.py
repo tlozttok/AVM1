@@ -4,7 +4,8 @@ import pytest
 from avm.memory import Memory, _wrap_value
 from avm.memory_device import StringDevice, MetaListDevice, MetaDictDevice, InputsListDevice, OutputsListDevice, MemoryDevice
 from avm.types import MetaDict, MetaList, LinkNode
-from avm.exceptions import VMMemoryError, MemoryKeyNotFoundError, MemoryIndexOutOfRangeError, MemoryTypeError
+from avm.exceptions import (VMMemoryError, IllegalOperationError, MemoryKeyNotFoundError,
+                                  MemoryIndexOutOfRangeError, MemoryTypeError)
 
 
 class TestMemoryBasic:
@@ -100,14 +101,16 @@ class TestUnwrap:
         mem = Memory()
         mem["plain"] = MetaList(data=["a", "b"])
         assert mem.unwrap(["$", "MEM", "plain", "0"], for_llm=False) == "a"
-        assert mem.unwrap(["$", "MEM", "plain", "-1"], for_llm=False) == "b"
+        # -1 不再是"最后一个元素"：它只表示列表追加位置，读侧一律拒绝（非法操作）
+        with pytest.raises(IllegalOperationError):
+            mem.unwrap(["$", "MEM", "plain", "-1"], for_llm=False)
 
     def test_mem_list_index_errors_stay_typed(self):
         mem = Memory()
         mem["plain"] = MetaList(data=["a"])
         with pytest.raises(MemoryIndexOutOfRangeError):
             mem.unwrap(["$", "MEM", "plain", "5"], for_llm=False)
-        with pytest.raises(MemoryTypeError):
+        with pytest.raises(IllegalOperationError):
             mem.unwrap(["$", "MEM", "plain", "x"], for_llm=False)
 
     def test_mem_list_nested_index(self):
@@ -179,11 +182,17 @@ class TestDeviceResolvePath:
         assert dev.resolve_path(["0"]) == "hello"
         assert capsys.readouterr().out == "hello\n"
 
-    def test_outputs_device_write_minus_one_prints(self, capsys):
+    def test_outputs_device_write_named_out_prints(self, capsys):
         dev = OutputsListDevice()
-        dev[-1] = "printed"
+        dev["out"] = "printed"
         assert dev.resolve_path(["0"]) == "printed"
         assert capsys.readouterr().out == "printed\n"
+        # 数字位置写入不再可用（设备写只走命名接口）
+        with pytest.raises(VMMemoryError):
+            dev["-1"] = "again"
+        # 负下标读取也不可用
+        with pytest.raises(VMMemoryError):
+            dev.resolve_path(["-1"])
 
     def test_string_device_subpath_raises(self):
         dev = StringDevice("val")
@@ -226,19 +235,25 @@ class TestMemoryDeviceMount:
 class TestMemorySet:
     def test_set_top_level(self):
         mem = Memory()
+        mem["key"] = ""
         mem.set("$MEM.key", "val")
         assert mem["key"] == "val"
 
     def test_set_nested(self):
         mem = Memory()
         mem["parent"] = {}
+        mem.make("$MEM.parent", "child", "str")
         mem.set("$MEM.parent.child", "deep")
         assert mem["parent"]["child"] == "deep"
 
-    def test_set_creates_intermediate(self):
+    def test_set_does_not_create_nodes(self):
+        """创建归 memory_make：写入不存在的地址一律报错，不补建任何节点。"""
         mem = Memory()
-        mem.set("$MEM.a.b.c", "val")
-        assert mem["a"]["b"]["c"] == "val"
+        with pytest.raises(MemoryKeyNotFoundError):
+            mem.set("$MEM.key", "val")
+        with pytest.raises(MemoryKeyNotFoundError):
+            mem.set("$MEM.a.b.c", "val")
+        assert "key" not in mem.to_dict() and "a" not in mem.to_dict()
 
     def test_set_without_dollar_raises(self):
         """写入引用的语法错误是 VMMemoryError（可返回给调用者），不是裸 ValueError。"""
@@ -291,11 +306,19 @@ class TestMemoryMake:
         mem.make("$MEM.base", "child", "list")
         assert mem["base"]["child"] == []
 
-    def test_make_on_list(self):
+    def test_make_on_list_appends_only(self):
         mem = Memory()
-        mem["base"] = [None]
-        mem.make("$MEM.base", "0", "str")
+        mem["base"] = []
+        # 新列表可随意指定类型
+        assert mem.make("$MEM.base", "-1", "str") == "$MEM.base.0"
         assert mem["base"][0] == ""
+        # 已有下标不覆盖（只创建），追加位置只有 -1
+        with pytest.raises(VMMemoryError):
+            mem.make("$MEM.base", "0", "str")
+        # 已有值时必须与已有元素同类型
+        with pytest.raises(VMMemoryError):
+            mem.make("$MEM.base", "-1", "dict")
+        assert mem.make("$MEM.base", "-1", "str") == "$MEM.base.1"
 
     def test_make_rejects_empty_key(self):
         mem = Memory()
@@ -329,10 +352,20 @@ class TestMemoryMake:
         with pytest.raises(VMMemoryError):
             mem.make("$MEM.base", "child", "dict")
 
-    def test_make_on_nonexistent_raises(self):
+    def test_make_creates_missing_chain(self):
+        """ref 上缺失的段由 make 补建：下一段是 -1 建 list，否则建 dict。"""
         mem = Memory()
+        assert mem.make("$MEM.nonex", "child", "dict") == "$MEM.nonex.child"
+        assert isinstance(mem["nonex"], MetaDict) and isinstance(mem["nonex"]["child"], MetaDict)
+        mem2 = Memory()
+        assert mem2.make("$MEM.a.-1", "b", "str") == "$MEM.a.0.b"
+        assert isinstance(mem2["a"], MetaList) and mem2["a"][0]["b"] == ""
+
+    def test_make_on_device_path_raises(self):
+        mem = Memory()
+        mem.mount("dev", MemoryDevice())
         with pytest.raises(VMMemoryError):
-            mem.make("$MEM.nonex", "child", "dict")
+            mem.make("$MEM.dev", "child", "dict")
 
     def test_make_list_bad_index_raises(self):
         mem = Memory()

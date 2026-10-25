@@ -6,11 +6,21 @@ import pytest
 
 from avm.core import Core, MemoryReadInstruction, EditMetadataInstruction, _build_conversation
 from avm.events import EVENT_TYPES
-from avm.exceptions import MemoryCircularReferenceError, VMMemoryError
+from avm.exceptions import MemoryCircularReferenceError, VMMemoryError, MemoryKeyNotFoundError
 from avm.image import ImageError, load_image
 from avm.memory import Memory
 from avm.memory_device import LinkDevice, BUILTIN_DEVICE_CLASSES
 from avm.types import MetaDict, MetaList, LinkNode
+
+
+def _seed(mem, ref, value, owner_cid=None):
+    """测试夹具：先 make 建链再写（memory_write 不再建节点）。"""
+    try:
+        return mem.set(ref, value, owner_cid=owner_cid)
+    except MemoryKeyNotFoundError:
+        parent, _, key = ref.rpartition(".")
+        mem.make(parent, key, "str", owner_cid=owner_cid)
+        return mem.set(ref, value, owner_cid=owner_cid)
 
 
 def _python_node(code):
@@ -50,10 +60,10 @@ class TestBasicTransparency:
         # 读子路径
         assert core.unwrap("$MEM.alias.a.b", for_llm=False) == "orig"
         # 写子路径
-        core.mem.set("$MEM.alias.a.c", "new", owner_cid=0)
+        _seed(core.mem, "$MEM.alias.a.c", "new", owner_cid=0)
         assert core.mem["deep"]["a"]["c"] == "new"
         # 精确别名写（目标为 dict 时是写 meta，沿用既有语义）
-        core.mem.set("$MEM.alias", "whole", owner_cid=0)
+        _seed(core.mem, "$MEM.alias", "whole", owner_cid=0)
         assert core.mem["deep"].get_metadata() == "whole"
 
     def test_non_mem_alias(self):
@@ -122,7 +132,7 @@ class TestChainAndCycle:
         _mount(core, "b", "$MEM.a")
 
         with pytest.raises(MemoryCircularReferenceError):
-            core.mem.set("$MEM.a.sub", "x")
+            _seed(core.mem, "$MEM.a.sub", "x")
 
 
 class TestErrorHiding:
@@ -223,7 +233,7 @@ class TestEventTransparency:
         sink = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         core._dormant_cids.append(sink.cid)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         _mount(core, "alias", "$MEM.box.msg")
 
         core.mem["h"] = _python_node(
@@ -254,7 +264,7 @@ class TestEventTransparency:
         sink = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         core._dormant_cids.append(sink.cid)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         _mount(core, "alias", "$MEM.box.msg")
         core.mem["h"] = _python_node(
             "def handle(event):\n    return {'notify': [{'cid': 1, 'content': json.dumps(event['payload'], ensure_ascii=False)}]}"

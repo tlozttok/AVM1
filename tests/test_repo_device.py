@@ -273,7 +273,7 @@ class TestRepoImage:
         assert "实际代码" in prompt and "用户指令" in prompt
         # 镜像不规定步骤：步骤由运行时的用户指令给出，改起来不用动镜像
         assert "步骤" not in user and not re.search(r"\d\s*[.、]", user)
-        assert "$MEM.inputs.-1" in user and "$MEM.outputs.-1" in user
+        assert "$MEM.inputs.next" in user and "$MEM.outputs.out" in user
         # 接口由设备自述给出：提示词里不写动作语法与分页规则
         for token in ("ls", 'read."', 'search."', "每页", "双引号", "页码"):
             assert token not in prompt
@@ -287,7 +287,7 @@ class TestRepoImage:
         MemoryReadInstruction("tc2", conv.cid, {"ref": '$MEM.AVMRepo.ls."avm"'}).execute(core, conv)
         assert conv.user_batch.tool_responses[-1].content.startswith('ls "avm"')
         MemoryWriteInstruction(
-            "tc3", conv.cid, {"ref": "$MEM.outputs.-1", "content": "报到：开始测 AVMRepo"}
+            "tc3", conv.cid, {"ref": "$MEM.outputs.out", "content": "报到：开始测 AVMRepo"}
         ).execute(core, conv)
         assert core.mem._devices["outputs"]._data == ["报到：开始测 AVMRepo"]
 

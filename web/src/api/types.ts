@@ -179,7 +179,7 @@ export interface ListenersResponse {
   editable_fields: string[]
 }
 
-/** OpenAI function schema：九条指令各自带一份，`GET /api/tools` 原样导出。 */
+/** OpenAI function schema：指令表里每条指令带一份，`GET /api/tools` 原样导出。 */
 export interface JsonSchemaProp {
   type?: string
   description?: string

@@ -1,3 +1,4 @@
+from avm.exceptions import MemoryKeyNotFoundError
 """plm.function / plm.machine 测试：纯函数、状态机 DSL、工具与 Core 集成。"""
 
 import json
@@ -7,6 +8,16 @@ import pytest
 from avm.core import Core
 from avm.python_server import create_plm, PLM_REGISTRY
 from avm.types import MetaDict
+
+
+def _seed(mem, ref, value, owner_cid=None):
+    """测试夹具：先 make 建链再写（memory_write 不再建节点）。"""
+    try:
+        return mem.set(ref, value, owner_cid=owner_cid)
+    except MemoryKeyNotFoundError:
+        parent, _, key = ref.rpartition(".")
+        mem.make(parent, key, "str", owner_cid=owner_cid)
+        return mem.set(ref, value, owner_cid=owner_cid)
 
 
 def _params(*tool_names):
@@ -341,6 +352,7 @@ state running:
   on stop -> idle | {"content": "stopped", "tools": [{"name": "memory_write", "arguments": {"ref": "$MEM.log", "content": "stopped"}}]}
 """
         core, root = _setup_core(dsl, "plm.machine")
+        _seed(core.mem, "$MEM.log", "")
         core.lmu = MockLMU([
             (None, [{"call_id": "cc", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.program", "para_ref": "$MEM.params"}}], None),
             (None, [{"call_id": "s1", "cmd_type": "send_instruction", "args": {"cid": 1, "content": json.dumps({"event": "start"})}}], None),

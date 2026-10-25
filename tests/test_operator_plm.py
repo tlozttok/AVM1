@@ -1,3 +1,4 @@
+from avm.exceptions import MemoryKeyNotFoundError
 """操作员执行器测试
 
 覆盖：动作往返（工具调用 → Core 执行 → 工具响应回到执行器）、结束动作让出执行权、
@@ -12,6 +13,16 @@ import pytest
 
 from avm.core import Core
 from avm.python_server import OperatorPLM, PLM_REGISTRY, create_plm
+
+
+def _seed(mem, ref, value, owner_cid=None):
+    """测试夹具：先 make 建链再写（memory_write 不再建节点）。"""
+    try:
+        return mem.set(ref, value, owner_cid=owner_cid)
+    except MemoryKeyNotFoundError:
+        parent, _, key = ref.rpartition(".")
+        mem.make(parent, key, "str", owner_cid=owner_cid)
+        return mem.set(ref, value, owner_cid=owner_cid)
 
 
 class RecordingChannel:
@@ -61,10 +72,14 @@ class TestRegistry:
 
 
 class TestChannelRequired:
-    def test_without_channel_it_refuses_instead_of_hanging(self):
+    def test_without_channel_returns_generic_error_instead_of_crashing(self, capsys):
+        """通道缺失不该杀内核；对话只看到通用拒绝，宿主在 stderr 看到真实原因。"""
         plm = create_plm("plm.operator")
-        with pytest.raises(ValueError, match="操作员对话必须由控制台创建"):
-            plm.handle_messages(SYSTEM_ONLY, {})
+        resp = plm.handle_messages(SYSTEM_ONLY, {})
+        assert resp == {"content": "错误: 操作被外部原因拒绝"}
+        err = capsys.readouterr().err
+        assert "操作员对话必须由控制台创建" in err
+        assert "操作被外部原因拒绝" not in err
 
 
 class TestResponseShape:
@@ -181,6 +196,7 @@ class TestThroughCore:
             {"tool": "memory_write", "arguments": {"ref": "$MEM.x", "content": "hi"}},
             {"end": True},
         ])
+        _seed(core.mem, "$MEM.x", "")
         core.advance_conversation()
         assert core.mem["x"] == "hi"
         assert core._active_cid == panel.cid, "有工具返回时对话保持活跃"
@@ -198,6 +214,7 @@ class TestThroughCore:
             {"tool": "memory_write", "arguments": {"ref": "$MEM.x", "content": "hi"}},
             {"end": True},
         ])
+        _seed(core.mem, "$MEM.x", "")
         core.advance_conversation()
         writes = [e for e in core._turn_events if e["event_type"] == "memory_write"]
         assert [e["phase"] for e in writes] == ["before", "after"]

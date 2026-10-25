@@ -8,8 +8,9 @@
   产生事件、发起者是面板对话。控制台不另开写内存的路径；
 - **设备调试动作是例外**：直接调用设备自己声明的 `run`，不入核心、不产生事件。
 
-面板对话是 AVM 里的一条普通对话：真实 cid、出现在 $MEM.conversations 里、由中断
-向量表激活、结束交互即让出执行权。面板本身不主动抢占。
+面板对话是 AVM 里的一条宿主对话：保留魔数 cid（-1），对普通对话不可见、不可寻址
+（conversations/scheduler 列表过滤，send/close 报不存在），由中断向量表激活、
+结束交互即让出执行权。面板本身不主动抢占。
 
 用法：
     python -m avm.console <image.json> [--port 8700] [--checkpoint-in cp.json]
@@ -311,7 +312,7 @@ class Console:
 
     def memory(self, ref: Optional[str] = None) -> dict:
         # 这里走的是普通读取路径，如果 ref 落在设备上，设备的读会被真的执行。
-        # 对 InputsListDevice 来说 `$MEM.inputs.-1` 就是"请求一次操作员输入"：控制台托管下
+        # 对 InputsListDevice 来说 `$MEM.inputs.next` 就是"请求一次操作员输入"：控制台托管下
         # （host_flags["console"]）这一读等在面板输入队列上，所以这个端点会挂起，
         # 直到有人在面板里喂一行（POST /api/device-action）——不再是挂起在终端上等敲键盘。
         target = ref if ref else "$MEM"

@@ -1,3 +1,4 @@
+from avm.exceptions import MemoryKeyNotFoundError
 """plm.command 测试：字符串 IO 命令行、生成器工具调用往返、与 Core 集成。"""
 
 import json
@@ -5,6 +6,16 @@ import json
 from avm.core import Core
 from avm.python_server import create_plm, PLM_REGISTRY, CommandPLM
 from avm.types import MetaDict
+
+
+def _seed(mem, ref, value, owner_cid=None):
+    """测试夹具：先 make 建链再写（memory_write 不再建节点）。"""
+    try:
+        return mem.set(ref, value, owner_cid=owner_cid)
+    except MemoryKeyNotFoundError:
+        parent, _, key = ref.rpartition(".")
+        mem.make(parent, key, "str", owner_cid=owner_cid)
+        return mem.set(ref, value, owner_cid=owner_cid)
 
 
 def _params(*tool_names):
@@ -277,6 +288,7 @@ class TestCommandPLMViaCore:
         )
         core, root = _setup_core(program, "plm.command")
         core.mem["seed"] = "42"
+        _seed(core.mem, "$MEM.out", "")
         core.lmu = MockLMU([
             (None, [{"call_id": "cc", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.program", "para_ref": "$MEM.params"}}], None),
             (None, [{"call_id": "si", "cmd_type": "send_instruction", "args": {"cid": 1, "content": "run"}}], None),

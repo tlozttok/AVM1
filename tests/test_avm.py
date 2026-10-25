@@ -11,7 +11,7 @@ from avm.core import (
 )
 from avm.types import Conversation, UserMessageBatch, SystemMessage, UserMessage, AssistantMessage, MetaDict, MetaList
 from avm.memory import Memory
-from avm.exceptions import VMMemoryError
+from avm.exceptions import VMMemoryError, MemoryKeyNotFoundError
 from types import SimpleNamespace
 
 
@@ -33,6 +33,16 @@ class MockLMU:
 
     def exec(self, conversation, para):
         return self._next(conversation, para)
+
+
+def _seed(mem, ref, value, owner_cid=None):
+    """测试夹具：先 make 建链再写（memory_write 不再建节点）。"""
+    try:
+        return mem.set(ref, value, owner_cid=owner_cid)
+    except MemoryKeyNotFoundError:
+        parent, _, key = ref.rpartition(".")
+        mem.make(parent, key, "str", owner_cid=owner_cid)
+        return mem.set(ref, value, owner_cid=owner_cid)
 
 
 def make_core(responses=None):
@@ -137,6 +147,7 @@ class TestMemoryOpsThroughScheduling:
         core = make_core([
             (None, [{"call_id": "tc1", "cmd_type": "memory_write", "args": {"ref": "$MEM.out", "content": "written"}}], None),
         ])
+        _seed(core.mem, "$MEM.out", "")
         _new_root(core)
         core._active_cid = core._ready_cids.pop(0)
         core.advance_conversation()
@@ -161,6 +172,8 @@ class TestMemoryOpsThroughScheduling:
             ], None),
             ("done", [], None),
         ])
+        _seed(core.mem, "$MEM.a", "")
+        _seed(core.mem, "$MEM.b", "")
         _new_root(core)
         core._active_cid = core._ready_cids.pop(0)
 
@@ -332,7 +345,7 @@ class TestSendInstruction:
         assert st1["active"] == root.cid
         assert child.cid in st1["ready"]
         assert root.cid not in st1["dormant"]
-        assert ("已投递到 init#1", "si") in _batch(core, root.cid)
+        assert ("已投递到 init#1（cid=1）", "si") in _batch(core, root.cid)
         # content 原样投递，无 JSON 信封
         assert child.user_batch.user_contents == ["do X"]
 
@@ -394,7 +407,7 @@ class TestSendInstruction:
         # 两个目标各收到原样消息；无 ICC 记录；发起者不休眠
         for t in (child, child2):
             assert t.user_batch.user_contents[-1] == "broadcast"
-        assert ("已投递到 2", "ms") in _batch(core, root.cid)
+        assert ("已投递到 cid=[1, 2]", "ms") in _batch(core, root.cid)
         assert root.cid not in core._dormant_cids
         assert core._active_cid == root.cid
         assert child.cid in core._ready_cids
@@ -485,7 +498,8 @@ class TestCreateSub:
         st2 = _state(core)
         assert st2["active"] == 0  # parent wakes
         assert 0 not in st2["dormant"]  # 休眠标记被清理
-        assert 1 in st2["dormant"]  # 亚对话交互结束进入休眠
+        # 亚对话用完即删：完成后不再保留个体，父对话拿到返回
+        assert 1 not in st2["dormant"] and 1 not in core._conv_by_cid
 
         # parent batch has sub's result
         batch = _batch(core, 0)
@@ -747,7 +761,7 @@ class TestInfoDevices:
         core = make_core()
         _new_root(core)
         with pytest.raises(VMMemoryError):
-            core.mem.set("$MEM.scheduler", "x")
+            _seed(core.mem, "$MEM.scheduler", "x")
 
 
 class TestReasoningContent:
@@ -891,7 +905,7 @@ class TestCloseInstruction:
         core.advance_conversation()
 
         content, _ = _batch(core, 0)[0]
-        assert "finished" in content
+        assert "已关闭" in content
 
     def test_send_instruction_to_closed_errors(self, capsys):
         core = make_core([
@@ -941,7 +955,7 @@ class TestEditMetadata:
         core, root = self._root()
         core.mem["a"] = MetaDict(data={})
         content, _ = self._exec(core, root, {"ref": "$MEM.a", "type": "set", "key": "type"})
-        assert "key 和 value 都必需" in content
+        assert "value 必需" in content
         assert core.mem["a"].get_ctrl() is None
 
     def test_get_by_key(self):

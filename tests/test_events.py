@@ -8,6 +8,7 @@ from avm.core import (
     MemoryReadInstruction,
     MemoryWriteInstruction,
     MemoryMakeInstruction,
+    MemoryDeleteInstruction,
     EditMetadataInstruction,
     CreateInstruction,
     CreateSubInstruction,
@@ -19,10 +20,20 @@ from avm.core import (
     _build_conversation,
 )
 from avm.events import EventHandlerError, EVENT_TYPES
-from avm.exceptions import VMMemoryError
+from avm.exceptions import VMMemoryError, MemoryKeyNotFoundError
 from avm.memory import Memory
 from avm.memory_device import MemoryDevice
 from avm.types import MetaDict, MetaList
+
+
+def _seed(mem, ref, value, owner_cid=None):
+    """测试夹具：先 make 建链再写（memory_write 不再建节点）。"""
+    try:
+        return mem.set(ref, value, owner_cid=owner_cid)
+    except MemoryKeyNotFoundError:
+        parent, _, key = ref.rpartition(".")
+        mem.make(parent, key, "str", owner_cid=owner_cid)
+        return mem.set(ref, value, owner_cid=owner_cid)
 
 
 def _new_root(core):
@@ -49,10 +60,11 @@ def _para():
 # ------------------------------------------------------------------
 
 class TestToolSet:
-    def test_nine_tools_and_listen_schema(self):
+    def test_ten_tools_and_listen_schema(self):
         tools = _build_tools()
         names = [t["function"]["name"] for t in tools]
-        assert len(names) == 9
+        assert len(names) == 10
+        assert "memory_delete" in names
         assert names.count("listen_event") == 1
         assert "listen_event" in _instruction_registry()
         listen_def = next(t for t in tools if t["function"]["name"] == "listen_event")
@@ -81,7 +93,7 @@ class TestOwner:
 
     def test_set_implicit_intermediate_containers_get_owner(self):
         mem = Memory()
-        mem.set("$MEM.a.b.c", "v", owner_cid=7)
+        _seed(mem, "$MEM.a.b.c", "v", owner_cid=7)
         assert mem["a"].get_ctrl()["owner"] == "7"
         assert mem["a"]["b"].get_ctrl()["owner"] == "7"
         assert mem["a"]["b"]["c"] == "v"
@@ -89,13 +101,13 @@ class TestOwner:
     def test_set_does_not_change_existing_container_owner(self):
         mem = Memory()
         mem["a"] = MetaDict(data={}, ctrl={"owner": "5"})
-        mem.set("$MEM.a.b", "v", owner_cid=7)
+        _seed(mem, "$MEM.a.b", "v", owner_cid=7)
         assert mem["a"].get_ctrl()["owner"] == "5"
 
     def test_save_load_keeps_owner(self, tmp_path):
         mem = Memory()
         mem.make("$MEM", "d", "dict", owner_cid=3)
-        mem.set("$MEM.d.x", "v", owner_cid=3)
+        _seed(mem, "$MEM.d.x", "v", owner_cid=3)
         path = str(tmp_path / "mem.json")
         mem.save(path)
         loaded = Memory.load(path)
@@ -113,7 +125,7 @@ class TestPermissions:
         root = _new_root(core)
         core.mem["handler"] = _python_node("def handle(event):\n    return {}")
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         return core, root
 
     def test_owner_can_register_non_owner_rejected(self):
@@ -178,7 +190,7 @@ class TestPermissions:
         core.mem["handler"] = _python_node("def handle(event):\n    return {}")
 
         with pytest.raises(ValueError, match="未授权"):
-            core.events.register(0, "memory_read", "$MEM.inputs.-1", "$MEM.handler")
+            core.events.register(0, "memory_read", "$MEM.inputs.next", "$MEM.handler")
         with pytest.raises(ValueError, match="未授权"):
             core.events.register(0, "memory_make", "$MEM.inputs.job.child", "$MEM.handler")
         assert device.resolve_calls == 0
@@ -193,7 +205,7 @@ class TestBeforeWaterfall:
         core = Core()
         root = _new_root(core)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "secret", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "secret", owner_cid=0)
         return core, root
 
     def test_memory_read_replace_and_short_circuit(self):
@@ -207,7 +219,7 @@ class TestBeforeWaterfall:
 
         MemoryReadInstruction("tc", 0, {"ref": "$MEM.box.msg"}).execute(core, root)
 
-        assert [r.content for r in root.user_batch.tool_responses] == ["请输入密码"]
+        assert [r.content for r in root.user_batch.tool_responses] == ["Interrupted: 请输入密码"]
 
     def test_memory_write_payload_rewrite(self):
         core, root = self._core_with_path()
@@ -231,7 +243,7 @@ class TestBeforeWaterfall:
         MemoryWriteInstruction("tc", 0, {"ref": "$MEM.box.msg", "content": "new"}).execute(core, root)
 
         assert core.mem["box"]["msg"] == "secret"
-        assert root.user_batch.tool_responses[-1].content == "no"
+        assert root.user_batch.tool_responses[-1].content == "Interrupted: no"
 
     def test_order_first_replace_wins(self):
         core, root = self._core_with_path()
@@ -244,7 +256,7 @@ class TestBeforeWaterfall:
 
         MemoryReadInstruction("tc", 0, {"ref": "$MEM.box.msg"}).execute(core, root)
 
-        assert root.user_batch.tool_responses[-1].content == "first"
+        assert root.user_batch.tool_responses[-1].content == "Interrupted: first"
 
     def test_order_execute_then_replace(self):
         core, root = self._core_with_path()
@@ -257,7 +269,7 @@ class TestBeforeWaterfall:
 
         MemoryReadInstruction("tc", 0, {"ref": "$MEM.box.msg"}).execute(core, root)
 
-        assert root.user_batch.tool_responses[-1].content == "second"
+        assert root.user_batch.tool_responses[-1].content == "Interrupted: second"
 
 
 # ------------------------------------------------------------------
@@ -273,7 +285,7 @@ class TestNotify:
         target = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         core._dormant_cids.append(target.cid)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         return core, root, target
 
     def test_notify_delivers_to_target_and_wakes(self):
@@ -318,7 +330,7 @@ class TestSendInstructionIntercept:
 
         SendInstruction("tc", 0, {"cid": [1, 2], "content": "hi"}).execute(core, root)
 
-        assert root.user_batch.tool_responses[-1].content == "blocked"
+        assert root.user_batch.tool_responses[-1].content == "Interrupted: blocked"
         assert all(c.user_batch.user_contents == [] for c in children)
         assert all(c.cid in core._dormant_cids for c in children)
 
@@ -333,7 +345,7 @@ class TestSendInstructionIntercept:
 
         SendInstruction("tc", 0, {"cid": [1, 2], "content": "hi"}).execute(core, root)
 
-        assert root.user_batch.tool_responses[-1].content == "已投递到 1，1 个被拦截，0 个处理失败"
+        assert root.user_batch.tool_responses[-1].content == "已投递到 cid=[2]（1 个被拦截，0 个处理失败）"
         assert children[0].user_batch.user_contents == []
         assert children[1].user_batch.user_contents == ["hi"]
         assert children[0].cid in core._dormant_cids
@@ -349,17 +361,17 @@ class TestLifecycle:
         core = Core()
         root = _new_root(core)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         core.mem["h1"] = _python_node("def handle(event):\n    return {'action': 'replace', 'response': 'one'}")
         core.mem["h2"] = _python_node("def handle(event):\n    return {'action': 'replace', 'response': 'two'}")
         lid = core.events.register(0, "memory_read", "$MEM.box.msg", "$MEM.h1")
         MemoryReadInstruction("tc", 0, {"ref": "$MEM.box.msg"}).execute(core, root)
-        assert root.user_batch.tool_responses[-1].content == "one"
+        assert root.user_batch.tool_responses[-1].content == "Interrupted: one"
 
         core.events.modify(lid, 0, "$MEM.h2")
         root.user_batch.clear()
         MemoryReadInstruction("tc", 0, {"ref": "$MEM.box.msg"}).execute(core, root)
-        assert root.user_batch.tool_responses[-1].content == "two"
+        assert root.user_batch.tool_responses[-1].content == "Interrupted: two"
 
         core.events.cancel(lid, 0)
         root.user_batch.clear()
@@ -374,7 +386,7 @@ class TestLifecycle:
         child = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         core._dormant_cids.append(child.cid)
         core.mem.make("$MEM", "box", "dict", owner_cid=1)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=1)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=1)
         core.mem["h"] = _python_node("def handle(event):\n    return {'action': 'replace', 'response': 'blocked'}")
         core.events.register(child.cid, "memory_read", "$MEM.box.msg", "$MEM.h")
         assert len(core.events.listeners) == 1
@@ -469,7 +481,7 @@ class TestHandlerErrors:
         core = Core()
         root = _new_root(core)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         core.mem["h"] = _python_node("def handle(event):\n    raise RuntimeError('boom')")
         core.events.register(0, "memory_read", "$MEM.box.msg", "$MEM.h")
 
@@ -484,7 +496,7 @@ class TestHandlerErrors:
         core = Core()
         root = _new_root(core)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         core.mem["h"] = _python_node("def handle(event):\n    return 'not-a-dict'")
         core.events.register(0, "memory_read", "$MEM.box.msg", "$MEM.h")
 
@@ -583,7 +595,7 @@ class TestInfoAndMonitor:
         core = Core()
         root = _new_root(core)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         core.mem["h"] = _python_node("def handle(event):\n    return {}")
         core.events.register(0, "memory_read", "$MEM.box.msg", "$MEM.h")
 
@@ -609,7 +621,7 @@ class TestInfoAndMonitor:
         core.lmu = MockLMU()
         root = _new_root(core)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         core._active_cid = core._ready_cids.pop(0)
         core.monitor.record_baseline(core)
 
@@ -635,7 +647,7 @@ class TestSelfDelivery:
         SendInstruction("tc", 0, {"cid": 0, "content": "hi"}).execute(core, root)
 
         assert root.user_batch.tool_responses[-1].content == \
-            "Error: send_instruction 不允许自我投递（cid=0 是当前对话）"
+            "Illegal: send_instruction 不允许自我投递（cid=0 是当前对话）"
         assert root.user_batch.user_contents == []
         assert "不允许自我投递" in capsys.readouterr().err
 
@@ -659,7 +671,7 @@ class TestNotifySelf:
         core = Core()
         root = _new_root(core)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         core.mem["h"] = _python_node(
             "def handle(event):\n    return {'notify': [{'cid': 0, 'content': 'self'}]}"
         )
@@ -705,7 +717,7 @@ class TestBeforeHandlerErrorEventResult:
         target = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         core._dormant_cids.append(target.cid)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         core.mem["h1"] = _python_node(
             "def handle(event):\n    return {'notify': [{'cid': 1, 'content': 'first'}]}"
         )
@@ -727,7 +739,7 @@ class TestBeforeHandlerErrorEventResult:
         core = Core()
         root = _new_root(core)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         core.mem["h"] = _python_node("def handle(event):\n    raise RuntimeError('boom')")
         core.events.register(0, "memory_read", "$MEM.box.msg", "$MEM.h")
 
@@ -753,7 +765,7 @@ class TestBeforeHandlerErrorEventResult:
         core.lmu = MockLMU()
         root = _new_root(core)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         core.mem["h"] = _python_node("def handle(event):\n    raise RuntimeError('boom')")
         core.events.register(0, "memory_read", "$MEM.box.msg", "$MEM.h")
         core._active_cid = core._ready_cids.pop(0)
@@ -786,7 +798,7 @@ class TestMulticastPartial:
 
         SendInstruction("tc", 0, {"cid": [1, 2, 3], "content": "hi"}).execute(core, root)
 
-        assert root.user_batch.tool_responses[-1].content == "已投递到 1，1 个被拦截，1 个处理失败"
+        assert root.user_batch.tool_responses[-1].content == "已投递到 cid=[3]（1 个被拦截，1 个处理失败）"
         assert children[0].user_batch.user_contents == []
         assert children[1].user_batch.user_contents == []
         assert children[2].user_batch.user_contents == ["hi"]
@@ -819,6 +831,54 @@ class TestMissingCoverage:
         assert sub.user_batch.user_contents == ["sub created"]
         assert sub.cid in core._ready_cids
 
+    def test_memory_delete_before_replace_keeps_node(self):
+        core = Core()
+        root = _new_root(core)
+        core.mem.make("$MEM", "box", "dict", owner_cid=0)
+        core.mem.make("$MEM.box", "msg", "str", owner_cid=0)
+        core.mem.set("$MEM.box.msg", "v")
+        core.mem["h"] = _python_node(
+            "def handle(event):\n    return {'action': 'replace', 'response': 'no delete'}"
+        )
+        core.events.register(0, "memory_delete", "$MEM.box.msg", "$MEM.h")
+
+        MemoryDeleteInstruction("tc", 0, {"ref": "$MEM.box.msg"}).execute(core, root)
+        assert core.mem["box"]["msg"] == "v"
+        assert root.user_batch.tool_responses[-1].content == "Interrupted: no delete"
+
+    def test_memory_delete_before_handler_error_keeps_node(self):
+        core = Core()
+        root = _new_root(core)
+        core.mem.make("$MEM", "box", "dict", owner_cid=0)
+        core.mem.make("$MEM.box", "msg", "str", owner_cid=0)
+        core.mem.set("$MEM.box.msg", "v")
+        core.mem["h"] = _python_node("def handle(event):\n    raise ValueError('坏了')")
+        core.events.register(0, "memory_delete", "$MEM.box.msg", "$MEM.h")
+
+        MemoryDeleteInstruction("tc", 0, {"ref": "$MEM.box.msg"}).execute(core, root)
+        assert core.mem["box"]["msg"] == "v"  # handler_error：删除不执行
+
+    def test_memory_delete_after_event_carries_type(self):
+        core = Core()
+        root = _new_root(core)
+        sink = core.start("sys", "sink")  # cid 1：after 处理器把 payload notify 到这里
+        core.mem.make("$MEM", "box", "dict", owner_cid=0)
+        core.mem.make("$MEM.box", "msg", "str", owner_cid=0)
+        core.mem.set("$MEM.box.msg", "v")
+        core.mem["h_after"] = _python_node(
+            "def handle(event):\n"
+            "    return {'notify': [{'cid': 1, 'content': json.dumps(event['payload'], ensure_ascii=False)}]}"
+        )
+        core.events.register(0, "memory_delete", "$MEM.box.msg", "$MEM.h_after", phase="after")
+        core._turn_events = []
+
+        MemoryDeleteInstruction("tc", 0, {"ref": "$MEM.box.msg"}).execute(core, root)
+        after = [e for e in core._turn_events if e["event_type"] == "memory_delete" and e["phase"] == "after"]
+        assert len(after) == 1
+        assert after[0]["source"] == {"kind": "memory"}
+        payload = json.loads(sink.user_batch.user_contents[0])
+        assert payload["deleted_type"] == "str" and payload["ref"] == "$MEM.box.msg"
+
     def test_memory_make_before_replace_and_execute(self):
         core = Core()
         root = _new_root(core)
@@ -830,7 +890,7 @@ class TestMissingCoverage:
 
         MemoryMakeInstruction("tc", 0, {"ref": "$MEM.box", "key": "new", "mem_type": "dict"}).execute(core, root)
         assert "new" not in core.mem["box"]
-        assert root.user_batch.tool_responses[-1].content == "no make"
+        assert root.user_batch.tool_responses[-1].content == "Interrupted: no make"
 
         # 清除 replace 监听，验证 execute 正常创建
         core.events.cancel(1, 0)
@@ -850,7 +910,7 @@ class TestMissingCoverage:
 
         EditMetadataInstruction("tc", 0, {"ref": "$MEM.box", "type": "set", "key": "type", "value": "settingup"}).execute(core, root)
         assert (core.mem["box"].get_ctrl() or {}).get("type") is None
-        assert root.user_batch.tool_responses[-1].content == "no edit"
+        assert root.user_batch.tool_responses[-1].content == "Interrupted: no edit"
 
         # 改为 value 改写
         core.events.cancel(1, 0)
@@ -918,7 +978,7 @@ class TestMemoryAfterEvents:
         sink = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         core._dormant_cids.append(sink.cid)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         # 捕获 after payload：各事件把 payload JSON 通知给 sink
         core.mem["h_read"] = _python_node(
             "def handle(event):\n    return {'notify': [{'cid': 1, 'content': json.dumps(event['payload'], ensure_ascii=False)}]}"
@@ -964,7 +1024,7 @@ class TestMemoryAfterEvents:
         core = Core()
         root = _new_root(core)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         core.mem["h"] = _python_node("def handle(event):\n    return {'action': 'replace', 'response': 'no'}")
         core.events.register(0, "memory_read", "$MEM.box.msg", "$MEM.h", phase="before")
 
@@ -1074,7 +1134,7 @@ class TestPhaseMatching:
             core._dormant_cids.append(t.cid)
             targets.append(t)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         core.mem["h_before"] = _python_node("def handle(event):\n    return {'notify': [{'cid': 1, 'content': 'b'}]}")
         core.mem["h_after"] = _python_node("def handle(event):\n    return {'notify': [{'cid': 2, 'content': 'a'}]}")
         core.mem["h_all"] = _python_node("def handle(event):\n    return {'notify': [{'cid': 3, 'content': event['phase']}]}")
@@ -1092,7 +1152,8 @@ class TestPhaseMatching:
         core = Core()
         _new_root(core)
         core.mem["h"] = _python_node("def handle(event):\n    return {}")
-        with pytest.raises(ValueError, match="只有 after"):
+        from avm.exceptions import IllegalOperationError
+        with pytest.raises(IllegalOperationError, match="只有 after"):
             core.events.register(0, "create_cmd", "*", "$MEM.h", phase="before")
 
 
@@ -1158,7 +1219,7 @@ class TestNewSourceSelfNotify:
         core = Core()
         root = _new_root(core)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.set("$MEM.box.msg", "v", owner_cid=0)
+        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
         core.mem["h"] = _python_node("def handle(event):\n    return {'notify': [{'cid': 0, 'content': 'self'}]}")
         core.events.register(0, "memory_read", "$MEM.box.msg", "$MEM.h", phase="before")
 
@@ -1184,3 +1245,178 @@ class TestNewSourceSelfNotify:
         child = core._conv_by_cid[1]
         assert root.user_batch.user_contents == []
         assert child.user_batch.user_contents == ["other"]
+
+
+# ------------------------------------------------------------------
+# 2026-10-24 事件报告：契约修复（批 A / B1 / B3 / B5）
+# ------------------------------------------------------------------
+
+class TestEventContractFixes20261024:
+    def test_append_write_after_keeps_original_ref(self):
+        """A7：追加写入的 after target 是原 ref，真实地址放到 payload.address。"""
+        core = Core()
+        root = _new_root(core)
+        core.mem.make("$MEM", "lst", "list", owner_cid=0)
+        seen = []
+        core.events.add_observer(seen.append)
+        MemoryWriteInstruction("tc", 0, {"ref": "$MEM.lst.-1", "content": "v"}).execute(core, root)
+        after = [e for e in seen if e["event_type"] == "memory_write" and e["phase"] == "after"]
+        assert after, "追加写入应有 after 事件"
+        assert after[0]["target"] == "$MEM.lst.-1"
+        assert after[0]["payload"]["address"] == "$MEM.lst.0"
+
+    def test_send_after_for_waiting_parent(self):
+        """§2.2：目标在等亚对话返回时，消息已被接受，也要有 send_instruction after。"""
+        core = Core()
+        parent = _new_root(core)
+        other = core.start("sys", "other")
+        core.mem["prog"] = _settingup("p")
+        core.mem["para"] = _para()
+        core.mem["u"] = "task"
+        parent.append_assistant_message("", tool_calls=[{
+            "id": "cs", "type": "function",
+            "function": {"name": "create_sub", "arguments": "{}"},
+        }])
+        CreateSubInstruction("cs", parent.cid, {
+            "system_ref": "$MEM.prog", "user_ref": "$MEM.u", "para_ref": "$MEM.para",
+        }).execute(core, parent)
+        assert core._is_waiting_for_return(parent)
+        seen = []
+        core.events.add_observer(seen.append)
+        core._active_cid = other.cid
+        SendInstruction("s1", other.cid, {"cid": parent.cid, "content": "hi"}).execute(core, other)
+        after = [e for e in seen if e["event_type"] == "send_instruction" and e["phase"] == "after"]
+        assert after and after[0]["target"] == f"cid:{parent.cid}"
+        assert parent.user_batch.user_contents == ["hi"]
+
+    def test_default_replace_response_has_prefix(self):
+        """B3：被拦截的指令，调用者一定能从 `被打断:` 前缀识别。"""
+        core = Core()
+        root = _new_root(core)
+        core.mem.make("$MEM", "box", "dict", owner_cid=0)
+        _seed(core.mem, "$MEM.box.x", "v", owner_cid=0)
+        core.mem["h"] = _python_node("def handle(event):\n    return {'action': 'replace'}")
+        core.events.register(0, "memory_read", "$MEM.box.x", "$MEM.h")
+        MemoryReadInstruction("r", 0, {"ref": "$MEM.box.x"}).execute(core, root)
+        assert root.user_batch.tool_responses[-1].content == "Interrupted: 事件被监听器拦截"
+
+    def test_listen_argument_errors_are_illegal(self):
+        core = Core()
+        root = _new_root(core)
+        core.mem.make("$MEM", "box", "dict", owner_cid=0)
+        _seed(core.mem, "$MEM.box.x", "v", owner_cid=0)
+        core.mem["h"] = _python_node("def handle(e):\n    return {}")
+        ListenEventInstruction("l", 0, {
+            "action": "listen", "event_type": "memory_read", "target": "*",
+            "handler_ref": "$MEM.h",
+        }).execute(core, root)
+        assert root.user_batch.tool_responses[-1].content.startswith("Illegal:")
+        root.user_batch.clear()
+        ListenEventInstruction("l2", 0, {
+            "action": "listen", "event_type": "create_cmd", "target": "*",
+            "handler_ref": "$MEM.h", "phase": "before",
+        }).execute(core, root)
+        assert root.user_batch.tool_responses[-1].content.startswith("Illegal:")
+
+    def test_listen_permission_errors_stay_error(self):
+        core = Core()
+        root = _new_root(core)
+        core.mem.make("$MEM", "otherbox", "dict", owner_cid=1)
+        _seed(core.mem, "$MEM.otherbox.y", "v", owner_cid=1)
+        core.mem["h"] = _python_node("def handle(e):\n    return {}")
+        ListenEventInstruction("l", 0, {
+            "action": "listen", "event_type": "memory_read", "target": "$MEM.otherbox.y",
+            "handler_ref": "$MEM.h",
+        }).execute(core, root)
+        assert root.user_batch.tool_responses[-1].content.startswith("Error:")
+
+    def test_listener_error_counters_visible(self):
+        """B1：监听器失败后，$MEM.listeners 能自查。"""
+        core = Core()
+        root = _new_root(core)
+        core.mem.make("$MEM", "box", "dict", owner_cid=0)
+        _seed(core.mem, "$MEM.box.x", "v", owner_cid=0)
+        core.mem["h"] = _python_node("def handle(e):\n    raise RuntimeError('boom')")
+        lid = core.events.register(0, "memory_write", "$MEM.box.x", "$MEM.h", phase="after")
+        MemoryWriteInstruction("w", 0, {"ref": "$MEM.box.x", "content": "z"}).execute(core, root)
+        text = core.unwrap("$MEM.listeners")
+        assert f"listener_id={lid}" in text and "error_count=1" in text and "boom" in text
+        assert "last_error" in core.unwrap(f"$MEM.listeners.{lid}")
+
+    def test_frame_detail_includes_event_summaries(self):
+        """B1：frames.<seq> 能看到本帧事件与 handler_errors。"""
+        core = Core()
+        root = _new_root(core)
+        core.mem.make("$MEM", "box", "dict", owner_cid=0)
+        _seed(core.mem, "$MEM.box.x", "v", owner_cid=0)
+        core.mem["h"] = _python_node("def handle(e):\n    raise RuntimeError('frame-boom')")
+        core.events.register(0, "memory_write", "$MEM.box.x", "$MEM.h", phase="after")
+        MemoryWriteInstruction("w", 0, {"ref": "$MEM.box.x", "content": "z"}).execute(core, root)
+        core.monitor.record(core, last_call={"events": list(core._turn_events)})
+        seq = core.monitor.frames()[-1].seq
+        detail = core.unwrap(f"$MEM.monitor.frames.{seq}")
+        assert "handler_errors" in detail and "frame-boom" in detail
+
+    def test_non_owner_modify_and_cancel_are_rejected(self):
+        """报告 §4：非注册者不能 modify/cancel 别人的监听器。"""
+        core = Core()
+        root = _new_root(core)
+        core.mem["prog"] = _settingup("p")
+        core.mem["para"] = _para()
+        CreateInstruction("c", 0, {"system_ref": "$MEM.prog", "para_ref": "$MEM.para"}).execute(core, root)
+        child = core.get_conversation(1)
+        core.mem.make("$MEM", "box", "dict", owner_cid=0)
+        _seed(core.mem, "$MEM.box.x", "v", owner_cid=0)
+        core.mem["h"] = _python_node("def handle(e):\n    return {}")
+        ListenEventInstruction("l", 0, {
+            "action": "listen", "event_type": "memory_read",
+            "target": "$MEM.box.x", "handler_ref": "$MEM.h",
+        }).execute(core, root)
+        lid = core.events.listeners[0]["listener_id"]
+        root.user_batch.clear()
+        ListenEventInstruction("m", child.cid, {
+            "action": "modify", "listener_id": lid, "handler_ref": "$MEM.h",
+        }).execute(core, child)
+        assert child.user_batch.tool_responses[-1].content.startswith("Error:")
+        ListenEventInstruction("c2", child.cid, {
+            "action": "cancel", "listener_id": lid,
+        }).execute(core, child)
+        assert child.user_batch.tool_responses[-1].content.startswith("Error:")
+        assert core.events.listeners, "非注册者的请求不得改动监听器"
+
+    def test_sub_deletion_cancels_its_listeners(self):
+        """报告 §4：亚对话用完即删时，它注册的监听器一并撤销。"""
+        core = Core()
+        parent = _new_root(core)
+        core.mem["prog"] = _settingup("p")
+        core.mem["para"] = _para()
+        core.mem["u"] = "task"
+        parent.append_assistant_message("", tool_calls=[{
+            "id": "cs", "type": "function",
+            "function": {"name": "create_sub", "arguments": "{}"},
+        }])
+        CreateSubInstruction("cs", parent.cid, {
+            "system_ref": "$MEM.prog", "user_ref": "$MEM.u", "para_ref": "$MEM.para",
+        }).execute(core, parent)
+        sub = [c for c in core._conv_by_cid.values() if c.is_sub][0]
+        core.mem["h"] = _python_node("def handle(e):\n    return {}")
+        core.events.register(sub.cid, "close_conversation", "*", "$MEM.h", phase="after")
+        assert any(l["owner_cid"] == sub.cid for l in core.events.listeners)
+        CloseInstruction("cl", parent.cid, {"cid": sub.cid}).execute(core, parent)
+        assert not any(l["owner_cid"] == sub.cid for l in core.events.listeners)
+
+    def test_handler_sandbox_has_type_helpers(self):
+        """B5：处理器里 isinstance 等基础函数可用。"""
+        core = Core()
+        root = _new_root(core)
+        core.mem.make("$MEM", "box", "dict", owner_cid=0)
+        core.mem["h"] = _python_node(
+            "def handle(event):\n"
+            "    return {'action': 'replace',"
+            " 'response': str(isinstance(event['payload']['value'], str))}"
+        )
+        core.events.register(0, "edit_metadata", "$MEM.box", "$MEM.h", phase="before")
+        EditMetadataInstruction("e", 0, {
+            "ref": "$MEM.box", "type": "set", "key": "k", "value": "val",
+        }).execute(core, root)
+        assert root.user_batch.tool_responses[-1].content == "Interrupted: True"

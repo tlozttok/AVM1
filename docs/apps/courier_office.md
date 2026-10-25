@@ -51,7 +51,7 @@ dispatcher --memory_read($MEM.board.latest)--> $MEM.outputs
 
 ```
 状态 等待输入:
-  input = memory_read("$MEM.inputs.-1")
+  input = memory_read("$MEM.inputs.next")
   if input == "exit":
       close_conversation(worker_cid)  # 如已创建
       return "office closed"          # 无工具调用 => 交互结束
@@ -65,7 +65,7 @@ dispatcher --memory_read($MEM.board.latest)--> $MEM.outputs
 
 状态 处理结果（被 RESULT 唤醒）:
   record = memory_read("$MEM.board.latest")
-  memory_write("$MEM.outputs.-1", record)
+  memory_write("$MEM.outputs.out", record)
   goto 等待输入
 ```
 

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from avm.exceptions import MemoryTypeError
+from avm.exceptions import MemoryTypeError, MemoryKeyNotFoundError, VMMemoryError
 from avm.core import Core
 from avm.image import load_image
 from avm.python_server import PLM_REGISTRY
@@ -23,6 +23,16 @@ APPS = ROOT / "images" / "apps"
 COURIER_IMAGE = APPS / "courier_office" / "courier_office.json"
 VAULT_IMAGE = APPS / "vault_guard" / "vault_guard.json"
 LEDGER_IMAGE = APPS / "plm_ledger" / "plm_ledger.json"
+
+
+def _seed(mem, ref, value, owner_cid=None):
+    """测试夹具：先 make 建链再写（memory_write 不再建节点）。"""
+    try:
+        return mem.set(ref, value, owner_cid=owner_cid)
+    except MemoryKeyNotFoundError:
+        parent, _, key = ref.rpartition(".")
+        mem.make(parent, key, "str", owner_cid=owner_cid)
+        return mem.set(ref, value, owner_cid=owner_cid)
 
 
 def tool(call_id, name, **args):
@@ -101,7 +111,7 @@ class TestCourierOfficeImage:
         assert link.target == "board"
         assert "board" in core.mem._devices
         assert core.unwrap("$MEM.board") == (
-            "list[len=0,metadata='courier_office 完工记录板（只追加）']"
+            "list[len=0,elem=str,metadata='courier_office 完工记录板（只追加）']"
         )
 
         # 程序节点类型
@@ -109,25 +119,31 @@ class TestCourierOfficeImage:
         assert core.unwrap("$MEM.programs.calc", for_llm=False).get_ctrl()["type"] == "python"
         assert core.unwrap("$MEM.para.simple", for_llm=False).get_ctrl()["type"] == "para"
 
-    def test_board_device_append_and_index_semantics(self):
+    def test_board_device_named_access_semantics(self):
+        """设备按名称读写：append 写、latest 读；数字位置写入与负下标都不支持。"""
         core = load_image(Core(), str(COURIER_IMAGE))
         board = core.mem._devices["board"]
 
-        # 追加走显式 append 路径
-        core.mem.set("$MEM.board.append", "first")
-        core.mem.set("$MEM.board.append", "second")
+        # 追加走命名接口
+        _seed(core.mem, "$MEM.board.append", "first")
+        _seed(core.mem, "$MEM.board.append", "second")
         assert board._data == ["first", "second"]
         assert core.unwrap("$MEM.board.latest") == "second"
 
-        # -1 是普通列表语义：读最后一条；写入覆盖最后一条，不追加
-        assert core.unwrap("$MEM.board.-1") == "second"
-        core.mem.set("$MEM.board.-1", "second-revised")
-        assert board._data == ["first", "second-revised"]
-        assert core.unwrap("$MEM.board.latest") == "second-revised"
+        # 数字索引只读
+        assert core.unwrap("$MEM.board.0") == "first"
 
-        assert board.after_event("memory_write", ["append"], {"content": "second-revised"}) == {
+        # 数字位置写入不再可用（设备写只走命名接口）
+        with pytest.raises(VMMemoryError):
+            core.mem.set("$MEM.board.1", "x")
+        # 负下标也不再是"最后一条"
+        with pytest.raises(VMMemoryError):
+            core.unwrap("$MEM.board.-1")
+        assert board._data == ["first", "second"]
+
+        assert board.after_event("memory_write", ["append"], {"content": "second"}) == {
             "board_len": 2,
-            "latest": "second-revised",
+            "latest": "second",
         }
 
         with pytest.raises(MemoryTypeError):
@@ -139,23 +155,26 @@ class TestCourierOfficeImage:
             0: [
                 ("", [
                     tool("a1", "create_cmd", system_ref="$MEM.programs.worker", para_ref="$MEM.para.llm"),
+                    tool("a1b0", "memory_make", ref="$MEM.state", key="worker_cid", mem_type="str"),
                     tool("a1b", "memory_write", ref="$MEM.state.worker_cid", content="1"),
                     tool("a1c", "memory_read", ref="$MEM.reports"),
                 ], None),
                 ("", [
                     tool("a1d", "memory_make", ref="$MEM", key="reports", mem_type="dict"),
+                    tool("a1e", "memory_make", ref="$MEM.reports", key="1", mem_type="str"),
                     tool("a2", "send_instruction", cid=1,
                          content="JOB 1: 1+2 | 完成后 send_instruction(cid=0, content=RESULT 1 1+2 = 3)"),
                 ], None),
                 ("waiting", [], None),
                 ("", [
                     tool("a3", "memory_read", ref="$MEM.board.latest"),
-                    tool("a4", "memory_write", ref="$MEM.outputs.-1", content="JOB 1 1+2 = 3"),
+                    tool("a4", "memory_write", ref="$MEM.outputs.out", content="JOB 1 1+2 = 3"),
                 ], None),
                 ("waiting", [], None),
             ],
             1: [
                 ("", [
+                    tool("b1m", "memory_make", ref="$MEM.tasks", key="expr", mem_type="str"),
                     tool("b1", "memory_write", ref="$MEM.tasks.expr", content="1+2"),
                     tool("b2", "create_sub", system_ref="$MEM.programs.calc",
                          user_ref="$MEM.tasks.expr", para_ref="$MEM.para.simple"),
@@ -184,7 +203,7 @@ class TestCourierOfficeImage:
         st = _state(core)
         assert st["active"] is None
         assert st["ready"] == []
-        assert set(st["dormant"]) == {0, 1, 2}  # dispatcher / worker / calc 都交互结束休眠
+        assert set(st["dormant"]) == {0, 1}  # dispatcher / worker 休眠；calc 亚对话用完即删
         assert st["finished"] == []
 
         # 调度轨迹：dispatcher 三次 + worker 三次 + dispatcher 收尾两次
@@ -227,8 +246,8 @@ class TestVaultGuardImage:
                 ("", [
                     tool("g5", "memory_read", ref="$MEM.vault.audit"),
                     tool("g6", "memory_read", ref="$MEM.vault.deposit"),
-                    tool("g7", "memory_write", ref="$MEM.outputs.-1", content="AUDIT: TASK 1 尝试写入 deposit"),
-                    tool("g8", "memory_write", ref="$MEM.outputs.-1",
+                    tool("g7", "memory_write", ref="$MEM.outputs.out", content="AUDIT: TASK 1 尝试写入 deposit"),
+                    tool("g8", "memory_write", ref="$MEM.outputs.out",
                          content="FINAL: EMPTY" if task == "SECRET" else "FINAL: SAFE:" + task),
                 ], None),
                 ("done", [], None),
@@ -370,7 +389,7 @@ class TestPlmLedger:
                     tool("t2", "create_sub", system_ref="$MEM.programs.ledger",
                          user_ref="$MEM.request", para_ref="$MEM.para.ledger"),
                 ], None),
-                ("", [tool("t3", "memory_write", ref="$MEM.outputs.-1", content="OK PUT a=1")], None),
+                ("", [tool("t3", "memory_write", ref="$MEM.outputs.out", content="OK PUT a=1")], None),
                 ("done", [], None),
             ],
         })
@@ -381,15 +400,12 @@ class TestPlmLedger:
         assert json.loads(core.unwrap("$MEM.ledger.state", for_llm=False)) == {"a": "1"}
         assert core.mem._devices["outputs"]._data == ["OK PUT a=1"]
 
-        # LedgerPLM 历史应包含：system 配置、user 命令、工具调用、工具响应、最终答复
-        ledger = core.get_conversation(1)
-        roles = [m.role for m in ledger.messages]
-        assert roles == ["system", "user", "assistant", "tool", "assistant"]
-        assert ledger.messages[-1].content == "OK PUT a=1"
+        # 亚对话用完即删：账本对话完成后不再保留，但返回结果进入了 father 的工具响应
+        assert core.get_conversation(1) is None
 
         st = _state(core)
         assert st["active"] is None
-        assert set(st["dormant"]) == {0, 1}
+        assert set(st["dormant"]) == {0}
         assert [cid for cid, _ in core.lmu.calls] == [0, 0, 0]
 
     def test_python_conversation_rejects_unregistered_plm(self, monkeypatch):

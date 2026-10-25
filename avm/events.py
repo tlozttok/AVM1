@@ -1,7 +1,8 @@
 """AVM 事件模型 v1：事件构造、监听器注册表、权限校验、处理器执行与管道分发。
 
-每个工具调用对应一个事件；5 种 before 事件可被监听器拦截/改写，
-4 种 after 事件只产生通知。监听器是普通 Python 节点中的代码，
+每条指令成功时都产生一条 after 事实事件；其中 6 种工具另有 before 请求事件，
+可被监听器拦截/改写（memory_read / memory_write / memory_make / memory_delete /
+edit_metadata / send_instruction）。监听器是普通 Python 节点中的代码，
 每次事件在全新受限命名空间执行，不保留实例状态。
 """
 import copy
@@ -9,7 +10,7 @@ import json
 import sys
 from typing import Any, Dict, List, Optional
 
-from .exceptions import VMMemoryError
+from .exceptions import IllegalOperationError, VMMemoryError
 from .sandbox import safe_globals, exec_safe
 from .types import MetaDict, MetaList
 
@@ -17,6 +18,7 @@ EVENT_TYPES = [
     "memory_read",
     "memory_write",
     "memory_make",
+    "memory_delete",
     "edit_metadata",
     "send_instruction",
     "create_cmd",
@@ -29,6 +31,7 @@ INTERCEPTABLE_TYPES = {
     "memory_read",
     "memory_write",
     "memory_make",
+    "memory_delete",
     "edit_metadata",
     "send_instruction",
 }
@@ -164,22 +167,25 @@ class EventSystem:
 
     def register(self, owner_cid: int, event_type: str, target: str, handler_ref: str, phase: str = "all") -> int:
         if event_type not in EVENT_TYPES:
-            raise ValueError(f"未知事件类型：{event_type}，允许：{EVENT_TYPES}")
+            raise IllegalOperationError(f"未知事件类型：{event_type}，允许：{EVENT_TYPES}")
         if phase not in ("before", "after", "all"):
-            raise ValueError("phase 必须是 before/after/all")
+            raise IllegalOperationError("phase 必须是 before/after/all")
         if not isinstance(target, str) or not target:
-            raise ValueError("target 必须是字符串")
+            raise IllegalOperationError("target 必须是字符串")
         handler_code = self.resolve_handler(self._core, handler_ref)
 
         if event_type in AFTER_ONLY_TYPES:
             if phase == "before":
-                raise ValueError(f"{event_type} 只有 after 事件，不能注册 phase=before")
+                raise IllegalOperationError(f"{event_type} 只有 after 事件，不能注册 phase=before")
             # 生命周期 after 允许 * 或精确 target，任何对话可注册
         else:
             if target == "*":
-                raise ValueError("该事件类型只支持精确 target，不支持 *")
+                raise IllegalOperationError("该事件类型只支持精确 target，不支持 *")
             self._check_target_permission(owner_cid, event_type, target, phase)
 
+        # TODO(issue): 监听器生命周期跟随对话、不跟随 target。目标路径被删除后监听器
+        # 仍留在表里（悬空），路径重建后会“复活”（2026-10-24 事件报告 §3.4）。
+        # 后续可能改为按 target 清理，需要先定前缀/设备/通配的语义。
         listener_id = self._next_listener_id
         self._next_listener_id += 1
         self.listeners.append({
@@ -205,6 +211,12 @@ class EventSystem:
         listener = self._get_listener(listener_id)
         self._check_owner(listener, owner_cid)
         self.listeners.remove(listener)
+
+    @staticmethod
+    def _note_listener_error(listener: dict, message: str) -> None:
+        """记录监听器最近一次失败：$MEM.listeners 里可自查（B1）。"""
+        listener["error_count"] = int(listener.get("error_count", 0)) + 1
+        listener["last_error"] = message
 
     def cancel_all_for_owner(self, owner_cid: int) -> None:
         self.listeners = [l for l in self.listeners if l.get("owner_cid") != owner_cid]
@@ -328,7 +340,7 @@ class EventSystem:
                     raise ValueError(
                         f"设备 {mount_key} 未授权对话 {owner_cid} 监听 {target}"
                     )
-        elif event_type == "memory_make":
+        elif event_type in ("memory_make", "memory_delete"):
             split = self._core.mem.split_path(target)
             kind = split[0]
             if kind == "memory":
@@ -353,11 +365,11 @@ class EventSystem:
                     )
         elif event_type == "send_instruction":
             if not target.startswith("cid:"):
-                raise ValueError("send_instruction 事件的 target 必须是 cid:<cid>")
+                raise IllegalOperationError("send_instruction 事件的 target 必须是 cid:<cid>")
             try:
                 cid = int(target[4:])
             except ValueError:
-                raise ValueError(f"send_instruction 事件的 target cid 必须是数字：{target}")
+                raise IllegalOperationError(f"send_instruction 事件的 target cid 必须是数字：{target}")
             if cid != owner_cid:
                 raise ValueError(f"对话只能监听发往自己的消息，不能监听 {target}")
         else:
@@ -379,7 +391,7 @@ class EventSystem:
     def _has_device_prefix(core: 'Core', path: str) -> bool:
         """路径的任意前缀是否命中已挂载设备。
 
-        权限检查不能触发设备 resolve_path（如 $MEM.inputs.-1 会阻塞等待输入），
+        权限检查不能触发设备 resolve_path（如 $MEM.inputs.next 会阻塞等待输入），
         因此先做纯注册表检查；含设备前缀的路径走「最近非设备祖先」所有权规则。
         """
         if not isinstance(path, str) or not path.startswith("$MEM."):
@@ -514,7 +526,8 @@ class EventSystem:
                     0,
                     f"response 必须是字符串，得到 {type(response).__name__}",
                 )
-            event["response"] = response or DEFAULT_REPLACE_RESPONSE
+            # 调用者要能分辨"被拦截"与"成功"：统一加前缀；处理器自定义文本也加。
+            event["response"] = f"Interrupted: {response or DEFAULT_REPLACE_RESPONSE}"
 
         mutable = MUTABLE_PAYLOAD_KEYS.get(event["event_type"], set())
         payload_out = out.get("payload")
@@ -583,6 +596,7 @@ class EventSystem:
         matched = self._match(event)
         if event["phase"] == "before":
             for listener in matched:
+                before_errors = len(event.get("handler_errors") or [])
                 try:
                     out = self._run_listener(listener, event)
                     # _merge_output 中 action 为 replace 时也会校验 response/notify
@@ -592,14 +606,20 @@ class EventSystem:
                     # 指令执行方负责向 stderr 报告一次并返回 Error 工具响应。
                     if e.listener_id == 0:
                         e = EventHandlerError(listener["listener_id"], e.message)
+                    self._note_listener_error(listener, str(e))
                     event["action"] = "handler_error"
                     event["response"] = f"Error: {e}"
                     event["error"] = str(e)
                     break
+                else:
+                    for entry in (event.get("handler_errors") or [])[before_errors:]:
+                        if entry.get("listener_id") == listener["listener_id"]:
+                            self._note_listener_error(listener, entry.get("error", ""))
                 if event["action"] == "replace":
                     break
         else:  # after
             for listener in matched:
+                before_errors = len(event.get("handler_errors") or [])
                 try:
                     out = self._run_listener(listener, event)
                     self._merge_output(event, out, listener["listener_id"])
@@ -607,6 +627,7 @@ class EventSystem:
                     # fail open：记录 stderr，跳过该处理器的 notify，继续后续监听器
                     if e.listener_id == 0:
                         e = EventHandlerError(listener["listener_id"], e.message)
+                    self._note_listener_error(listener, str(e))
                     event.setdefault("handler_errors", []).append({
                         "listener_id": listener["listener_id"],
                         "error": str(e),
@@ -615,12 +636,16 @@ class EventSystem:
                     continue
                 except Exception as e:
                     err = f"{type(e).__name__}: {e}"
+                    self._note_listener_error(listener, err)
                     event.setdefault("handler_errors", []).append({
                         "listener_id": listener["listener_id"],
                         "error": err,
                     })
                     print(f"[AVM] 事件监听器 {listener['listener_id']} 处理失败: {err}", file=sys.stderr)
                     continue
+                for entry in (event.get("handler_errors") or [])[before_errors:]:
+                    if entry.get("listener_id") == listener["listener_id"]:
+                        self._note_listener_error(listener, entry.get("error", ""))
 
         self._append_summary(event)
         return event
@@ -650,7 +675,11 @@ class EventSystem:
                 )
 
     def deliver_notifies(self, event: dict) -> None:
-        """按 2.7 内部投递 notify：不经事件管道、不产生 send_instruction 事件。"""
+        """按 2.7 内部投递 notify：不经事件管道、不产生 send_instruction 事件。
+
+        TODO(issue): 不校验目标授权——监听器所有者可唤醒任意存活对话。作者倾向
+        “处理器只允许返回到自己”，需要单独讨论（question-notify-target-authorization-2026-10-24）。
+        """
         core = self._core
         for item in event.get("notify") or []:
             cid = item["cid"]
@@ -663,6 +692,9 @@ class EventSystem:
                 )
                 continue
             target.user_batch.add_user_content(content)
+            if core._is_waiting_for_return(target):
+                # 等亚对话返回的对话：notify 只入批次，不唤醒；亚对话结束后父对话先跑
+                continue
             if cid in core._dormant_cids:
                 core._dormant_cids.remove(cid)
             if cid in core._ready_cids:

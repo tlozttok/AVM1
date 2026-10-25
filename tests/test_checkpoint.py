@@ -30,7 +30,7 @@ class TestConversationCheckpoint:
                     content="",
                     tool_calls=[{
                         "id": "c1", "type": "function",
-                        "function": {"name": "memory_read", "arguments": '{"ref": "$MEM.inputs.-1"}'},
+                        "function": {"name": "memory_read", "arguments": '{"ref": "$MEM.inputs.next"}'},
                     }],
                     reasoning_content="think",
                 ),
@@ -103,7 +103,7 @@ class TestCoreCheckpoint:
         root = _root(core)
         root.append_assistant_message("", tool_calls=[{
             "id": "c1", "type": "function",
-            "function": {"name": "memory_read", "arguments": '{"ref": "$MEM.inputs.-1"}'},
+            "function": {"name": "memory_read", "arguments": '{"ref": "$MEM.inputs.next"}'},
         }])
         path = str(tmp_path / "cp.json")
 
@@ -163,7 +163,7 @@ class TestSaveDebugCommand:
         seq = iter(["/save", "real input"])
         monkeypatch.setattr("builtins.input", lambda _: next(seq))
 
-        assert dev[-1] == "real input"
+        assert dev["next"] == "real input"
         assert core.saved == [(7, str(tmp_path) + "/default.conv.json")]
         assert dev._data == ["real input"]
 
@@ -172,7 +172,7 @@ class TestSaveDebugCommand:
         seq = iter(["/save out/custom.json", "x"])
         monkeypatch.setattr("builtins.input", lambda _: next(seq))
 
-        assert dev[-1] == "x"
+        assert dev["next"] == "x"
         assert core.saved == [(7, str(tmp_path) + "/out/custom.json")]
 
     def test_save_without_core_does_not_crash(self, monkeypatch, capsys):
@@ -180,7 +180,7 @@ class TestSaveDebugCommand:
         seq = iter(["/save", "x"])
         monkeypatch.setattr("builtins.input", lambda _: next(seq))
 
-        assert dev[-1] == "x"
+        assert dev["next"] == "x"
         assert "未接入 Core" in capsys.readouterr().out
 
     def test_prompt_shows_waiting_conversation_identity(self, monkeypatch):
@@ -200,6 +200,6 @@ class TestSaveDebugCommand:
             return "x"
 
         monkeypatch.setattr("builtins.input", fake_input)
-        assert dev[-1] == "x"
+        assert dev["next"] == "x"
         assert "tester" in seen["prompt"]
         assert "等待输入" in seen["prompt"]

@@ -1,3 +1,4 @@
+from avm.exceptions import MemoryKeyNotFoundError
 """控制台 HTTP 层冒烟
 
 起真实服务、本地请求每个端点，断言状态码与关键字段。前端的契约变了这里会先红。
@@ -38,6 +39,16 @@ class EchoDevice(MemoryDevice):
     def debug_actions(self):
         return [{"name": "回显", "description": "原样返回参数",
                  "run": lambda args: {"echo": args}}]
+
+
+def _seed(mem, ref, value, owner_cid=None):
+    """测试夹具：先 make 建链再写（memory_write 不再建节点）。"""
+    try:
+        return mem.set(ref, value, owner_cid=owner_cid)
+    except MemoryKeyNotFoundError:
+        parent, _, key = ref.rpartition(".")
+        mem.make(parent, key, "str", owner_cid=owner_cid)
+        return mem.set(ref, value, owner_cid=owner_cid)
 
 
 def request(base, method, path, body=None):
@@ -103,7 +114,7 @@ class TestReadEndpoints:
         code, body = request(env[2], "GET", "/api/tools")
         assert code == 200
         assert body["tools"] == _build_tools()
-        assert len(body["tools"]) == 9
+        assert len(body["tools"]) == 10
 
     def test_state(self, env):
         core, console, base, _ = env
@@ -239,7 +250,7 @@ class TestWriteEndpoints:
         assert code == 200
         assert record["result"] == {"queued": 1}
 
-        assert core.mem["inputs"][-1] == "面板输入"
+        assert core.mem["inputs"]["next"] == "面板输入"
 
     def test_panel_input_wakes_a_waiting_read(self, env):
         """托管下的端到端：设备等在队列上，HTTP 喂一行把它唤醒。
@@ -254,7 +265,7 @@ class TestWriteEndpoints:
         assert device._console_input is True
 
         got = []
-        thread = threading.Thread(target=lambda: got.append(core.mem["inputs"][-1]))
+        thread = threading.Thread(target=lambda: got.append(core.mem["inputs"]["next"]))
         thread.start()
         for _ in range(300):  # 等到读真的等在队列上
             if device._pending_input:
@@ -324,6 +335,7 @@ class TestInterventionFlow:
         core, console, base, _ = env
         first = core.start("sys", "one")
         second = core.start("sys", "two")
+        _seed(core.mem, "$MEM.from_panel", "")
 
         def on_exec(conv):
             if conv.cid == first.cid:
@@ -375,7 +387,9 @@ class TestInterventionFlow:
         core, console, base, _ = env
         first = core.start("sys", "one")
         second = core.start("sys", "two")
+        _seed(core.mem, "$MEM.from_panel", "")
         third = core.start("sys", "three")
+        _seed(core.mem, "$MEM.auto", "")
         release = threading.Event()
 
         def on_exec(conv):
@@ -400,7 +414,7 @@ class TestInterventionFlow:
             assert body["auto_paused"] is True, "没暂停时控制台应当先自动中断"
 
             release.set()
-            assert wait_for(lambda: "auto" in core.mem), "恢复后动作应当被执行"
+            assert wait_for(lambda: core.mem["auto"] == "v"), "恢复后动作应当被执行"
             assert core.mem["auto"] == "v"
         finally:
             release.set()

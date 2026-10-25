@@ -57,7 +57,7 @@ worker(LLM, cid N)
   memory_write("$MEM.state.worker_cid", str(worker_cid))
 
 主循环:
-  input = memory_read("$MEM.inputs.-1")
+  input = memory_read("$MEM.inputs.next")
   if input == "exit":
       close_conversation(worker_cid); return "vault closed"
   send_instruction(cid=worker_cid,
@@ -66,9 +66,9 @@ worker(LLM, cid N)
 
 被唤醒时:
   if 收到 AUDIT 消息:
-      memory_read("$MEM.vault.audit"); memory_write("$MEM.outputs.-1", "AUDIT: " + 内容)
+      memory_read("$MEM.vault.audit"); memory_write("$MEM.outputs.out", "AUDIT: " + 内容)
   if 收到 RESULT 消息:
-      memory_read("$MEM.vault.deposit"); memory_write("$MEM.outputs.-1", "FINAL: " + 内容)
+      memory_read("$MEM.vault.deposit"); memory_write("$MEM.outputs.out", "FINAL: " + 内容)
       goto 主循环
 ```
 

@@ -36,6 +36,56 @@ class FakeRaw:
         return self._payload
 
 
+class _FakeHttpResponse:
+    """httpx 风格响应：只有 .json()。"""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class NewSdkRaw:
+    """openai 2.x 的 LegacyAPIResponse：没有 .json()，只有 .http_response 与 .text。"""
+
+    def __init__(self, payload):
+        self.http_response = _FakeHttpResponse(payload)
+        self.text = json.dumps(payload, ensure_ascii=False)
+
+
+class TextOnlyRaw:
+    """更保守的形状：没有 .json()/.http_response，只有 .text。"""
+
+    def __init__(self, payload):
+        self.text = json.dumps(payload, ensure_ascii=False)
+
+
+class UnparseableRaw:
+    """什么取 JSON 的入口都没有。"""
+
+
+class _RawModels:
+    def __init__(self, raw):
+        self._raw = raw
+
+    @property
+    def with_raw_response(self):
+        return self
+
+    def list(self, timeout=None):
+        return self._raw
+
+
+class _RawClient:
+    def __init__(self, raw):
+        self.models = _RawModels(raw)
+
+
+def _install_raw_client(core, raw):
+    core.lmu._client = _RawClient(raw)
+
+
 class FakeModels:
     def __init__(self, payload):
         self._payload = payload
@@ -75,9 +125,11 @@ class TestCatalogNode:
         catalog = _catalog(core)
         assert catalog.get_metadata(), "节点要有 meta 说明"
         plm_names = [e["name"] for e in catalog["plm"]]
-        assert plm_names == sorted(plm_names) or set(plm_names) >= {
-            "plm.simple", "plm.python", "plm.function", "plm.machine", "plm.command", "plm.operator"
+        # 对话可见的 PLM 列表：宿主独占的 plm.operator 不列（模型目录是对话可见面）
+        assert set(plm_names) == {
+            "plm.simple", "plm.python", "plm.function", "plm.machine", "plm.command"
         }
+        assert "plm.operator" not in plm_names
         assert catalog["llm"]["source"] == "unavailable"
         assert catalog["llm"]["required"] == "model"
         assert set(catalog["llm"]["params"].keys()) == set(LMU._API_PARAM_KEYS)
@@ -165,6 +217,45 @@ class TestRefresh:
         _install_fake_client(core, {"object": "list", "data": [{"id": "deepseek-flash"}]})
         assert core.refresh_model_catalog()["source"] == "api"
 
+    def test_new_sdk_raw_response_without_json_method(self):
+        """openai 2.x 的原始响应没有 .json()（现场：AttributeError: 'LegacyAPIResponse' ...)，
+        要能从 .http_response 取回 JSON。"""
+        core, _conv = _core()
+        _install_raw_client(core, NewSdkRaw({"object": "list", "data": [{"id": "m1"}]}))
+        assert core.refresh_model_catalog()["source"] == "api"
+        assert _catalog(core)["llm"]["models"][0]["id"] == "m1"
+
+    def test_text_only_raw_response(self):
+        core, _conv = _core()
+        _install_raw_client(core, TextOnlyRaw({"object": "list", "data": [{"id": "m2"}]}))
+        assert core.refresh_model_catalog()["source"] == "api"
+
+    def test_unparseable_raw_response_is_unavailable(self):
+        core, _conv = _core()
+        _install_raw_client(core, UnparseableRaw())
+        result = core.refresh_model_catalog()
+        assert result["source"] == "unavailable"
+        assert "无法从" in result["reason"]
+
+    def test_deepseek_documented_metadata_fields(self):
+        """按 DeepSeek /models 文档：没有 created，带 name/context_window/effort 等可选字段。"""
+        core, _conv = _core()
+        _install_raw_client(core, NewSdkRaw({
+            "object": "list",
+            "data": [{
+                "id": "deepseek-chat", "object": "model", "owned_by": "deepseek",
+                "name": "DeepSeek Chat", "context_window": 131072, "max_output_tokens": 8192,
+                "input_modalities": ["text"], "output_modalities": ["text"],
+                "effort": {"supported_levels": ["low", "medium", "high"], "default_level": "medium"},
+            }],
+        }))
+        assert core.refresh_model_catalog()["source"] == "api"
+        entry = _catalog(core)["llm"]["models"][0]
+        assert entry["name"] == "DeepSeek Chat"
+        assert entry["context_window"] == "131072"
+        assert entry["reasoning_effort_levels"] == "low, medium, high"
+        assert entry["default_effort_level"] == "medium"
+
     def test_bare_array_is_unavailable(self):
         core, _conv = _core()
         _install_fake_client(core, [{"id": "m"}])
@@ -210,7 +301,7 @@ class TestRefresh:
         assert core.unwrap("$MEM.model_catalog.llm.source") == "api"
         assert core.unwrap("$MEM.model_catalog.llm.models.0.id") == "deepseek-flash"
         assert core.unwrap("$MEM.model_catalog.plm.0.name") == "plm.simple"
-        assert core.unwrap("$MEM.model_catalog.plm.5.name") == "plm.operator"
+        assert core.unwrap("$MEM.model_catalog.plm.4.name") == "plm.command"
 
 
 # ----------------------------------------------------------------------
@@ -231,6 +322,17 @@ class TestNamespaceCheck:
         _call(core, conv, "create_cmd",
               {"system_ref": "$MEM.prog_py", "para_ref": "$MEM.para_plm"})
         assert _responses(conv) == ["Success created: cid=1"]
+
+    def test_host_only_plm_rejected_generically(self):
+        """plm.operator 是宿主独占：对话拿不到详细理由，也建不出对话。"""
+        core, conv = _core()
+        _with_nodes(core)
+        core.mem["para_host"] = MetaDict(data={"model": "plm.operator"}, ctrl={"type": "para"})
+        _call(core, conv, "create_cmd",
+              {"system_ref": "$MEM.prog_py", "para_ref": "$MEM.para_host"})
+        assert _responses(conv) == ["Illegal: 操作被外部原因拒绝"]
+        assert core.get_conversation(1) is None
+        assert "plm.operator" not in [e["name"] for e in _catalog(core)["plm"]]
 
     def test_python_program_rejects_llm_model(self):
         core, conv = _core()

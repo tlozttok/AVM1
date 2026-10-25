@@ -122,9 +122,8 @@ pip install openai python-dotenv pytest
 ### 运行
 
 ```bash
-python main.py                       # 调试入口（debug.json 或命令行参数）
+python main.py                       # 启动入口
 python -m avm.image <image.json>     # 加载并运行系统镜像
-python main.py <image.json> --frames # 运行后打印监测帧摘要
 ```
 
 ### 测试

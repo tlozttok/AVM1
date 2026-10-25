@@ -19,6 +19,8 @@ SAFE_BUILTIN_NAMES = {
     "list", "map", "max", "min", "oct", "ord", "pow", "range", "repr",
     "reversed", "round", "set", "slice", "sorted", "str", "sum", "tuple", "zip",
     "print",
+    # 类型/迭代工具：处理器常用，且不构成逃逸面（不打开文件/网络、不做动态导入）
+    "isinstance", "issubclass", "callable", "iter", "next",
     # 注意：这里不发 BaseException。Python 程序（PLM 代码、事件处理器）不该能触发
     # "紧急停止"——那会让一句 raise BaseException("x") 穿过内核所有错误处理。
     # 停机信号只来自宿主：人按 Ctrl+C、宿主主动退出。

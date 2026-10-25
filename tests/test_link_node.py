@@ -12,6 +12,7 @@ from avm.core import Core
 from avm.exceptions import (
     MemoryCircularReferenceError,
     MemoryKeyNotFoundError,
+    MemoryLinkBrokenError,
     MemoryTypeError,
     VMMemoryError,
 )
@@ -328,3 +329,55 @@ class TestConsoleRendering:
         assert flat["box"] == {"kind": "link", "target": "box"}
         # 链接不跟随：面板看到的是树本身，不是设备内部
         assert "box.a" not in flat
+
+
+class TestBrokenLink:
+    """目标消失后链接节点保留、访问报"链接无效"——像符号链接。"""
+
+    def _mem_with_link(self):
+        mem = Memory()
+        mem["real"] = "v"
+        mem._data._data["lk"] = LinkNode(target="$MEM.real")
+        return mem
+
+    def test_target_deleted_link_survives_but_read_fails(self):
+        mem = self._mem_with_link()
+        mem.delete("$MEM.real")
+        assert "lk" in mem._data._data  # 链接节点本身不消失
+        with pytest.raises(MemoryLinkBrokenError) as exc:
+            mem.unwrap(["$", "MEM", "lk"])
+        assert "链接无效" in str(exc.value)
+
+    def test_write_through_broken_link_fails(self):
+        mem = self._mem_with_link()
+        mem.delete("$MEM.real")
+        with pytest.raises(MemoryLinkBrokenError):
+            mem.set("$MEM.lk", "x")
+
+    def test_link_to_unknown_device_is_broken(self):
+        mem = Memory()
+        mem._data._data["bad"] = LinkNode(target="ghost")
+        with pytest.raises(MemoryLinkBrokenError):
+            mem.unwrap(["$", "MEM", "bad"])
+
+    def test_repair_after_target_recreated(self):
+        """目标重建后链接恢复可用（符号链接语义）。"""
+        mem = self._mem_with_link()
+        mem.delete("$MEM.real")
+        with pytest.raises(MemoryLinkBrokenError):
+            mem.unwrap(["$", "MEM", "lk"])
+        mem.make("$MEM", "real", "str")
+        mem.set("$MEM.real", "again")
+        assert mem.unwrap(["$", "MEM", "lk"]) == "again"
+
+    def test_instruction_reports_error_response_not_panic(self):
+        core = Core()
+        conv = core.start("sys", "hello")
+        core.mem["real"] = "v"
+        core.mem._data._data["lk"] = LinkNode(target="$MEM.real")
+        core.mem.delete("$MEM.real")
+        core._process_return_calls(
+            [{"cmd_type": "memory_read", "call_id": "c1", "args": {"ref": "$MEM.lk"}}], conv
+        )
+        content = conv.user_batch.tool_responses[-1].content
+        assert content.startswith("Error:") and "链接无效" in content

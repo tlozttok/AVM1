@@ -229,7 +229,25 @@ class MetaListDevice(MemoryDevice):
     def pretend_as_type(self) -> str:
         return "MetaList"
 
+    def _parse_index(self, index):
+        """设备子键：命名子键由子类处理；数字子键只接受非负整数。"""
+        if isinstance(index, str):
+            try:
+                return int(index)
+            except ValueError:
+                from .exceptions import MemoryTypeError
+                raise MemoryTypeError(
+                    f"{type(self).__name__} 的索引必须是整数或命名子键，got {index!r}"
+                ) from None
+        return index
+
     def __getitem__(self, index: int) -> Any:
+        index = self._parse_index(index)
+        if index < 0:
+            from .exceptions import MemoryIndexOutOfRangeError
+            raise MemoryIndexOutOfRangeError(
+                f"{type(self).__name__} 不支持负下标（-1 只表示内存列表的追加位置），请用命名子键读取"
+            )
         try:
             return self._data[index]
         except IndexError:
@@ -259,7 +277,21 @@ class MetaListDevice(MemoryDevice):
         return value in self._data
 
     def to_llm_string(self) -> str:
-        return f"list[len={len(self._data)},metadata={self._metadata!r}]"
+        kinds = set()
+        for value in self._data:
+            if isinstance(value, MetaDict):
+                kinds.add("dict")
+            elif isinstance(value, MetaList):
+                kinds.add("list")
+            else:
+                kinds.add("str")
+        if not kinds:
+            elem = "str"
+        elif len(kinds) == 1:
+            elem = kinds.pop()
+        else:
+            elem = "mixed(" + ",".join(sorted(kinds)) + ")"
+        return f"list[len={len(self._data)},elem={elem},metadata={self._metadata!r}]"
 
     def __len__(self) -> int:
         return len(self._data)
@@ -275,7 +307,7 @@ class InputsListDevice(MetaListDevice):
     """伪列表用户输入设备
     挂载到 $MEM.inputs，模拟一个不断增长的输入列表。
     - 读取 $MEM.inputs 时返回列表元数据
-    - 读取 $MEM.inputs.-1 时阻塞请求用户输入，追加到列表后返回
+    - 读取 $MEM.inputs.next 时阻塞请求用户输入，追加到列表后返回
     - 读取其他索引时，像正常列表一样返回已有元素
 
     输入源有两个：控制台的输入框（`debug_actions`）和终端。`_prompt_operator` 按启动标志
@@ -305,8 +337,8 @@ class InputsListDevice(MetaListDevice):
         """设备自己的调试台：给面板一个输入框。
 
         这是设备注册的行为，不属于核心要调试设备——不经指令集、不产生事件、与 Core 无关。
-        `run` 把一行文本排进队列并唤醒等队列的读；消费它的是 `__getitem__(-1)`，即下一次
-        `$MEM.inputs.-1` 读取。被控制台托管时那一读正等在队列上，喂进来立刻生效；走终端的
+        `run` 把一行文本排进队列并唤醒等队列的读；消费它的是 `__getitem__("next")`，即下一次
+        `$MEM.inputs.next` 读取。被控制台托管时那一读正等在队列上，喂进来立刻生效；走终端的
         运行时，喂输入要在读取发生之前。
         """
 
@@ -326,7 +358,7 @@ class InputsListDevice(MetaListDevice):
         return [
             {
                 "name": "投喂一行输入",
-                "description": "把一行文本排进输入队列；下一次 $MEM.inputs.-1 直接取走它，不碰终端。",
+                "description": "把一行文本排进输入队列；下一次 $MEM.inputs.next 直接取走它，不碰终端。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -344,19 +376,21 @@ class InputsListDevice(MetaListDevice):
             },
         ]
 
-    def _parse_index(self, index):
-        if isinstance(index, str):
-            try:
-                return int(index)
-            except ValueError:
-                from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
-                raise MemoryTypeError(f"InputsListDevice 索引必须是整数，got {index!r}")
-        return index
-
     def __getitem__(self, index):
+        if index == "next":
+            # 命名接口：请求下一行用户输入（阻塞）
+            return self._request_input()
         index = self._parse_index(index)
-        if index == -1:
-            # 伪列表语义：读最后一个元素 = 请求新用户输入
+        if isinstance(index, int) and index < 0:
+            from .exceptions import MemoryIndexOutOfRangeError
+            raise MemoryIndexOutOfRangeError(
+                "InputsListDevice 不支持负下标；请求下一行输入请读 $MEM.inputs.next"
+            )
+        return super().__getitem__(index)
+
+    def _request_input(self):
+        """请求下一行用户输入：追加进输入列表并返回。"""
+        if True:
             self._pending_input = True
             try:
                 try:
@@ -368,8 +402,6 @@ class InputsListDevice(MetaListDevice):
             # 读取成功才追加：读失败（如被中断/报错）时列表不应多出一个元素
             self._data.append(user_input)
             return user_input
-        # 正常列表访问
-        return super().__getitem__(index)
 
     def _prompt_operator(self) -> str:
         """取一行操作员输入：面板队列优先；被控制台托管时只等队列；其余走终端。"""
@@ -483,9 +515,9 @@ class OutputsListDevice(MetaListDevice):
     """伪列表用户输出设备
     挂载到 $MEM.outputs，模拟一个输出列表。
     - 读取 $MEM.outputs 时返回列表元数据
-    - 写入 $MEM.outputs.-1 时以追加方式写入，并打印到屏幕
+    - 写入 $MEM.outputs.out 时以追加方式写入，并打印到屏幕
     - 读取其他索引时，像正常列表一样返回已有元素
-    - 不可通过索引修改已有元素，只支持追加（通过 -1 写入）
+    - 不可通过索引修改已有元素，只支持命名写入（通过 out 追加）
     """
 
     def _parse_index(self, index):
@@ -499,15 +531,19 @@ class OutputsListDevice(MetaListDevice):
 
     def __getitem__(self, index):
         index = self._parse_index(index)
+        if isinstance(index, int) and index < 0:
+            from .exceptions import MemoryIndexOutOfRangeError
+            raise MemoryIndexOutOfRangeError(
+                "OutputsListDevice 不支持负下标；输出文本请写 $MEM.outputs.out"
+            )
         return super().__getitem__(index)
 
     def __setitem__(self, index, value):
-        index = self._parse_index(index)
-        if index == -1:
+        if index == "out":
             self.append(value)
-        else:
-            from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
-            raise MemoryTypeError("OutputsListDevice 只支持追加写入（索引 -1），不允许修改已有元素")
+            return
+        from .exceptions import MemoryTypeError
+        raise MemoryTypeError("OutputsListDevice 只支持命名写入 $MEM.outputs.out（追加并打印）")
 
     def append(self, value):
         if not isinstance(value, str):

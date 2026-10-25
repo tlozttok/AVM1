@@ -30,7 +30,7 @@
                           |
                           | 亚对话完成：结果自动写回 teller 的 tool response
                           v
-teller --memory_write($MEM.outputs.-1)--> 操作者
+teller --memory_write($MEM.outputs.out)--> 操作者
 ```
 
 组件：
@@ -52,14 +52,14 @@ teller --memory_write($MEM.outputs.-1)--> 操作者
 
 ```
 循环:
-  command = memory_read("$MEM.inputs.-1")
+  command = memory_read("$MEM.inputs.next")
   if command == "exit":
       return "ledger closed"                 # 无工具调用 => 交互结束
   memory_write("$MEM.request", command)
   reply = create_sub(system_ref="$MEM.programs.ledger",
                      user_ref="$MEM.request",
                      para_ref="$MEM.para.ledger")   # 工具响应即 LedgerPLM 最终输出
-  memory_write("$MEM.outputs.-1", reply)
+  memory_write("$MEM.outputs.out", reply)
   goto 循环
 ```
 

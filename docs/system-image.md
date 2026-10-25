@@ -30,8 +30,8 @@ python -m avm.image <image.json>
 | 字段 | 含义 |
 |---|---|
 | `kind` | `str` / `dict` / `list` / `device` / `link` |
-| `meta` | 可选字符串——元数据一，给 LLM 看的一句话描述 |
-| `ctrl` | 可选对象（`dict[str,str]`）——元数据二，给 Core 的结构化控制信息 |
+| `meta` | 可选字符串——描述（description），给 LLM 看的一句话摘要；元数据之一 |
+| `ctrl` | 可选对象（`dict[str,str]`）——控制数据，给 Core 的结构化控制信息；元数据之一 |
 | `target` | `kind: "link"` 必填——`$MEM` 地址或设备标识符 |
 | `value` | `str` → 字符串；`dict` → 子节点对象；`list` → 子节点数组；`device` → 不使用（`kind: "device"` 只作可读性标记，实际挂载由 `devices` 段完成）；`link` → 不使用 |
 
@@ -51,11 +51,11 @@ python -m avm.image <image.json>
 }
 ```
 
-**程序节点（settingup / python）**：`create_cmd` / `create_sub` 的 `system_ref` 必须指向这类节点（运行时校验；指向 str 节点、无类型 dict 节点或其他类型会报错，不创建对话）。`settingup` 节点的 `value` 含 `name`（对话身份）与 `content`（提示词文本）；`python` 节点的 `value` 含 `content`（Python 代码）。两者均可带可选的 `signature`（预期输入/输出描述）与 `para_ref`（该程序使用的模型参数节点，`init` 指向它时按这个字段取 para；`create_cmd` / `create_sub` 的 para 由指令参数给出）。
+**程序节点（settingup / python）**：`create_cmd` / `create_sub` 的 `system_ref` 必须指向这类节点（运行时校验；指向 str 节点、无类型 dict 节点或其他类型会报错，不创建对话）。`settingup` 节点的 `value` 含 `name`（对话身份）与 `content`（提示词文本）；`python` 节点的 `value` 含 `content`（Python 代码）。两者均可带可选的 `signature`（预期输入/输出描述）与 `para_ref`（该程序使用的模型参数节点，`init` 指向它时按这个字段取 para；`create_cmd` / `create_sub` 的 para 由指令参数给出）。`content` 必须是字符串（缺失或类型不符会在创建对话时被拒）；`name` 可选，缺省时创建出的对话身份回退为「父身份#cid」，根入口没有名字时身份 = cid。
 
 运行期可用 `edit_metadata` 指令给节点补 ctrl（例如给运行时创建的 dict 节点设置 `type='settingup'` / `'python'`），配合 `memory_make` / `memory_write` 组合出可被 `create_cmd` 使用的程序节点——程序节点不一定只在镜像中预置。
 
-程序的 `para` 里 `model` 取 LLM 模型名，或 PLM 注册表（`PLM_REGISTRY`）中的名字（`plm.simple` / `plm.function` / `plm.machine` / `plm.command` / `plm.python`）。`plm.operator` 只能由调试面板的宿主创建（它需要注入操作员通道），镜像里声明同名程序节点会在第一次推理时报错。
+程序的 `para` 里 `model` 取 LLM 模型名，或 PLM 注册表（`PLM_REGISTRY`）中的名字（`plm.simple` / `plm.function` / `plm.machine` / `plm.command` / `plm.python`）。
 
 两个命名空间由 `create_cmd` / `create_sub` 在输入边界交叉校验，依据是启动自带的 `$MEM.model_catalog`（结构见 [docs/runtime.md](runtime.md) 的"模型目录"一节）：`python` 程序的 `model` 必须是 `plm` 注册名；`settingup` 程序的 `model` 在上游清单取到时必须在 `llm.models` 里，取不到时只警告不拦。清单来自宿主启动时的一次 `GET /models`，失败不影响加载。
 
@@ -91,6 +91,7 @@ python -m avm.image <image.json>
 - `set_value(value)`：写入（可选）。
 - `authorize_listener(event_type, remainder, owner_cid) -> bool`：是否允许监听该设备内路径（保留兼容的 `LinkDevice` 会委托给真实目标）。
 - `after_event(event_type, remainder, result) -> Optional[dict]`：操作成功后返回纯 payload 事实事件。
+- **子路径按名称访问**：设备自己定义命名子键（如 `next`、`out`、`append`、`latest`）；数字下标只用于列表式设备的内容读取（非负）。设备没有"`-1` 是最后一条/追加位置"的语义（`-1` 只属于内存列表的追加位置），设备写入只走命名接口。
 
 **设备自述（帮助说明）**：镜像自带的设备对两类读取给出用法说明。
 
@@ -147,7 +148,6 @@ python -m avm.image <image.json>
 
 **加载镜像**依次做：
 
-0. 写入宿主标志（`host_flags`，缺省空——见下节）；
 1. 解析 mem（严格校验：结构错误与类型滑档都抛 `ImageError`——`meta` 必须是对象、`para_ref` 必须是非空字符串、`devices` 条目必须是对象）；
 2. 按 `para_ref` 校验 para 节点（`ctrl.type == "para"`）并配置 Core；
 3. 加载设备插件文件（校验继承关系与挂载路径唯一）并挂载；
@@ -159,12 +159,6 @@ python -m avm.image <image.json>
 之后 `core.run()`；若声明 `persist_to`，在 `finally` 中写回内存（异常也写）。
 
 错误不吞：格式错误输出到 stderr，CLI 退出码 1。
-
-## 宿主标志（host_flags）
-
-`load_image(core, image_path, checkpoint_in=None, host_flags=None)` 的 `host_flags` 是**宿主在加载时**传入的启动标志（如 `{"console": True}`），不是镜像内容：镜像 JSON 里没有对应的键，标志也不进 `$MEM`。它在挂载设备之前写入 Core，设备可在 `attach_core` 里读一次；核心启动后不再变化。不传则空，设备行为与从前一致。必须是对象、键必须是非空字符串，否则抛 `ImageError`。
-
-当前唯一的标志是 `console`：调试面板以 `{"console": True}` 加载镜像，输入设备据此只从面板输入框取行、不再读终端（见[运行时详细介绍](runtime.md#调试面板console)）。
 
 ## 示例
 

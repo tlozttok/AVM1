@@ -16,6 +16,11 @@ class VMMemoryError(VMError):
     pass
 
 
+class IllegalOperationError(VMMemoryError):
+    """非法操作：输入本身不合法（改参数可重试，内核状态没有变化）"""
+    pass
+
+
 class MemoryKeyNotFoundError(VMMemoryError):
     """键不存在 — LLM 可以用 memory_make 创建"""
     pass
@@ -37,6 +42,11 @@ class MemoryTypeError(VMMemoryError):
 
 class MemoryCircularReferenceError(VMMemoryError):
     """符号链接成环"""
+    pass
+
+
+class MemoryLinkBrokenError(VMMemoryError):
+    """链接无效 — 链接的目标不存在（链接节点本身保留，像符号链接一样悬空）"""
     pass
 
 

@@ -5,6 +5,7 @@ import os
 import pytest
 
 from avm.core import Core, _build_conversation
+from avm.exceptions import MemoryKeyNotFoundError
 from avm.monitor import Monitor
 from avm.types import MetaDict
 from types import SimpleNamespace
@@ -27,6 +28,16 @@ class MockLMU:
 
     def exec(self, conversation, para):
         return self._next(conversation, para)
+
+
+def _seed(mem, ref, value, owner_cid=None):
+    """测试夹具：先 make 建链再写（memory_write 不再建节点）。"""
+    try:
+        return mem.set(ref, value, owner_cid=owner_cid)
+    except MemoryKeyNotFoundError:
+        parent, _, key = ref.rpartition(".")
+        mem.make(parent, key, "str", owner_cid=owner_cid)
+        return mem.set(ref, value, owner_cid=owner_cid)
 
 
 def make_core(responses=None):
@@ -68,6 +79,7 @@ class TestFrameSequence:
         core = make_core([
             (None, [{"call_id": "tc1", "cmd_type": "memory_write", "args": {"ref": "$MEM.out", "content": "x"}}], None),
         ])
+        _seed(core.mem, "$MEM.out", "")
         _new_root(core)
         core._active_cid = core._ready_cids.pop(0)
         core.monitor.record_baseline(core)
@@ -121,6 +133,7 @@ class TestQuery:
         core = make_core([
             (None, [{"call_id": "tc1", "cmd_type": "memory_write", "args": {"ref": "$MEM.out", "content": "x"}}], None),
         ])
+        _seed(core.mem, "$MEM.out", "")
         _new_root(core)
         core._active_cid = core._ready_cids.pop(0)
         core.monitor.record_baseline(core)
@@ -173,6 +186,7 @@ class TestTruncation:
         core = make_core([
             (None, [{"call_id": "tc1", "cmd_type": "memory_write", "args": {"ref": "$MEM.out", "content": "y"}}], None),
         ])
+        _seed(core.mem, "$MEM.out", "")
         core.monitor = Monitor(max_item_len=8)
         _new_root(core)
         core._active_cid = core._ready_cids.pop(0)
@@ -220,7 +234,7 @@ class TestExceptionPath:
             chat = FakeChat
 
         from avm.core import LMU
-        from avm.exceptions import RunnerStop
+        from avm.exceptions import RunnerStop, MemoryKeyNotFoundError
 
         lmu = LMU()
         lmu._client = FakeClient

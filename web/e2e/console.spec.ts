@@ -13,8 +13,13 @@ test('观测：调度、对话详情、内存索引与设备信息', async ({ pa
 
   await expect(page.getByTestId('status-banner')).toContainText('运行中')
   await expect(page.getByTestId('event-log-connected')).toContainText('SSE 已连接')
-  // 指令表只有后端一份：GET /api/tools，九条指令都得读到（读不到就是红）
-  await expect(page.getByTestId('action-tools-source')).toContainText('GET /api/tools（9 条）')
+  // 指令表只有后端一份：GET /api/tools，表里有几条就得读到几条（读不到就是红）
+  const toolsResp = (await (await page.request.get('/api/tools')).json()) as {
+    tools: { function: { name: string } }[]
+  }
+  await expect(page.getByTestId('action-tools-source')).toContainText(
+    `GET /api/tools（${toolsResp.tools.length} 条）`,
+  )
 
   const list = page.getByTestId('conversation-list')
   await expect(list).toContainText('init')
@@ -56,22 +61,26 @@ test('观测：调度、对话详情、内存索引与设备信息', async ({ pa
   await page.getByTestId('ref-input').fill('$MEM.note.v')
   await page.getByTestId('ref-read').click()
   await expect(page.getByTestId('memory-view')).toContainText('$MEM.note.v')
+
+  // 阻塞读提示按命名子键认：$MEM.inputs.next 会等到有人喂输入；普通路径不提示
+  // （旧的按下标规则在接口从 -1 改名 next 之后失效了，这条断言防再漂）
+  await page.getByTestId('ref-input').fill('$MEM.inputs.next')
+  await expect(page.getByTestId('ref-blocking-hint')).toBeVisible()
+  await page.getByTestId('ref-input').fill('$MEM.note.v')
+  await expect(page.getByTestId('ref-blocking-hint')).toHaveCount(0)
 })
 
-test('工具选择：九条全在下拉里，未知名可以手输且不被顶回', async ({ page }) => {
+test('工具选择：指令表里每条都在下拉里，未知名可以手输且不被顶回', async ({ page }) => {
   await page.goto('/')
 
-  // 九条指令加一项「其它（手输）」；少一条就是红的（曾经的 bug：datalist 只按已输入内容过滤）
+  // 下拉 = 指令表里的每一条（顺序一致），末尾一项「其它（手输）」；少一条就是红的
+  // （曾经的 bug：datalist 只按已输入内容过滤，看起来只剩一条）
+  const toolsResp = (await (await page.request.get('/api/tools')).json()) as {
+    tools: { function: { name: string } }[]
+  }
+  const names = toolsResp.tools.map((t) => t.function.name)
   await expect(page.getByTestId('action-tool').locator('option')).toHaveText([
-    'memory_read',
-    'memory_write',
-    'memory_make',
-    'edit_metadata',
-    'create_cmd',
-    'create_sub',
-    'send_instruction',
-    'close_conversation',
-    'listen_event',
+    ...names,
     '其它（手输）',
   ])
 
@@ -116,23 +125,29 @@ test('三步交互：暂停 → 提交动作 → 继续', async ({ page }) => {
   await expect(page.getByTestId('status-banner')).toContainText('运行中')
 })
 
-test('喂输入：队列里的一行被下一次读取取走', async ({ page }) => {
+test('喂输入：多行文本整段进队列，被下一次读取取走', async ({ page }) => {
   await page.goto('/')
 
-  await page.getByTestId('input-feed-field').fill('你好，面板')
-  await page.getByTestId('input-feed-send').click()
+  const field = page.getByTestId('input-feed-field')
+  await field.fill('第一行\n第二行')
+  // 回车只换行，不投喂；投喂走 Ctrl+Enter 或按钮
+  await field.press('Enter')
+  await expect(page.getByTestId('input-feed-result')).toHaveCount(0)
+  await field.press('Control+Enter')
   await expect(page.getByTestId('input-feed-result')).toContainText('已排队')
 
-  // init 的下一轮改读 $MEM.inputs.-1，事件流里出现这次读
+  // init 的下一轮改读 $MEM.inputs.next（阻塞读取的命名接口），事件流里出现这次读
   const log = page.getByTestId('event-log')
   await expect(log.getByTestId('log-entry-event').filter({ hasText: 'inputs' }).first())
     .toBeVisible()
 
-  // 被读走的那一行留在设备列表里（$MEM.inputs.0 是普通下标读，不阻塞）。
+  // 被读走的那段留在设备列表里（$MEM.inputs.0 是普通下标读，不阻塞）：两行在同一项里，没被拆开。
   // 不查对话详情的 user_batch：它在 Core 每次 exec 后被清空（avm/core.py:1108），只在亚秒窗口内可见。
   await page.getByTestId('ref-input').fill('$MEM.inputs.0')
   await page.getByTestId('ref-read').click()
-  await expect(page.getByTestId('memory-view')).toContainText('你好，面板')
+  const view = page.getByTestId('memory-view')
+  await expect(view).toContainText('第一行')
+  await expect(view).toContainText('第二行')
 })
 
 test('构建产物由 console 自己托管：同一个面板从 8791 打开', async ({ page }) => {

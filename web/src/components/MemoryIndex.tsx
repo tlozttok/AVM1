@@ -19,8 +19,14 @@ interface Props {
   onReadRef: (ref: string, signal: AbortSignal) => Promise<MemoryNode>
 }
 
-/** 设备伪列表（末段是下标，例如 $MEM.inputs.-1）：读它会阻塞到有人喂输入。 */
-const BLOCKING_REF = /\.[0-9]+$/
+/** 设备伪列表的阻塞读取：末段是已知会阻塞的命名子键（当前只有 InputsListDevice 的 `next`）。 */
+const BLOCKING_SUBKEYS = new Set(['next'])
+
+function isBlockingRead(ref: string): boolean {
+  const trimmed = ref.trim()
+  const dot = trimmed.lastIndexOf('.')
+  return dot >= 0 && BLOCKING_SUBKEYS.has(trimmed.slice(dot + 1))
+}
 const READ_TIMEOUT_MS = 8000
 
 function kindLabel(node: MemoryNode): string {
@@ -61,7 +67,7 @@ export default function MemoryIndex({
     message: string | null
   }>({ ref: '', pending: false, message: null })
   const ctrlRef = useRef<AbortController | null>(null)
-  const blocking = BLOCKING_REF.test(refInput.trim())
+  const blocking = isBlockingRead(refInput)
 
   const toggle = (ref: string) => {
     setExpanded((prev) => {
@@ -78,7 +84,7 @@ export default function MemoryIndex({
     ctrlRef.current?.abort()
     const ctrl = new AbortController()
     ctrlRef.current = ctrl
-    const blockingRead = BLOCKING_REF.test(ref)
+    const blockingRead = isBlockingRead(ref)
     setReadState({
       ref,
       pending: true,
@@ -204,7 +210,7 @@ export default function MemoryIndex({
       </div>
       {blocking ? (
         <div className="hint warn" data-testid="ref-blocking-hint">
-          末段是下标：若它落在设备上，这一读会阻塞（$MEM.inputs.-1 就是「请求一次操作员输入」）
+          末段是已知会阻塞的命名子键（`$MEM.inputs.next` 就是「请求一次操作员输入」）：这一读会等到有人喂输入
         </div>
       ) : null}
       {readState.message ? <div className="hint warn">{readState.message}</div> : null}

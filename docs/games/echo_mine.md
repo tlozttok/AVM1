@@ -50,7 +50,7 @@ dice device: 读 $MEM.dice.d6 返回 1..6
   outputs <- 开场白 + map
 
 主循环:
-  input = memory_read("$MEM.inputs.-1")
+  input = memory_read("$MEM.inputs.next")
   quit        -> close ghost; close self
   look        -> 读 room.desc + map; turn += 1
   search      -> roll = memory_read("$MEM.dice.d6")

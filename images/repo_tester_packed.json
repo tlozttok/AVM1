@@ -24,7 +24,7 @@
     },
     "user": {
       "kind": "str",
-      "value": "这里不是用户指令，是初始指令的一部分。你的指令从 \"$MEM.inputs.-1\" 读，你的话写到 \"$MEM.outputs.-1\"。循环进行，一个完整的输出后，继续读取输入；做什么由用户指令决定。"
+      "value": "这里不是用户指令，是初始指令的一部分。你的指令从 \"$MEM.inputs.next\" 读，你的话写到 \"$MEM.outputs.out\"。循环进行，一个完整的输出后，继续读取输入；做什么由用户指令决定。"
     },
     "model_params": {
       "kind": "dict",
@@ -35,7 +35,7 @@
       "value": {
         "model": {
           "kind": "str",
-          "value": "deepseek-v4-flash"
+          "value": "deepseek-flash"
         }
       }
     },
