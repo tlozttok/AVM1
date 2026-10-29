@@ -379,8 +379,11 @@ class Console:
     # -- 介入：中断与动作 ----------------------------------------------
 
     def request_pause(self) -> dict:
-        """请求暂停。中断在下一个安全点生效；系统空转结束时不会生效。"""
-        self.core.interrupts.raise_("operator")
+        """请求暂停。中断在下一个安全点生效；系统空转结束时不会生效。
+
+        中断会向面板对话投一条 payload 为「已暂停」的消息，操作员在对话流里看得到。
+        """
+        self.core.interrupts.raise_("operator", payload="已暂停")
         return {
             "requested": True,
             "pending": self.core.interrupts.pending_types(),
@@ -398,7 +401,7 @@ class Console:
             raise ValueError("arguments 必须是对象")
         paused = self.core._active_cid == self.panel.cid
         if not paused:
-            self.core.interrupts.raise_("operator")
+            self.core.interrupts.raise_("operator", payload="已暂停")
         self.channel.submit_action({"tool": tool, "arguments": arguments})
         known = set(_instruction_registry())
         return {

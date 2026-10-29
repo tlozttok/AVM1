@@ -496,3 +496,124 @@ class TestPersistRoundtrip:
         loaded = Memory.load(str(path))
         assert loaded["a"] == ["x", "y"]
         assert loaded["a"].get_metadata() == "m"
+
+
+PLM_CODE = '''
+from avm.python_server import PLMServer
+
+
+class EchoPLM(PLMServer):
+    """测试用 PLM：不做推理，只回一句固定内容。"""
+
+    def handle_messages(self, raw_messages, params):
+        self._prev_input = raw_messages
+        return {"content": "echo from plm.demo"}
+
+    def _execute_system_message(self, content):
+        return content
+
+    def _execute_user_message(self, content):
+        return content
+
+    def _execute_tool_message(self, content, call_id):
+        return content
+'''
+
+NOT_A_PLM_CODE = '''
+class NotAPlm:
+    """不是 PLMServer 的子类。"""
+'''
+
+
+def _plm_declaration_image(plms, model="plm.demo"):
+    """在 _plm_init_image 基础上加 plms 段，并把 0 号对话的 model 指过去。"""
+    image = _plm_init_image()
+    image["mem"]["plm_params"]["value"]["model"] = {"kind": "str", "value": model}
+    image["plms"] = plms
+    return image
+
+
+def _write_plm(tmp_path, image, code=PLM_CODE):
+    (tmp_path / "plm_impl.py").write_text(code, encoding="utf-8")
+    return _write(tmp_path, image, devices_code=DEVICE_CODE)
+
+
+def _catalog_plm_names(core):
+    return [entry["name"] for entry in core.mem._data["model_catalog"]["plm"]]
+
+
+class TestImagePlms:
+    """镜像的 plms 段：自定义 PLM 由镜像声明，装载进本核的 Core.plms。"""
+
+    def test_declaration_lands_in_core_and_catalog(self, tmp_path):
+        image = _plm_declaration_image([
+            {"model": "plm.demo", "file": "plm_impl.py", "class": "EchoPLM"},
+        ])
+        core = load_image(Core(), _write_plm(tmp_path, image))
+        assert core.plms["plm.demo"].__name__ == "EchoPLM"
+        assert core.plms["plm.demo"].__module__.startswith("_avm_image_plm_")
+        # 模型目录是 PLM 注册表的可见面：声明的 PLM 必须出现在这里，
+        # 否则 create_sub 的命名空间校验会拒绝 para 里的 model。
+        assert "plm.demo" in _catalog_plm_names(core)
+        # 内建表不被镜像改写
+        from avm.python_server import PLM_REGISTRY
+        assert "plm.demo" not in PLM_REGISTRY
+
+    def test_declared_plm_runs_as_conversation(self, tmp_path):
+        image = _plm_declaration_image([
+            {"model": "plm.demo", "file": "plm_impl.py", "class": "EchoPLM"},
+        ])
+        core = load_image(Core(), _write_plm(tmp_path, image))
+        conv = core.get_conversation(0)
+        core.run()
+        assert conv.messages[-1].content == "echo from plm.demo"
+
+    def test_absent_section_changes_nothing(self, tmp_path):
+        image = _plm_init_image()
+        core = load_image(Core(), _write(tmp_path, image, devices_code=DEVICE_CODE))
+        assert core.plms == {}
+        assert "plm.demo" not in _catalog_plm_names(core)
+
+    def test_file_must_exist(self, tmp_path):
+        image = _plm_declaration_image([
+            {"model": "plm.demo", "file": "nope.py", "class": "EchoPLM"},
+        ])
+        path = _write(tmp_path, image, devices_code=DEVICE_CODE)
+        with pytest.raises(ImageError, match="文件不存在"):
+            load_image(Core(), path)
+
+    def test_class_must_be_a_plm_server(self, tmp_path):
+        image = _plm_declaration_image([
+            {"model": "plm.demo", "file": "plm_impl.py", "class": "NotAPlm"},
+        ])
+        core = load_image  # 只是为了避免未使用告警
+        with pytest.raises(ImageError, match="继承 PLMServer"):
+            load_image(Core(), _write_plm(tmp_path, image, code=NOT_A_PLM_CODE))
+
+    def test_model_must_not_shadow_a_builtin(self, tmp_path):
+        image = _plm_declaration_image([
+            {"model": "plm.python", "file": "plm_impl.py", "class": "EchoPLM"},
+        ], model="plm.python")
+        with pytest.raises(ImageError, match="与内建 PLM 重名"):
+            load_image(Core(), _write_plm(tmp_path, image))
+
+    def test_duplicate_model_is_rejected(self, tmp_path):
+        image = _plm_declaration_image([
+            {"model": "plm.demo", "file": "plm_impl.py", "class": "EchoPLM"},
+            {"model": "plm.demo", "file": "plm_impl.py", "class": "EchoPLM"},
+        ])
+        with pytest.raises(ImageError, match="重复声明"):
+            load_image(Core(), _write_plm(tmp_path, image))
+
+    def test_missing_field_is_rejected(self, tmp_path):
+        image = _plm_declaration_image([{"model": "plm.demo"}])
+        path = _write(tmp_path, image, devices_code=DEVICE_CODE)
+        with pytest.raises(ImageError, match="非空 file"):
+            load_image(Core(), path)
+
+    def test_section_must_be_an_array(self, tmp_path):
+        image = _plm_init_image()
+        image["plms"] = {"model": "plm.demo"}
+        path = _write(tmp_path, image, devices_code=DEVICE_CODE)
+        with pytest.raises(ImageError, match="plms 段必须是数组"):
+            load_image(Core(), path)

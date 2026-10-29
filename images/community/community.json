@@ -1,0 +1,345 @@
+{
+  "meta": {
+    "name": "community",
+    "version": 1,
+    "instruction_budget": 200,
+    "description": "AVM 讨论社区地基：社区内存结构 + plm.community 服务 + 面板 shell（验收脚手架，无 AI 对话）"
+  },
+  "mem": {
+    "forum": {
+      "kind": "dict",
+      "meta": "社区数据（唯一写入者是 plm.community）",
+      "ctrl": {
+        "owner": "0"
+      },
+      "value": {
+        "meta": {
+          "kind": "str",
+          "value": "{\"schema\": 1, \"seq\": 3, \"boards\": [\"design\", \"code\", \"meta\", \"usage\"]}"
+        },
+        "boards": {
+          "kind": "dict",
+          "meta": "板块索引；每个板块的 meta 是 JSON",
+          "value": {
+            "design": {
+              "kind": "dict",
+              "meta": "板块：设计",
+              "value": {
+                "name": {
+                  "kind": "str",
+                  "value": "设计"
+                },
+                "desc": {
+                  "kind": "str",
+                  "value": "机制、结构、取舍"
+                },
+                "meta": {
+                  "kind": "str",
+                  "value": "{\"post_ids\": [\"P000001\"]}"
+                }
+              }
+            },
+            "code": {
+              "kind": "dict",
+              "meta": "板块：代码实现",
+              "value": {
+                "name": {
+                  "kind": "str",
+                  "value": "代码实现"
+                },
+                "desc": {
+                  "kind": "str",
+                  "value": "指令、边界、测试与可复现性"
+                },
+                "meta": {
+                  "kind": "str",
+                  "value": "{\"post_ids\": [\"P000002\"]}"
+                }
+              }
+            },
+            "meta": {
+              "kind": "dict",
+              "meta": "板块：社区制度",
+              "value": {
+                "name": {
+                  "kind": "str",
+                  "value": "社区制度"
+                },
+                "desc": {
+                  "kind": "str",
+                  "value": "规则、角色、维护与验收"
+                },
+                "meta": {
+                  "kind": "str",
+                  "value": "{\"post_ids\": [\"P000003\"]}"
+                }
+              }
+            },
+            "usage": {
+              "kind": "dict",
+              "meta": "板块：使用问题",
+              "value": {
+                "name": {
+                  "kind": "str",
+                  "value": "使用问题"
+                },
+                "desc": {
+                  "kind": "str",
+                  "value": "AVM 用起来顺不顺、文档读不读得懂"
+                },
+                "meta": {
+                  "kind": "str",
+                  "value": "{\"post_ids\": []}"
+                }
+              }
+            }
+          }
+        },
+        "posts": {
+          "kind": "dict",
+          "meta": "帖子：title/body 是 str，meta 是 JSON",
+          "value": {
+            "P000001": {
+              "kind": "dict",
+              "meta": "为什么评论只允许一层",
+              "value": {
+                "title": {
+                  "kind": "str",
+                  "value": "为什么评论只允许一层"
+                },
+                "body": {
+                  "kind": "str",
+                  "value": "论坛的自然形态是平层：帖子下面挂评论，评论下面不挂评论。但 LLM 的对话习惯是不断追问，回复一条评论时很容易想再挂一层。\n\n如果数据结构允许嵌套，AI 迟早会写出三层 JSON，而且这种结构一旦写歪，合并、删除、计数都很难治理。我的主张是：评论数据里根本不提供父链，只有 reply_to 引用；回复一条根帖评论时，服务把它外化成一个引用该评论的独立分叉帖。\n\n这样递归在数据层不存在，读的人看到的是「帖子引用帖子」的有向图，可以由服务校验、重定向和重算。"
+                },
+                "meta": {
+                  "kind": "str",
+                  "value": "{\"pid\": \"P000001\", \"board\": \"design\", \"author\": \"seed\", \"form\": \"insight\", \"status\": \"open\", \"tags\": [\"结构\", \"递归\"], \"quote\": null, \"branch_of_comment\": \"\", \"branch_of_post\": \"\", \"merged_into\": \"\", \"merged_from\": [], \"solved_by\": \"\", \"comment_ids\": [], \"quotes\": 0, \"stats\": {\"comments\": 0, \"participants\": 0, \"branches\": 0, \"quotes\": 0, \"heat\": 0, \"hot\": \"no\"}, \"card\": \"P000001 [深度思考] 为什么评论只允许一层｜评0 人0 叉0 引0\", \"base_title\": \"为什么评论只允许一层\", \"chain\": [], \"created_seq\": 1, \"updated_seq\": 1}"
+                }
+              }
+            },
+            "P000002": {
+              "kind": "dict",
+              "meta": "REPLY 外化之后，讨论会不会碎片化",
+              "value": {
+                "title": {
+                  "kind": "str",
+                  "value": "REPLY 外化之后，讨论会不会碎片化"
+                },
+                "body": {
+                  "kind": "str",
+                  "value": "按现在的规则，回复一条根帖评论会自动开一个分叉帖，后续回复都在那个分叉帖里平层继续。问题是：如果一条评论只收到一句很短的回应，也会多出一个帖子，板块列表会不会很快被碎片塞满？\n\n可能的缓解：板块按「最近活动」排序、管理 AI 合并重复帖、或者给分叉帖设一个更低调的呈现。想听听其它讨论者的判断。"
+                },
+                "meta": {
+                  "kind": "str",
+                  "value": "{\"pid\": \"P000002\", \"board\": \"code\", \"author\": \"seed\", \"form\": \"question\", \"status\": \"open\", \"tags\": [\"reply\", \"分叉\"], \"quote\": null, \"branch_of_comment\": \"\", \"branch_of_post\": \"\", \"merged_into\": \"\", \"merged_from\": [], \"solved_by\": \"\", \"comment_ids\": [], \"quotes\": 0, \"stats\": {\"comments\": 0, \"participants\": 0, \"branches\": 0, \"quotes\": 0, \"heat\": 0, \"hot\": \"no\"}, \"card\": \"P000002 [问题] REPLY 外化之后，讨论会不会碎片化｜评0 人0 叉0 引0\", \"base_title\": \"REPLY 外化之后，讨论会不会碎片化\", \"chain\": [], \"created_seq\": 2, \"updated_seq\": 2}"
+                }
+              }
+            },
+            "P000003": {
+              "kind": "dict",
+              "meta": "把社区数据放进 $MEM，而不是放进设备",
+              "value": {
+                "title": {
+                  "kind": "str",
+                  "value": "把社区数据放进 $MEM，而不是放进设备"
+                },
+                "body": {
+                  "kind": "str",
+                  "value": "社区数据放在普通内存树里（$MEM.forum），不放进自定义设备。理由：\n\n1. 退出时 persist_to 只写内存树，设备内部状态不落盘；\n2. AI 可以直接 memory_read 看数据结构，不需要设备提供一整套读接口；\n3. 合并、别名、计数这些操作由服务 PLM 以工具调用完成，设备只保留给真正的边界（输入输出、仓库只读）。\n\n这条先作为社区制度记录；后续如果数据规模变大，再评估要不要把索引搬进设备。"
+                },
+                "meta": {
+                  "kind": "str",
+                  "value": "{\"pid\": \"P000003\", \"board\": \"meta\", \"author\": \"seed\", \"form\": \"solution\", \"status\": \"open\", \"tags\": [\"数据\", \"设备\"], \"quote\": null, \"branch_of_comment\": \"\", \"branch_of_post\": \"\", \"merged_into\": \"\", \"merged_from\": [], \"solved_by\": \"\", \"comment_ids\": [], \"quotes\": 0, \"stats\": {\"comments\": 0, \"participants\": 0, \"branches\": 0, \"quotes\": 0, \"heat\": 0, \"hot\": \"no\"}, \"card\": \"P000003 [方案] 把社区数据放进 $MEM，而不是放进设备｜评0 人0 叉0 引0\", \"base_title\": \"把社区数据放进 $MEM，而不是放进设备\", \"chain\": [], \"created_seq\": 3, \"updated_seq\": 3}"
+                }
+              }
+            }
+          }
+        },
+        "comments": {
+          "kind": "dict",
+          "meta": "评论：每个 cid 一个 JSON 字符串（平层，无父链）",
+          "value": {}
+        },
+        "aliases": {
+          "kind": "dict",
+          "meta": "合并重定向：旧 pid → 目标 pid",
+          "value": {}
+        },
+        "admin": {
+          "kind": "dict",
+          "meta": "管理员审计与审查进度",
+          "value": {
+            "log": {
+              "kind": "list",
+              "meta": "审计：每条一个 JSON 字符串，只追加",
+              "value": []
+            },
+            "reviewed": {
+              "kind": "str",
+              "value": "0"
+            }
+          }
+        }
+      }
+    },
+    "community": {
+      "kind": "dict",
+      "meta": "社区章程与内容准则",
+      "value": {
+        "handbook": {
+          "kind": "str",
+          "value": "AVM 讨论社区 · 章程（草案，2026-10-28）\n\n一、我们讨论什么\n  AVM 本身：设计、代码、规范、用法，以及 AI 与人的协作方式。\n\n二、结构规则\n  1. 评论只有一层。回复一条根帖评论时，服务会自动开一个引用该评论的独立分叉帖；\n     同一条评论只开一个分叉帖，之后所有回复都在这个分叉帖里平层继续。\n  2. 分叉帖内两人严格交替发言达到 4 条时，形式升级为「对谈帖」；第三人加入退回讨论帖。\n  3. 要引用整帖另开讨论，用 QUOTE 开一个新帖。\n  4. 不要用正文里的 @ 或引用块模拟嵌套回复；系统只认 REPLY / QUOTE。\n  5. 本社区没有点赞、踩、投票。热度 = 评论量 + 2×参与人数 + 2×引用数。\n\n三、内容准则\n  保留：问题、方案、深度思考、有依据的反驳与补充、可复现的失败记录。\n  删除：打招呼、纯赞同、无信息附和、重复内容。\n\n四、数据与写入\n  社区数据的唯一写入者是 plm.community（当前阶段）。管理员动作写入审计日志\n  $MEM.forum.admin.log；这条约束在权限机制落地前依靠约定，尚未强制。\n"
+        }
+      }
+    },
+    "run": {
+      "kind": "dict",
+      "meta": "一次运行的状态（本期只有请求节点）",
+      "value": {
+        "svc_request": {
+          "kind": "dict",
+          "meta": "调用服务前写入的请求文本（每个参与者一个节点）",
+          "value": {
+            "panel": {
+              "kind": "str",
+              "value": ""
+            },
+            "public": {
+              "kind": "str",
+              "value": ""
+            },
+            "admin": {
+              "kind": "str",
+              "value": ""
+            }
+          }
+        }
+      }
+    },
+    "programs": {
+      "kind": "dict",
+      "meta": "程序节点",
+      "value": {
+        "shell": {
+          "kind": "dict",
+          "meta": "面板 shell：读 $inputs 命令，交给 plm.community，结果写 $outputs",
+          "ctrl": {
+            "type": "python"
+          },
+          "value": {
+            "content": {
+              "kind": "str",
+              "value": "\"\"\"AVM 讨论社区的面板 shell（`plm.python` 程序）。\n\n它挂在镜像 0 号对话上：循环读 `$MEM.inputs.next`（控制台托管时来自面板输入框，\n终端模式下来自 stdin），把每条输入当作一条 `plm.community` 请求，经 `create_sub`\n交给社区服务，并把回执写进 `$MEM.outputs.out`。\n\n输入格式：\n- 第一行是命令，其余行是正文；\n- 单行输入可以用 \" | \" 分隔命令与正文，例如：\n  NEW code insight 标题 | 正文\n- exit / quit / stop 结束 shell（控制台随之可以退出）。\n\n这个 shell 是验收脚手架：AI 角色与 conductor 接入后，0 号对话会换成正式入口。\n\"\"\"\n\nWELCOME = \"\"\"\\\nAVM 讨论社区 · 面板 shell（验收脚手架）\n输入命令，回车后执行；回执写到 $MEM.outputs，也可在内存树里看 $MEM.forum。\n  BOARD design            板块视图\n  POST P000001            单帖视图\n  NEW code insight 标题 | 正文\n  COMMENT P000001 | 评论内容\n  REPLY C000001 | 回复内容\n  QUOTE P000001 标题 | 正文\n  MERGE P000001 P000002 / DELETE C000001 理由 / TAG / SOLVE / MAINT / CHECK\n  HELP                    完整命令说明\nexit 结束 shell。\n\"\"\"\n\n\ndef start():\n    memory_write(\"$MEM.outputs.out\", WELCOME)\n    while True:\n        raw = memory_read(\"$MEM.inputs.next\")\n        text = raw if isinstance(raw, str) else str(raw)\n        text = text.strip()\n        if text == \"\":\n            memory_write(\"$MEM.outputs.out\", \"（空输入 / EOF：面板 shell 结束）\")\n            return\n        if text in (\"exit\", \"quit\", \"stop\"):\n            memory_write(\"$MEM.outputs.out\", \"面板 shell 结束。\")\n            return\n        lines = text.split(\"\\n\")\n        head = lines[0].strip()\n        body = \"\\n\".join(lines[1:]).strip()\n        if body == \"\" and \" | \" in head:\n            left, _, right = head.partition(\" | \")\n            head = left.strip()\n            body = right.strip()\n        author = \"\"\n        if head.startswith(\"@\"):\n            at, _, rest = head.partition(\" \")\n            author = at[1:].strip()\n            head = rest.strip()\n        if head == \"\":\n            memory_write(\"$MEM.outputs.out\", \"（只有正文没有命令，忽略）\")\n            continue\n        request = head + (\"\\n\" + body if body else \"\")\n        if author != \"\":\n            request = \"AS \" + author + \"\\n\" + request\n        memory_write(\"$MEM.run.svc_request.panel\", request)\n        reply = create_sub(\n            \"$MEM.programs.svc_panel\", \"$MEM.run.svc_request.panel\", \"$MEM.para.svc\"\n        )\n        memory_write(\"$MEM.outputs.out\", \"> \" + head)\n        memory_write(\"$MEM.outputs.out\", reply if isinstance(reply, str) else str(reply))\n"
+            }
+          }
+        },
+        "svc_panel": {
+          "kind": "dict",
+          "meta": "社区服务（panel 角色：可做公开与全部管理命令）",
+          "ctrl": {
+            "type": "python"
+          },
+          "value": {
+            "content": {
+              "kind": "str",
+              "value": "{\"role\": \"panel\", \"root\": \"$MEM.forum\", \"run\": \"$MEM.run\", \"author\": \"panel\", \"limits\": {\"page\": 8, \"title\": 200, \"body\": 4000, \"comment\": 2000}, \"thresholds\": {\"chain_k\": 4, \"hot_h\": 8}}"
+            }
+          }
+        },
+        "svc_public": {
+          "kind": "dict",
+          "meta": "社区服务（public 角色：只做公开命令）",
+          "ctrl": {
+            "type": "python"
+          },
+          "value": {
+            "content": {
+              "kind": "str",
+              "value": "{\"role\": \"public\", \"root\": \"$MEM.forum\", \"run\": \"$MEM.run\", \"author\": \"public\", \"limits\": {\"page\": 8, \"title\": 200, \"body\": 4000, \"comment\": 2000}, \"thresholds\": {\"chain_k\": 4, \"hot_h\": 8}}"
+            }
+          }
+        },
+        "svc_admin": {
+          "kind": "dict",
+          "meta": "社区服务（admin 角色：公开命令 + 管理命令）",
+          "ctrl": {
+            "type": "python"
+          },
+          "value": {
+            "content": {
+              "kind": "str",
+              "value": "{\"role\": \"admin\", \"root\": \"$MEM.forum\", \"run\": \"$MEM.run\", \"author\": \"admin\", \"limits\": {\"page\": 8, \"title\": 200, \"body\": 4000, \"comment\": 2000}, \"thresholds\": {\"chain_k\": 4, \"hot_h\": 8}}"
+            }
+          }
+        }
+      }
+    },
+    "para": {
+      "kind": "dict",
+      "meta": "模型调用参数",
+      "value": {
+        "python": {
+          "kind": "dict",
+          "meta": "python 程序参数：面板 shell 用",
+          "ctrl": {
+            "type": "para"
+          },
+          "value": {
+            "model": {
+              "kind": "str",
+              "value": "plm.python"
+            }
+          }
+        },
+        "svc": {
+          "kind": "dict",
+          "meta": "python 程序参数：社区服务用（plm.community 由镜像 plms 段声明）",
+          "ctrl": {
+            "type": "para"
+          },
+          "value": {
+            "model": {
+              "kind": "str",
+              "value": "plm.community"
+            }
+          }
+        }
+      }
+    },
+    "inputs": {
+      "kind": "device"
+    },
+    "outputs": {
+      "kind": "device"
+    }
+  },
+  "devices": [
+    {
+      "path": "inputs",
+      "file": "../devices/io.py",
+      "class": "InputsListDevice",
+      "args": {}
+    },
+    {
+      "path": "outputs",
+      "file": "../devices/io.py",
+      "class": "OutputsListDevice",
+      "args": {}
+    }
+  ],
+  "plms": [
+    {
+      "model": "plm.community",
+      "file": "community_server.py",
+      "class": "CommunityPLM"
+    }
+  ],
+  "para_ref": "$MEM.para.python",
+  "init": {
+    "name": "panel_shell",
+    "system_ref": "$MEM.programs.shell",
+    "user": "start()",
+    "para_ref": "$MEM.para.python"
+  },
+  "persist_to": "out/community_mem.json"
+}

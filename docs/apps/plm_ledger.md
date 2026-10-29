@@ -102,16 +102,19 @@ tool 消息:
 ### 2.3 启动器 run_ledger.py
 
 ```python
-from avm.python_server import PLM_REGISTRY
-from plm_ledger_server import LedgerPLM
 from avm.image import load_image
 
-PLM_REGISTRY["plm.ledger"] = LedgerPLM
-core = load_image("plm_ledger.json")
+core = load_image("plm_ledger.json")   # 镜像的 plms 段声明 plm.ledger
 core.run()
 ```
 
-`Core._get_executor` 对 Python 对话按 `para.model` 查 `PLM_REGISTRY`；注册发生在 `load_image` 之前即可。镜像本身没有 PLM 声明段，所以这一步必须在宿主完成（记录为 issue）。
+`Core._get_executor` 对 Python 对话按 `para.model` 查「内建 `PLM_REGISTRY` + 本核 `Core.plms`」。镜像用顶层的 `plms` 段自行声明自定义 PLM：
+
+```json
+"plms": [{"model": "plm.ledger", "file": "plm_ledger_server.py", "class": "LedgerPLM"}]
+```
+
+`file` 相对镜像目录，`class` 必须继承 `PLMServer`。装载发生在 `load_image` 里、安装模型目录之前，所以 `plm.ledger` 会出现在 `$MEM.model_catalog.plm` 中。宿主**不再需要**在 `load_image` 之前改写 `PLM_REGISTRY`；本文档早期版本记的「镜像本身没有 PLM 声明段」这条 issue 已由计划 `plan-image-plm-declaration-2026-10-28`（记录区 implemented/）关闭。
 
 ## 3. 持久化协议
 

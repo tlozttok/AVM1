@@ -1314,6 +1314,10 @@ class Core:
         # 由 load_image 在挂载设备之前写入，核心启动后不再变化。设备在 attach_core 里读，
         # 核心不读、不校验、不监督。
         self.host_flags: Dict[str, Any] = {}
+        # 镜像声明的 PLM 实现：model 名 → 类，由 load_image 按镜像的 plms 段装载。
+        # 与宿主内建的 PLM_REGISTRY 并列，内建优先（镜像不得同名覆盖，装载期拒绝）。
+        # 放在这里是因为本函数末尾的 install_model_catalog 要枚举它。
+        self.plms: Dict[str, type] = {}
         self.debug: bool = False
         self.monitor: Monitor = Monitor()
         self.para_ref: str = "$MEM.model_params"
@@ -1660,17 +1664,18 @@ class Core:
 
     def _get_executor(self, conv: Conversation, para: MetaDict):
         """按对话的程序类型选择执行器（由 Core 管理，不挂在对话上）。
-        Python 对话：model 必须在 PLM_REGISTRY 中，否则报错（不静默回退）；
-        LLM 对话：用 core.lmu（model 交给 API 校验）。"""
+        Python 对话：model 必须在内建 PLM_REGISTRY 或本核的 self.plms 中，
+        否则报错（不静默回退）；LLM 对话：用 core.lmu（model 交给 API 校验）。"""
         if conv.cid in self._executors:
             return self._executors[conv.cid]
         model = para.get("model")
         if conv.is_python:
-            if not isinstance(model, str) or model not in PLM_REGISTRY:
+            if not isinstance(model, str) or not (model in PLM_REGISTRY or model in self.plms):
+                available = list(PLM_REGISTRY) + sorted(set(self.plms) - set(PLM_REGISTRY))
                 raise ValueError(
-                    f"Python 对话 {conv.cid} 的 model {model!r} 不在 PLM_REGISTRY 中（可用: {list(PLM_REGISTRY)}）"
+                    f"Python 对话 {conv.cid} 的 model {model!r} 不在 PLM_REGISTRY 中（可用: {available}）"
                 )
-            executor = PLMExecutor(create_plm(model))
+            executor = PLMExecutor(create_plm(model, extra=self.plms))
             self._executors[conv.cid] = executor
             return executor
         return self.lmu
@@ -1890,6 +1895,11 @@ class Core:
                     Core._plm_catalog_entry(name, cls)
                     for name, cls in PLM_REGISTRY.items()
                     if name not in HOST_ONLY_PLMS  # 宿主独占的 PLM 不列给对话
+                ] + [
+                    # 镜像声明的 PLM 也列进来（同名内建优先，装载期已拒绝重名）
+                    Core._plm_catalog_entry(name, cls)
+                    for name, cls in self.plms.items()
+                    if name not in PLM_REGISTRY
                 ],
                 metadata="PLM 注册表：本地实现，不需要网络",
             )

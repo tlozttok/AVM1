@@ -1,13 +1,14 @@
-"""AVM 系统镜像：一个 JSON + 若干设备 Python 文件 = 标准 AVM 系统镜像
+"""AVM 系统镜像：一个 JSON + 若干设备/PLM 的 Python 文件 = 标准 AVM 系统镜像
 
 用法: python -m avm.image <image.json>
 
 镜像格式见 docs/system-image.md。镜像加载过程：
 1. 解析 mem 段为显式节点树（kind/meta/ctrl/value），kind=device 为可读性标记（可出现在任意层级）；
-2. 按 para_ref 校验 para 节点（ctrl.type == "para"）并配置 Core；
-3. 按 devices 段加载设备插件文件（必须继承 MemoryDevice）并挂载；
-4. 启动 init 对话（0 号，默认名 "init"；入口可以是 settingup LLM 程序，也可以是 python PLM 程序）；
-5. run() 执行；若镜像声明 persist_to，结束后写回内存。
+2. 装载 plms 段的自定义 PLM（必须继承 PLMServer）进本核的 Core.plms；
+3. 按 para_ref 校验 para 节点（ctrl.type == "para"）并配置 Core；
+4. 按 devices 段加载设备插件文件（必须继承 MemoryDevice）并挂载；
+5. 启动 init 对话（0 号，默认名 "init"；入口可以是 settingup LLM 程序，也可以是 python PLM 程序）；
+6. run() 执行；若镜像声明 persist_to，结束后写回内存。
 """
 
 import argparse
@@ -21,6 +22,7 @@ from typing import Optional
 from .core import Core, _build_conversation
 from .exceptions import VMMemoryError, RunnerStop
 from .memory_device import MemoryDevice, BUILTIN_DEVICE_CLASSES
+from .python_server import PLM_REGISTRY, PLMServer
 from .runner_prompt import prompt_api_error
 from .types import MetaDict, MetaList, LinkNode
 
@@ -77,14 +79,65 @@ def _parse_node(value, path, markers):
     return None
 
 
-def _load_device_module(file_path: str, dev_path: str):
-    name = "_avm_image_dev_" + hashlib.sha1(file_path.encode("utf-8")).hexdigest()[:12]
+def _load_image_module(file_path: str, kind: str, subject: str):
+    """按文件路径加载镜像自带的 Python 模块（设备与 PLM 共用）。
+
+    kind 进模块名前缀（dev / plm），避免同一文件扮演两种角色时模块名相撞；
+    subject 是报错时的对象名（如 "设备 inputs"、"PLM plm.community"）。
+    """
+    name = f"_avm_image_{kind}_" + hashlib.sha1(file_path.encode("utf-8")).hexdigest()[:12]
     spec = importlib.util.spec_from_file_location(name, file_path)
     if spec is None or spec.loader is None:
-        raise ImageError(f"设备 {dev_path}: 无法加载文件 {file_path}")
+        raise ImageError(f"{subject}: 无法加载文件 {file_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_device_module(file_path: str, dev_path: str):
+    return _load_image_module(file_path, "dev", f"设备 {dev_path}")
+
+
+def _load_plms(core: Core, image_path: str, plms: list):
+    """装载镜像的 plms 段：把 {model, file, class} 声明的类装进本核的 core.plms。
+
+    形状与 devices 段对称（file 相对镜像目录，class 必须是 PLMServer 的子类）。
+    区别：PLM 是按名构造的类，装载期不实例化，也不进内存树。
+    必须在 install_model_catalog 之前调用——模型目录是 PLM 注册表的可见面。
+    """
+    if not isinstance(plms, list):
+        raise ImageError(f"plms 段必须是数组，得到 {type(plms).__name__}")
+    base = os.path.dirname(os.path.abspath(image_path))
+    modules = {}  # 同一个文件被引用多次时只加载一次
+    seen = set()
+    for item in plms:
+        if not isinstance(item, dict):
+            raise ImageError(f"plms 条目必须是对象，得到 {type(item).__name__}")
+        model = item.get("model")
+        file_rel = item.get("file")
+        class_name = item.get("class")
+        if not isinstance(model, str) or not model:
+            raise ImageError("plms 条目必须包含非空 model")
+        if not isinstance(file_rel, str) or not file_rel:
+            raise ImageError(f"PLM {model}: 必须包含非空 file")
+        if not isinstance(class_name, str) or not class_name:
+            raise ImageError(f"PLM {model}: 必须包含非空 class")
+        if model in PLM_REGISTRY:
+            raise ImageError(f"PLM {model}: 与内建 PLM 重名，镜像不能覆盖宿主注册表")
+        if model in seen:
+            raise ImageError(f"PLM {model}: 同一个 plms 段里重复声明")
+        seen.add(model)
+        file_path = file_rel if os.path.isabs(file_rel) else os.path.join(base, file_rel)
+        if not os.path.isfile(file_path):
+            raise ImageError(f"PLM {model}: 文件不存在 {file_path}")
+        module = modules.get(file_path)
+        if module is None:
+            module = _load_image_module(file_path, "plm", f"PLM {model}")
+            modules[file_path] = module
+        cls = getattr(module, class_name, None)
+        if not isinstance(cls, type) or not issubclass(cls, PLMServer):
+            raise ImageError(f"PLM {model}: {class_name} 必须是继承 PLMServer 的类")
+        core.plms[model] = cls
 
 
 def _mount_devices(core: Core, image_path: str, devices: list, mem_device_paths: list):
@@ -241,6 +294,9 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
     host_flags：启动标志——本次运行由哪个宿主托管（如 {"console": True}）。宿主事实，
     不属于镜像内容，不进 $MEM。在挂载设备之前写入 Core，设备可在 attach_core 里读；
     核心启动后不再变化。不传则空，设备行为与从前一致。
+
+    镜像的 plms 段（顶层数组，条目 {model, file, class}）在这里装载进 core.plms，
+    与内建 PLM_REGISTRY 并列；没有该段时行为与从前一致。
     """
     if core._conv_by_cid:
         raise ImageError(
@@ -287,6 +343,9 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
     core.mem._data = root
     # Core 的内建设备在 __init__ 里挂载，早于这次整树替换；按设备表把挂载点链接重新物化
     core.mem.materialize_mount_links()
+    # 镜像声明的 PLM 必须在安装模型目录之前装载：$MEM.model_catalog.plm 是它的可见面，
+    # 装完目录再注册就不会出现在对话看得见的清单里。
+    _load_plms(core, image_path, image.get("plms") or [])
     # 启动自带的模型目录同样会被整树替换冲掉，这里重装（幂等，镜像已有的字段不覆盖）
     core.install_model_catalog()
 

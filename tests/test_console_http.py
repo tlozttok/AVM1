@@ -382,6 +382,23 @@ class TestInterventionFlow:
 
         assert core._active_cid is None
 
+    def test_pause_delivers_a_message_to_the_panel(self, env):
+        """暂停中断给面板投一条「已暂停」；面板执行器把它 publish 成 user_message。"""
+        core, console, base, _ = env
+        panel = console.panel
+        code, body = request(base, "POST", "/api/interrupt")
+        assert code == 200
+        # 没有活跃对话时 Core 走不到安全点，这里手动派发一次
+        records = core.interrupts.dispatch()
+        assert records and records[0]["action"] == "switch"
+        assert panel.user_batch.get_user_content() == "已暂停"
+        # 面板跑一轮：把新的用户消息 publish 出去，然后结束本轮
+        console.channel.submit_action({"end": True})
+        core.advance_conversation()
+        kinds = [(e["kind"], (e.get("data") or {}).get("content"))
+                 for e in console.channel.drain()]
+        assert ("user_message", "已暂停") in kinds, kinds
+
     def test_action_auto_pauses(self, env):
         """没暂停时提交动作：控制台先自动中断，动作在下一个安全点被面板取走。"""
         core, console, base, _ = env

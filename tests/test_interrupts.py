@@ -257,3 +257,70 @@ class TestPauseAndResume:
         assert core.lmu.ran == [first.cid, second.cid]
         assert core._active_cid is None
         assert sorted(core._dormant_cids) == sorted([first.cid, second.cid])
+
+
+class TestPayloadDelivery:
+    """派发时把 payload 作为正文投进目标对话的 user_batch（作者 2026-10-10 定夺）。
+
+    switch 与 noop 两条路径都投；dropped 没有可用目标，不投；payload 为 None 不投。
+    """
+
+    def _setup(self, on_exec=None):
+        core = make_core(on_exec)
+        panel, channel = attach_panel(core)
+        first = core.start("sys", "one")
+        second = core.start("sys", "two")
+        core._pick_next_active()
+        return core, panel, channel, first, second
+
+    def test_payload_lands_in_target_batch(self):
+        core, panel, *_ = self._setup()
+        core.interrupts.raise_("operator", payload="已暂停")
+        records = core.interrupts.dispatch()
+        assert records[0]["action"] == "switch"
+        assert records[0]["payload"] == "已暂停"
+        assert panel.user_batch.get_user_content() == "已暂停"
+
+    def test_no_payload_delivers_nothing(self):
+        core, panel, *_ = self._setup()
+        core.interrupts.raise_("operator")
+        core.interrupts.dispatch()
+        assert panel.user_batch.get_user_content() == ""
+
+    def test_active_target_still_gets_the_payload(self):
+        """目标已是活跃对话也投：中断是新信息，对话有必要知道。"""
+        core, panel, *_ = self._setup()
+        core.interrupts.raise_("operator")
+        core.interrupts.dispatch()
+        assert core._active_cid == panel.cid
+
+        core.interrupts.raise_("operator", payload="第二条")
+        records = core.interrupts.dispatch()
+        assert records[0]["action"] == "noop"
+        assert panel.user_batch.get_user_content() == "第二条"
+
+    def test_dropped_target_gets_nothing(self):
+        core = make_core()
+        target = core.start("sys", "one")
+        core.interrupts.register("operator", target.cid)
+        core._finished.add(target.cid)
+        core.interrupts.raise_("operator", payload="不该到")
+        records = core.interrupts.dispatch()
+        assert records[0]["action"] == "dropped"
+        assert target.user_batch.get_user_content() == ""
+
+    def test_normal_conversation_sees_the_payload_when_it_runs(self):
+        """普通对话被中断激活后，模型看到的那条 user 消息就是 payload。"""
+        seen = []
+
+        def on_exec(conv):
+            seen.append((conv.cid, conv.user_batch.get_user_content()))
+
+        core = make_core(on_exec)
+        target = core.start("sys", "target")
+        core.interrupts.register("operator", target.cid)
+        core._pick_next_active()
+        core.interrupts.raise_("operator", payload="中断正文")
+        core.interrupts.dispatch()   # 目标是活跃对话：noop 路径，但照样投递
+        core.advance_conversation()  # 跑一轮，执行器在清空 batch 之前看得到正文
+        assert (target.cid, "中断正文") in seen

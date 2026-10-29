@@ -6,7 +6,7 @@ import json
 import math
 import re
 import sys
-from typing import List
+from typing import List, Optional
 from abc import ABC, abstractmethod
 
 from .types import (
@@ -1032,10 +1032,15 @@ PLM_REGISTRY = {
 HOST_ONLY_PLMS = frozenset({"plm.operator"})
 
 
-def create_plm(model: str, **kwargs) -> PLMServer:
-    """按 model 参数创建 PLM 实例（注册表在本模块）。"""
-    cls = PLM_REGISTRY.get(model)
+def create_plm(model: str, extra: Optional[dict] = None, **kwargs) -> PLMServer:
+    """按 model 参数创建 PLM 实例。
+
+    extra：调用方额外的 name → 类表（Core.plms，镜像里声明的 PLM）。内建注册表优先；
+    名字在两处都不存在时报错，不静默回退。
+    """
+    cls = PLM_REGISTRY.get(model) or (extra or {}).get(model)
     if cls is None:
-        raise ValueError(f"未知 PLM 类型: {model}（可用: {list(PLM_REGISTRY)}）")
+        available = list(PLM_REGISTRY) + sorted(set(extra or {}) - set(PLM_REGISTRY))
+        raise ValueError(f"未知 PLM 类型: {model}（可用: {available}）")
     return cls(**kwargs)
         
