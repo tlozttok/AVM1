@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 先读文档
+    url: https://github.com/tlozttok/AVM1/blob/main/CONTEXT.md
+    about: 术语以 CONTEXT.md 为准；提问前先确认用的是同一个词义。
