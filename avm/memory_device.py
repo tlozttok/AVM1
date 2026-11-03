@@ -478,7 +478,8 @@ class InputsListDevice(MetaListDevice):
         rest = cmd[len("/save"):].strip()
         if rest:
             base = getattr(self._core, "image_dir", None) or "."
-            path = rest if os.path.isabs(rest) else os.path.join(base, rest)
+            # normpath：命令行给的相对落点常用 "/"，拼进目录后归一成宿主分隔符
+            path = rest if os.path.isabs(rest) else os.path.normpath(os.path.join(base, rest))
         else:
             path = self._core.checkpoint_path(cid)
         try:

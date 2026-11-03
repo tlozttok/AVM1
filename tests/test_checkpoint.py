@@ -173,7 +173,7 @@ class TestSaveDebugCommand:
         monkeypatch.setattr("builtins.input", lambda _: next(seq))
 
         assert dev["next"] == "x"
-        assert core.saved == [(7, str(tmp_path) + "/out/custom.json")]
+        assert core.saved == [(7, os.path.join(str(tmp_path), "out", "custom.json"))]
 
     def test_save_without_core_does_not_crash(self, monkeypatch, capsys):
         dev = InputsListDevice()

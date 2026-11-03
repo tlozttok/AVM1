@@ -440,8 +440,8 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
     if persist_to is not None:
         if not isinstance(persist_to, str):
             raise ImageError("persist_to 必须是字符串路径")
-        core.persist_to = persist_to if os.path.isabs(persist_to) else os.path.join(
-            os.path.dirname(os.path.abspath(image_path)), persist_to)
+        core.persist_to = persist_to if os.path.isabs(persist_to) else os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(image_path)), persist_to))
     # 内核转储（诊断快照，不是恢复输入）：core_dump 开关、core_dump_to 落点，与 persist_to 同为顶层字段
     core_dump = image.get("core_dump")
     if core_dump is not None and not isinstance(core_dump, bool):
@@ -451,8 +451,10 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
     if core_dump_to is not None:
         if not isinstance(core_dump_to, str) or not core_dump_to:
             raise ImageError("core_dump_to 必须是非空字符串路径")
-        core.core_dump_to = core_dump_to if os.path.isabs(core_dump_to) else os.path.join(
-            os.path.dirname(os.path.abspath(image_path)), core_dump_to)
+        # normpath：镜像里写的相对落点常用 "/"，拼进目录后归一成宿主分隔符，
+        # 否则 Windows 上会产出 "dir\out/x.json" 这种混合形式
+        core.core_dump_to = core_dump_to if os.path.isabs(core_dump_to) else os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(image_path)), core_dump_to))
     return core
 
 

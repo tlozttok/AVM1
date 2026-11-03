@@ -7,6 +7,7 @@ import importlib.util
 import json
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,43 @@ from avm.image import load_image
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEVICE_FILE = REPO_ROOT / "images" / "devices" / "avm_repo.py"
 IMAGE_FILE = REPO_ROOT / "images" / "repo_tester.json"
+
+
+def _fs_supports(build) -> bool:
+    """探测文件系统能力：夹具里有两类文件在部分平台上根本建不出来。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            build(Path(tmp))
+        except OSError:
+            return False
+        return True
+
+
+def _make_quoted_name(base: Path) -> None:
+    # Windows 文件名不允许双引号（Errno 22 / WinError 123）
+    (base / 'we"ird.txt').write_text("probe\n", encoding="utf-8")
+
+
+def _make_symlink(base: Path) -> None:
+    # Windows 建符号链接需要管理员或开发者模式（WinError 1314）
+    (base / "target.txt").write_text("probe\n", encoding="utf-8")
+    (base / "link.txt").symlink_to(base / "target.txt")
+
+
+HAS_QUOTED_NAME = _fs_supports(_make_quoted_name)
+HAS_SYMLINK = _fs_supports(_make_symlink)
+
+# 根目录固定有 pkg/、big.txt、.gitignore；另两项依平台能力出现
+ROOT_ENTRY_COUNT = 3 + HAS_QUOTED_NAME + HAS_SYMLINK
+
+requires_quoted_name = pytest.mark.skipif(
+    not HAS_QUOTED_NAME,
+    reason="文件系统不允许文件名含双引号（Windows）：地址引号还原用例只能在 POSIX 上跑",
+)
+requires_symlink = pytest.mark.skipif(
+    not HAS_SYMLINK,
+    reason="当前环境不允许创建符号链接（Windows 需管理员或开发者模式）：越界用例只能在类 POSIX 上跑",
+)
 
 
 def _git(cwd, *args):
@@ -42,15 +80,20 @@ def repo(tmp_path):
     (root / "big.txt").write_text(
         "line 1\nline 2\nline 3 needle\nline 4\nline 5\n", encoding="utf-8"
     )
-    (root / 'we"ird.txt').write_text("quoted name\n", encoding="utf-8")
     (root / ".gitignore").write_text("*.tmp\n", encoding="utf-8")
     (root / "untracked.txt").write_text("not in git\n", encoding="utf-8")
     (root / ".env").write_text("SECRET=1\n", encoding="utf-8")
-    outside = tmp_path / "outside.txt"
-    outside.write_text("outside needle\n", encoding="utf-8")
-    (root / "link.txt").symlink_to(outside)
+    tracked = ["pkg", "big.txt", ".gitignore"]
+    if HAS_QUOTED_NAME:
+        (root / 'we"ird.txt').write_text("quoted name\n", encoding="utf-8")
+        tracked.append('we"ird.txt')
+    if HAS_SYMLINK:
+        outside = tmp_path / "outside.txt"
+        outside.write_text("outside needle\n", encoding="utf-8")
+        (root / "link.txt").symlink_to(outside)
+        tracked.append("link.txt")
     _git(root, "init", "-q")
-    _git(root, "add", "pkg", "big.txt", 'we"ird.txt', "link.txt", ".gitignore")
+    _git(root, "add", *tracked)
     _git(root, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "init")
     return root
 
@@ -98,11 +141,11 @@ class TestAddressGrammar:
         out = _core(device).unwrap('$MEM.AVMRepo.ls.""', for_llm=True)
         assert "d pkg" in out
         assert "f big.txt" in out
-        assert "5 项" in out
+        assert f"{ROOT_ENTRY_COUNT} 项" in out
 
     def test_ls_dot_path_is_root(self, device):
         out = _core(device).unwrap('$MEM.AVMRepo.ls."."', for_llm=True)
-        assert out.startswith('ls ".": 5 项')
+        assert out.startswith(f'ls ".": {ROOT_ENTRY_COUNT} 项')
 
     def test_dot_leading_names(self, device):
         # 以点号开头的名字切出来是 ['"', 'gitignore"']，引号区间要照样接回去
@@ -146,6 +189,7 @@ class TestAddressGrammar:
         out = _core(device).unwrap('$MEM.AVMRepo.read."pkg/mod.py".0', for_llm=True)
         assert "needle here" in out
 
+    @requires_quoted_name
     def test_escaped_quote_in_filename(self, device):
         out = _core(device).unwrap('$MEM.AVMRepo.read."we\\"ird.txt".0', for_llm=True)
         assert "quoted name" in out
@@ -185,6 +229,7 @@ class TestSearch:
         with pytest.raises(VMMemoryError):
             _core(device).unwrap('$MEM.AVMRepo.search."".0', for_llm=True)
 
+    @requires_symlink
     def test_does_not_follow_symlink_out_of_root(self, device):
         # link.txt 指向仓库外的文件，其内容含 needle；搜索不跟着出去
         out = _core(device).unwrap('$MEM.AVMRepo.search."outside".0', for_llm=True)
@@ -212,6 +257,7 @@ class TestScope:
         with pytest.raises(VMMemoryError):
             core.unwrap('$MEM.AVMRepo.read."pkg/../big.txt".0', for_llm=True)
 
+    @requires_symlink
     def test_symlink_escape_rejected(self, device):
         with pytest.raises(VMMemoryError):
             _core(device).unwrap('$MEM.AVMRepo.read."link.txt".0', for_llm=True)
