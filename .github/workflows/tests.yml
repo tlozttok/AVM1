@@ -10,6 +10,10 @@ jobs:
   pytest:
     name: pytest (${{ matrix.os }}, py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
+    # 入口脚本的 print 带全角标点（：[build_image] OK：…）；GitHub 的 Windows
+    # runner 控制台是 cp1252，不指定编码会 UnicodeEncodeError。见 README 的环境一节。
+    env:
+      PYTHONIOENCODING: utf-8
     strategy:
       fail-fast: false
       matrix:
