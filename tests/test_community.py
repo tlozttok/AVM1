@@ -159,6 +159,9 @@ class TestImage:
             cwd=ROOT,
             capture_output=True,
             text=True,
+            # 脚本按 UTF-8 打印（构建提示带全角标点）；text=True 缺省用 locale 解码，
+            # 英文 Windows 上是 cp1252，会在读取线程里 decoding 失败并让 stdout 变 None
+            encoding="utf-8",
         )
         assert proc.returncode == 0, proc.stderr + proc.stdout
 
@@ -581,6 +584,8 @@ class TestPanelAcceptance:
             cwd=ROOT,
             capture_output=True,
             text=True,
+            # --help 的输出是中文；见上，显式按 UTF-8 解码
+            encoding="utf-8",
         )
         assert proc.returncode == 0
         assert "面板验收" in proc.stdout
