@@ -83,8 +83,8 @@ class TestMountMaterializesLink:
         core = Core()
         core.mem.mount("box", BoxDevice({"a": "1"}))
         summary = core.mem.resolve_path(["MEM", "memory"], for_llm=True)
-        # 五个内建设备 + box
-        assert "'link': 6" in summary
+        # 七个内建设备（含 roots/caps） + box
+        assert "'link': 8" in summary
 
     def test_parent_segments_materialized(self):
         core = Core()

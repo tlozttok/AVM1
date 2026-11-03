@@ -2,6 +2,8 @@
 import json
 from typing import Dict, Optional
 
+from .capabilities import Capability, caps_from_dict, caps_to_dict, default_kernel_caps
+
 CHECKPOINT_VERSION = 1
 
 
@@ -20,6 +22,39 @@ def _tool_call_to_dict(tc) -> dict:
         "type": getattr(tc, "type", "function"),
         "function": {"name": fn.name, "arguments": fn.arguments},
     }
+
+
+class StrNode(str):
+    """字符串叶子 + 控制数据（ctrl）。
+
+    字符串只有控制数据，没有描述数据（描述属于容器）：`ctrl` 可存 `owner` 等
+    Core/内核态需要的结构化信息；`meta` 对字符串不适用。
+    作为 str 的子类，比较、JSON 序列化、`isinstance(x, str)` 都保持原语义。
+    """
+
+    __slots__ = ("_ctrl",)
+
+    def __new__(cls, value: str = "", ctrl=None):
+        obj = super().__new__(cls, value)
+        obj._ctrl = dict(ctrl) if ctrl else None
+        return obj
+
+    def get_ctrl(self):
+        return self._ctrl
+
+    def set_ctrl(self, ctrl) -> None:
+        self._ctrl = ctrl
+
+    def __reduce__(self):
+        # pickle / copy 用：保留控制数据（否则 str 子类的属性会在复制中丢失）
+        return (StrNode, (str(self), self._ctrl))
+
+    def __copy__(self):
+        return StrNode(str(self), dict(self._ctrl) if self._ctrl else None)
+
+    def __deepcopy__(self, memo):
+        import copy as _copy
+        return StrNode(str(self), _copy.deepcopy(self._ctrl, memo))
 
 
 class MetaList:
@@ -314,8 +349,10 @@ class Conversation:
     name: Optional[str] = None
     para_ref: Optional[str] = None  # 本对话的 para 引用（缺省用 Core.para_ref）
     is_python: bool = False  # 程序类型：True = Python 对话（system_ref 指向 type="python" 节点），False = LLM 对话
-    
-    def __init__(self, messages: List[Message] = None, cid: int = 0, is_sub:bool=False, parent: Optional['Conversation'] = None, is_root: bool = False, metadata: Dict[str, str] = None, name: Optional[str] = None):
+    caps: 'Capability' = None  # 对话能力（模式/组/根表/工具集）；None 时用默认内核态全能力
+    attrs: Dict[str, str] = None  # 自由元数据（镜像层权限策略用；不写内存树）
+
+    def __init__(self, messages: List[Message] = None, cid: int = 0, is_sub:bool=False, parent: Optional['Conversation'] = None, is_root: bool = False, metadata: Dict[str, str] = None, name: Optional[str] = None, caps: Optional['Capability'] = None, attrs: Dict[str, str] = None):
         self.messages = messages or []
         self.user_batch = UserMessageBatch()
         self.cid = cid
@@ -324,6 +361,8 @@ class Conversation:
         self.is_root = is_root
         self.metadata = metadata or {}
         self.name = name
+        self.caps = caps if caps is not None else default_kernel_caps()
+        self.attrs = dict(attrs or {})
         self.validate(require_last_assistant=False)
 
     @property
@@ -447,6 +486,8 @@ class Conversation:
             "is_sub": self.is_sub,
             "is_root": self.is_root,
             "metadata": dict(self.metadata or {}),
+            "caps": caps_to_dict(self.caps),
+            "attrs": dict(self.attrs or {}),
             "messages": [_msg(m) for m in self.messages],
         }
 
@@ -483,6 +524,10 @@ class Conversation:
         )
         conv.para_ref = cp.get("para_ref")
         conv.is_python = bool(cp.get("is_python", False))
+        # 旧检查点没有 caps/attrs：回退内核态全能力与空元数据（宿主可信，不提升上界检查）
+        caps = cp.get("caps")
+        conv.caps = caps_from_dict(caps) if caps is not None else default_kernel_caps()
+        conv.attrs = dict(cp.get("attrs") or {})
         return conv
 
     @classmethod

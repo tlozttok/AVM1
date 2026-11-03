@@ -24,7 +24,7 @@ def _seed(mem, ref, value, owner_cid=None):
 
 
 def _python_node(code):
-    return MetaDict(data={"content": code}, ctrl={"type": "python"})
+    return MetaDict(data={"content": code}, ctrl={"type": "handler"})
 
 
 def _mount(core, path, target):
@@ -250,7 +250,7 @@ class TestEventTransparency:
         MemoryReadInstruction("tc", 0, {"ref": "$MEM.alias"}).execute(core, root)
         before = [e for e in core._turn_events if e["phase"] == "before"]
         assert before[-1]["target"] == "$MEM.alias"
-        assert before[-1]["source"] == {"kind": "core", "initiator_cid": 0}
+        assert {k: v for k, v in before[-1]["source"].items() if k != "conversation"} == {"kind": "core", "initiator_cid": 0}
         # after 事件 source 是 memory（真实目标为 memory），target 仍是别名
         after = [e for e in core._turn_events if e["phase"] == "after"]
         assert after[-1]["source"] == {"kind": "memory"}

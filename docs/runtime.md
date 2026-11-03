@@ -70,13 +70,16 @@ Core 只执行指令，不做业务决策。全部指令如下：
 | `create_sub` | 创建亚对话（立即执行；完成自动写回并立即唤醒父；父子之间不插其他对话；**完成或关闭后立即删除个体**；`system_ref`/`para_ref` 要求同 `create_cmd`，`user_ref` 必须指向 str 节点） | `system_ref`, `user_ref`, `para_ref` |
 | `send_instruction` | 按 cid 投递指令内容（支持多播；只确认投递成功，不保证返回；投递后本对话继续执行，不自动休眠） | `cid`(int/列表), `content` |
 | `close_conversation` | 内核级关闭：关闭指定 cid 的对话（自身或他人，不需要对方回应）；关闭后不可再调度、不可再被调用，其注册的事件监听自动撤销。亚对话不能关闭主对话（`Illegal:`）；亚对话被关闭时个体直接删除，父对话收到 `Error:` 响应 | `cid` |
-| `listen_event` | 注册/修改/取消事件监听；监听器是 `ctrl.type="python"` 节点的 `content`，每次事件在受限沙箱中执行 | `action`, `event_type`?, `target`?, `handler_ref`?, `listener_id`?, `phase`? |
+| `listen_event` | 注册/修改/取消事件监听；监听条件是 handler 节点 `condition` 数据叶子里声明的声明式条件；可带 `priority`/`tier` | `action`, `handler_ref`?, `listener_id`?, `priority`?, `tier`? |
+
+**工具面按对话裁剪**：每个对话有一份工具集（指令名集合，见[对话能力与权限](#对话能力与权限批次一)）。模型看到的工具 schema、PLM 注入的工具函数与 Core 实际接受的指令都按它过滤；宿主控制台 `/api/tools` 始终是全量 10 条。旧对话（无能力声明）默认全部 10 条。
 
 ### 地址与键的语法（指令边界校验）
 
 指令在落笔前先校验引用与键的语法；不合法输入得到 `Illegal: ...` 工具响应，内存与事件都不动：
 
 - **引用**（`memory_read` / `memory_write` 的 `ref`）必须以 `$` 开头。不以 `$` 开头的字符串不是内存引用，直接拒绝（此前 `memory_read` 会把 `"MEM"` 当值原样回显）。
+- **引用第一段是根名**：按当前对话的根表精确匹配（`MEM` 是内建根；用户态对话有 `work` 等工作空间根与授予根）。根表里没有的名字得到统一 `Error: 引用根不可用…`，不区分拼错与未授权；根目标本身缺失时报"引用根无效"。根表里含 `MEM` 的对话保留设备路径简写（如 `$inputs.next`）与 `$conv`/`$batch` 伪根；用户态对话两者都不可用。
 - **路径不能有空段**：`$MEM..x` 一类输入报"引用不能有空段"，读侧与写侧同一套语法；`$MEM` 本身是合法的根。
 - **键**（`memory_make` 的 `key`）必须是非空字符串、不能含点号——点号是路径分隔符，带点的键建得出来却永远读不回来。空键同样拒绝（它会让 `$MEM.` 与读根混淆）。
 - **`memory_write` 不建节点**：写入只修改已存在的地址（中间段或末段缺失都返回 `Error: 路径不存在…——memory_write 不建节点，先用 memory_make 创建`）。新地址一律由 `memory_make` 创建；`memory_make` 的 ref 可以建链，所以"先 make 再 write"是两步。
@@ -89,23 +92,23 @@ Core 只执行指令，不做业务决策。全部指令如下：
 
 ## 内存模型
 
-内存是全局共享的键值树，路径形如 `$MEM.a.b.c`。四种数据类型：
+内存是全局共享的键值树，真实路径形如 `$MEM.a.b.c`；对话看到的引用以根名开头（`$work.a`、`$lib.x`），根名到真实段的映射是对话能力的一部分（见[对话能力与权限](#对话能力与权限批次一)）。四种数据类型：
 
-- **str**：叶子节点，直接返回内容。
+- **str（StrNode）**：叶子节点，直接返回内容；只有控制数据 `ctrl`（owner 等），没有描述数据 `meta`。
 - **MetaDict / MetaList**：带元数据（描述 + 控制数据）的复合类型。列表用 `-1` 位置追加（规则见上）；可删 str 元素与空列表，删除用 `memory_delete`（删元素后后续下标前移）。
 - **链接节点（LinkNode）**：`target` 以 `$` 开头是内存树地址，否则是设备唯一标识符；寻址遇到它即进入目标（见下文）。
 - **设备（device）**：挂载到路径上的伪节点（见下文）。挂载点本身在树里就是一个链接节点。
 
 ### 元数据：描述与控制数据
 
-MetaDict / MetaList 有两份元数据：
+MetaDict / MetaList 有两份元数据；字符串叶子只有控制数据：
 
 - 描述（`meta`，字符串；镜像与代码字段名 `metadata`）：给 LLM 快速扫描的文件摘要/描述。LLM 读取时默认只看到摘要和键列表，深入索引后才返回子节点。
 - 控制数据（`ctrl`，`dict[str,str]`）：给 Core / 内核态的结构化控制信息，如 `type="para"`（模型参数）、`type="settingup"`（LLM 提示词程序）、`type="python"`（Python 程序）、`owner`（节点所有者 cid，由 Core 维护）。
 
 两者统称**元数据**：`memory_write` 对容器改的是描述，`edit_metadata` 改的是控制数据。
 
-`memory_make` 创建 dict/list 节点时（含 ref 建链的中间容器）Core 会写入 `ctrl.owner`；`memory_write` 不建节点，因此不写 owner；覆盖已有节点不改 owner；str 叶子没有 ctrl。`edit_metadata` 对 `owner` 键的 set/del 一律拒绝，get 允许。无主路径在事件模型 v1 中不能注册 before 内存监听；镜像作者可在 `ctrl` 中显式预置 `"owner": "0"`。
+`memory_make` 创建 dict/list/str 节点时（含 ref 建链的中间容器与列表追加）Core 会写入 `ctrl.owner`；`memory_write` 不建节点，因此不写 owner，写已有字符串只改内容、保留它的 ctrl（不夺权）；覆盖已有容器节点不改 owner。字符串叶子只接受 `ctrl`，镜像里给它写 `meta` 会报 `ImageError`。`edit_metadata` 对 `owner` 键的 set/del 一律拒绝，get 允许。无主路径在事件模型 v1 中不能注册 before 内存监听；镜像作者可在 `ctrl` 中显式预置 `"owner": "0"`。
 
 ### 字符串与链接
 
@@ -166,6 +169,77 @@ Core 内置只读信息设备：`$MEM.conversations`（对话列表与单对话�
 - `system_ref` 指向 `settingup` 程序 → `llm.source == "api"` 时 `model` 必须在 `models` 里，取不到清单时只记 stderr 不拦；`para` 缺 `model` 与上游清单无关，一律 `Illegal:`。
 
 漏网的错配（例如创建后把 para 的 `model` 改坏）由 `_get_executor` 兜底：它现在在 `advance_conversation` 的 `try` 之内，会留下监测帧再上抛。
+
+## 对话能力与权限（批次一）
+
+完整的能力模型、事件权限机制与镜像层安全程序写法见 [docs/capabilities.md](capabilities.md)。本节只列运行时要点。
+
+批次一实现了权限体系的机制层：每个对话的能力（`caps`）、地址空间、私有工作空间与工具面。**权限策略**（事件监听器做 ACL、对话设备控制面、内存访问权限）留给后续批次。
+
+### 对话能力（caps）
+
+`Conversation.caps` 是 `avm/capabilities.py` 的 `Capability`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `mode` | `kernel`（内核态，根表含 `MEM`）或 `user`（用户态，只有 `work` 与授予根） |
+| `groups` | 组标签（镜像层策略使用；事件载荷后续批次带上） |
+| `roots` | 根表：根名 → `$MEM` 之后的真实段序列 |
+| `tools` | 工具集：本对话可调用的指令名集合 |
+
+默认值：宿主侧创建的对话（`Core.start`、操作员对话、旧检查点恢复）是内核态全能力（`MEM` 根 + 10 条工具）。检查点保存 `caps` 与 `attrs`（自由元数据；本批还没有写入面）。
+
+### 程序声明能力：`value.caps`
+
+程序节点（`ctrl.type` 为 `settingup` 或 `python` 的 dict）用数据节点 `value.caps` 声明子对话能力（`ctrl` 只描述类型与数据组织）：
+
+```json
+{"kind": "dict", "value": {
+  "mode": {"kind": "str", "value": "user"},
+  "groups": {"kind": "list", "value": [{"kind": "str", "value": "worker"}]},
+  "roots": {"kind": "list", "value": [{"kind": "str", "value": "lib"}]},
+  "tools": {"kind": "list", "value": [{"kind": "str", "value": "memory_read"}]},
+  "workspace": {"kind": "str", "value": "work"}
+}}
+```
+
+`ctrl.caps` 不再支持：镜像装载与创建对话都会拒绝。
+
+- `mode` 缺省继承父模式；用户态父对话不能创建内核态子对话；亚对话不能跨模式；镜像 init 强制内核态。
+- `tools` 缺省继承父工具集；显式声明时必须 ⊆ 父工具集；未知工具名报错。
+- `groups` 缺省继承；用户态父对话只能给子对话父已有的组。
+- `roots` 是**根注册表里的名字列表**（见下），只能由内核态父对话授予；同域创建（亚对话、用户态父对话建子对话）只能沿用父根表。
+- `workspace` 是用户态子对话工作空间根名（缺省 `work`）。
+- 没有 `caps` 的程序：继承父能力（旧镜像行为不变）。
+
+### 根注册表与工作空间（镜像 `security` 段）
+
+镜像顶层新增可选 `security` 段：
+
+```json
+"security": {
+  "roots": { "lib": "$MEM.lib", "repo": "$MEM.AVMRepo" },
+  "workspace_region": "$MEM.workspaces"
+}
+```
+
+- `roots` 是可授予根的注册表（名字 → `$MEM` 路径），装载时校验名字规则与目标**两两前缀无关**、不与工作空间区域重叠。
+- `workspace_region` 是工作空间区域，缺省 `$MEM.workspaces`；装载器在缺失时建空 dict，并拒绝区域子树里的链接节点（含设备挂载）——这是工作空间不可逃逸的结构保证。
+- 创建用户态对话时（内核态父对话 + 程序声明 `mode=user`），Core 在区域内分配 `w<n>` 空子树、记录 `ctrl.owner`，并把根名绑进子对话根表。工作空间目标与其他可授予根目标两两前缀无关，所以父方向没有根覆盖它、子方向没有根从内部切出。
+- 对话关闭时根绑定随对话消失，工作空间子树保留（回收另立计划）。
+
+### 用户态对话看到什么
+
+- 引用：`$work...`（自己的工作空间）与授予根（如 `$lib.greeting`）；`$MEM`、设备路径简写、`$conv`/`$batch` 都得到统一错误。
+- 工具：只有 `caps.tools` 里的指令；未授权调用返回 `Error: 工具 <名> 未授权给本对话`。
+- 创建：`create_sub` 在同域内可用（沿用父根表、工具只收窄）；能否 `create_cmd`/`close_conversation`/`listen_event` 由镜像授予的工具集决定。
+- `$MEM.conversations` 单对话详情增加 `mode` / `groups` / `roots` 名字 / 工具数；控制台 `/api/conversations/<cid>` 增加 caps 摘要（根只给名字，不给真实目标）。
+
+### 当前边界
+
+- 组、根、自由元数据的**运行期写入**已由批次三的对话设备控制面提供（见[内核信息与控制设备](#内核信息与控制设备批次三)）；`.mode`/`.tools` 仍只读。
+- 事件层权限机制已按批次二实现（before 覆盖全部工具、载荷分级、处理器分级、priority/allow、`ctrl.type="handler"`），见[事件模型 v1](#事件模型-v1批次二权限机制)。
+- 节点级内存访问权限（读写规则、密码、回调）的设计由作者给出；权限机制的特殊方法已于 2026-10-28 给出并实施，本批之后的机制改造见 `design-unified-event-bus-2026-10-31.md`。
 
 ## 对话间通信
 
@@ -292,22 +366,35 @@ PLM 代码运行在受限环境：安全 builtins 白名单 + AST 检查（禁�
 
 白名单**不包含 `BaseException`**：Python 程序（PLM 代码、事件处理器）不能触发"紧急停止"——`raise BaseException("x")` 只是一句普通的 `NameError`。停机信号只来自宿主：人按 Ctrl+C、宿主主动退出，宿主在 `finally` 里写回 `persist_to` 之后退出。
 
-## 事件模型 v1
+## 事件模型 v1（批次二：权限机制）
 
-事件是瞬时 dict，不落盘；由 Core 单调递增生成 `event_id`。**发布者分工**：before 请求事件由 Core 发布（source 为 `{"kind":"core","initiator_cid":cid}`）；after 事实事件由实际执行组件发布（Memory 发布 `{"kind":"memory"}`，设备发布 `{"kind":"device","path":"$MEM.<mount>"}`，Core 发布 `{"kind":"core"}`）。对话身份只出现在 before 的 `source.initiator_cid` 与 after 的 `payload.actor_cid`。
+事件是瞬时 dict，不落盘；由 Core 单调递增生成 `event_id`。**发布者分工**：before 请求事件由 Core 发布（source 为 `{"kind":"core","initiator_cid":cid}`），after 事实事件由实际执行组件发布（Memory 发布 `{"kind":"memory"}`，设备发布 `{"kind":"device","path":"$MEM.<mount>"}`，Core 发布 `{"kind":"core"}`）。
 
-### before 事件（6 种可拦截工具）
+### 事件载荷
 
-| event_type | source | target 格式 |
-|---|---|---|
-| `memory_read` | `{"kind":"core","initiator_cid":cid}` | 原 `ref` |
-| `memory_write` | 同上 | 原 `ref` |
-| `memory_make` | 同上 | 新建完整路径 `ref.key` |
-| `memory_delete` | 同上 | 原 `ref`（删除目标） |
-| `edit_metadata` | 同上 | 原 `ref` |
-| `send_instruction` | 同上（每个目标一条） | `"cid:<cid>"` |
+每次派发（有监听器匹配时）在事件顶层构造：
 
-before 语义：操作被请求，不保证到达执行组件；可被 `replace` / `handler_error` 阻断。before 在指令参数校验**之前**分发（例如 `edit_metadata` 的 `type` 非法时也会先经过监听器）：监听器看到的是请求，不是一定会执行的合法操作。
+- `source.conversation`：发起者（before 的 `initiator_cid` 或 after 的 `payload.actor_cid`）的对话快照：`cid`、`identity`、`name`、`mode`、`groups`、`is_sub`、`is_python`、`parent_cid`、`state`、`para_ref`。
+- `target_info`：目标简单信息——`kind`（memory/device/conversation/listener/wildcard）、`ref`（请求别名）、`exists`、`type`、`meta`、`ctrl`、`ancestors`（从根到父的简单信息 `[{depth,type,meta,ctrl}]`，不含真实路径，深度上限 32）、`parent`（目标存在或最长存在前缀下的直接父节点信息）；目标不存在时（make/追加）给 `longest_existing_prefix`（最近存在前缀的别名、depth 与信息）；device 目标给 `device`（设备自述）、`mount`、`remainder`；conversation 目标给对话快照；listener 目标给监听器摘要。
+- 内部 `target_ref`：canonical 目标（跟随根别名、链接与 LinkDevice 透明挂载后的真实段序列），只用于匹配与 owner 判定，不放进处理器载荷。
+- kernel 级追加（只有匹配到 kernel 级监听器时构造）：`target_full`（目标节点完整 JSON 安全数据）、`source_context`（来源对话消息列表，保最后 20 条，带 `total`/`truncated`）。
+
+### before 事件（10 种工具全部可拦截）
+
+| event_type | source | target 格式 | 基础 payload |
+|---|---|---|---|
+| `memory_read` | core | 原 `ref` | `{"ref"}` |
+| `memory_write` | core | 原 `ref` | `{"ref", "content"}` |
+| `memory_make` | core | 新建完整路径 `ref.key` | `{"ref", "key", "mem_type"}` |
+| `memory_delete` | core | 原 `ref` | `{"ref"}` |
+| `edit_metadata` | core | 原 `ref` | `{"ref", "type", "key", "value"}` |
+| `send_instruction` | core（每个目标一条） | `"cid:<cid>"` | `{"cid", "content"}` |
+| `create_cmd` | core | `system_ref` 程序节点（别名） | `{"system_ref", "para_ref"}` |
+| `create_sub` | core | `system_ref` 程序节点（别名） | `{"system_ref", "user_ref", "para_ref"}` |
+| `close_conversation` | core | `"cid:<目标 cid>"` | `{"cid"}` |
+| `listen_event` | core | action=listen：`"*"`（条件在 handler 节点）；modify/cancel：`"listener:<id>"` | `{"action", "handler_ref"?, "priority"?, "tier"?, "listener_id"?}` |
+
+before 语义：操作被请求，不保证到达执行组件；可被 `allow` 放行短路、`replace` 阻断/改写或 `handler_error` 阻断。before 在指令参数校验**之前**分发（例如 `edit_metadata` 的 `type` 非法时也会先经过监听器）：监听器看到的是请求，不是一定会执行的合法操作。这四类生命周期事件的 before 可变 payload 不开放改写，只允许决策动作。
 
 ### after 事件（10 种工具，成功时）
 
@@ -324,37 +411,104 @@ before 语义：操作被请求，不保证到达执行组件；可被 `replace`
 | `close_conversation` | core | `"cid:<被关闭 cid>"` | `{"cid", "actor_cid"}` |
 | `listen_event` | core | `"listener:<id>"` | `{"listener_id", "action", "actor_cid"}` |
 
-规则：失败、被 replace、handler_error 的操作不产生 after；after 的 action 固定为 `execute`，处理器不能 replace；after 阶段对 payload 的改写会并入事件，但操作已经执行完毕，不改变任何结果。
+规则：失败、被 replace、handler_error 的操作不产生 after；after 的 action 固定为 `execute`，决策动作被忽略；after 阶段对 payload 的改写会并入事件，但操作已经执行完毕，不改变任何结果。
 
-### 监听器与 waterfall
+### 监听器：类型、级别与顺序
 
-- `listen_event` 支持 `phase=before/after/all`，缺省 `all`；`$MEM.listeners` 会显示 phase。
-- 监听器是 `ctrl.type="python"` 节点中的 `content`，每次事件在全新受限沙箱命名空间执行（只提供 `json` 和上面列出的受限 builtins），不创建对话、不保留处理器实例状态。**处理器代码在注册时抄一份副本**：之后改内存里的节点内容不会自动生效，必须 `listen_event action=modify` 一次重新解析（创建处理器节点本身要 make/write/edit_metadata 若干条指令，注意预算）。
-- 处理器代码必须定义可调用 `handle(event)`，返回 dict；返回的 `action` 在 before 阶段可为 `execute` / `replace`，首个 `replace` 短路，后续监听器不再执行。
-- `replace` 后原指令不执行，调用者收到以 **`Interrupted: `**（英文前缀）开头的工具响应：处理器给的 `response` 文本会加这个前缀（缺省为 `Interrupted: 事件被监听器拦截`），调用者据此分辨「被拦截」与「成功」。
+- 监听器是 `ctrl.type="handler"` 节点：`content` 是处理器代码，`condition` 是声明式条件数据叶子。每次事件在全新受限沙箱命名空间执行（只提供 `json` 和受限 builtins），不创建对话、不保留处理器实例状态。**处理器代码与条件在注册时抄副本**：之后改内存里的节点不会自动生效，必须 `listen_event action=modify` 一次重新解析。
+- 条件 schema（handler 节点 `condition`，JSON 字符串叶）：`events`（事件类型列表）、`phase`（before/after 列表）、`target`（`exact`/`subtree` + `$` 引用；以及 preset 内置的 `owned_by_owner`/`cid_owner`/`self_lifecycle`）、`source`（`mode`/`groups`/`cid` 过滤）。匹配用 canonical 目标。
+- 用户态对话只能用命名条件子集（preset）：`own_work.memory`、`own_nodes.memory`、`inbox`、`self.lifecycle`；自定义条件被拒绝。内核态可以写完整条件，`subtree` 或省略 target 用于全局监听（例如禁止访问表）。
+- 旧式 `listen_event` 的 `event_type`/`target`/`phase` 参数已移除；`action=modify` 可更新 handler_ref 与/或 priority，并重新解析 handler 的条件。
+- 处理器必须定义可调用 `handle(event)`，返回 dict。返回的 `action` 在 before 阶段可为 `execute`（继续）、`replace`（拒绝/改写，原指令不执行）、`allow`（接受并短路，原指令照常执行）。
+- **级别（tier）**由注册者的模式决定：内核态对话注册的监听器可声明 `tier=kernel`；普通对话一律 `normal`，不采信 handler 节点自报。kernel 级拿正常载荷 + `target_full` + `source_context`；normal 级拿不到这两个重块。
+- **顺序**：`priority` 降序，同优先级按 `listener_id`（注册顺序）升序。`priority` 是非负整数，缺省 0；`priority>0` 与 `tier=kernel` 只有内核态对话可设置。首个 `allow`/`replace` 短路；`execute` 继续；管道结束仍无决定则执行原指令。
+- `allow` 只有 kernel 级监听器可返回；normal 级返回 `allow` 视为处理器错误（before fail closed：原指令不执行、调用者收到 Error）。
 - 处理器可改的 payload 字段：`memory_write.content`、`send_instruction.content`、`edit_metadata.value`（仅原操作 `type=set`）。身份字段不可改。
-- 处理器可返回 `notify`：`[{"cid": int, "content": str}]`，由 Core 在管道结束后内部投递（与 `send_instruction` 相同语义，但不产生事件、不递归）。**不允许自我投递**：before 阶段视为处理器错误；after 阶段丢弃该条并记入 `handler_errors`。**当前不校验 notify 的目标授权**：监听器所有者可以唤醒任意存活对话；是否收紧到「处理器只能返回到自己」待单独讨论（见 `question-notify-target-authorization-2026-10-24`）。
-- before 处理器错误不再抛异常，而是返回 `action="handler_error"` 的事件结果：管道停止、原指令不执行、调用者收到 Error 工具响应；此前已累积的 notify 仍会投递。after 处理器错误 fail open：记录 stderr、跳过该处理器的 notify、继续后续监听器。监听器的失败计数与最近错误写进 `$MEM.listeners` 的 `error_count` / `last_error`；本帧事件摘要（含 `handler_errors`）可在 `$MEM.monitor.frames.<seq>` 查看。
+- 处理器可返回 `notify`：`[{"cid": int, "content": str}]`，由 Core 在管道结束后内部投递（与 `send_instruction` 相同语义，但不产生事件、不递归）。**不允许自我投递**：before 阶段视为处理器错误；after 阶段丢弃该条并记入 `handler_errors`。**notify 的目标授权按监听器所有者模式限制**：用户态监听器只能通知注册者自己（否则处理失败）；内核态监听器可通知任意存活对话，由镜像层策略负责。`send_instruction` 不受这条限制。
+- before 处理器错误返回 `action="handler_error"` 的事件结果：管道停止、原指令不执行、已累积的 notify 仍投递。after 处理器错误 fail open：记录 stderr、跳过该处理器的 notify、继续后续监听器。监听器失败计数与最近错误写进 `$MEM.listeners`。
 
-### 监听权限与 owner
+### 事件匹配与 canonical 目标
 
-- 内存类 before/after 监听（`memory_read` / `memory_write` / `edit_metadata` / `memory_make` / `memory_delete`）按 `split_path` 区分：
-  - memory 路径：`_owner_of(target)` 必须等于注册者 cid；`memory_make` 要求父路径所有者等于注册者 cid；
-  - device 路径：询问设备 `authorize_listener(event_type, remainder, owner_cid)`，设备返回 `False` 则拒绝。
-- `send_instruction` before/after 监听只允许目标对话监听发往自己的消息（`target="cid:<自己>"`）。`send_instruction` 本身不允许对话向自己投递；多播中单个目标被拦截或处理失败不阻断其他目标。
-- `create_cmd` / `create_sub` / `close_conversation` / `listen_event` 只有 after，允许 `target="*"` 或精确 target。
-- `modify` / `cancel` 只允许注册该监听器的对话执行。
+- 事件对象内部有 canonical `target_ref`：按发起对话根表展开别名、跟随链接与 LinkDevice 后的真实目标（`("memory", 段序列)` / `("device", 挂载键, 剩余段)` / `("cid", id)` / `("listener", id)` / `("*",)`）。
+- `_match` 用 canonical 目标比较：用户态对话在 `$work.x` 上产生的事件会命中内核态安全对话注册在 `$MEM.workspaces.w0.x` 上的监听器；同一节点用别名与真实路径注册的监听器互相命中。处理器看到的 `target` 与 `target_info.ref` 仍是请求别名。
+
+### 监听注册权限
+
+- 内存目标：普通对话维持「目标所有者 = 注册者」规则（`memory_make`/`memory_delete` 看父路径所有者）；**内核态对话可以监听任意内存目标**（监督与安全需要）。
+- 设备目标：继续由设备 `authorize_listener(event_type, remainder, owner_cid)` 决定；内核态对话不自动越过设备策略。
+- `send_instruction`：普通对话只能监听发往自己的消息（`cid:<自己>`）；内核态可监听任意 cid。
+- `close_conversation`：普通对话只能监听关闭自己的事件；内核态可监听任意 cid。
+- `create_cmd` / `create_sub`：普通对话只能监听自己拥有的程序节点；内核态可监听任意程序节点。
+- `listen_event` 自身：普通对话只能使用命名条件子集；内核态可以用完整条件与 subtree/任意事件范围。
+- 条件 target 为 `subtree` 或省略 target 时可用于任意范围监听；这只对内核态开放（用户态受 preset 限制）。
+- `tier=kernel` 与 `priority>0` 只有内核态对话可注册（`listen_event` 的 before 事件再给安全监听器一次否决机会）。
+- `modify` / `cancel` 只允许注册该监听器的对话执行；modify 可改 handler_ref 与 priority，tier/event_type/target/phase 不可改。
+
+### 监听器生命周期
+
 - **监听器生命周期跟随对话、不跟随 target**：关闭对话时撤销它的全部监听；目标路径后来被 `memory_delete` 删除时监听器悬空（不删、不报错），路径重建后会重新生效。
-- 一次成功操作在 `phase=all` 下会调用处理器两次（before + after）；after 阶段返回 `replace` 被忽略。
-- 目标对话可以注册发往自己的 `send_instruction` before 监听并 `replace`，效果是静默丢弃自己的收件箱——这是能力，使用需自行注意。
-- `close_conversation` 自动撤销被关闭对话注册的全部监听。
-- `_owner_of` 只处理 memory kind；device kind 返回 None（设备授权交给 `authorize_listener`）。`split_path` 按最长挂载键匹配，权限检查不会调用设备 `resolve_path`。
+- 一次成功操作在 `phase=all` 下会调用处理器两次（before + after）；after 阶段返回决策动作被忽略。
+- 目标对话可以注册发往自己的 `send_instruction` before 监听并 `replace`，效果是静默丢弃自己的收件箱。
+- 亚对话被关闭时自动撤销其监听。
 
-### 信息设备与设备自改
+### 内核信息与控制设备（批次三）
 
-- `$MEM.conversations` 按状态分组列出存活对话（active / ready / dormant / finished 分开）；已关闭与已回收的个体不保留记录，cid 出现空洞时无法从列表区分「回收 / 关闭 / 从未分配」。
-- `$MEM.monitor` 根路径只给汇总（帧数、最近 seq、active、工具摘要、事件数）；单帧细节保留在 `frames.<seq>` 子路径（含调度队列、该轮 result/error 与事件摘要、`handler_errors`），但不写进设备自述、也不进镜像提示词——读取方式的宣传面留给后续安全批次（先保功能全面，再加限制）。
-- `$MEM.listeners` 只读列出 `listener_id / owner_cid / event_type / phase / target / handler_ref / enabled`，失败后追加 `error_count` / `last_error`；子路径 `<listener_id>` 返回单条详情；不暴露 handler 代码全文。宿主可用调试面板的 `PATCH /api/listeners/<id>` 就地启停（对话没有这条路径）。
+内核设备按用途分三类：
+
+| 类 | 设备 | 语义 |
+| --- | --- | --- |
+| 观测面（只读） | `$MEM.scheduler`、`$MEM.memory`、`$MEM.monitor` | 读运行时状态；写入拒绝 |
+| 控制面（可写） | `$MEM.conversations`、`$MEM.listeners`、`$MEM.roots` | 读实时状态；写固定字段直接改 Core 运行时对象，不在内存树生成节点 |
+| 能力自述（只读） | `$MEM.caps` | 按 cid 读对话能力摘要；用户态经保留根 `caps` 读自己 |
+| 镜像设备 | 镜像 `devices` 段挂载的设备 | 各自定义，与内核控制面分开 |
+
+控制面共同规则：
+
+- **真相在 Core 运行时对象**：写 `$MEM.conversations.<cid>.groups` 改的是 `Conversation.caps`，不写内存树；读同一路径返回实时值。这些字段不进 `persist_to`，由检查点/内核转储单独保存。
+- **写是整体替换**；字段名固定，未知字段与只读字段拒绝；结构校验在设备内完成：对话存在且未关闭、类型正确、根名/目标合法、根目标前缀无关、不占保留区。
+- **授权由镜像层策略做**：设备接口拿不到调用者身份，所以设备不判断"谁可以改"；写入在 Core 里是普通 `memory_write`，before 事件 target 是设备路径，镜像层的安全监听器可以 `allow`/`replace`（引导顺序：先注册保护监听器，再开放写入）。
+- **只有根表含 `MEM` 的内核态对话能命名这些设备**；用户态对话看不到控制面。
+- **写入不改变内存树的值域**：调用者得到普通 `Success set` 响应；after 事件最小化发布（`cid`/`listener_id`、字段、新值），不给完整对象。
+- 控制面设备的 `authorize_listener` 允许内核态对话注册监听，观测设备继续拒绝。
+
+**`$MEM.conversations`**
+
+| 路径 | 读 | 写 | 语义 |
+| --- | --- | --- | --- |
+| `$MEM.conversations` | 按状态分组的列表 + mode/groups 摘要 | — | — |
+| `$MEM.conversations.<cid>` | 详情（含 mode/groups/根名/工具数/meta 键） | — | — |
+| `...<cid>.groups` | JSON 字符串数组 | 开（v1） | 整体替换组；后续事件载荷立即反映新组 |
+| `...<cid>.roots` | JSON 对象 `{根名: {"target": "$MEM...", "core": bool}}` | 开（v1） | 整体替换"授予根"；Core 分配的工作空间根保留并标 `core: true` |
+| `...<cid>.meta` | JSON 对象（字符串→字符串） | 开（v1） | 自由元数据进 `Conversation.attrs`（与内部 `metadata` 分开） |
+| `...<cid>.meta.<key>` | 字符串 | 开（v1） | 单键写入；删除用整体替换 `.meta` |
+| `...<cid>.mode` / `.tools` | 字符串 / JSON 数组 | 只读 | 运行期改模式与工具集留后续 |
+
+`.roots` 校验：根名规则；目标以 `$MEM` 开头且非空；用户态根表不能含 `MEM`；内核态对话写 `.roots` 一律拒绝；工作空间根名不能被授予根覆盖；新目标与工作空间区域、内核设备路径不重叠（显式授予设备本身允许）、与其他存活对话的根目标前缀无关（相同目标允许共享）、不能绑定其他对话的工作空间目标。
+
+**`$MEM.listeners`**
+
+| 路径 | 读 | 写 | 语义 |
+| --- | --- | --- | --- |
+| `$MEM.listeners` / `.<id>` | 列表与详情（含 priority/tier） | — | — |
+| `...<id>.priority` | 十进制字符串 | 开（v1） | 非负整数，上限 10000；下一次派发按新优先级排序 |
+| `...<id>.enabled` | `true` / `false` | 开（v1） | 启停监听器 |
+| `...<id>.<其他字段>` | 事件类型/目标/phase/tier/handler_ref | 只读 | 改 handler_ref 要重解析代码副本，仍用 `listen_event action=modify` |
+
+**`$MEM.roots`**
+
+| 路径 | 读 | 写 | 语义 |
+| --- | --- | --- | --- |
+| `$MEM.roots` | 根注册表 JSON | 开（v1） | 整体替换 JSON 对象 `根名 -> "$MEM..."` |
+| `$MEM.roots.<name>` | 该根目标别名 | 开（v1） | 单条新增/替换；删除用整体替换 |
+
+运行期注册的根在后续创建对话的 `caps.roots` 中可按名字引用；校验与镜像 `security.roots` 共用：根名、目标前缀无关、保留区、存活对话工作空间。只有根表含 `MEM` 的内核态对话能命名。
+
+**`$MEM.caps`**（只读）：`<cid>` 给能力摘要（mode/groups/tools/roots 名字与 core 标记/workspace）；用户态对话根表自动带保留根 `caps -> $MEM.caps.<cid>`，可读自己的 mode/groups/roots 名字/tools/workspace；写入拒绝。
+
+控制面失败行为：对话/监听器不存在或已关闭 → `Error:`；字段未知或只读、JSON 形状不对、组名/根名/目标非法、priority 非非负整数或超上限、enabled 不是 true/false → `Illegal:`；被安全监听器 replace → `Interrupted:`，值不变。
+
+### 设备自改
+
 - 事件本身瞬时，不提供 `$MEM.events` 历史、不写盘。
 - `Core.emit_device_event(device_path, target, payload)` 是设备自改事件入口：只支持 `memory_write` before，source 为设备自身路径，target 必须属于 `$MEM.<device_path>`（用 `split_path` 判定，避免字符串前缀误匹配）；返回处理后的 event，设备据此决定是否执行自改。
 - 设备路径的 after 事件不由 `emit_device_event` 产生；设备可在操作成功后通过 `after_event(event_type, remainder, result)` 返回纯 payload，由 Core 统一包装成 after 事件。v1 不实现设备异步自发 after 事件。
@@ -368,7 +522,8 @@ before 语义：操作被请求，不保证到达执行组件；可被 `replace`
 - **显式节点**：内存每个节点都是 `{ "kind": "str"|"dict"|"list"|"device"|"link", "meta"?, "ctrl"?, "value" }`，无任何隐式转换（str 也必须显式包装）。`kind="device"` 是任意层级都可出现的可读性标记，实际挂载在 `devices` 段；`kind="link"` 用 `target` 声明链接（`$MEM` 地址或设备标识符），不写 `value`。
 - **para**：`ctrl.type="para"` 的 dict 节点存放模型调用参数（`model`、`temperature`、`use_tool`、`extra_body`、`reasoning_effort` 等），均以字符串存储，每次调用 API 前把数值型参数转回数值。
 - **devices**：数组，每项 `{ path, file, class, args, id? }`。`file` 是相对镜像文件的 Python 模块路径，`class` 是其中的设备类，**必须继承** `MemoryDevice`，否则加载报错；`id` 可选，覆盖缺省的设备标识符（缺省取 `path`）。这样"一个 JSON + 几个定义设备的 Python 文件"就是一个完整的系统镜像。
-- **init**：启动对话配置（`name` 默认 `"init"`，`system`/`system_ref`、`user`/`user_ref`、可选 `para_ref`）。`system_ref` 指向 `ctrl.type="settingup"` 的 LLM 程序节点，或 `ctrl.type="python"` 的 Python 程序节点（PLM 入口：0 号是 Python 对话）；`system` 字面量仍只表示 LLM 入口。入口的 para 按 `init.para_ref` → 程序节点 `value.para_ref` → 镜像顶层 `para_ref` 取，Python 入口在前两者都缺时报错（顶层 para 是 LLM 参数）；`user_ref` 指向 str 节点。只启动 0 号对话，不预置其他对话；其他对话由对话运行期自己 `create_cmd` / `create_sub` 创建。
+- **security**：可选安全段（`roots` 根注册表、`workspace_region` 工作空间区域），见[对话能力与权限](#对话能力与权限批次一)。
+- **init**：启动对话配置（`name` 默认 `"init"`，`system`/`system_ref`、`user`/`user_ref`、可选 `para_ref`）。`system_ref` 指向 `ctrl.type="settingup"` 的 LLM 程序节点，或 `ctrl.type="python"` 的 Python 程序节点（PLM 入口：0 号是 Python 对话）；`system` 字面量仍只表示 LLM 入口。入口的 para 按 `init.para_ref` → 程序节点 `value.para_ref` → 镜像顶层 `para_ref` 取，Python 入口在前两者都缺时报错（顶层 para 是 LLM 参数）；`user_ref` 指向 str 节点。只启动 0 号对话，不预置其他对话；其他对话由对话运行期自己 `create_cmd` / `create_sub` 创建。init 强制内核态：程序 `caps.mode` 声明 `user` 时装载报 `ImageError`。
 - **persist_to**：运行结束后内存写回路径（异常也写）。
 - **meta**：`version` 必须为 1；`instruction_budget` 可配核心中断预算。
 
@@ -404,7 +559,7 @@ before 语义：操作被请求，不保证到达执行组件；可被 `replace`
 
 ### 单对话检查点（调试用）
 
-`Core.save_conversation(cid, path)` / `Core.restore_conversation(path)` 保存/恢复单个 LLM 对话：序列化无损、确定性，恢复后发送给 API 的消息前缀与保存时逐字节一致（可命中厂商前缀缓存）。历史末尾是未配对的工具调用时（如等待输入响应），保存会自动截到最后一个完整交换。v1 不支持 Python 对话。
+`Core.save_conversation(cid, path)` / `Core.restore_conversation(path)` 保存/恢复单个 LLM 对话：序列化无损、确定性；检查点包含 `caps` 与 `attrs`，旧检查点恢复为内核态全能力，恢复后发送给 API 的消息前缀与保存时逐字节一致（可命中厂商前缀缓存）。历史末尾是未配对的工具调用时（如等待输入响应），保存会自动截到最后一个完整交换。v1 不支持 Python 对话。
 
 输入设备支持操作者命令 `/save`（可带路径 `/save <path>`）：在输入前截取，保存当前活跃对话的检查点后继续等待真实输入——对话感知不到该命令。恢复在 host 侧进行（`restore_conversation`），不做 AVM 内 `/load`。
 
@@ -430,8 +585,8 @@ cd web && npm run dev                    # 开发期：Vite 代理 /api 到 AVM_
 
 - **操作员对话**：面板启动时另建一条对话（`plm.operator`），使用保留魔数 cid `-1`、走正常调度；对普通对话隐藏（`$MEM.conversations` / `$MEM.scheduler` 列表过滤，`send_instruction` / `close_conversation` 与 `$conv.-1` 一律按「不存在」处理）。初始进休眠队列、不进就绪队列——只有中断能激活。它活跃就等于全局暂停（其他对话都不推进）。`POST /api/interrupt` 挂起 `operator` 中断（在下一个安全点生效；`core.run()` 已返回时不再生效），`POST /api/resume` 让它结束本轮、让出执行权。`POST /api/action` 提交一条动作，未暂停时先自动中断；未知工具名有意允许（响应里有 `known_tool` 与提示）。
 - **读取端点**：`GET /api/state`（运行状态、调度、中断、屏蔽账本）、`/api/tools`（十条指令表）、`/api/conversations/<cid>`、`/api/memory`（可带 `ref`，整树无分页）、`/api/memory/diff?from=&to=`、`/api/listeners`、`/api/devices`、`/api/events`（SSE：面板输出与调度变化的有序流，按 `seq` 增量读）。
-- **介入端点**：`POST /api/device-action`（调设备自己声明的调试动作，如给 `$inputs` 投喂一行）、`/api/memory/snapshot`、`PATCH /api/listeners/<id>`（就地启停监听器）、`POST|DELETE /api/mask/memory`、`/api/mask/device`（临时摘下一个内存节点或卸载一台设备，`DELETE` 还原；调试原语不产生事件）。
-- **界面当前接的**：三栏界面（对话列表 / 内存索引与对话·内存·设备详情 / 暂停与动作·事件流）、暂停与继续、十条指令的结构化动作表单（下拉 +「其它（手输）」+ 原始 JSON 兜底）、事件流、`$inputs` 喂输入框。内存索引照树画：链接节点一行，没有子节点可展开；挂载点那行标出设备类型（`device InputsListDevice`），点它打开设备视图，描述与动作来自 `GET /api/devices`。监听器编辑、屏蔽还原、快照与 diff 视图、设备动作全量都已有后端端点、界面未接。
+- **介入端点**：`POST /api/device-action`（调设备自己声明的调试动作，如给 `$inputs` 投喂一行）、`/api/memory/snapshot`、`PATCH /api/listeners/<id>`（就地启停监听器、改 priority/tier）、`POST|DELETE /api/mask/memory`、`/api/mask/device`（临时摘下一个内存节点或卸载一台设备，`DELETE` 还原；调试原语不产生事件）。
+- **界面当前接的**：三栏界面（对话列表 / 内存索引与对话·内存·设备详情 / 暂停与动作·事件流）；对话列表与详情带 caps 摘要（mode/groups/根名/工具集）、暂停与继续、十条指令的结构化动作表单（下拉 +「其它（手输）」+ 原始 JSON 兜底）、事件流、`$inputs` 喂输入框。内存索引照树画：链接节点一行，没有子节点可展开；挂载点那行标出设备类型（`device InputsListDevice`），点它打开设备视图，描述与动作来自 `GET /api/devices`。监听器编辑、屏蔽还原、快照与 diff 视图、设备动作全量都已有后端端点、界面未接。
 - **边界**：面板对话的消息随每次动作增长，且不能存检查点（v1 检查点不支持 Python 对话）；面板输出是容量 4000 条的有界环形缓冲，丢弃数记在状态里；`GET /api/devices` 的动作账本只留最近 50 条；阻塞读的路径末段是已知会阻塞的命名子键（当前只有 `next`，如 `$MEM.inputs.next`）时面板先标出、点击才发请求（8 秒超时）。
 
 ### 思维链内容

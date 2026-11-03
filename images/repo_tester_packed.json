@@ -94,17 +94,14 @@
     },
     "file_list": {
       "kind": "str",
-      "meta": "打包器的 user 消息：要打包的文件列表",
       "value": "pack(\"CONTEXT.md\", \"README.md\", \"AGENTS.md\", \"docs/system-image.md\", \"docs/philosophy.md\", \"docs/programming-guide.md\")"
     },
     "packed_docs": {
       "kind": "str",
-      "meta": "启动时写入：系统提示词里打包了哪些文档",
       "value": ""
     },
     "packer_report": {
       "kind": "str",
-      "meta": "启动时写入：打包器的完成报告",
       "value": ""
     }
   },

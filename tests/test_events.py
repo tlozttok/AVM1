@@ -23,7 +23,7 @@ from avm.events import EventHandlerError, EVENT_TYPES
 from avm.exceptions import VMMemoryError, MemoryKeyNotFoundError
 from avm.memory import Memory
 from avm.memory_device import MemoryDevice
-from avm.types import MetaDict, MetaList
+from avm.types import MetaDict, MetaList, StrNode
 
 
 def _seed(mem, ref, value, owner_cid=None):
@@ -41,10 +41,15 @@ def _new_root(core):
 
 
 def _python_node(code, ctrl=None):
-    c = {"type": "python"}
+    c = {"type": "handler"}
     if ctrl:
         c.update(ctrl)
     return MetaDict(data={"content": code}, ctrl=c)
+
+
+def _set_condition(core, ref, condition):
+    node = core.unwrap(ref, for_llm=False)
+    node["condition"] = StrNode(json.dumps(condition))
 
 
 def _settingup(content="sys"):
@@ -419,7 +424,7 @@ class TestAfterEvents:
         core.mem["h"] = _python_node(
             "def handle(event):\n    return {'notify': [{'cid': 1, 'content': 'created'}]}"
         )
-        core.events.register(0, "create_cmd", "*", "$MEM.h")
+        core.events.register(0, "create_cmd", "*", "$MEM.h", phase="after", kernel_mode=True)
 
         CreateInstruction("tc", 0, {"system_ref": "$MEM.s", "para_ref": "$MEM.p"}).execute(core, root)
 
@@ -440,7 +445,7 @@ class TestAfterEvents:
         core.mem["h"] = _python_node(
             "def handle(event):\n    return {'notify': [{'cid': 2, 'content': 'closed'}]}"
         )
-        core.events.register(0, "close_conversation", "*", "$MEM.h")
+        core.events.register(0, "close_conversation", "*", "$MEM.h", phase="after", kernel_mode=True)
 
         CloseInstruction("tc", 0, {"cid": close_target.cid}).execute(core, root)
 
@@ -456,14 +461,12 @@ class TestAfterEvents:
         core.mem["h"] = _python_node(
             "def handle(event):\n    return {'notify': [{'cid': 1, 'content': 'listener changed'}]}"
         )
-        core.events.register(0, "listen_event", "*", "$MEM.h")
+        core.events.register(0, "listen_event", "*", "$MEM.h", phase="after", kernel_mode=True)
         core.mem["h2"] = _python_node("def handle(event):\n    return {}")
+        _set_condition(core, "$MEM.h2", {"events": ["send_instruction"]})
 
         ListenEventInstruction("tc", 0, {
-            "action": "listen",
-            "event_type": "send_instruction",
-            "target": "cid:0",
-            "handler_ref": "$MEM.h2",
+            "action": "listen", "handler_ref": "$MEM.h2",
         }).execute(core, root)
 
         # listen_event 的 after 事件通配监听会收到通知（非自我投递）
@@ -510,7 +513,7 @@ class TestHandlerErrors:
         core.mem["p"] = _para()
         core.mem["s"] = _settingup()
         core.mem["h"] = _python_node("def handle(event):\n    raise RuntimeError('after boom')")
-        core.events.register(0, "create_cmd", "*", "$MEM.h")
+        core.events.register(0, "create_cmd", "*", "$MEM.h", phase="after", kernel_mode=True)
 
         CreateInstruction("tc", 0, {"system_ref": "$MEM.s", "para_ref": "$MEM.p"}).execute(core, root)
 
@@ -696,7 +699,7 @@ class TestNotifySelf:
         core.mem["h"] = _python_node(
             "def handle(event):\n    return {'notify': [{'cid': 0, 'content': 'self'}, {'cid': 1, 'content': 'other'}]}"
         )
-        core.events.register(0, "create_cmd", "*", "$MEM.h")
+        core.events.register(0, "create_cmd", "*", "$MEM.h", phase="after", kernel_mode=True)
 
         CreateInstruction("tc", 0, {"system_ref": "$MEM.s", "para_ref": "$MEM.p"}).execute(core, root)
 
@@ -818,7 +821,7 @@ class TestMissingCoverage:
         core.mem["h"] = _python_node(
             "def handle(event):\n    return {'notify': [{'cid': 1, 'content': 'sub created'}]}"
         )
-        core.events.register(0, "create_sub", "*", "$MEM.h")
+        core.events.register(0, "create_sub", "*", "$MEM.h", kernel_mode=True)
 
         CreateSubInstruction("tc", 0, {
             "system_ref": "$MEM.s",
@@ -875,7 +878,7 @@ class TestMissingCoverage:
         MemoryDeleteInstruction("tc", 0, {"ref": "$MEM.box.msg"}).execute(core, root)
         after = [e for e in core._turn_events if e["event_type"] == "memory_delete" and e["phase"] == "after"]
         assert len(after) == 1
-        assert after[0]["source"] == {"kind": "memory"}
+        assert {k: v for k, v in after[0]["source"].items() if k != "conversation"} == {"kind": "memory"}
         payload = json.loads(sink.user_batch.user_contents[0])
         assert payload["deleted_type"] == "str" and payload["ref"] == "$MEM.box.msg"
 
@@ -1009,7 +1012,7 @@ class TestMemoryAfterEvents:
         after = [e for e in core._turn_events if e["phase"] == "after"]
         types = [e["event_type"] for e in after]
         assert types == ["memory_read", "memory_write", "memory_make", "edit_metadata"]
-        assert all(e["source"] == {"kind": "memory"} for e in after)
+        assert all({k: v for k, v in e["source"].items() if k != "conversation"} == {"kind": "memory"} for e in after)
 
         payloads = [json.loads(c) for c in sink.user_batch.user_contents]
         assert len(payloads) == 4
@@ -1064,7 +1067,7 @@ class TestDeviceAfterEvents:
         after = [e for e in core._turn_events if e["phase"] == "after" and e["event_type"] == "memory_read"]
         assert len(after) == 1
         ev = after[0]
-        assert ev["source"] == {"kind": "device", "path": "$MEM.box.dev"}
+        assert ev["source"]["kind"] == "device" and ev["source"]["path"] == "$MEM.box.dev"
         payload = json.loads(sink.user_batch.user_contents[0])
         assert payload["result"] == "device-result"
         assert payload["ref"] == "$MEM.box.dev"
@@ -1148,13 +1151,19 @@ class TestPhaseMatching:
         assert targets[1].user_batch.user_contents == ["a"]
         assert targets[2].user_batch.user_contents == ["before", "after"]
 
-    def test_after_only_type_rejects_before(self):
+    def test_lifecycle_before_is_interceptable(self):
+        """批次二：create_cmd 也有 before 事件，安全监听器可以拦截。"""
         core = Core()
-        _new_root(core)
-        core.mem["h"] = _python_node("def handle(event):\n    return {}")
-        from avm.exceptions import IllegalOperationError
-        with pytest.raises(IllegalOperationError, match="只有 after"):
-            core.events.register(0, "create_cmd", "*", "$MEM.h", phase="before")
+        root = _new_root(core)
+        core.mem["p"] = _para()
+        core.mem["s"] = _settingup()
+        core.mem["h"] = _python_node(
+            "def handle(event):\n    return {'action': 'replace', 'response': 'no create'}"
+        )
+        core.events.register(0, "create_cmd", "*", "$MEM.h", phase="before", kernel_mode=True)
+        CreateInstruction("tc", 0, {"system_ref": "$MEM.s", "para_ref": "$MEM.p"}).execute(core, root)
+        assert root.user_batch.tool_responses[-1].content == "Interrupted: no create"
+        assert len(core._conv_by_cid) == 1, "被拦截后不应创建子对话"
 
 
 class TestLifecycleAfterSourceCore:
@@ -1168,13 +1177,13 @@ class TestLifecycleAfterSourceCore:
         core.mem["h"] = _python_node(
             "def handle(event):\n    return {'notify': [{'cid': 1, 'content': json.dumps(event['payload'], ensure_ascii=False)}]}"
         )
-        core.events.register(0, "create_cmd", "*", "$MEM.h", phase="after")
+        core.events.register(0, "create_cmd", "*", "$MEM.h", phase="after", kernel_mode=True)
 
         CreateInstruction("tc", 0, {"system_ref": "$MEM.s", "para_ref": "$MEM.p"}).execute(core, root)
 
         after = [e for e in core._turn_events if e["event_type"] == "create_cmd" and e["phase"] == "after"]
         assert len(after) == 1
-        assert after[0]["source"] == {"kind": "core"}
+        assert {k: v for k, v in after[0]["source"].items() if k != "conversation"} == {"kind": "core"}
         assert json.loads(sink.user_batch.user_contents[0]) == {"cid": 2, "actor_cid": 0}
 
     def test_send_instruction_after_only_for_delivered(self):
@@ -1195,7 +1204,7 @@ class TestLifecycleAfterSourceCore:
 
         after = [e for e in core._turn_events if e["event_type"] == "send_instruction" and e["phase"] == "after"]
         assert len(after) == 1
-        assert after[0]["source"] == {"kind": "core"}
+        assert {k: v for k, v in after[0]["source"].items() if k != "conversation"} == {"kind": "core"}
         assert after[0]["target"] == "cid:1"
         assert json.loads(sink.user_batch.user_contents[0]) == {"cid": 1, "content": "hi", "actor_cid": 0}
 
@@ -1237,7 +1246,7 @@ class TestNewSourceSelfNotify:
         core.mem["h"] = _python_node(
             "def handle(event):\n    return {'notify': [{'cid': 0, 'content': 'self'}, {'cid': 1, 'content': 'other'}]}"
         )
-        core.events.register(0, "create_cmd", "*", "$MEM.h", phase="after")
+        core.events.register(0, "create_cmd", "*", "$MEM.h", phase="after", kernel_mode=True)
 
         CreateInstruction("tc", 0, {"system_ref": "$MEM.s", "para_ref": "$MEM.p"}).execute(core, root)
 
@@ -1305,30 +1314,24 @@ class TestEventContractFixes20261024:
         root = _new_root(core)
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
         _seed(core.mem, "$MEM.box.x", "v", owner_cid=0)
-        core.mem["h"] = _python_node("def handle(e):\n    return {}")
-        ListenEventInstruction("l", 0, {
-            "action": "listen", "event_type": "memory_read", "target": "*",
-            "handler_ref": "$MEM.h",
-        }).execute(core, root)
-        assert root.user_batch.tool_responses[-1].content.startswith("Illegal:")
-        root.user_batch.clear()
-        ListenEventInstruction("l2", 0, {
-            "action": "listen", "event_type": "create_cmd", "target": "*",
-            "handler_ref": "$MEM.h", "phase": "before",
-        }).execute(core, root)
-        assert root.user_batch.tool_responses[-1].content.startswith("Illegal:")
-
     def test_listen_permission_errors_stay_error(self):
+        """用户态对话只能用命名条件子集；自定义 condition 被拒绝。"""
+        from avm.capabilities import ALL_TOOL_NAMES, Capability
+
         core = Core()
         root = _new_root(core)
         core.mem.make("$MEM", "otherbox", "dict", owner_cid=1)
         _seed(core.mem, "$MEM.otherbox.y", "v", owner_cid=1)
-        core.mem["h"] = _python_node("def handle(e):\n    return {}")
-        ListenEventInstruction("l", 0, {
-            "action": "listen", "event_type": "memory_read", "target": "$MEM.otherbox.y",
-            "handler_ref": "$MEM.h",
+        h = _python_node("def handle(e):\n    return {}")
+        h["condition"] = StrNode('{"events": ["memory_read"]}')
+        core.mem["h"] = h
+        root.caps = Capability(mode="user", roots={"o": ("otherbox",), "h": ("h",)},
+                               tools=ALL_TOOL_NAMES)
+        ListenEventInstruction("l", root.cid, {
+            "action": "listen", "handler_ref": "$h",
         }).execute(core, root)
-        assert root.user_batch.tool_responses[-1].content.startswith("Error:")
+        assert root.user_batch.tool_responses[-1].content.startswith(("Error:", "Illegal:"))
+        assert core.events.listeners == []
 
     def test_listener_error_counters_visible(self):
         """B1：监听器失败后，$MEM.listeners 能自查。"""
@@ -1368,9 +1371,11 @@ class TestEventContractFixes20261024:
         core.mem.make("$MEM", "box", "dict", owner_cid=0)
         _seed(core.mem, "$MEM.box.x", "v", owner_cid=0)
         core.mem["h"] = _python_node("def handle(e):\n    return {}")
+        _set_condition(core, "$MEM.h",
+                       {"events": ["memory_read"],
+                        "target": {"kind": "exact", "ref": "$MEM.box.x"}})
         ListenEventInstruction("l", 0, {
-            "action": "listen", "event_type": "memory_read",
-            "target": "$MEM.box.x", "handler_ref": "$MEM.h",
+            "action": "listen", "handler_ref": "$MEM.h",
         }).execute(core, root)
         lid = core.events.listeners[0]["listener_id"]
         root.user_batch.clear()
@@ -1400,7 +1405,7 @@ class TestEventContractFixes20261024:
         }).execute(core, parent)
         sub = [c for c in core._conv_by_cid.values() if c.is_sub][0]
         core.mem["h"] = _python_node("def handle(e):\n    return {}")
-        core.events.register(sub.cid, "close_conversation", "*", "$MEM.h", phase="after")
+        core.events.register(sub.cid, "close_conversation", f"cid:{sub.cid}", "$MEM.h", phase="after")
         assert any(l["owner_cid"] == sub.cid for l in core.events.listeners)
         CloseInstruction("cl", parent.cid, {"cid": sub.cid}).execute(core, parent)
         assert not any(l["owner_cid"] == sub.cid for l in core.events.listeners)

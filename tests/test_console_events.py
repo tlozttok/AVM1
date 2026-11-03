@@ -22,7 +22,7 @@ PASS_THROUGH = "def handle(event):\n    return {}\n"
 
 def make_core(handler_code=INTERCEPT):
     core = Core()
-    core.mem["h"] = MetaDict(data={"content": handler_code}, ctrl={"type": "python"})
+    core.mem["h"] = MetaDict(data={"content": handler_code}, ctrl={"type": "handler"})
     core.mem["own"] = MetaDict(data={}, ctrl={"owner": "1"})
     core.mem["own"]["child"] = ""
     return core
@@ -130,11 +130,19 @@ class TestUpdate:
         with pytest.raises(ValueError, match="无主路径"):
             core.events.update(listener_id, target="$MEM.free")
 
-    def test_update_rejects_before_phase_for_after_only_event(self):
+    def test_update_accepts_before_phase_for_lifecycle_event(self):
+        """批次二：生命周期事件也有 before；target 按生命周期规则改成 cid:1。"""
         core = make_core()
         listener_id = add_listener(core)
-        with pytest.raises(ValueError):
-            core.events.update(listener_id, event_type="close_conversation", phase="before")
+        core.events.update(listener_id, event_type="close_conversation",
+                           target="cid:1", phase="before")
+        assert core.events.listeners[0]["phase"] == "before"
+
+    def test_update_rejects_wildcard_for_non_lifecycle_event(self):
+        core = make_core()
+        listener_id = add_listener(core)
+        with pytest.raises(ValueError, match="不支持 \*"):
+            core.events.update(listener_id, target="*")
 
     def test_update_reresolves_handler_code(self):
         """处理器代码是注册时抄下的副本；改内存节点不会自动生效，update 会重解析。"""

@@ -11,6 +11,33 @@
 
 对话由 `system_ref` 指向的程序节点（或入口对话的字面量）和一条用户消息启动。`create_cmd` / `create_sub` 的 `system_ref` 必须指向 `ctrl.type="settingup"` 或 `"python"` 的程序节点，指向 str 节点或无类型节点会报错。程序文本在内存中，对话可以读取、检查、修改其他节点——AVM 的元编程基础在这里。
 
+## 声明对话能力（内核态 / 用户态）
+
+程序节点用数据 `value.caps`（一个 dict 数据节点）声明由它创建的对话的能力：
+
+```json
+{"kind": "dict", "ctrl": {"type": "settingup"},
+ "value": {"content": {"kind": "str", "value": "..."},
+           "caps": {"kind": "dict", "value": {
+             "mode": {"kind": "str", "value": "user"},
+             "groups": {"kind": "list", "value": [{"kind": "str", "value": "worker"}]},
+             "roots": {"kind": "list", "value": [{"kind": "str", "value": "lib"}]},
+             "tools": {"kind": "list", "value": [{"kind": "str", "value": "memory_read"}]},
+             "workspace": {"kind": "str", "value": "work"}}}}}
+```
+
+`ctrl.caps` 不再支持；能力属于数据，`ctrl` 只描述节点类型与数据组织。
+
+- `mode` 缺省继承父对话。内核态父对话可以创建内核态或用户态子对话；用户态父对话只能创建用户态子对话，亚对话不能跨模式。
+- `roots` 是镜像 `security.roots` 注册表里的名字列表，只由内核态父对话授予；用户态对话拿到的是根名到真实子树/设备的绑定，自己看不到真实路径。
+- `tools` 缺省继承父工具集；显式声明时只能是父工具集的子集。模型看到的工具表、PLM 注入的函数与 Core 实际接受三处一致。
+- `workspace` 是用户态子对话的工作空间根名（缺省 `work`）。工作空间由 Core 在 `security.workspace_region` 里分配，与其他可授予根前缀无关，是私有区域；区域内禁止链接与设备挂载。
+- 没有 `caps` 的程序继承父能力（旧镜像行为不变）。
+
+写用户态程序时：提示词只使用 `$work` 与授予根名（例如 `$lib`），不要写 `$MEM`；工具集按需要声明得尽量小；需要长期个体时由内核态对话创建（用户态是否能用 `create_cmd` 取决于工具集）。写内核态程序时：它持有 `$MEM` 与默认全部工具，负责建立权限层、分配工作空间、注册程序。
+
+本批只有创建时的能力声明；运行期改根、改组、改工具集（对话设备控制面）与事件监听器的权限策略（载荷分级、处理器分级、priority/allow）在后续批次。
+
 ## 一个对话做一件小事
 
 每个对话只承担一个微小、可管理、可追溯的任务。从概率模型角度：模型倾向认可自己刚产出的内容（否则不会写），而另一个模型看到旧内容倾向质疑（否则不会被派来）。小的任务边界是隔离这两类偏差的物理手段；对话之间的结论靠显式消息传递，不靠共享上下文。
@@ -35,7 +62,7 @@
 
 ## 用 listen_event 表达等待
 
-- 监听器是 `ctrl.type="python"` 节点中的 `content`，每次事件在全新受限沙箱中执行，定义 `handle(event)` 返回 dict。
+- 监听器是 `ctrl.type="handler"` 节点中的 `content`，每次事件在全新受限沙箱中执行，定义 `handle(event)` 返回 dict。
 - 内存 before 事件需要路径 owner 才能注册；`send_instruction` 只能监听发往自己的消息；after 事件可通配监听。
 - 处理器可返回 `action="replace"` 拦截 before 事件，或改写允许的 payload 字段；返回 `notify` 可让 Core 向指定对话投递消息并唤醒它。
 - `notify` 不允许投递给当前对话（禁止自我投递）。

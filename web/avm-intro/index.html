@@ -1,0 +1,1010 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="AVM：从修改外壳到统一基底——一份关于上下文循环、运行外壳与中立底层约定的交互式介绍。">
+  <title>AVM：从修改外壳到统一基底</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 fill=%22%23121210%22/%3E%3Cpath d=%22M7 22 13 8h2l6 14h-2.4l-1.5-3.6h-6.2L10.4 22H7Zm4.7-5.5h4.6l-2.2-5.4-2.4 5.4Z%22 fill=%22%23e86a4d%22/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body data-chrome="dark">
+  <a class="skip-link" href="#main">跳到正文</a>
+
+  <header class="topbar" aria-label="站点导航">
+    <button class="brand" type="button" data-go="0" aria-label="回到封面">
+      <span class="brand__mark">AVM</span>
+      <span class="brand__sub">多对话运行基底</span>
+    </button>
+
+    <nav class="chapter-nav" aria-label="章节">
+      <button type="button" class="chapter-nav__item" data-go="1"><span>01</span>起点</button>
+      <button type="button" class="chapter-nav__item" data-go="2"><span>02</span>路径</button>
+      <button type="button" class="chapter-nav__item" data-go="3"><span>03</span>重构</button>
+      <button type="button" class="chapter-nav__item" data-go="4"><span>04</span>设计</button>
+      <button type="button" class="chapter-nav__item" data-go="5"><span>05</span>回纳</button>
+      <button type="button" class="chapter-nav__item" data-go="6"><span>06</span>标准</button>
+    </nav>
+
+    <div class="topbar__actions">
+      <button class="icon-button" type="button" id="fullscreenButton" aria-label="进入全屏" title="全屏">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+          <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>
+        </svg>
+      </button>
+      <button class="menu-button" type="button" id="menuButton" aria-controls="menuDialog" aria-expanded="false">
+        <span>目录</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+          <path d="M4 7h16M4 12h16M4 17h16"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <main id="main" class="deck" tabindex="-1" aria-live="off">
+    <!-- 00 封面 -->
+    <section class="scene scene--dark scene--cover is-active" data-scene="0" data-title="封面" aria-labelledby="cover-title">
+      <div class="scene__inner">
+        <div class="cover">
+          <div class="cover__main">
+            <p class="cover__eyebrow" data-reveal style="--i:0">
+              <span class="eyebrow-line"></span>
+              AVM / 设计介绍
+            </p>
+            <h1 class="cover__title" id="cover-title">
+              <span class="mask-line" style="--i:1"><span>从修改外壳</span></span>
+              <span class="mask-line" style="--i:2"><span>到<em>统一基底</em></span></span>
+            </h1>
+            <p class="cover__en" data-reveal style="--i:3">FROM PATCHING THE HARNESS TO A COMMON SUBSTRATE</p>
+            <p class="cover__lead" data-reveal style="--i:4">
+              一份关于上下文循环、运行外壳与共同底层展开的多媒体介绍。
+            </p>
+            <div class="cover__actions" data-reveal style="--i:5">
+              <button class="button button--accent" type="button" data-go="1">
+                开始阅读
+                <span aria-hidden="true">→</span>
+              </button>
+              <span class="cover__meta">6 节 · 交互图解 · 支持方向键</span>
+            </div>
+          </div>
+
+          <nav class="cover-toc" aria-label="章节目录" data-reveal style="--i:2">
+            <div class="cover-toc__head">
+              <span>目录 / CONTENTS</span>
+              <span>06 CHAPTERS</span>
+            </div>
+            <button class="cover-toc__item" type="button" data-go="1">
+              <span class="cover-toc__num">01</span>
+              <span class="cover-toc__copy"><strong>一个常见的起点</strong><small>不断拼接的上下文循环</small></span>
+              <span class="cover-toc__arrow" aria-hidden="true">↗</span>
+            </button>
+            <button class="cover-toc__item" type="button" data-go="2">
+              <span class="cover-toc__num">02</span>
+              <span class="cover-toc__copy"><strong>分头修改外壳</strong><small>几条有代表性的路径</small></span>
+              <span class="cover-toc__arrow" aria-hidden="true">↗</span>
+            </button>
+            <button class="cover-toc__item" type="button" data-go="3">
+              <span class="cover-toc__num">03</span>
+              <span class="cover-toc__copy"><strong>为什么想到重构</strong><small>当各自的补丁难以拼装</small></span>
+              <span class="cover-toc__arrow" aria-hidden="true">↗</span>
+            </button>
+            <button class="cover-toc__item" type="button" data-go="4">
+              <span class="cover-toc__num">04</span>
+              <span class="cover-toc__copy"><strong>部分设计思路</strong><small>提供一种中立的底层约定</small></span>
+              <span class="cover-toc__arrow" aria-hidden="true">↗</span>
+            </button>
+            <button class="cover-toc__item" type="button" data-go="5">
+              <span class="cover-toc__num">05</span>
+              <span class="cover-toc__copy"><strong>容纳不同方案</strong><small>统一基底上的自然表达</small></span>
+              <span class="cover-toc__arrow" aria-hidden="true">↗</span>
+            </button>
+            <button class="cover-toc__item" type="button" data-go="6">
+              <span class="cover-toc__num">06</span>
+              <span class="cover-toc__copy"><strong>为什么值得统一标准</strong><small>封装边界与未知的涌现</small></span>
+              <span class="cover-toc__arrow" aria-hidden="true">↗</span>
+            </button>
+            <div class="cover-toc__foot">
+              <span>内容依据 AVM 项目文案</span>
+              <span class="cover-toc__rule" aria-hidden="true"></span>
+            </div>
+          </nav>
+        </div>
+      </div>
+      <div class="cover__decor" aria-hidden="true">
+        <span class="cover__decor-label">CONTEXT · HARNESS · MEMORY · EVENT · SUBSTRATE</span>
+        <span class="cover__decor-index">00</span>
+      </div>
+    </section>
+
+    <!-- 01 起点 -->
+    <section class="scene scene--paper" data-scene="1" data-title="起点" aria-labelledby="ch1-title">
+      <div class="scene__inner">
+        <header class="chapter-head">
+          <div class="chapter-head__num" data-reveal style="--i:0">01</div>
+          <div class="chapter-head__title">
+            <p class="chapter-eyebrow" data-reveal style="--i:0">起点 / STARTING POINT</p>
+            <h2 id="ch1-title" data-reveal style="--i:1">一个常见的起点：<br><span class="title-accent">不断拼接的上下文循环</span></h2>
+          </div>
+          <p class="chapter-lead" data-reveal style="--i:2">
+            今天接触到的大部分大语言模型应用，底层往往都跑着一个相似的循环。
+          </p>
+        </header>
+
+        <div class="chapter-rule" aria-hidden="true"></div>
+
+        <div class="ch1-layout">
+          <figure class="media media--loop" data-reveal style="--i:3">
+            <div class="media__head">
+              <span>图 01 / 上下文循环</span>
+              <span>ONE TURN <span class="media__hint">/ 左右滑动 ↔</span></span>
+            </div>
+            <div class="media__canvas">
+              <svg class="diagram diagram--loop" viewBox="0 0 620 420" role="img" aria-labelledby="loop-title loop-desc">
+                <title id="loop-title">上下文循环示意</title>
+                <desc id="loop-desc">上下文与输入进入模型得到输出，输出被追加到上下文末尾，成为下一轮输入的一部分。</desc>
+                <defs>
+                  <marker id="loop-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                    <path d="M0 0 L8 4 L0 8 Z" class="marker-fill"></path>
+                  </marker>
+                  <marker id="loop-arrow-accent" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                    <path d="M0 0 L8 4 L0 8 Z" class="marker-fill marker-fill--accent"></path>
+                  </marker>
+                </defs>
+
+                <text x="26" y="28" class="svg-micro">每一轮循环 / ONE CYCLE</text>
+                <text x="594" y="28" text-anchor="end" class="svg-micro">输入 → 输出 → 追加</text>
+
+                <rect x="26" y="58" width="186" height="250" rx="3" class="svg-panel"></rect>
+                <text x="46" y="88" class="svg-label">上下文</text>
+                <text x="46" y="108" class="svg-small">持续累积的历史</text>
+                <rect x="46" y="126" width="132" height="17" class="history-bar history-bar--old"></rect>
+                <rect x="46" y="152" width="146" height="17" class="history-bar history-bar--old"></rect>
+                <rect x="46" y="178" width="112" height="17" class="history-bar"></rect>
+                <rect x="46" y="204" width="154" height="17" class="history-bar"></rect>
+                <rect x="46" y="230" width="126" height="17" class="history-bar"></rect>
+                <rect x="46" y="256" width="146" height="17" class="history-bar history-bar--current"></rect>
+                <text x="46" y="292" class="svg-note">越早的设定，越容易被长历史冲淡</text>
+
+                <rect x="262" y="132" width="148" height="102" rx="3" class="svg-panel svg-panel--solid"></rect>
+                <text x="336" y="168" text-anchor="middle" class="svg-label svg-inverse">模型</text>
+                <text x="336" y="190" text-anchor="middle" class="svg-note svg-inverse-soft">上下文 + 本次输入</text>
+                <text x="336" y="212" text-anchor="middle" class="svg-micro svg-inverse-soft">MODEL / LLM</text>
+
+                <rect x="466" y="132" width="120" height="102" rx="3" class="svg-panel"></rect>
+                <text x="526" y="168" text-anchor="middle" class="svg-label">输出</text>
+                <text x="526" y="190" text-anchor="middle" class="svg-note">本轮结果</text>
+
+                <path d="M212 183 H252" class="svg-wire" marker-end="url(#loop-arrow)"></path>
+                <path d="M410 183 H456" class="svg-wire" marker-end="url(#loop-arrow)"></path>
+                <text x="232" y="168" text-anchor="middle" class="svg-micro">送入</text>
+                <text x="438" y="168" text-anchor="middle" class="svg-micro">得到</text>
+
+                <path d="M526 234 V322 Q526 336 512 336 H134 Q119 336 119 322 V310" class="svg-wire svg-wire--accent draw-line" pathLength="1" marker-end="url(#loop-arrow-accent)"></path>
+                <path d="M526 234 V322 Q526 336 512 336 H134 Q119 336 119 322 V310" class="svg-pulse-line"></path>
+                <text x="335" y="369" text-anchor="middle" class="svg-small svg-accent-text">将本轮输入与输出，拼接到上下文末尾</text>
+                <text x="335" y="390" text-anchor="middle" class="svg-micro">下一轮计算，从更长的上下文开始</text>
+
+              </svg>
+            </div>
+            <figcaption>
+              在单次对话中，这种循环非常自然；当系统变复杂，它的结构限制会从不同角度显现。
+            </figcaption>
+          </figure>
+
+          <div class="ch1-copy">
+            <div data-reveal style="--i:4">
+              <p class="body-text">
+                将“上下文”与“输入”送入模型，得到“输出”；再将这次的输入与输出拼接到上下文末尾，作为下一次计算的上下文。
+              </p>
+              <p class="body-text">
+                一般的软件会由程序主动维护运行环境；在这个循环里，环境主要靠简单的“拼接”不断向后增长。单次对话或简单任务中，这种方式非常自然，但更复杂的系统会从不同角度撞上这个结构本身的限制。
+              </p>
+            </div>
+
+            <div class="issue-block" data-reveal style="--i:5">
+              <div class="section-label">几个常见的例子</div>
+              <article class="issue">
+                <span class="issue__num">01</span>
+                <div>
+                  <h3>信息的淤积与稀释</h3>
+                  <p>随着工具返回和中间步骤不断拼接，早期的设定很容易被长历史冲淡；模型不得不花费大量精力去应付陌生的工具返回。</p>
+                </div>
+              </article>
+              <article class="issue">
+                <span class="issue__num">02</span>
+                <div>
+                  <h3>同一上下文里的视角惯性</h3>
+                  <p>在连续上下文中，模型在概率上倾向于顺着自己此前的结论往下走；让它在同一个窗口里客观地挑出自己的毛病，并不容易。</p>
+                </div>
+              </article>
+              <article class="issue">
+                <span class="issue__num">03</span>
+                <div>
+                  <h3>多对话直接交谈时的同化</h3>
+                  <p>当几个对话直接互相聊天配合时，它们常常会在几轮交互后互相附和，慢慢变成同一种声音。</p>
+                </div>
+              </article>
+            </div>
+          </div>
+        </div>
+
+        <p class="chapter-footnote" data-reveal style="--i:6">
+          实际开发中遇到的麻烦远不止这些。正是为了应对各自场景下的具体问题，许多人开始动手修改模型外围的运行外壳（Harness）。
+        </p>
+      </div>
+    </section>
+
+    <!-- 02 分岔 -->
+    <section class="scene scene--paper" data-scene="2" data-title="路径" aria-labelledby="ch2-title">
+      <div class="scene__inner">
+        <header class="chapter-head">
+          <div class="chapter-head__num" data-reveal style="--i:0">02</div>
+          <div class="chapter-head__title">
+            <p class="chapter-eyebrow" data-reveal style="--i:0">路径 / APPROACHES</p>
+            <h2 id="ch2-title" data-reveal style="--i:1">分头修改外壳：<br><span class="title-accent">几条有代表性的路径</span></h2>
+          </div>
+          <p class="chapter-lead" data-reveal style="--i:2">
+            每个人的切入点不同，改出来的形态也千差万别。以下四个方向，以各自的合理性开始，也都遇到了新的问题。
+          </p>
+        </header>
+
+        <div class="chapter-rule" aria-hidden="true"></div>
+
+        <div class="fork-grid">
+          <article class="fork" data-reveal style="--i:3">
+            <div class="fork__head">
+              <span class="fork__letter">A</span>
+              <span class="fork__tag">拆分对话 / SPLIT</span>
+            </div>
+            <div class="fork__figure" aria-hidden="true">
+              <svg viewBox="0 0 280 112">
+                <defs>
+                  <marker id="arrow-2a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                    <path d="M0 0 L8 4 L0 8 Z" class="marker-fill"></path>
+                  </marker>
+                  <marker id="arrow-2a-accent" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                    <path d="M0 0 L8 4 L0 8 Z" class="marker-fill marker-fill--accent"></path>
+                  </marker>
+                </defs>
+                <rect x="104" y="8" width="72" height="26" rx="2" class="svg-panel"></rect>
+                <text x="140" y="25" text-anchor="middle" class="svg-mini-label">主对话</text>
+                <path d="M124 34 V54 H62 V66" class="svg-mini-wire" marker-end="url(#arrow-2a)"></path>
+                <path d="M156 34 V54 H218 V66" class="svg-mini-wire" marker-end="url(#arrow-2a)"></path>
+                <rect x="22" y="70" width="80" height="30" rx="2" class="svg-panel"></rect>
+                <text x="62" y="89" text-anchor="middle" class="svg-mini-label">新对话</text>
+                <rect x="178" y="70" width="80" height="30" rx="2" class="svg-panel svg-panel--accent"></rect>
+                <text x="218" y="89" text-anchor="middle" class="svg-mini-label svg-accent-text">新对话</text>
+                <path d="M238 100 H260" class="svg-mini-wire svg-mini-wire--dashed" marker-end="url(#arrow-2a-accent)"></path>
+                <text x="266" y="92" class="svg-mini-note">独立？</text>
+              </svg>
+            </div>
+            <h3>从“拆分对话”开始</h3>
+            <p>遇到独立步骤或需要挑刺审查时，另外拉起一个新的对话窗口。新上下文没有历史包袱，看问题往往更挑剔。</p>
+            <div class="fork__friction">
+              <span class="friction-label">新的纠结</span>
+              <p>如果新窗口完全听命于主窗口、干完活必须汇报，主窗口的思路和偏见仍会通过提问传下去；主窗口作为汇总点，又变成新的瓶颈。</p>
+            </div>
+            <p class="fork__aside">于是开始考虑：除了上下级委派，是否还需要真正平起平坐、各自独立的对话关系。</p>
+          </article>
+
+          <article class="fork" data-reveal style="--i:4">
+            <div class="fork__head">
+              <span class="fork__letter">B</span>
+              <span class="fork__tag">共享状态 / SHARE</span>
+            </div>
+            <div class="fork__figure" aria-hidden="true">
+              <svg viewBox="0 0 280 112">
+                <defs>
+                  <marker id="arrow-2b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M0 0 L8 4 L0 8 Z" class="marker-fill"></path>
+                  </marker>
+                </defs>
+                <rect x="86" y="10" width="108" height="68" rx="2" class="svg-panel"></rect>
+                <path d="M100 26 H180 M100 42 H180 M100 58 H180" class="svg-mini-wire"></path>
+                <path d="M122 10 V78 M158 10 V78" class="svg-mini-wire"></path>
+                <rect x="122" y="26" width="36" height="16" class="svg-cell--accent"></rect>
+                <circle cx="40" cy="92" r="10" class="svg-node"></circle>
+                <circle cx="140" cy="96" r="10" class="svg-node"></circle>
+                <circle cx="240" cy="92" r="10" class="svg-node"></circle>
+                <path d="M48 86 L78 72 M132 88 L120 78 M232 86 L202 72" class="svg-mini-wire" marker-start="url(#arrow-2b)"></path>
+                <text x="140" y="104" text-anchor="middle" class="svg-mini-note">公共区域 / 共享文件树</text>
+              </svg>
+            </div>
+            <h3>从“共享外部状态”切入</h3>
+            <p>引入类似“公共公告板”或“共享文件树”的设计：大家不直接闲聊，而是读写同一片公共区域的数据，避免回音壁，也为主窗口减负。</p>
+            <div class="fork__friction">
+              <span class="friction-label">新的纠结</span>
+              <p>静态的公告板自己不会说话：某块数据更新后，怎么通知下一个该干活的对话？某个对话因为幻觉写坏了公共格式，怎么在落盘前把它拦住？</p>
+            </div>
+            <p class="fork__aside">于是又在公告板外围加上轮询、通知和校验逻辑。</p>
+          </article>
+
+          <article class="fork" data-reveal style="--i:5">
+            <div class="fork__head">
+              <span class="fork__letter">C</span>
+              <span class="fork__tag">确定性 / GUARD</span>
+            </div>
+            <div class="fork__figure" aria-hidden="true">
+              <svg viewBox="0 0 280 112">
+                <defs>
+                  <marker id="arrow-2c" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                    <path d="M0 0 L8 4 L0 8 Z" class="marker-fill"></path>
+                  </marker>
+                </defs>
+                <rect x="20" y="24" width="92" height="62" rx="2" class="svg-panel"></rect>
+                <text x="66" y="50" text-anchor="middle" class="svg-mini-label">传统代码</text>
+                <text x="66" y="68" text-anchor="middle" class="svg-mini-note">状态机 · 钩子</text>
+                <rect x="168" y="24" width="92" height="62" rx="2" class="svg-panel"></rect>
+                <text x="214" y="50" text-anchor="middle" class="svg-mini-label">模型</text>
+                <text x="214" y="68" text-anchor="middle" class="svg-mini-note">提示词</text>
+                <path d="M120 44 H158" class="svg-mini-wire" marker-end="url(#arrow-2c)"></path>
+                <path d="M158 68 H120" class="svg-mini-wire svg-mini-wire--dashed" marker-end="url(#arrow-2c)"></path>
+                <path d="M140 14 V96" class="svg-mini-divider"></path>
+                <text x="140" y="108" text-anchor="middle" class="svg-mini-note">两套语言 / 胶水层</text>
+              </svg>
+            </div>
+            <h3>用传统代码守住确定性</h3>
+            <p>在外围写大量传统代码、状态机和拦截钩子，只在需要理解与判断的地方调用模型，兜住算术、查表、状态流转和系统的硬性边界。</p>
+            <div class="fork__friction">
+              <span class="friction-label">新的纠结</span>
+              <p>系统往往分成两套不太相容的语言：外部框架里的控制代码，与模型里的提示词。代码把模型当函数调，模型把代码当插件调，胶水越写越厚。</p>
+            </div>
+            <p class="fork__aside">底线被兜住了，但系统内的两种语言仍在彼此翻译。</p>
+          </article>
+
+          <article class="fork" data-reveal style="--i:6">
+            <div class="fork__head">
+              <span class="fork__letter">D</span>
+              <span class="fork__tag">元编程 / META</span>
+            </div>
+            <div class="fork__figure" aria-hidden="true">
+              <svg viewBox="0 0 280 112">
+                <defs>
+                  <marker id="arrow-2d" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M0 0 L8 4 L0 8 Z" class="marker-fill"></path>
+                  </marker>
+                </defs>
+                <rect x="26" y="32" width="76" height="48" rx="2" class="svg-panel svg-panel--accent"></rect>
+                <text x="64" y="55" text-anchor="middle" class="svg-mini-label">观察 AI</text>
+                <text x="64" y="70" text-anchor="middle" class="svg-mini-note">修改提示词</text>
+                <rect x="178" y="32" width="76" height="48" rx="2" class="svg-panel"></rect>
+                <text x="216" y="55" text-anchor="middle" class="svg-mini-label">目标 AI</text>
+                <text x="216" y="70" text-anchor="middle" class="svg-mini-note">运行中</text>
+                <path d="M106 48 H168" class="svg-mini-wire" marker-end="url(#arrow-2d)"></path>
+                <path d="M168 68 H106" class="svg-mini-wire svg-mini-wire--dashed" marker-end="url(#arrow-2d)"></path>
+                <path d="M64 82 V100 M216 82 V100" class="svg-mini-wire"></path>
+                <rect x="88" y="96" width="104" height="10" rx="1" class="svg-history-line"></rect>
+                <text x="140" y="106" text-anchor="middle" class="svg-mini-note">静态配置散落工程目录</text>
+              </svg>
+            </div>
+            <h3>让 AI 优化 AI</h3>
+            <p>让一个专门的 AI 观察另一个 AI 的表现，帮它修改提示词或调整流程，尝试把提示词和流程的优化也交给模型。</p>
+            <div class="fork__friction">
+              <span class="friction-label">新的纠结</span>
+              <p>同一个对话“边跑边改自己”，几次修改后容易偏离初衷；换另一个独立对话来改，提示词和代码又作为静态配置散落在工程目录，缺少统一、不越界的读写入口。</p>
+            </div>
+            <p class="fork__aside">问题落在：运行中的 AI 如何直接、且安全地读写“程序本身”。</p>
+          </article>
+        </div>
+
+        <p class="chapter-footnote" data-reveal style="--i:7">
+          这四个例子并不是实践的全部——有人在做复杂的记忆检索，有人在做多级角色扮演流水线，有人在做自治社区。但把它们摆在一起，已经能看出一条共同的趋势。
+        </p>
+      </div>
+    </section>
+
+    <!-- 03 重构 -->
+    <section class="scene scene--paper" data-scene="3" data-title="重构" aria-labelledby="ch3-title">
+      <div class="scene__inner">
+        <header class="chapter-head">
+          <div class="chapter-head__num" data-reveal style="--i:0">03</div>
+          <div class="chapter-head__title">
+            <p class="chapter-eyebrow" data-reveal style="--i:0">重构 / RATIONALE</p>
+            <h2 id="ch3-title" data-reveal style="--i:1">为什么想到重构：<br><span class="title-accent">当各自的补丁难以拼装</span></h2>
+          </div>
+          <p class="chapter-lead" data-reveal style="--i:2">
+            如果只是为了跑通手头那一个独立项目，继续打磨各自的 Harness 没有问题。问题出现在想往前多走一步的时候。
+          </p>
+        </header>
+
+        <div class="chapter-rule" aria-hidden="true"></div>
+
+        <div class="ch3-layout">
+          <aside class="stack-panel" data-reveal style="--i:3">
+            <div class="stack-panel__head">
+              <span>在各自外壳里陆续加上去的机制</span>
+              <span class="stack-panel__badge">5 类</span>
+            </div>
+            <ol class="stack-list">
+              <li><span class="stack-list__num">01</span><span>独立的对话生命周期</span><span class="stack-list__en">PROCESS</span></li>
+              <li><span class="stack-list__num">02</span><span>共享的目录与状态</span><span class="stack-list__en">STATE</span></li>
+              <li><span class="stack-list__num">03</span><span>读写前后的拦截与唤醒</span><span class="stack-list__en">HOOK</span></li>
+              <li><span class="stack-list__num">04</span><span>传统代码与大模型的配合</span><span class="stack-list__en">CODE</span></li>
+              <li><span class="stack-list__num">05</span><span>运行期对提示词的修改</span><span class="stack-list__en">META</span></li>
+            </ol>
+            <div class="stack-panel__result">
+              <span class="stack-panel__equals">≈</span>
+              <div>
+                <strong>已经在重造类似操作系统的基础组件</strong>
+                <span>只是这些组件分散在各自的私有代码里</span>
+              </div>
+            </div>
+          </aside>
+
+          <div class="ch3-side">
+            <div class="section-label" data-reveal style="--i:4">从单个项目走向组合时，问题出现了</div>
+            <div class="assembly-case" data-reveal style="--i:5">
+              <div class="assembly-case__head">
+                <span class="assembly-case__tag">场景 01 / 拼接</span>
+                <span class="assembly-case__state">不兼容</span>
+              </div>
+              <h3>把朋友写的“多轮交叉审查机制”，直接装进你写的“长文档生成工具”</h3>
+              <p>状态管理、事件钩子、调用约定混杂在各自私有的胶水代码里，两套东西很难直接拼在一起。</p>
+              <div class="mismatch" aria-hidden="true">
+                <span>机制 A</span>
+                <i>×</i>
+                <span>工具 B</span>
+              </div>
+            </div>
+            <div class="assembly-case" data-reveal style="--i:6">
+              <div class="assembly-case__head">
+                <span class="assembly-case__tag">场景 02 / 替换</span>
+                <span class="assembly-case__state">需重写</span>
+              </div>
+              <h3>把单个 AI 完成的模块，替换成三个 AI 和一段脚本配合的子工作流</h3>
+              <p>同时希望外面的调用方完全不用修改代码。每换一种组织方式，往往意味着把底层的连接代码推倒重来。</p>
+            </div>
+
+            <div class="turning-note" data-reveal style="--i:7">
+              <div class="turning-note__mark" aria-hidden="true">↑</div>
+              <div>
+                <p class="turning-note__quote">
+                  我们其实都在那个简单的“上下文拼接循环”外面，一点点重造着类似操作系统的基础组件。
+                </p>
+                <p class="turning-note__body">
+                  当外围的补丁越来越多、不同方案之间又难以直接兼容和复用时，一个自然的念头浮现出来：把最基础的循环重新写一遍，把反复用到的底层能力，收敛成一套干净、中立的共同基底。
+                </p>
+                <p class="turning-note__origin">这就是 AVM 诞生的背景。</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 04 设计 -->
+    <section class="scene scene--paper" data-scene="4" data-title="设计" aria-labelledby="ch4-title">
+      <div class="scene__inner">
+        <header class="chapter-head chapter-head--compact">
+          <div class="chapter-head__num" data-reveal style="--i:0">04</div>
+          <div class="chapter-head__title">
+            <p class="chapter-eyebrow" data-reveal style="--i:0">设计 / DESIGN CHOICES</p>
+            <h2 id="ch4-title" data-reveal style="--i:1">AVM 的部分设计思路：<br><span class="title-accent">提供一种中立的底层约定</span></h2>
+          </div>
+          <p class="chapter-lead" data-reveal style="--i:2">
+            AVM 不预设具体的工作方式，自身也在持续迭代。这里不罗列技术规格，只说明四个基础选择——它们构成了承载上层方案的支点。
+          </p>
+        </header>
+
+        <div class="chapter-rule" aria-hidden="true"></div>
+
+        <div class="tabs" data-reveal style="--i:3">
+          <div class="tablist" role="tablist" aria-label="AVM 的四个设计选择">
+            <button class="tab" type="button" role="tab" id="tab-1" aria-controls="panel-1" aria-selected="true" tabindex="0" data-tab="0">
+              <span class="tab__num">01</span>
+              <span class="tab__label">独立计算单元</span>
+              <span class="tab__dot" aria-hidden="true"></span>
+            </button>
+            <button class="tab" type="button" role="tab" id="tab-2" aria-controls="panel-2" aria-selected="false" tabindex="-1" data-tab="1">
+              <span class="tab__num">02</span>
+              <span class="tab__label">程序与数据同树</span>
+              <span class="tab__dot" aria-hidden="true"></span>
+            </button>
+            <button class="tab" type="button" role="tab" id="tab-3" aria-controls="panel-3" aria-selected="false" tabindex="-1" data-tab="2">
+              <span class="tab__num">03</span>
+              <span class="tab__label">模型与代码对等</span>
+              <span class="tab__dot" aria-hidden="true"></span>
+            </button>
+            <button class="tab" type="button" role="tab" id="tab-4" aria-controls="panel-4" aria-selected="false" tabindex="-1" data-tab="3">
+              <span class="tab__num">04</span>
+              <span class="tab__label">事件与边界</span>
+              <span class="tab__dot" aria-hidden="true"></span>
+            </button>
+          </div>
+
+          <div class="tab-panels">
+            <section class="tab-panel is-active" id="panel-1" role="tabpanel" aria-labelledby="tab-1" data-panel="0">
+              <div class="tab-panel__copy">
+                <p class="panel-eyebrow">选择 01 / 计算单元的形态</p>
+                <h3>把“对话”当作可休眠、可唤醒的独立计算单元</h3>
+                <p>一个对话只在有事可做时处于活跃状态；当它不再调用工具时，就自然进入休眠，直到收到新的消息或事件通知，才进入队列等待调度。</p>
+                <ul class="point-list">
+                  <li>没有预设“等待用户输入”的固定卡点。用户输入只是通过外部接口挂载进来的信息源之一，对话首先围绕环境中设定的目标运转。</li>
+                  <li>启动关系被区分为不同耦合度：可以拉起用完即走、帮自己分担上下文的临时帮手（亚对话）；也可以创建长期驻留、拥有独立视角、不对父对话唯命是从的独立个体（子对话）。</li>
+                </ul>
+              </div>
+              <figure class="tab-panel__figure">
+                <figcaption class="figure-hint">左右滑动查看完整图示 ↔</figcaption>
+                <svg class="diagram diagram--tab" viewBox="0 0 540 370" role="img" aria-label="对话状态示意图：活跃、休眠、就绪之间循环切换；对话可以拉起紧耦合的亚对话，或创建独立视角的子对话">
+                  <defs>
+                    <marker id="arrow-4a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                      <path d="M0 0 L8 4 L0 8 Z" class="marker-fill"></path>
+                    </marker>
+                    <marker id="arrow-4a-accent" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                      <path d="M0 0 L8 4 L0 8 Z" class="marker-fill marker-fill--accent"></path>
+                    </marker>
+                  </defs>
+                  <text x="24" y="24" class="svg-micro">对话状态 / DIALOGUE LIFECYCLE</text>
+                  <rect x="24" y="66" width="124" height="58" rx="29" class="svg-panel svg-panel--solid"></rect>
+                  <text x="86" y="91" text-anchor="middle" class="svg-mini-label svg-inverse">活跃</text>
+                  <text x="86" y="108" text-anchor="middle" class="svg-mini-note svg-inverse-soft">ACTIVE</text>
+                  <rect x="208" y="66" width="124" height="58" rx="29" class="svg-panel"></rect>
+                  <text x="270" y="91" text-anchor="middle" class="svg-mini-label">休眠</text>
+                  <text x="270" y="108" text-anchor="middle" class="svg-mini-note">DORMANT</text>
+                  <rect x="392" y="66" width="124" height="58" rx="29" class="svg-panel"></rect>
+                  <text x="454" y="91" text-anchor="middle" class="svg-mini-label">就绪</text>
+                  <text x="454" y="108" text-anchor="middle" class="svg-mini-note">READY</text>
+
+                  <path d="M148 95 H198" class="svg-wire draw-line" pathLength="1" marker-end="url(#arrow-4a)"></path>
+                  <path d="M332 95 H382" class="svg-wire draw-line" pathLength="1" marker-end="url(#arrow-4a)"></path>
+                  <path d="M454 128 V200 H86 V134" class="svg-wire svg-wire--accent draw-line" pathLength="1" marker-end="url(#arrow-4a-accent)"></path>
+                  <text x="174" y="82" text-anchor="middle" class="svg-micro">不再调用工具</text>
+                  <text x="357" y="82" text-anchor="middle" class="svg-micro">消息 / 事件</text>
+                  <text x="270" y="190" text-anchor="middle" class="svg-micro">被调度，回到活跃</text>
+
+                  <text x="24" y="262" class="svg-micro">扩展关系 / 启动对话</text>
+                  <rect x="42" y="280" width="198" height="56" rx="2" class="svg-panel"></rect>
+                  <text x="141" y="302" text-anchor="middle" class="svg-mini-label">亚对话</text>
+                  <text x="141" y="319" text-anchor="middle" class="svg-mini-note">紧耦合 · 用完即走</text>
+                  <rect x="300" y="280" width="198" height="56" rx="2" class="svg-panel svg-panel--accent"></rect>
+                  <text x="399" y="302" text-anchor="middle" class="svg-mini-label svg-accent-text">子对话</text>
+                  <text x="399" y="319" text-anchor="middle" class="svg-mini-note">独立视角 · 长期驻留</text>
+                  <text x="24" y="358" class="svg-micro">两类启动关系，耦合度不同</text>
+                </svg>
+              </figure>
+            </section>
+
+            <section class="tab-panel" id="panel-2" role="tabpanel" aria-labelledby="tab-2" data-panel="1" hidden>
+              <div class="tab-panel__copy">
+                <p class="panel-eyebrow">选择 02 / 程序的位置</p>
+                <h3>让“程序”与“数据”住在同一棵内存树里</h3>
+                <p>普通的数据、挂载的外部接口，以及提示词程序、传统代码程序，在底层都是这棵树上的节点，带着各自的摘要描述与控制信息。</p>
+                <ul class="point-list">
+                  <li>程序与数据在寻址层面被统一。提示词不再是锁在外部工程里的静态文件；一个被授权的对话，可以像读取普通数据一样读取另一个对话的提示词节点，评估后直接改写它。</li>
+                  <li>软件的更新与局部演进，在底层就只是一次内存写入。</li>
+                </ul>
+              </div>
+              <figure class="tab-panel__figure">
+                <figcaption class="figure-hint">左右滑动查看完整图示 ↔</figcaption>
+                <svg class="diagram diagram--tab" viewBox="0 0 540 370" role="img" aria-label="内存树示意图：普通数据、外部接口、提示词程序、传统代码程序都是树上节点；被授权的对话可以改写提示词节点">
+                  <defs>
+                    <marker id="arrow-4b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                      <path d="M0 0 L8 4 L0 8 Z" class="marker-fill"></path>
+                    </marker>
+                    <marker id="arrow-4b-accent" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                      <path d="M0 0 L8 4 L0 8 Z" class="marker-fill marker-fill--accent"></path>
+                    </marker>
+                  </defs>
+                  <text x="24" y="24" class="svg-micro">内存树 / MEMORY TREE</text>
+                  <rect x="220" y="44" width="100" height="38" rx="2" class="svg-panel svg-panel--solid"></rect>
+                  <text x="270" y="68" text-anchor="middle" class="svg-mini-label svg-inverse">内存树</text>
+                  <path d="M270 82 V108 M270 108 H66 M270 108 H196 M270 108 H344 M270 108 H474" class="svg-wire draw-line" pathLength="1"></path>
+                  <path d="M66 108 V130 M196 108 V130 M344 108 V130 M474 108 V130" class="svg-wire"></path>
+
+                  <rect x="14" y="130" width="104" height="92" rx="2" class="svg-panel"></rect>
+                  <text x="66" y="157" text-anchor="middle" class="svg-mini-label">普通数据</text>
+                  <text x="66" y="175" text-anchor="middle" class="svg-mini-note">DATA</text>
+                  <rect x="144" y="130" width="104" height="92" rx="2" class="svg-panel"></rect>
+                  <text x="196" y="157" text-anchor="middle" class="svg-mini-label">外部接口</text>
+                  <text x="196" y="175" text-anchor="middle" class="svg-mini-note">DEVICE</text>
+                  <rect x="292" y="130" width="104" height="92" rx="2" class="svg-panel svg-panel--accent"></rect>
+                  <text x="344" y="157" text-anchor="middle" class="svg-mini-label svg-accent-text">提示词程序</text>
+                  <text x="344" y="175" text-anchor="middle" class="svg-mini-note">PROMPT</text>
+                  <rect x="422" y="130" width="104" height="92" rx="2" class="svg-panel"></rect>
+                  <text x="474" y="157" text-anchor="middle" class="svg-mini-label">传统代码</text>
+                  <text x="474" y="175" text-anchor="middle" class="svg-mini-note">PYTHON</text>
+
+                  <rect x="330" y="280" width="180" height="48" rx="2" class="svg-panel"></rect>
+                  <text x="420" y="299" text-anchor="middle" class="svg-mini-label">被授权的对话</text>
+                  <text x="420" y="316" text-anchor="middle" class="svg-mini-note">读取 / 评估 / 改写</text>
+                  <path d="M344 278 C300 240 300 220 344 190" class="svg-wire svg-wire--accent draw-line" pathLength="1" marker-end="url(#arrow-4b-accent)"></path>
+                  <text x="270" y="248" class="svg-micro">一次内存写入</text>
+                  <path d="M354 200 H388" class="svg-wire svg-wire--accent" marker-end="url(#arrow-4b-accent)"></path>
+
+                  <text x="24" y="358" class="svg-micro">程序与数据同为节点；更新 = 数据变化</text>
+                </svg>
+              </figure>
+            </section>
+
+            <section class="tab-panel" id="panel-3" role="tabpanel" aria-labelledby="tab-3" data-panel="2" hidden>
+              <div class="tab-panel__copy">
+                <p class="panel-eyebrow">选择 03 / 执行者的关系</p>
+                <h3>让大模型与传统代码，在协议上对等</h3>
+                <p>AVM 的底层分发器并不关心当前运行的是大模型还是传统代码。一段注册在内存里的 Python 程序，和一个提示词程序遵守完全一致的输入输出与指令协议。</p>
+                <ul class="point-list">
+                  <li>需要模糊判断和创造性思考时，交给大模型对话；需要精确计算、查表或执行严格逻辑时，交给传统代码对话。</li>
+                  <li>它们在同一个环境里互相发送消息、互相调用，谁也不是谁的附庸。</li>
+                </ul>
+              </div>
+              <figure class="tab-panel__figure">
+                <figcaption class="figure-hint">左右滑动查看完整图示 ↔</figcaption>
+                <svg class="diagram diagram--tab" viewBox="0 0 540 370" role="img" aria-label="协议对等示意图：大模型对话与传统代码对话通过同一分发器互相发送指令和结果">
+                  <defs>
+                    <marker id="arrow-4c" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                      <path d="M0 0 L8 4 L0 8 Z" class="marker-fill"></path>
+                    </marker>
+                    <marker id="arrow-4c-accent" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                      <path d="M0 0 L8 4 L0 8 Z" class="marker-fill marker-fill--accent"></path>
+                    </marker>
+                  </defs>
+                  <text x="24" y="24" class="svg-micro">分发器 / DISPATCHER</text>
+                  <rect x="32" y="86" width="136" height="78" rx="2" class="svg-panel"></rect>
+                  <text x="100" y="115" text-anchor="middle" class="svg-mini-label">大模型对话</text>
+                  <text x="100" y="134" text-anchor="middle" class="svg-mini-note">提示词程序</text>
+                  <rect x="372" y="86" width="136" height="78" rx="2" class="svg-panel"></rect>
+                  <text x="440" y="115" text-anchor="middle" class="svg-mini-label">传统代码</text>
+                  <text x="440" y="134" text-anchor="middle" class="svg-mini-note">Python 程序</text>
+                  <rect x="202" y="92" width="136" height="66" rx="2" class="svg-panel svg-panel--solid"></rect>
+                  <text x="270" y="118" text-anchor="middle" class="svg-mini-label svg-inverse">分发器</text>
+                  <text x="270" y="136" text-anchor="middle" class="svg-mini-note svg-inverse-soft">不区分执行者类型</text>
+                  <path d="M168 112 H192" class="svg-wire" marker-start="url(#arrow-4c)" marker-end="url(#arrow-4c)"></path>
+                  <path d="M348 112 H362" class="svg-wire" marker-start="url(#arrow-4c)" marker-end="url(#arrow-4c)"></path>
+                  <text x="180" y="100" text-anchor="middle" class="svg-micro">指令</text>
+                  <text x="355" y="100" text-anchor="middle" class="svg-micro">指令</text>
+                  <path d="M100 164 V214 H440 V164" class="svg-wire svg-wire--accent"></path>
+                  <text x="270" y="240" text-anchor="middle" class="svg-small svg-accent-text">相同的输入 / 输出 / 指令协议</text>
+
+                  <g class="protocol-tags">
+                    <rect x="76" y="278" width="104" height="30" rx="15" class="svg-panel"></rect>
+                    <text x="128" y="297" text-anchor="middle" class="svg-micro">互相发送消息</text>
+                    <rect x="196" y="278" width="104" height="30" rx="15" class="svg-panel"></rect>
+                    <text x="248" y="297" text-anchor="middle" class="svg-micro">互相调用</text>
+                    <rect x="316" y="278" width="148" height="30" rx="15" class="svg-panel"></rect>
+                    <text x="390" y="297" text-anchor="middle" class="svg-micro">没有谁附属于谁</text>
+                  </g>
+                  <text x="24" y="358" class="svg-micro">模糊判断交给模型；精确逻辑交给代码</text>
+                </svg>
+              </figure>
+            </section>
+
+            <section class="tab-panel" id="panel-4" role="tabpanel" aria-labelledby="tab-4" data-panel="3" hidden>
+              <div class="tab-panel__copy">
+                <p class="panel-eyebrow">选择 04 / 边界与提示词</p>
+                <h3>用底层的事件与结构维护边界，并换一种视角写提示词</h3>
+                <p>在 AVM 中，对话之间不直接倾倒自然语言回复，所有动作都通过基础指令完成；而指令的执行过程可以被监听、在事前被拦截或改写、在事后唤醒其他休眠的对话。</p>
+                <ul class="point-list">
+                  <li>概率模型的误差很难像传统软件工程那样在事前被彻底消灭，但可以通过结构来调节。</li>
+                  <li>提示词可以不写成死板的“算法脚本”；借鉴控制论（设定目标、感知状态、调节偏差）与管理学（划分职责、明确汇报边界、处理异常）的思路，去组织多个对话的协作。底座本身不限制你用什么风格编写程序。</li>
+                </ul>
+              </div>
+              <figure class="tab-panel__figure">
+                <figcaption class="figure-hint">左右滑动查看完整图示 ↔</figcaption>
+                <svg class="diagram diagram--tab" viewBox="0 0 540 370" role="img" aria-label="事件边界示意图：基础指令经过执行前的监听器，可被拦截或改写；执行后由监听器通知并唤醒休眠对话">
+                  <defs>
+                    <marker id="arrow-4d" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                      <path d="M0 0 L8 4 L0 8 Z" class="marker-fill"></path>
+                    </marker>
+                    <marker id="arrow-4d-accent" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                      <path d="M0 0 L8 4 L0 8 Z" class="marker-fill marker-fill--accent"></path>
+                    </marker>
+                  </defs>
+                  <text x="24" y="24" class="svg-micro">指令路径 / INSTRUCTION PIPELINE</text>
+                  <rect x="16" y="88" width="106" height="56" rx="2" class="svg-panel"></rect>
+                  <text x="69" y="112" text-anchor="middle" class="svg-mini-label">基础指令</text>
+                  <text x="69" y="130" text-anchor="middle" class="svg-mini-note">INSTRUCTION</text>
+                  <rect x="148" y="88" width="112" height="56" rx="2" class="svg-panel svg-panel--accent"></rect>
+                  <text x="204" y="112" text-anchor="middle" class="svg-mini-label svg-accent-text">before 监听</text>
+                  <text x="204" y="130" text-anchor="middle" class="svg-mini-note">拦截 / 改写</text>
+                  <rect x="286" y="88" width="86" height="56" rx="2" class="svg-panel"></rect>
+                  <text x="329" y="112" text-anchor="middle" class="svg-mini-label">执行</text>
+                  <text x="329" y="130" text-anchor="middle" class="svg-mini-note">DISPATCH</text>
+                  <rect x="398" y="88" width="126" height="56" rx="2" class="svg-panel svg-panel--accent"></rect>
+                  <text x="461" y="112" text-anchor="middle" class="svg-mini-label svg-accent-text">after 监听</text>
+                  <text x="461" y="130" text-anchor="middle" class="svg-mini-note">通知 / 唤醒</text>
+                  <path d="M122 116 H138" class="svg-wire" marker-end="url(#arrow-4d)"></path>
+                  <path d="M260 116 H276" class="svg-wire" marker-end="url(#arrow-4d)"></path>
+                  <path d="M372 116 H388" class="svg-wire" marker-end="url(#arrow-4d)"></path>
+
+                  <path d="M444 144 V222 H362" class="svg-wire svg-wire--accent draw-line" pathLength="1" marker-end="url(#arrow-4d-accent)"></path>
+                  <rect x="246" y="232" width="184" height="54" rx="2" class="svg-panel"></rect>
+                  <text x="338" y="254" text-anchor="middle" class="svg-mini-label">休眠中的对话</text>
+                  <text x="338" y="272" text-anchor="middle" class="svg-mini-note">被通知后进入就绪队列</text>
+                  <text x="24" y="254" class="svg-micro">事件不移动执行流；</text>
+                  <text x="24" y="272" class="svg-micro">它监听指令执行，并按规则通知。</text>
+
+                  <g class="theory-tags">
+                    <rect x="24" y="312" width="146" height="32" rx="16" class="svg-panel"></rect>
+                    <text x="97" y="332" text-anchor="middle" class="svg-micro">控制论 · 目标与调节</text>
+                    <rect x="184" y="312" width="170" height="32" rx="16" class="svg-panel"></rect>
+                    <text x="269" y="332" text-anchor="middle" class="svg-micro">管理学 · 职责与边界</text>
+                  </g>
+                  <text x="24" y="366" class="svg-micro">底层不限制提示词的写作风格</text>
+                </svg>
+              </figure>
+            </section>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 05 回纳 -->
+    <section class="scene scene--paper" data-scene="5" data-title="回纳" aria-labelledby="ch5-title">
+      <div class="scene__inner">
+        <header class="chapter-head">
+          <div class="chapter-head__num" data-reveal style="--i:0">05</div>
+          <div class="chapter-head__title">
+            <p class="chapter-eyebrow" data-reveal style="--i:0">回纳 / MAPPING</p>
+            <h2 id="ch5-title" data-reveal style="--i:1">容纳不同的方案：<br><span class="title-accent">在统一基底上的自然表达</span></h2>
+          </div>
+          <p class="chapter-lead" data-reveal style="--i:2">
+            前面那些在各自 Harness 里探索出来的方案，不再需要各自编写繁琐的外部控制代码，可以很自然地表示为基底上的不同组合。
+          </p>
+        </header>
+
+        <div class="chapter-rule" aria-hidden="true"></div>
+
+        <div class="scenario-grid">
+          <article class="scenario" data-reveal style="--i:3" data-match="memory child">
+            <div class="scenario__head">
+              <span class="scenario__num">01</span>
+              <svg class="scenario__icon" viewBox="0 0 40 40" aria-hidden="true">
+                <rect x="7" y="5" width="17" height="23" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/>
+                <path d="M12 11h7M12 16h7M12 21h4" stroke="currentColor" stroke-width="1.2"/>
+                <circle cx="27" cy="25" r="6" fill="none" stroke="currentColor" stroke-width="1.4"/>
+                <path d="M31.5 29.5 36 34" stroke="currentColor" stroke-width="1.4"/>
+              </svg>
+              <span class="scenario__tag">交叉审查 / REVIEW</span>
+            </div>
+            <h3>独立视角的交叉审查</h3>
+            <p>在内存里放好待审材料，启动一个独立的子对话并发送指令。每个对话只负责一件边界清晰的小事，跑完即止。</p>
+            <div class="flow" aria-hidden="true">
+              <span>待审材料</span><i>→</i><span class="flow__hot">独立子对话</span><i>→</i><span>结论</span>
+            </div>
+          </article>
+
+          <article class="scenario" data-reveal style="--i:4" data-match="memory event">
+            <div class="scenario__head">
+              <span class="scenario__num">02</span>
+              <svg class="scenario__icon" viewBox="0 0 40 40" aria-hidden="true">
+                <rect x="6" y="6" width="28" height="28" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/>
+                <path d="M6 14h28M6 22h28M14 6v28M22 6v28" stroke="currentColor" stroke-width="1"/>
+                <rect x="15" y="15" width="6" height="6" fill="currentColor" opacity=".18"/>
+                <circle cx="29" cy="29" r="2" fill="currentColor"/>
+              </svg>
+              <span class="scenario__tag">异步协作 / BOARD</span>
+            </div>
+            <h3>基于公告板的异步协作</h3>
+            <p>在内存树上建好分支；上游对话写完结果就进入休眠。挂在该分支上的事件监听代码会自动发通知，唤醒下游对话。</p>
+            <div class="flow" aria-hidden="true">
+              <span>写入分支</span><i>→</i><span class="flow__hot">after 事件</span><i>→</i><span>唤醒下游</span>
+            </div>
+          </article>
+
+          <article class="scenario" data-reveal style="--i:5" data-match="instruction event">
+            <div class="scenario__head">
+              <span class="scenario__num">03</span>
+              <svg class="scenario__icon" viewBox="0 0 40 40" aria-hidden="true">
+                <path d="M20 4 33 9v10c0 8-5.5 13.5-13 17-7.5-3.5-13-9-13-17V9L20 4Z" fill="none" stroke="currentColor" stroke-width="1.4"/>
+                <path d="m14.5 19.5 4 4 8-9" fill="none" stroke="currentColor" stroke-width="1.6"/>
+              </svg>
+              <span class="scenario__tag">权限守卫 / GUARD</span>
+            </div>
+            <h3>硬性规则与权限守卫</h3>
+            <p>把校验逻辑写成前置事件监听器，挂在关键的内存路径上。无论前面的模型怎么推理，不合规的修改在发生前就会被拦下。</p>
+            <div class="flow" aria-hidden="true">
+              <span>修改指令</span><i>→</i><span class="flow__hot">before 监听</span><i>→</i><span>放行 / 拦截</span>
+            </div>
+          </article>
+
+          <article class="scenario" data-reveal style="--i:6" data-match="memory meta">
+            <div class="scenario__head">
+              <span class="scenario__num">04</span>
+              <svg class="scenario__icon" viewBox="0 0 40 40" aria-hidden="true">
+                <path d="M8 13h20M22 7l7 6-7 6" fill="none" stroke="currentColor" stroke-width="1.4"/>
+                <path d="M32 27H12M18 21l-7 6 7 6" fill="none" stroke="currentColor" stroke-width="1.4"/>
+                <circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" stroke-width="1.2"/>
+                <circle cx="32" cy="32" r="2" fill="none" stroke="currentColor" stroke-width="1.2"/>
+              </svg>
+              <span class="scenario__tag">多样性 / META</span>
+            </div>
+            <h3>用多样性对抗偏见，或做元编程实验</h3>
+            <p>让一个专门的观察对话读取并打乱提示词顺序，分发给多个不同上下文的对话执行；或者在隔离的子环境里测试、修改程序节点。</p>
+            <div class="flow" aria-hidden="true">
+              <span>观察者</span><i>→</i><span class="flow__hot">重排提示词</span><i>→</i><span>多个上下文</span>
+            </div>
+          </article>
+        </div>
+
+        <div class="base-bar" data-reveal style="--i:7">
+          <span class="base-bar__label">同一基底</span>
+          <div class="base-bar__tags" aria-label="四个场景共同使用的底层机制">
+            <span data-base="memory">内存树</span>
+            <span data-base="child">子对话 / 亚对话</span>
+            <span data-base="instruction">基础指令</span>
+            <span data-base="event">before / after 事件</span>
+            <span data-base="meta">程序节点与元编程</span>
+          </div>
+          <span class="base-bar__note">可混用，可调整</span>
+        </div>
+
+        <p class="chapter-footnote" data-reveal style="--i:8">
+          这些原本散落在不同框架、不同脚本里的设计，在同一个内存与调度模型下，变成了可以随时混用、随时调整的常规操作。
+        </p>
+      </div>
+    </section>
+
+    <!-- 06 标准 -->
+    <section class="scene scene--paper" data-scene="6" data-title="标准" aria-labelledby="ch6-title">
+      <div class="scene__inner">
+        <header class="chapter-head">
+          <div class="chapter-head__num" data-reveal style="--i:0">06</div>
+          <div class="chapter-head__title">
+            <p class="chapter-eyebrow" data-reveal style="--i:0">标准 / WHY A COMMON FLOOR</p>
+            <h2 id="ch6-title" data-reveal style="--i:1">为什么值得统一标准：<br><span class="title-accent">封装边界与未知的涌现</span></h2>
+          </div>
+          <p class="chapter-lead" data-reveal style="--i:2">
+            如果每个人顺着自己的需求改下去，迟早也能搭出趁手的工具。那为什么还要费力气寻找一个共同底层？
+          </p>
+        </header>
+
+        <div class="chapter-rule" aria-hidden="true"></div>
+
+        <div class="ch6-layout">
+          <aside class="os-note" data-reveal style="--i:3">
+            <p class="section-label">参照 / 操作系统史</p>
+            <blockquote>
+              只有当底层的寻址方式、通信规则和运行边界成为共同标准时，个人手里的一次性脚本，才能变成所有人都能直接调用的库与软件。
+            </blockquote>
+            <div class="os-stack" aria-hidden="true">
+              <div class="os-stack__layer"><span>软件</span><i></i></div>
+              <div class="os-stack__layer"><span>库</span><i></i></div>
+              <div class="os-stack__layer"><span>一次性脚本</span><i></i></div>
+              <div class="os-stack__base">
+                <span>共同标准</span>
+                <small>寻址 · 通信 · 运行边界</small>
+              </div>
+            </div>
+          </aside>
+
+          <div class="value-list">
+            <p class="section-label" data-reveal style="--i:4">三件会变得顺理成章的事</p>
+            <article class="value-row" data-reveal style="--i:5">
+              <span class="value-row__num">01</span>
+              <div class="value-row__body">
+                <h3>控制流的打包与共享</h3>
+                <p>过去分享一个 Skill，分享的往往只是一段给单个 AI 看的提示词。底层统一后，一整套包含多个对话分工、传统代码配合、内存目录结构以及事件拦截守卫的协作体系，可以作为整体的“镜像”或内存子树被直接打包带走，在任何人的环境里原样跑起来。</p>
+              </div>
+              <svg class="value-row__icon" viewBox="0 0 78 78" aria-hidden="true">
+                <path d="M14 37 39 24l25 13-25 13-25-13Z" fill="none" stroke="currentColor" stroke-width="1.4"/>
+                <path d="M14 37v14l25 13 25-13V37M39 50v14" fill="none" stroke="currentColor" stroke-width="1.2"/>
+                <path d="M59 22V8M59 8l-5 5M59 8l5 5" fill="none" stroke="currentColor" stroke-width="1.4"/>
+              </svg>
+            </article>
+            <article class="value-row" data-reveal style="--i:6">
+              <span class="value-row__num">02</span>
+              <div class="value-row__body">
+                <h3>真正的黑盒封装与无感替换</h3>
+                <p>调用方只需要知道内存树上某个服务的地址和它的接口说明。地址背后，今天是简单脚本、明天是大模型、后天是十几个对话配合的流水线；只要接口描述不变，外部调用方不需要感知内部的变化，更不需要跟着修改自己的代码。</p>
+              </div>
+              <svg class="value-row__icon" viewBox="0 0 78 78" aria-hidden="true">
+                <rect x="18" y="20" width="42" height="16" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/>
+                <rect x="18" y="39" width="42" height="16" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.2" opacity=".45"/>
+                <rect x="18" y="58" width="42" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.2" opacity=".25"/>
+                <path d="M60 28h7M60 47h7" fill="none" stroke="currentColor" stroke-width="1.4"/>
+                <circle cx="12" cy="28" r="3" fill="currentColor"/>
+                <circle cx="12" cy="47" r="3" fill="none" stroke="currentColor" stroke-width="1.2"/>
+              </svg>
+            </article>
+            <article class="value-row" data-reveal style="--i:7">
+              <span class="value-row__num">03</span>
+              <div class="value-row__body">
+                <h3>同构环境可能带来的涌现</h3>
+                <p>在生物细胞里，每一个蛋白质分子其实都只是结构相对简单的机器；但因为成千上万种蛋白质处在同一个统一的化学环境里、遵循相同的相互作用规则，它们就能在没有中央总控的情况下，自发组织出复杂的代谢回路与免疫系统。</p>
+                <p>同样地，当提示词程序、传统代码、状态数据、权限管理、调试工具、包管理器本身，全都作为同构的节点和对话运行在同一个环境里时，AI 的行为就成了另一些 AI 的运行环境。</p>
+                <p>一个人写的权限守卫可以直接保护另一个人写的业务模块；一个负责优化的对话可以直接调整另一个模块的提示词。</p>
+              </div>
+              <svg class="value-row__icon" viewBox="0 0 78 78" aria-hidden="true">
+                <circle cx="39" cy="39" r="25" fill="none" stroke="currentColor" stroke-width="1.1" opacity=".4"/>
+                <circle cx="39" cy="17" r="4" fill="none" stroke="currentColor" stroke-width="1.4"/>
+                <circle cx="20" cy="49" r="4" fill="none" stroke="currentColor" stroke-width="1.4"/>
+                <circle cx="58" cy="49" r="4" fill="none" stroke="currentColor" stroke-width="1.4"/>
+                <circle cx="39" cy="39" r="3" fill="currentColor"/>
+                <path d="M39 21v14M24 46l11-5M54 46l-11-5M23 44 36 20M55 44 42 20M24 49h26" fill="none" stroke="currentColor" stroke-width="1.1" opacity=".55"/>
+              </svg>
+            </article>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 07 结语 -->
+    <section class="scene scene--dark scene--coda" data-scene="7" data-title="结语" aria-labelledby="coda-title">
+      <div class="scene__inner">
+        <div class="coda">
+          <div class="coda__main">
+            <p class="cover__eyebrow" data-reveal style="--i:0">
+              <span class="eyebrow-line"></span>
+              结语 / CODA
+            </p>
+            <h2 id="coda-title" data-reveal style="--i:1">AVM 只提供基底，<br><span class="title-accent">不替你定义未来。</span></h2>
+            <p class="coda__body" data-reveal style="--i:2">
+              AVM 并没有声称自己已经穷尽了 AI 架构的答案，它的很多机制仍在演进。它所做的，只是试着把那些绑在模型外面的杂乱支架拆掉，提供一个尽可能简单、自洽的底层环境——至于在这个环境里会长出什么样的软件与生态，那本来就是属于所有探索者的事情。
+            </p>
+            <div class="coda__actions" data-reveal style="--i:3">
+              <button class="button button--accent" type="button" data-go="0">重新阅读</button>
+              <button class="button button--ghost" type="button" data-go="1">回到第一节</button>
+            </div>
+          </div>
+          <div class="coda__mark" aria-hidden="true">
+            <span class="coda__mark-word">AVM</span>
+            <span class="coda__mark-line"></span>
+            <span class="coda__mark-caption">A COMMON SUBSTRATE<br>FOR MULTI-DIALOGUE COMPUTING</span>
+          </div>
+        </div>
+        <div class="coda__meta" data-reveal style="--i:4">
+          <span>内容依据 AVM 项目文案</span>
+          <span>图示为概念示意</span>
+          <span>交互介绍 / 静态单页</span>
+        </div>
+      </div>
+      <div class="coda__grid" aria-hidden="true"></div>
+    </section>
+  </main>
+
+  <footer class="pager" aria-label="翻页">
+    <div class="pager__current">
+      <span class="pager__section" id="currentSection">封面</span>
+      <span class="pager__index" id="currentIndex">00 / 07</span>
+    </div>
+    <div class="pager__track" aria-hidden="true">
+      <div class="pager__fill" id="pagerFill"></div>
+      <div class="pager__ticks" id="pagerTicks"></div>
+    </div>
+    <div class="pager__nav">
+      <button class="scroll-cue" id="scrollCue" type="button" aria-label="向下滚动阅读本页内容">
+        <span>向下滚动</span>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><path d="M8 3v9M4.5 8.5 8 12l3.5-3.5"/></svg>
+      </button>
+      <button class="pager__button" type="button" id="prevButton" aria-label="上一节">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M19 12H5M11 6l-6 6 6 6"/></svg>
+      </button>
+      <span class="pager__hint">← →</span>
+      <button class="pager__button" type="button" id="nextButton" aria-label="下一节">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </button>
+    </div>
+  </footer>
+
+  <div class="menu" id="menuDialog" role="dialog" aria-modal="true" aria-labelledby="menuTitle" aria-hidden="true">
+    <div class="menu__scrim" data-close-menu></div>
+    <div class="menu__panel">
+      <div class="menu__head">
+        <div>
+          <p class="chapter-eyebrow">目录 / CONTENTS</p>
+          <h2 id="menuTitle">AVM 设计介绍</h2>
+        </div>
+        <button class="icon-button menu__close" type="button" data-close-menu aria-label="关闭目录">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+        </button>
+      </div>
+      <nav class="menu__list" aria-label="全部页面">
+        <button type="button" data-go="0"><span>00</span><strong>封面</strong><small>从修改外壳到统一基底</small><i>↗</i></button>
+        <button type="button" data-go="1"><span>01</span><strong>一个常见的起点</strong><small>不断拼接的上下文循环</small><i>↗</i></button>
+        <button type="button" data-go="2"><span>02</span><strong>分头修改外壳</strong><small>几条有代表性的路径</small><i>↗</i></button>
+        <button type="button" data-go="3"><span>03</span><strong>为什么想到重构</strong><small>当各自的补丁难以拼装</small><i>↗</i></button>
+        <button type="button" data-go="4"><span>04</span><strong>部分设计思路</strong><small>提供一种中立的底层约定</small><i>↗</i></button>
+        <button type="button" data-go="5"><span>05</span><strong>容纳不同的方案</strong><small>统一基底上的自然表达</small><i>↗</i></button>
+        <button type="button" data-go="6"><span>06</span><strong>为什么值得统一标准</strong><small>封装边界与未知的涌现</small><i>↗</i></button>
+        <button type="button" data-go="7"><span>07</span><strong>结语</strong><small>AVM 只提供基底</small><i>↗</i></button>
+      </nav>
+      <div class="menu__foot">
+        <span>方向键 / 滚轮切换</span>
+        <span>内容依据 AVM 项目文案</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="sr-only" id="liveRegion" aria-live="polite"></div>
+  <script src="./main.js" defer></script>
+</body>
+</html>

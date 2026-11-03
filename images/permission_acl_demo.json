@@ -1,0 +1,211 @@
+{
+  "meta": {
+    "version": 1
+  },
+  "mem": {
+    "model_params": {
+      "kind": "dict",
+      "value": {
+        "model": {
+          "kind": "str",
+          "value": "plm.python"
+        }
+      },
+      "ctrl": {
+        "type": "para"
+      }
+    },
+    "lib": {
+      "kind": "dict",
+      "value": {
+        "greeting": {
+          "kind": "str",
+          "value": "hello",
+          "ctrl": {
+            "acl.read": "{\"allow\": [{\"group\": \"worker\"}]}",
+            "acl.write": "{\"allow\": []}"
+          }
+        },
+        "secret": {
+          "kind": "str",
+          "value": "top-secret",
+          "ctrl": {
+            "acl.read": "{\"deny\": [{\"group\": \"worker\"}]}"
+          }
+        }
+      },
+      "ctrl": {
+        "owner": "0"
+      },
+      "meta": "ACL 示例库：greeting 允许 worker 组读，secret 拒绝 worker 组读，greeting 禁止写"
+    },
+    "programs": {
+      "kind": "dict",
+      "value": {
+        "init": {
+          "kind": "dict",
+          "value": {
+            "content": {
+              "kind": "str",
+              "value": "WORKER_CID = None\nWORK_RESULT = None\n\nWORKER_TASK = \"\"\"def run_checks():\n    allowed = memory_read(\"$lib.greeting\")\n    denied_secret = memory_read(\"$lib.secret\")\n    denied_write = memory_write(\"$lib.greeting\", \"hacked\")\n    memory_make(\"$work\", \"result\", \"str\")\n    memory_write(\n        \"$work.result\",\n        \"greeting=%s | secret=%s | write=%s\"\n        % (str(allowed), str(denied_secret), str(denied_write)),\n    )\n\nrun_checks()\n\"\"\"\n\n\ndef setup_acl():\n    # 条件在 handler 节点里声明；这里只登记 handler\n    listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.read_greeting\",\n                 tier=\"kernel\", priority=10)\n    listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.read_secret\",\n                 tier=\"kernel\", priority=10)\n    listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.write_greeting\",\n                 tier=\"kernel\", priority=10)\n\n\ndef on_done():\n    result = str(memory_read(WORK_RESULT))\n    greeting = str(memory_read(\"$MEM.lib.greeting\"))\n    memory_write(\n        \"$MEM.report\",\n        \"ACL 演示报告\\n工作对话结果: \" + result + \"\\n库节点 greeting: \" + greeting,\n    )\n    close_conversation(WORKER_CID)\n    close_conversation(0)\n\n\ndef main():\n    global WORKER_CID, WORK_RESULT\n    setup_acl()\n    created = str(create_cmd(\"$MEM.programs.worker\", \"$MEM.model_params\"))\n    WORKER_CID = int(created.rsplit(\"=\", 1)[1])\n    roots = json.loads(str(memory_read(\"$MEM.conversations.%d.roots\" % WORKER_CID)))\n    WORK_RESULT = roots[\"work\"][\"target\"] + \".result\"\n    # 工作结果写入后的 after 事实事件：通知 init 醒来收尾（条件在 handler 节点里）\n    listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.done\")\n    send_instruction(WORKER_CID, WORKER_TASK)\n"
+            }
+          },
+          "ctrl": {
+            "type": "python"
+          }
+        },
+        "worker": {
+          "kind": "dict",
+          "value": {
+            "content": {
+              "kind": "str",
+              "value": ""
+            },
+            "caps": {
+              "kind": "dict",
+              "value": {
+                "mode": {
+                  "kind": "str",
+                  "value": "user"
+                },
+                "workspace": {
+                  "kind": "str",
+                  "value": "work"
+                },
+                "groups": {
+                  "kind": "list",
+                  "value": [
+                    {
+                      "kind": "str",
+                      "value": "worker"
+                    }
+                  ]
+                },
+                "roots": {
+                  "kind": "list",
+                  "value": [
+                    {
+                      "kind": "str",
+                      "value": "lib"
+                    }
+                  ]
+                },
+                "tools": {
+                  "kind": "list",
+                  "value": [
+                    {
+                      "kind": "str",
+                      "value": "memory_read"
+                    },
+                    {
+                      "kind": "str",
+                      "value": "memory_write"
+                    },
+                    {
+                      "kind": "str",
+                      "value": "memory_make"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "ctrl": {
+            "type": "python"
+          },
+          "meta": "用户态工作程序：只持有 $work 与只读库根 $lib"
+        }
+      }
+    },
+    "handlers": {
+      "kind": "dict",
+      "value": {
+        "read_greeting": {
+          "kind": "dict",
+          "value": {
+            "content": {
+              "kind": "str",
+              "value": "def handle(event):\n    info = event.get(\"target_info\") or {}\n    ctrl = info.get(\"ctrl\") or {}\n    source = (event.get(\"source\") or {}).get(\"conversation\") or {}\n    # 内核态监督对话越过 ACL（它本来就持有 MEM 根）\n    if source.get(\"mode\") == \"kernel\":\n        return {}\n    groups = source.get(\"groups\") or []\n    cid = source.get(\"cid\")\n    try:\n        acl = json.loads(ctrl.get(\"acl.read\") or \"{}\")\n    except Exception:\n        acl = {}\n\n    def match(rule):\n        if not isinstance(rule, dict):\n            return False\n        if rule.get(\"cid\") == cid:\n            return True\n        return rule.get(\"group\") in groups\n\n    if any(match(rule) for rule in (acl.get(\"deny\") or [])):\n        return {\"action\": \"replace\", \"response\": \"ACL 拒绝读取\"}\n    if any(match(rule) for rule in (acl.get(\"allow\") or [])):\n        return {\"action\": \"allow\"}\n    return {\"action\": \"replace\", \"response\": \"ACL 默认拒绝读取\"}\n"
+            },
+            "condition": {
+              "kind": "str",
+              "value": "{\"events\": [\"memory_read\"], \"target\": {\"kind\": \"exact\", \"ref\": \"$MEM.lib.greeting\"}}"
+            }
+          },
+          "ctrl": {
+            "type": "handler"
+          }
+        },
+        "read_secret": {
+          "kind": "dict",
+          "value": {
+            "content": {
+              "kind": "str",
+              "value": "def handle(event):\n    info = event.get(\"target_info\") or {}\n    ctrl = info.get(\"ctrl\") or {}\n    source = (event.get(\"source\") or {}).get(\"conversation\") or {}\n    # 内核态监督对话越过 ACL（它本来就持有 MEM 根）\n    if source.get(\"mode\") == \"kernel\":\n        return {}\n    groups = source.get(\"groups\") or []\n    cid = source.get(\"cid\")\n    try:\n        acl = json.loads(ctrl.get(\"acl.read\") or \"{}\")\n    except Exception:\n        acl = {}\n\n    def match(rule):\n        if not isinstance(rule, dict):\n            return False\n        if rule.get(\"cid\") == cid:\n            return True\n        return rule.get(\"group\") in groups\n\n    if any(match(rule) for rule in (acl.get(\"deny\") or [])):\n        return {\"action\": \"replace\", \"response\": \"ACL 拒绝读取\"}\n    if any(match(rule) for rule in (acl.get(\"allow\") or [])):\n        return {\"action\": \"allow\"}\n    return {\"action\": \"replace\", \"response\": \"ACL 默认拒绝读取\"}\n"
+            },
+            "condition": {
+              "kind": "str",
+              "value": "{\"events\": [\"memory_read\"], \"target\": {\"kind\": \"exact\", \"ref\": \"$MEM.lib.secret\"}}"
+            }
+          },
+          "ctrl": {
+            "type": "handler"
+          }
+        },
+        "write_greeting": {
+          "kind": "dict",
+          "value": {
+            "content": {
+              "kind": "str",
+              "value": "def handle(event):\n    info = event.get(\"target_info\") or {}\n    ctrl = info.get(\"ctrl\") or {}\n    source = (event.get(\"source\") or {}).get(\"conversation\") or {}\n    if source.get(\"mode\") == \"kernel\":\n        return {}\n    groups = source.get(\"groups\") or []\n    cid = source.get(\"cid\")\n    try:\n        acl = json.loads(ctrl.get(\"acl.write\") or \"{}\")\n    except Exception:\n        acl = {}\n\n    def match(rule):\n        if not isinstance(rule, dict):\n            return False\n        if rule.get(\"cid\") == cid:\n            return True\n        return rule.get(\"group\") in groups\n\n    if any(match(rule) for rule in (acl.get(\"deny\") or [])):\n        return {\"action\": \"replace\", \"response\": \"ACL 拒绝写入\"}\n    if any(match(rule) for rule in (acl.get(\"allow\") or [])):\n        return {\"action\": \"allow\"}\n    return {\"action\": \"replace\", \"response\": \"ACL 默认拒绝写入\"}\n"
+            },
+            "condition": {
+              "kind": "str",
+              "value": "{\"events\": [\"memory_write\"], \"target\": {\"kind\": \"exact\", \"ref\": \"$MEM.lib.greeting\"}}"
+            }
+          },
+          "ctrl": {
+            "type": "handler"
+          }
+        },
+        "done": {
+          "kind": "dict",
+          "value": {
+            "content": {
+              "kind": "str",
+              "value": "def handle(event):\n    return {\"notify\": [{\"cid\": 0, \"content\": \"on_done()\"}]}\n"
+            },
+            "condition": {
+              "kind": "str",
+              "value": "{\"events\": [\"memory_write\"], \"phase\": [\"after\"], \"target\": {\"kind\": \"subtree\", \"ref\": \"$MEM.workspaces\"}}"
+            }
+          },
+          "ctrl": {
+            "type": "handler"
+          }
+        }
+      }
+    },
+    "init_user": {
+      "kind": "str",
+      "value": "main()"
+    },
+    "report": {
+      "kind": "str",
+      "value": ""
+    }
+  },
+  "security": {
+    "roots": {
+      "lib": "$MEM.lib"
+    },
+    "workspace_region": "$MEM.workspaces"
+  },
+  "para_ref": "$MEM.model_params",
+  "init": {
+    "name": "acl-demo",
+    "system_ref": "$MEM.programs.init",
+    "user_ref": "$MEM.init_user",
+    "para_ref": "$MEM.model_params"
+  }
+}

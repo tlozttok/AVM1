@@ -283,6 +283,13 @@ class Console:
             "is_root": conv.is_root,
             "parent": conv.parent.cid if conv.parent is not None else None,
             "messages": len(conv.messages),
+            # 宿主观测面：只展示能力摘要（根名/工具名），不展开根目标的真实地址
+            "caps": {
+                "mode": conv.caps.mode,
+                "groups": list(conv.caps.groups),
+                "roots": sorted(conv.caps.roots),
+                "tools": sorted(conv.caps.tools),
+            },
         }
 
     def conversation(self, cid: int) -> dict:

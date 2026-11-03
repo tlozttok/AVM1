@@ -1001,11 +1001,19 @@ class TestEditMetadata:
         content, _ = self._exec(core, root, {"ref": "$MEM.a", "type": "upsert"})
         assert "必须是 set/get/del" in content
 
-    def test_str_node_errors(self):
+    def test_str_node_ctrl_is_editable(self):
+        """字符串叶子只有控制数据、没有描述数据；edit_metadata 可改它的 ctrl。"""
         core, root = self._root()
         core.mem["a"] = "leaf"
         content, _ = self._exec(core, root, {"ref": "$MEM.a", "type": "set", "key": "type", "value": "x"})
-        assert "不是 MetaDict/MetaList" in content
+        assert "已写入" in content
+        content, _ = self._exec(core, root, {"ref": "$MEM.a", "type": "get", "key": "type"})
+        assert content == "x"
+
+    def test_device_node_has_no_ctrl(self):
+        core, root = self._root()
+        content, _ = self._exec(core, root, {"ref": "$MEM.listeners", "type": "get"})
+        assert "带控制数据的节点" in content
 
     def test_invalid_ref_errors(self):
         core, root = self._root()

@@ -20,6 +20,7 @@ python -m avm.image <image.json>
 | `mem` | 是 | 内存树（对象，顶层键 → 显式节点） |
 | `para_ref` | 否 | para 节点路径，默认 `$MEM.model_params` |
 | `devices` | 否 | 设备挂载列表 |
+| `security` | 否 | 权限段：根注册表 `roots` 与工作空间区域 `workspace_region`（见下文） |
 | `init` | 否 | 启动对话配置（缺省时不启动任何对话） |
 | `persist_to` | 否 | 运行结束后内存写回路径（相对镜像文件所在目录） |
 
@@ -30,7 +31,7 @@ python -m avm.image <image.json>
 | 字段 | 含义 |
 |---|---|
 | `kind` | `str` / `dict` / `list` / `device` / `link` |
-| `meta` | 可选字符串——描述（description），给 LLM 看的一句话摘要；元数据之一 |
+| `meta` | 可选字符串——描述（description），给 LLM 看的一句话摘要；仅容器（kind=dict/list）可带，str 没有描述数据 |
 | `ctrl` | 可选对象（`dict[str,str]`）——控制数据，给 Core 的结构化控制信息；元数据之一 |
 | `target` | `kind: "link"` 必填——`$MEM` 地址或设备标识符 |
 | `value` | `str` → 字符串；`dict` → 子节点对象；`list` → 子节点数组；`device` → 不使用（`kind: "device"` 只作可读性标记，实际挂载由 `devices` 段完成）；`link` → 不使用 |
@@ -40,7 +41,8 @@ python -m avm.image <image.json>
 - `kind` 未知即报错；`ctrl` 必须是对象。
 - `kind=device` 可出现在**任意层级**，作为可读性标记；该节点从 mem 根到自身的点号路径（如 `game.map.rooms`）必须在 `devices` 段的 `path` 里出现，否则加载报错。反向不要求：`devices` 段可以有 mem 里没有标记的挂载项，照样挂载。device 节点不写入数据树，实际挂载由 `devices` 段完成（挂载会在该路径物化一个链接节点，见[运行时](runtime.md)的挂载与链接节点一节）。
 - `kind=link` 声明链接节点：`target` 以 `$` 开头是内存树地址（`$MEM.a.b`），否则是设备唯一标识符（`devices` 段条目的 `id`，缺省取 `path`）。寻址遇到链接即进入目标，读/写/`memory_make`/`edit_metadata` 都作用于目标；链接只由内核侧声明，运行期没有创建/删除链接的指令。
-- `ctrl.type` 目前定义的取值：`para`（模型调用参数）、`settingup`（LLM 提示词程序）、`python`（Python 程序）。
+- `ctrl.type` 目前定义的取值：`para`（模型调用参数）、`settingup`（LLM 提示词程序）、`python`（Python 程序）、`handler`（事件处理器；处理器节点不再用 `python` 类型）。
+- `kind="str"` 的节点只有控制数据：可带 `ctrl`（如预置 `"owner"`），**不能带 `meta`**（镜像装载报 `ImageError`）。字符串节点在运行时是 `StrNode`（str 子类），`memory_make`/列表追加创建时由 Core 写入 `ctrl.owner`。
 - `ctrl.owner` 是 Core 维护的所有者标记（字符串 cid）。`memory_make` / `memory_write` 创建容器节点时会自动写入；镜像作者也可在 `ctrl` 中显式预置 `"owner": "0"` 来声明所有权。无主节点在事件模型 v1 中不可注册 before 内存监听。
 
 ```json
@@ -52,6 +54,20 @@ python -m avm.image <image.json>
 ```
 
 **程序节点（settingup / python）**：`create_cmd` / `create_sub` 的 `system_ref` 必须指向这类节点（运行时校验；指向 str 节点、无类型 dict 节点或其他类型会报错，不创建对话）。`settingup` 节点的 `value` 含 `name`（对话身份）与 `content`（提示词文本）；`python` 节点的 `value` 含 `content`（Python 代码）。两者均可带可选的 `signature`（预期输入/输出描述）与 `para_ref`（该程序使用的模型参数节点，`init` 指向它时按这个字段取 para；`create_cmd` / `create_sub` 的 para 由指令参数给出）。`content` 必须是字符串（缺失或类型不符会在创建对话时被拒）；`name` 可选，缺省时创建出的对话身份回退为「父身份#cid」，根入口没有名字时身份 = cid。
+
+**程序能力声明 `value.caps`**：程序节点用数据节点 `value.caps` 声明由它创建的对话的能力（详见 [runtime.md](runtime.md#对话能力与权限批次一)）；`ctrl` 只描述类型与数据组织，`ctrl.caps` 不再支持：
+
+```json
+{"kind": "dict", "ctrl": {"type": "settingup"},
+ "value": {"content": {"kind": "str", "value": "..."},
+           "caps": {"kind": "dict", "value": {
+             "mode": {"kind": "str", "value": "user"},
+             "roots": {"kind": "list", "value": [{"kind": "str", "value": "lib"}]},
+             "tools": {"kind": "list", "value": [{"kind": "str", "value": "memory_read"}]},
+             "workspace": {"kind": "str", "value": "work"}}}}}
+```
+
+缺省字段继承父对话；`roots` 是 `security.roots` 注册表里的名字列表；`tools` 必须是父工具集的子集；`workspace` 是用户态对话工作空间根名（缺省 `work`）。没有 `caps` 的程序继承父能力（旧镜像行为不变）。程序节点的 `caps` 在创建对话时校验，非法时不创建对话。
 
 运行期可用 `edit_metadata` 指令给节点补 ctrl（例如给运行时创建的 dict 节点设置 `type='settingup'` / `'python'`），配合 `memory_make` / `memory_write` 组合出可被 `create_cmd` 使用的程序节点——程序节点不一定只在镜像中预置。
 
@@ -133,6 +149,23 @@ python -m avm.image <image.json>
 }
 ```
 
+## security（权限：根注册表与工作空间区域）
+
+可选对象；缺省时根注册表为空、工作空间区域取 `$MEM.workspaces`：
+
+```json
+"security": {
+  "roots": { "lib": "$MEM.lib", "repo": "$MEM.AVMRepo" },
+  "workspace_region": "$MEM.workspaces"
+}
+```
+
+- `roots`：可授予根的注册表，名字 → `$MEM` 引用。装载时校验：名字规则（与程序 `caps.roots` 一致：非空、不含点号、不带 `$`、不占用 `MEM`/`conv`/`batch`）、目标非空、不同目标**两两前缀无关**、不与工作空间区域重叠。用户态对话的 `caps.roots` 只能引用这里的名字。
+- `workspace_region`：工作空间区域（`$MEM` 引用，不能是根本身）。装载器校验区域指向 dict（缺则建空 dict），并拒绝区域子树里的链接节点与设备挂载——工作空间不可逃逸。
+- 只有内核态对话能通过 `create_cmd` + 程序 `caps.mode=user` 触发工作空间分配；分配出的 `w<n>` 子树带 `ctrl.owner`（创建者 cid），并作为 `caps.workspace` 指定名字绑进子对话根表。
+- 本段在设备挂载之后安装，因此区域里的设备挂载能被拒绝；`roots` 目标只校验语法与前缀，目标缺失在访问时报"引用根无效"。
+- 本批没有运行期修改 `security` 的入口（对话设备控制面在后续批次）。
+
 ## init（启动对话）
 
 - `name`：0 号对话名，默认 `"init"`。
@@ -140,7 +173,7 @@ python -m avm.image <image.json>
 - `para_ref`：可选，`$` 开头的内存引用，指定入口对话的 para 节点。缺省时取程序节点 `value.para_ref`，再缺省取镜像顶层 `para_ref`；PLM 入口在前两者都没有时报错（顶层 para 按约定是 LLM 参数）。
 - `user` / `user_ref`：二选一。`user` 是字面量；`user_ref` 是 `$` 开头的内存引用，必须指向 str 节点（启动用户消息）。PLM 入口的首条用户消息就是这条（`plm.function` 的 JSON 输入、`plm.command` 的整行命令都从这里来）。
 
-只启动 0 号对话；**不预置其他对话**（其他对话由对话运行期自己 `create_cmd` / `create_sub` 创建）。PLM 入口的典型用法：0 号程序先做确定性的准备工作（读设备、组装提示词、写内存），再 `create_cmd` 出真正跑推理的 LLM 对话并 `send_instruction` 启动它，自己 `close_conversation`。
+init 强制内核态：程序 `ctrl.caps.mode` 声明 `user` 时装载报 `ImageError`（没有内核态就无法管理权限）。只启动 0 号对话；**不预置其他对话**（其他对话由对话运行期自己 `create_cmd` / `create_sub` 创建）。PLM 入口的典型用法：0 号程序先做确定性的准备工作（读设备、组装提示词、写内存），再 `create_cmd` 出真正跑推理的 LLM 对话并 `send_instruction` 启动它，自己 `close_conversation`。
 
 ## 启动流程
 
@@ -149,10 +182,11 @@ python -m avm.image <image.json>
 **加载镜像**依次做：
 
 1. 解析 mem（严格校验：结构错误与类型滑档都抛 `ImageError`——`meta` 必须是对象、`para_ref` 必须是非空字符串、`devices` 条目必须是对象）；
-2. 按 `para_ref` 校验 para 节点（`ctrl.type == "para"`）并配置 Core；
-3. 加载设备插件文件（校验继承关系与挂载路径唯一）并挂载；
-4. 安装启动自带的模型目录 `$MEM.model_catalog`（镜像或检查点里已有的字段不覆盖，只补缺失）；
-5. 启动 init 对话（cid 0，`name`；LLM 入口或 PLM 入口）。`init` 缺失或为空时给一行 stderr 诊断，不启动任何对话。
+2. 装载镜像 `plms` 段（自定义 PLM），安装启动自带的模型目录 `$MEM.model_catalog`（镜像或检查点里已有的字段不覆盖，只补缺失）；
+3. 按 `para_ref` 校验 para 节点（`ctrl.type == "para"`）并配置 Core；
+4. 加载设备插件文件（校验继承关系与挂载路径唯一）并挂载；
+5. 解析并安装 `security` 段（根注册表、工作空间区域；错误抛 `ImageError`）；
+6. 启动 init 对话（cid 0，`name`；LLM 入口或 PLM 入口）。`init` 缺失或为空时给一行 stderr 诊断，不启动任何对话。
 
 **启动核心**依次做：拉一次上游 `GET /models` 填模型目录（失败只警告，不拦启动）；装 API 失败的运行者策略（终端三选项：更新环境 / 继续 / 退出）。
 

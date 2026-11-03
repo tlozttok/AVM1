@@ -84,7 +84,7 @@ def env(tmp_path):
     core.lmu = MockLMU()
     core.mem["note"] = MetaDict(data={"v": "hi"}, metadata="一条笔记", ctrl={"owner": "0"})
     core.mem["h"] = MetaDict(data={"content": "def handle(event):\n    return {}\n"},
-                             ctrl={"type": "python"})
+                             ctrl={"type": "handler"})
     core.mem["own"] = MetaDict(data={"child": ""}, ctrl={"owner": "0"})
     core.mem.mount("echo", EchoDevice())
     # web_root 指向一个空目录：这里断言「没构建」的分支，测试不依赖开发者是否跑过 npm build

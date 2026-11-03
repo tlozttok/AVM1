@@ -78,19 +78,17 @@ def build_image():
         "ctrl": {"type": "para"},
         "value": {"model": {"kind": "str", "value": "plm.python"}},
     }
+    # str 没有描述数据：这些节点只存字符串；说明放在 README/程序注释里
     mem["file_list"] = {
         "kind": "str",
-        "meta": "打包器的 user 消息：要打包的文件列表",
         "value": file_list_code(),
     }
     mem["packed_docs"] = {
         "kind": "str",
-        "meta": "启动时写入：系统提示词里打包了哪些文档",
         "value": "",
     }
     mem["packer_report"] = {
         "kind": "str",
-        "meta": "启动时写入：打包器的完成报告",
         "value": "",
     }
     image["init"] = {

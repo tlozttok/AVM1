@@ -19,12 +19,13 @@ import os
 import sys
 from typing import Optional
 
-from .core import Core, _build_conversation
-from .exceptions import VMMemoryError, RunnerStop
+from .core import Core, _build_conversation, _derive_child_caps
+from .capabilities import grant_target_segments
+from .exceptions import IllegalOperationError, VMMemoryError, RunnerStop
 from .memory_device import MemoryDevice, BUILTIN_DEVICE_CLASSES
 from .python_server import PLM_REGISTRY, PLMServer
 from .runner_prompt import prompt_api_error
-from .types import MetaDict, MetaList, LinkNode
+from .types import MetaDict, MetaList, LinkNode, StrNode
 
 IMAGE_VERSION = 1
 KINDS = ("str", "dict", "list", "device", "link")
@@ -46,12 +47,19 @@ def _parse_node(value, path, markers):
     ctrl = value.get("ctrl")
     if ctrl is not None and not isinstance(ctrl, dict):
         raise ImageError(f"{path}: ctrl 必须是对象（dict[str,str]）")
+    if ctrl is not None and "caps" in ctrl:
+        raise ImageError(
+            f"{path}: 能力声明必须放在 value.caps 数据节点里，ctrl.caps 不再支持"
+        )
     node_value = value.get("value")
 
     if kind == "str":
         if not isinstance(node_value, str):
             raise ImageError(f"{path}: str 节点的 value 必须是字符串")
-        return node_value
+        if meta is not None:
+            # 字符串只有控制数据，没有描述数据；描述放到父容器或删除
+            raise ImageError(f"{path}: str 节点没有描述数据（meta）；请改用 ctrl 或把描述放到父容器")
+        return StrNode(node_value, ctrl=ctrl)
     if kind == "dict":
         if not isinstance(node_value, dict):
             raise ImageError(f"{path}: dict 节点的 value 必须是对象")
@@ -202,6 +210,43 @@ def _mount_devices(core: Core, image_path: str, devices: list, mem_device_paths:
                 raise ImageError(f"链接 {device.mount_path} 目标不可达: {e}")
 
 
+_SECURITY_KEYS = frozenset({"roots", "workspace_region"})
+
+
+def _parse_security(core: Core, image: dict) -> None:
+    """解析并安装镜像顶层 security 段；缺省时保持空注册表与默认工作空间区域。"""
+    security = image.get("security")
+    if security is None:
+        return
+    if not isinstance(security, dict):
+        raise ImageError("security 必须是对象")
+    unknown = sorted(set(security) - _SECURITY_KEYS)
+    if unknown:
+        raise ImageError(f"security 含未知字段：{unknown}（允许：{sorted(_SECURITY_KEYS)}）")
+    roots_raw = security.get("roots") or {}
+    if not isinstance(roots_raw, dict):
+        raise ImageError("security.roots 必须是对象")
+    roots_spec = {}
+    for name, ref in roots_raw.items():
+        try:
+            if not isinstance(name, str) or not name:
+                raise IllegalOperationError("根名必须是非空字符串")
+            roots_spec[name] = grant_target_segments(ref)
+        except (IllegalOperationError, VMMemoryError) as e:
+            raise ImageError(f"security.roots.{name}: {e}")
+    region_ref = security.get("workspace_region", "$MEM.workspaces")
+    if not isinstance(region_ref, str) or not region_ref:
+        raise ImageError(f"security.workspace_region 必须是非空字符串，得到 {region_ref!r}")
+    try:
+        region = grant_target_segments(region_ref)
+    except (IllegalOperationError, VMMemoryError) as e:
+        raise ImageError(f"security.workspace_region: {e}")
+    try:
+        core.install_security_config(roots_spec, region)
+    except (IllegalOperationError, VMMemoryError) as e:
+        raise ImageError(f"security 段非法：{e}")
+
+
 def _resolve_para(core: Core, para_ref: str) -> str:
     try:
         node = core.unwrap(para_ref, for_llm=False)
@@ -273,13 +318,26 @@ def _start_init(core: Core, init: dict):
         # PLM 入口：0 号对话是 Python 对话。分派与模型命名空间校验复用 _build_conversation，
         # 它建好 SystemMessage（程序代码）、注册对话、设 para_ref 与 is_python；
         # 这里补用户消息与"0 号 + 就绪"语义（与 Core.start 对齐，区别只在执行器是 PLM）。
-        conv = _build_conversation(core, system_ref, para_ref, parent=None, is_sub=False)
+        if node is not None:
+            try:
+                _derive_child_caps(core, None, node, is_sub=False, is_init=True)
+            except (VMMemoryError, IllegalOperationError) as e:
+                raise ImageError(f"init 程序的能力声明非法：{e}")
+        conv = _build_conversation(core, system_ref, para_ref, parent=None, is_sub=False, is_init=True)
         conv.append_user_message(user)
         conv.is_root = True
         conv.name = name
         core._ready_cids.append(conv.cid)
         return
     conv = core.start(system, user, para_ref)
+    if node is not None:
+        # LLM 入口同样按程序 ctrl.caps 计算 init 能力；init 强制内核态
+        try:
+            caps, workspace_name = _derive_child_caps(core, None, node, is_sub=False, is_init=True)
+        except (VMMemoryError, IllegalOperationError) as e:
+            raise ImageError(f"init 程序的能力声明非法：{e}")
+        conv.caps = caps
+        conv.workspace_root_name = workspace_name
     conv.name = name
 
 
@@ -355,6 +413,8 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
         raise ImageError(f"para_ref 必须是非空字符串，得到 {para_ref!r}")
     core.para_ref = _resolve_para(core, para_ref)
     _mount_devices(core, image_path, image.get("devices") or [], device_markers)
+    # security 段在设备挂载之后安装：区域子树里的设备挂载链接此时已物化，能被拒绝
+    _parse_security(core, image)
 
     init = image.get("init")
     if checkpoint_in:

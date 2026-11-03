@@ -10,6 +10,11 @@ import sys
 import time
 
 from .types import MetaList, MetaDict
+from .capabilities import (
+    CONTROL_DEVICE_ROOTS, MEM_ROOT_NAME, MODE_KERNEL, MODE_USER, Capability, caps_to_dict,
+    check_root_name, default_kernel_caps, grant_target_segments, path_is_prefix,
+    targets_prefix_free,
+)
 from .exceptions import IllegalOperationError, VMSyntaxError, VMMemoryError, APIError, RunnerStop, KernelPanic
 from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, message_to_api_dict, LinkNode
 from .memory import Memory, check_new_key
@@ -18,7 +23,7 @@ from .monitor import Monitor
 from .python_server import HOST_ONLY_PLMS, PLM_REGISTRY, create_plm
 from .events import EventSystem, build_event, EVENT_TYPES
 from .info_devices import (
-    ConversationsDevice, SchedulerDevice,
+    CapsDevice, ConversationsDevice, RootsDevice, SchedulerDevice,
     ListenersDevice, MemorySummaryDevice, MonitorDevice,
 )
 from .interrupts import InterruptTable
@@ -36,6 +41,28 @@ def _report_tool_error(conv: Conversation, message: str):
     print(f"[AVM] 对话 {conv.cid}: {message}", file=sys.stderr)
 
 
+def _canonical_ref(core: 'Core', target, space=None, follow_final: bool = True):
+    """把请求别名转成事件内部 canonical target_ref；无法解析时返回 None。
+
+    follow_final=False 用于删除链接：最终段不跟随，canonical 指向链接节点本身。
+    """
+    return core.canonical_ref(target, space=space, follow_final=follow_final)
+
+
+def _dispatch_before_event(core: 'Core', conv: Conversation, event_type: str, target: str,
+                           payload: dict, target_ref=None):
+    """构造并派发一条 before 事件（10 条指令共用）；返回处理后的 event。"""
+    event = build_event(
+        core, event_type, "before", conv=conv, target=target,
+        payload=payload, target_ref=target_ref,
+    )
+    event = core.events.dispatch(event)
+    core.events.deliver_notifies(event)
+    if event["action"] == "handler_error":
+        _report_tool_error(conv, event["response"])
+    return event
+
+
 def _publish_memory_after(
     core: 'Core',
     event_type: str,
@@ -44,16 +71,19 @@ def _publish_memory_after(
     payload: dict,
     result: Optional[dict] = None,
     follow_target: Optional[str] = None,
+    space=None,
 ) -> None:
     """读取/写入成功后发布 memory/device after 事实事件。
 
     事件 target 用调用者给的地址（append 时保持原 ref，带 -1）；追设备能力时要
     一个可解析的地址，追加写入由调用方通过 follow_target 传真实下标地址。
+    `space` 是发起对话的地址上下文（根表）。
     """
-    follow = core.mem.follow_link_target(follow_target or target)
+    follow = core.mem.follow_link_target(follow_target or target, space=space)
     if follow[0] == "memory":
         core.events.publish_after_event(
-            event_type, conv, target, payload, source_kind="memory"
+            event_type, conv, target, payload, source_kind="memory",
+            target_ref=("memory", tuple(follow[1])),
         )
         return
     _, mount_key, remainder = follow
@@ -65,7 +95,8 @@ def _publish_memory_after(
     merged["ref"] = target
     merged["actor_cid"] = conv.cid
     core.events.publish_after_event(
-        event_type, conv, target, merged, device_path=mount_key
+        event_type, conv, target, merged, device_path=mount_key,
+        target_ref=("device", mount_key, tuple(remainder)),
     )
 
 
@@ -173,14 +204,14 @@ def _validate_instruction_args(instr_cls, args) -> Optional[str]:
             return "type=del 时 key 必需"
     if tool == "listen_event":
         action = args.get("action")
-        if action == "listen" and any(
-            args.get(k) is None for k in ("event_type", "target", "handler_ref")
-        ):
-            return "action=listen 时必须提供 event_type、target、handler_ref"
-        if action == "modify" and any(
-            args.get(k) is None for k in ("listener_id", "handler_ref")
-        ):
-            return "action=modify 时必须提供 listener_id、handler_ref"
+        if action == "listen":
+            if args.get("handler_ref") is None:
+                return "action=listen 时必须提供 handler_ref"
+        if action == "modify":
+            if args.get("listener_id") is None:
+                return "action=modify 时必须提供 listener_id"
+            if args.get("handler_ref") is None and args.get("priority") is None:
+                return "action=modify 时必须提供 handler_ref 或 priority"
         if action == "cancel" and args.get("listener_id") is None:
             return "action=cancel 时必须提供 listener_id"
     return None
@@ -205,7 +236,8 @@ def _publish_after_safely(conv: Conversation, label: str, publish) -> None:
 
 
 def _publish_core_after_safely(core: 'Core', event_type: str, conv: Conversation, target: str,
-                               payload: dict, source_kind: str = "core") -> None:
+                               payload: dict, source_kind: str = "core",
+                               target_ref=None) -> None:
     """发布一条 Core / 内存侧 after 事实事件，失败只记 stderr（fail-open）。
 
     与 `_publish_after_safely` 同一件事，只是把 `core.events.publish_after_event`
@@ -215,7 +247,8 @@ def _publish_core_after_safely(core: 'Core', event_type: str, conv: Conversation
         conv,
         event_type,
         lambda: core.events.publish_after_event(
-            event_type, conv, target, payload, source_kind=source_kind
+            event_type, conv, target, payload, source_kind=source_kind,
+            target_ref=target_ref,
         ),
     )
 
@@ -258,7 +291,9 @@ class MemoryReadInstruction(Instruction):
     ref: str
 
     def execute(self, core: 'Core', conv: Conversation):
-        event = build_event(core, "memory_read", "before", conv=conv, target=self.ref, payload={"ref": self.ref})
+        event = build_event(core, "memory_read", "before", conv=conv, target=self.ref,
+                            payload={"ref": self.ref},
+                            target_ref=_canonical_ref(core, self.ref, conv.caps.space()))
         event = core.events.dispatch(event)
         core.events.deliver_notifies(event)
         if event["action"] == "handler_error":
@@ -267,7 +302,7 @@ class MemoryReadInstruction(Instruction):
             conv.user_batch.add_tool_response(event["response"], self.call_id)
             return
         try:
-            content = core.unwrap(self.ref, for_llm=True)
+            content = core.unwrap(self.ref, for_llm=True, space=conv.caps.space())
         except _INSTRUCTION_ERRORS as e:
             _respond_error(conv, self.call_id, e)
             return
@@ -289,6 +324,7 @@ class MemoryReadInstruction(Instruction):
                 self.ref,
                 {"ref": self.ref, "actor_cid": conv.cid, "result": content},
                 result={"result": content},
+                space=conv.caps.space(),
             ),
         )
 
@@ -321,6 +357,7 @@ class MemoryWriteInstruction(Instruction):
             conv=conv,
             target=self.ref,
             payload={"ref": self.ref, "content": self.content},
+            target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
         )
         event = core.events.dispatch(event)
         core.events.deliver_notifies(event)
@@ -331,7 +368,7 @@ class MemoryWriteInstruction(Instruction):
             return
         content = event["payload"]["content"]
         try:
-            address = core.mem.set(self.ref, content, owner_cid=conv.cid)
+            address = core.mem.set(self.ref, content, owner_cid=conv.cid, space=conv.caps.space())
         except _INSTRUCTION_ERRORS as e:
             _respond_error(conv, self.call_id, e)
             return
@@ -353,6 +390,7 @@ class MemoryWriteInstruction(Instruction):
                 after_payload,
                 result={"content": content},
                 follow_target=address,
+                space=conv.caps.space(),
             ),
         )
 
@@ -388,6 +426,7 @@ class MemoryMakeInstruction(Instruction):
             conv=conv,
             target=target,
             payload={"ref": self.ref, "key": self.key, "mem_type": self.mem_type},
+            target_ref=_canonical_ref(core, target, conv.caps.space()),
         )
         event = core.events.dispatch(event)
         core.events.deliver_notifies(event)
@@ -397,7 +436,8 @@ class MemoryMakeInstruction(Instruction):
             conv.user_batch.add_tool_response(event["response"], self.call_id)
             return
         try:
-            address = core.mem.make(self.ref, self.key, self.mem_type, owner_cid=conv.cid)
+            address = core.mem.make(self.ref, self.key, self.mem_type, owner_cid=conv.cid,
+                                     space=conv.caps.space())
         except _INSTRUCTION_ERRORS as e:
             _respond_error(conv, self.call_id, e)
             return
@@ -424,6 +464,7 @@ class MemoryMakeInstruction(Instruction):
                     "actor_cid": conv.cid,
                 },
                 result={"key": self.key, "mem_type": self.mem_type, "path": address},
+                space=conv.caps.space(),
             ),
         )
 
@@ -454,6 +495,7 @@ class MemoryDeleteInstruction(Instruction):
             conv=conv,
             target=self.ref,
             payload={"ref": self.ref},
+            target_ref=_canonical_ref(core, self.ref, conv.caps.space(), follow_final=False),
         )
         event = core.events.dispatch(event)
         core.events.deliver_notifies(event)
@@ -463,7 +505,7 @@ class MemoryDeleteInstruction(Instruction):
             conv.user_batch.add_tool_response(event["response"], self.call_id)
             return
         try:
-            deleted_type, address = core.mem.delete(self.ref)
+            deleted_type, address = core.mem.delete(self.ref, space=conv.caps.space())
         except _INSTRUCTION_ERRORS as e:
             _respond_error(conv, self.call_id, e)
             return
@@ -475,6 +517,7 @@ class MemoryDeleteInstruction(Instruction):
             address,
             {"ref": address, "deleted_type": deleted_type, "actor_cid": conv.cid},
             source_kind="memory",
+            target_ref=_canonical_ref(core, address, conv.caps.space(), follow_final=False),
         )
 
 
@@ -511,6 +554,7 @@ class EditMetadataInstruction(Instruction):
             conv=conv,
             target=self.ref,
             payload={"ref": self.ref, "type": op, "key": key, "value": value},
+            target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
         )
         event = core.events.dispatch(event)
         core.events.deliver_notifies(event)
@@ -526,13 +570,14 @@ class EditMetadataInstruction(Instruction):
             )
             return
         try:
-            node = core.unwrap(self.ref, for_llm=False)
+            node = core.unwrap(self.ref, for_llm=False, space=conv.caps.space())
         except _INSTRUCTION_ERRORS as e:
             _respond_error(conv, self.call_id, e)
             return
-        if not isinstance(node, (MetaDict, MetaList)):
+        if not hasattr(node, "get_ctrl"):
             conv.user_batch.add_tool_response(
-                f"Error: {self.ref} 不是 MetaDict/MetaList 节点，无法编辑 ctrl", self.call_id
+                f"Error: {self.ref} 不是带控制数据的节点（dict/list/str），无法编辑 ctrl",
+                self.call_id,
             )
             return
         ctrl = dict(node.get_ctrl() or {})
@@ -561,6 +606,7 @@ class EditMetadataInstruction(Instruction):
                 self.ref,
                 {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
                 source_kind="memory",
+                target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
             )
         elif op == "get":
             if not key:
@@ -573,6 +619,7 @@ class EditMetadataInstruction(Instruction):
                     self.ref,
                     {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
                     source_kind="memory",
+                target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
                 )
             elif key in ctrl:
                 conv.user_batch.add_tool_response(str(ctrl[key]), self.call_id)
@@ -582,6 +629,7 @@ class EditMetadataInstruction(Instruction):
                     self.ref,
                     {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
                     source_kind="memory",
+                target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
                 )
             else:
                 conv.user_batch.add_tool_response(f"Error: ctrl 中没有键 {key}", self.call_id)
@@ -608,6 +656,7 @@ class EditMetadataInstruction(Instruction):
                 self.ref,
                 {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
                 source_kind="memory",
+                target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
             )
 
 
@@ -632,9 +681,18 @@ class CreateInstruction(Instruction):
     para_ref: str
 
     def execute(self, core: 'Core', conv: Conversation):
+        before = _dispatch_before_event(
+            core, conv, "create_cmd", self.system_ref,
+            {"system_ref": self.system_ref, "para_ref": self.para_ref},
+            target_ref=_canonical_ref(core, self.system_ref, conv.caps.space()),
+        )
+        if before["action"] in ("replace", "handler_error"):
+            conv.user_batch.add_tool_response(before["response"], self.call_id)
+            return
         try:
-            node = core.unwrap(self.system_ref, for_llm=False)
-            child = _build_conversation(core, self.system_ref, self.para_ref, parent=conv, is_sub=False)
+            node = core.unwrap(self.system_ref, for_llm=False, space=conv.caps.space())
+            child = _build_conversation(core, self.system_ref, self.para_ref, parent=conv, is_sub=False,
+                                        space=conv.caps.space())
         except _INSTRUCTION_ERRORS as e:
             # system_ref 不是程序节点或引用不存在：错误作为工具响应返回，不创建对话，本对话保持活跃可自纠
             _respond_error(conv, self.call_id, e)
@@ -647,12 +705,13 @@ class CreateInstruction(Instruction):
         # 子对话创建后进入休眠，等待 send_instruction 投递指令
         if child.cid not in core._dormant_cids:
             core._dormant_cids.append(child.cid)
-        _publish_core_after_safely(core, 
+        _publish_core_after_safely(core,
             "create_cmd",
             conv,
             f"cid:{child.cid}",
             {"cid": child.cid, "actor_cid": conv.cid},
             source_kind="core",
+            target_ref=("cid", child.cid),
         )
         conv.user_batch.add_tool_response(f"Success created: cid={child.cid}", self.call_id)
 
@@ -680,14 +739,23 @@ class CreateSubInstruction(Instruction):
     para_ref: str
 
     def execute(self, core: 'Core', conv: Conversation):
+        before = _dispatch_before_event(
+            core, conv, "create_sub", self.system_ref,
+            {"system_ref": self.system_ref, "user_ref": self.user_ref, "para_ref": self.para_ref},
+            target_ref=_canonical_ref(core, self.system_ref, conv.caps.space()),
+        )
+        if before["action"] in ("replace", "handler_error"):
+            conv.user_batch.add_tool_response(before["response"], self.call_id)
+            return
         try:
-            user_content = core.unwrap(self.user_ref, for_llm=False)
+            user_content = core.unwrap(self.user_ref, for_llm=False, space=conv.caps.space())
             if not isinstance(user_content, str):
                 raise VMMemoryError(
                     f"{self.user_ref} 不是字符串节点：user_ref 必须指向 str 节点"
                     f"（得到 {type(user_content).__name__}）"
                 )
-            sub = _build_conversation(core, self.system_ref, self.para_ref, parent=conv, is_sub=True)
+            sub = _build_conversation(core, self.system_ref, self.para_ref, parent=conv, is_sub=True,
+                                      space=conv.caps.space())
         except _INSTRUCTION_ERRORS as e:
             # system_ref 不是程序节点或引用不存在：错误作为工具响应返回，不创建对话，本对话保持活跃可自纠
             _respond_error(conv, self.call_id, e)
@@ -698,12 +766,13 @@ class CreateSubInstruction(Instruction):
         core._ready_cids.insert(0, sub.cid)
         if conv.cid not in core._dormant_cids:
             core._dormant_cids.append(conv.cid)
-        _publish_core_after_safely(core, 
+        _publish_core_after_safely(core,
             "create_sub",
             conv,
             f"cid:{sub.cid}",
             {"cid": sub.cid, "actor_cid": conv.cid},
             source_kind="core",
+            target_ref=("cid", sub.cid),
         )
 
 
@@ -778,6 +847,7 @@ class SendInstruction(Instruction):
                 conv=conv,
                 target=f"cid:{target.cid}",
                 payload={"cid": target.cid, "content": self.content},
+                target_ref=("cid", target.cid),
             )
             event = core.events.dispatch(event)
             core.events.deliver_notifies(event)
@@ -801,6 +871,7 @@ class SendInstruction(Instruction):
                 f"cid:{target.cid}",
                 {"cid": target.cid, "content": content, "actor_cid": conv.cid},
                 source_kind="core",
+                target_ref=("cid", target.cid),
             )
             if core._is_waiting_for_return(target):
                 # 等亚对话返回的对话：消息只入批次，不唤醒；亚对话结束后父对话先跑。
@@ -867,15 +938,29 @@ class CloseInstruction(Instruction):
         if self.cid in core._finished:
             conv.user_batch.add_tool_response(f"Error: 对话 {self.cid} 已关闭", self.call_id)
             return
+        if conv.caps.mode != MODE_KERNEL and target.caps.mode == MODE_KERNEL:
+            msg = f"用户态对话不能关闭内核态对话（目标 cid={self.cid} mode=kernel）"
+            _report_tool_error(conv, msg)
+            conv.user_batch.add_tool_response(f"Illegal: {msg}", self.call_id)
+            return
+        before = _dispatch_before_event(
+            core, conv, "close_conversation", f"cid:{self.cid}",
+            {"cid": self.cid},
+            target_ref=("cid", self.cid),
+        )
+        if before["action"] in ("replace", "handler_error"):
+            conv.user_batch.add_tool_response(before["response"], self.call_id)
+            return
         dropped = bool(target.user_batch.tool_responses or target.user_batch.user_contents)
         dropped = dropped or self.cid in core._ready_cids
         core._close_conversation(self.cid)
-        _publish_core_after_safely(core, 
+        _publish_core_after_safely(core,
             "close_conversation",
             conv,
             f"cid:{self.cid}",
             {"cid": self.cid, "actor_cid": conv.cid},
             source_kind="core",
+            target_ref=("cid", self.cid),
         )
         hint = "，其待执行批次已丢弃" if dropped else ""
         conv.user_batch.add_tool_response(f"对话 {self.cid} 已关闭（finished）{hint}", self.call_id)
@@ -887,16 +972,15 @@ class ListenEventInstruction(Instruction):
         "type": "function",
         "function": {
             "name": "listen_event",
-            "description": "注册/修改/取消事件监听。action=listen：按 event_type/target/handler_ref 注册（handler_ref 必须指向 ctrl.type='python' 的 Python 节点，其 content 定义 handle(event)->dict）；phase 可选 before/after/all，缺省 all；action=modify：用新的 handler_ref 替换已注册监听器的处理器（event_type/target/phase 不可变）；action=cancel：取消监听器。注册/修改/取消只允许所有者执行。处理器返回 notify 时不允许投递给当前对话（禁止自我投递）",
+            "description": "注册/修改/取消事件监听。监听条件在 handler 节点的 condition 数据叶子中声明（events/phase/target/source；用户态只能用命名条件子集 preset）。action=listen：只提供 handler_ref，注册时解析 handler 的 condition；priority 可选（0 起，降序执行；>0 只有内核态对话可设置）；tier 可选 normal/kernel（kernel 级载荷含目标完整数据与来源上下文，只有内核态对话可注册）；action=modify：用新的 handler_ref 和/或 priority 更新已注册监听器（重新解析 handler 的 condition；event_type/target/phase/tier 不可变）；action=cancel：取消监听器。注册/修改/取消只允许所有者执行。处理器返回 notify 时不允许投递给当前对话（禁止自我投递）",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["listen", "modify", "cancel"]},
-                    "event_type": {"type": "string", "enum": EVENT_TYPES},
-                    "target": {"type": "string"},
                     "handler_ref": {"type": "string"},
                     "listener_id": {"type": "integer"},
-                    "phase": {"type": "string", "enum": ["before", "after", "all"]},
+                    "priority": {"type": "integer", "description": "监听优先级，非负整数，缺省 0；大的先执行"},
+                    "tier": {"type": "string", "enum": ["normal", "kernel"], "description": "载荷级别，缺省 normal"},
                 },
                 "required": ["action"],
             }
@@ -911,31 +995,73 @@ class ListenEventInstruction(Instruction):
                 self.call_id,
             )
             return
+        # before 事件：监听注册/修改/取消本身也受事件层权限检查
+        listener_id = getattr(self, "listener_id", None)
+        if action == "listen":
+            b_target = getattr(self, "target", None)
+            if not isinstance(b_target, str):
+                b_target = ""
+            b_payload = {
+                "action": action,
+                "event_type": getattr(self, "event_type", None),
+                "target": b_target,
+                "handler_ref": getattr(self, "handler_ref", None),
+                "phase": getattr(self, "phase", None),
+                "priority": getattr(self, "priority", None),
+                "tier": getattr(self, "tier", None),
+            }
+            if b_target == "*":
+                b_ref = ("*",)
+            else:
+                b_ref = _canonical_ref(core, b_target, conv.caps.space())
+        else:
+            b_target = f"listener:{listener_id}"
+            b_payload = {"action": action, "listener_id": listener_id,
+                         "handler_ref": getattr(self, "handler_ref", None),
+                         "priority": getattr(self, "priority", None)}
+            b_ref = ("listener", listener_id) if isinstance(listener_id, int) else None
+        before = _dispatch_before_event(core, conv, "listen_event", b_target, b_payload, target_ref=b_ref)
+        if before["action"] in ("replace", "handler_error"):
+            conv.user_batch.add_tool_response(before["response"], self.call_id)
+            return
         try:
             if action == "listen":
-                event_type = getattr(self, "event_type", None)
-                target = getattr(self, "target", None)
                 handler_ref = getattr(self, "handler_ref", None)
-                if event_type is None or target is None or handler_ref is None:
-                    raise IllegalOperationError("action=listen 时必须提供 event_type、target、handler_ref")
-                phase = getattr(self, "phase", None) or "all"
-                if phase not in ("before", "after", "all"):
-                    raise IllegalOperationError("phase 必须是 before/after/all")
-                listener_id = core.events.register(conv.cid, event_type, target, handler_ref, phase=phase)
+                if handler_ref is None:
+                    raise IllegalOperationError("action=listen 时必须提供 handler_ref")
+                node = core.unwrap(handler_ref, for_llm=False, space=conv.caps.space())
+                has_condition = isinstance(node, MetaDict) and node.get("condition") is not None
+                if not has_condition:
+                    raise IllegalOperationError(
+                        "handler 节点没有 condition 数据；监听条件必须在 handler 节点声明"
+                    )
+                priority = getattr(self, "priority", 0)
+                tier = getattr(self, "tier", None) or "normal"
+                listener_id = core.events.register_condition(
+                    conv.cid, handler_ref, space=conv.caps.space(),
+                    tier=tier, priority=0 if priority is None else priority,
+                    kernel_mode=(conv.caps.mode == "kernel"),
+                )
                 response = f"listener_id={listener_id} 已注册"
                 after_payload = {"listener_id": listener_id, "action": "listen", "actor_cid": conv.cid}
             elif action == "modify":
                 listener_id = getattr(self, "listener_id", None)
                 handler_ref = getattr(self, "handler_ref", None)
-                if listener_id is None or handler_ref is None:
-                    raise IllegalOperationError("action=modify 时必须提供 listener_id、handler_ref")
+                if listener_id is None or (handler_ref is None and getattr(self, "priority", None) is None):
+                    raise IllegalOperationError(
+                        "action=modify 时必须提供 listener_id，以及 handler_ref 或 priority 至少一个"
+                    )
                 if (
                     getattr(self, "event_type", None) is not None
                     or getattr(self, "target", None) is not None
                     or getattr(self, "phase", None) is not None
+                    or getattr(self, "tier", None) is not None
                 ):
-                    raise IllegalOperationError("action=modify 只允许修改 handler_ref，不能改 event_type/target/phase")
-                core.events.modify(listener_id, conv.cid, handler_ref)
+                    raise IllegalOperationError(
+                        "action=modify 只允许修改 handler_ref/priority，不能改 event_type/target/phase/tier"
+                    )
+                core.events.modify(listener_id, conv.cid, handler_ref, space=conv.caps.space(),
+                                   priority=getattr(self, "priority", None))
                 response = f"listener_id={listener_id} 已更新"
                 after_payload = {"listener_id": listener_id, "action": "modify", "actor_cid": conv.cid}
             else:  # cancel
@@ -946,12 +1072,13 @@ class ListenEventInstruction(Instruction):
                 response = f"listener_id={listener_id} 已取消"
                 after_payload = {"listener_id": listener_id, "action": "cancel", "actor_cid": conv.cid}
 
-            _publish_core_after_safely(core, 
+            _publish_core_after_safely(core,
                 "listen_event",
                 conv,
                 f"listener:{listener_id}",
                 after_payload,
                 source_kind="core",
+                target_ref=("listener", listener_id),
             )
             conv.user_batch.add_tool_response(response, self.call_id)
         except _INSTRUCTION_ERRORS as e:
@@ -971,8 +1098,12 @@ def _instruction_registry() -> Dict[str, Type[Instruction]]:
     }
 
 
-def _build_tools() -> list:
-    return [cls.tool_def for cls in _instruction_registry().values()]
+def _build_tools(conv: Optional[Conversation] = None) -> list:
+    """全部工具定义；给了对话时只返回该对话工具集里的工具（宿主/控制台传 None 拿全量）。"""
+    tools = [cls.tool_def for cls in _instruction_registry().values()]
+    if conv is None:
+        return tools
+    return [t for t in tools if conv.caps.tool_allowed((t.get("function") or {}).get("name"))]
 
 
 class PLMExecutor:
@@ -994,7 +1125,7 @@ class PLMExecutor:
             messages.append({"role": "user", "content": user_content})
 
         params = para.to_dict()
-        params["tools"] = _build_tools()
+        params["tools"] = _build_tools(conversation)
         response = self.plm.handle_messages(messages, params)
         result = response.get("content", "") or ""
         return_calls = self._parse_tool_calls(response.get("tool_calls") or [])
@@ -1082,8 +1213,147 @@ def _check_model_namespace(core: 'Core', program_type: str, para: MetaDict, para
         )
 
 
-def _build_conversation(core: 'Core', system_ref: str, para_ref: str, parent: Conversation, is_sub: bool) -> Conversation:
-    node = core.unwrap(system_ref, for_llm=False)
+_CAPS_SPEC_KEYS = frozenset({"mode", "groups", "roots", "tools", "workspace"})
+
+
+def _read_caps_value(caps_node, key: str):
+    """把 value.caps 下的一个数据节点读成 Python 值。"""
+    value = caps_node.get(key)
+    if key in ("groups", "roots", "tools"):
+        if not isinstance(value, MetaList):
+            raise IllegalOperationError(
+                f"程序节点的 value.caps.{key} 必须是 list 数据节点"
+            )
+        items = []
+        for i, item in enumerate(value):
+            if not isinstance(item, str):
+                raise IllegalOperationError(
+                    f"程序节点的 value.caps.{key}[{i}] 必须是 str 数据节点"
+                )
+            items.append(str(item))
+        return items
+    if not isinstance(value, str):
+        raise IllegalOperationError(
+            f"程序节点的 value.caps.{key} 必须是 str 数据节点"
+        )
+    return str(value)
+
+
+def _program_caps_spec(node) -> dict:
+    """读取程序节点 value.caps 数据；缺省空规格（继承父能力）。
+
+    能力声明是节点数据，不是控制数据：ctrl 只描述类型与数据组织格式。
+    ctrl.caps 一律拒绝（镜像装载与运行期创建两处入口）。
+    """
+    if not isinstance(node, MetaDict):
+        return {}
+    ctrl = node.get_ctrl() or {}
+    if "caps" in ctrl:
+        raise IllegalOperationError(
+            "程序节点的能力声明必须放在 value.caps 数据节点里；ctrl.caps 不再支持"
+        )
+    caps_node = node.get("caps")
+    if caps_node is None:
+        return {}
+    if not isinstance(caps_node, MetaDict):
+        raise IllegalOperationError("程序节点的 value.caps 必须是 dict 数据节点")
+    unknown = sorted(set(caps_node.keys()) - _CAPS_SPEC_KEYS)
+    if unknown:
+        raise IllegalOperationError(
+            f"程序节点的 value.caps 含未知字段：{unknown}（允许：{sorted(_CAPS_SPEC_KEYS)}）"
+        )
+    return {key: _read_caps_value(caps_node, key) for key in caps_node.keys()}
+
+
+def _derive_child_caps(core: 'Core', parent: Optional[Conversation], node, is_sub: bool,
+                       is_init: bool = False):
+    """按程序 ctrl.caps 与父能力计算子对话能力，返回 (Capability, workspace_root_name)。
+
+    规则（批次一）：
+    - 模式：缺省继承；用户态不能创建内核态；亚对话不能跨模式；init 强制内核态。
+    - 工具集：缺省继承；显式声明时必须 ⊆ 父工具集。
+    - 组：缺省继承；用户态父对话只能给子对话父已有的组（内核态父可指定）。
+    - 根：内核态子对话固定 `{MEM: ()}`；用户态子对话的授予根来自 caps.roots 的
+      `根名 -> $MEM 路径`（同域创建时只能沿用父根，不能新增）。
+    """
+    spec = _program_caps_spec(node)
+    parent_caps = parent.caps if parent is not None else default_kernel_caps()
+    parent_mode = parent_caps.mode
+
+    mode = spec.get("mode", parent_mode)
+    if mode not in (MODE_KERNEL, MODE_USER):
+        raise IllegalOperationError(f"程序 caps.mode 必须是 kernel/user，得到 {mode!r}")
+    if is_init and mode != MODE_KERNEL:
+        raise VMMemoryError("init 程序必须是内核态（没有内核态就无法管理权限）")
+    if parent is not None:
+        if parent_mode == MODE_USER and mode != MODE_USER:
+            raise VMMemoryError("模式不可提权：用户态对话只能创建用户态对话")
+        if is_sub and mode != parent_mode:
+            raise VMMemoryError("亚对话不能跨模式创建")
+
+    workspace_name = spec.get("workspace", "work")
+    if not isinstance(workspace_name, str) or not workspace_name:
+        raise IllegalOperationError(f"程序 caps.workspace 必须是非空字符串，得到 {workspace_name!r}")
+    check_root_name(workspace_name)
+
+    tools_spec = spec.get("tools")
+    if tools_spec is None:
+        tools = parent_caps.tools
+    else:
+        if not isinstance(tools_spec, list) or not all(isinstance(x, str) for x in tools_spec):
+            raise IllegalOperationError("程序 caps.tools 必须是字符串列表")
+        tools = frozenset(tools_spec)
+        extra = tools - parent_caps.tools
+        if extra:
+            raise VMMemoryError(f"工具集不可超出父对话：{sorted(extra)}")
+
+    groups_spec = spec.get("groups")
+    if groups_spec is None:
+        groups = parent_caps.groups
+    else:
+        if not isinstance(groups_spec, list) or not all(isinstance(x, str) and x for x in groups_spec):
+            raise IllegalOperationError("程序 caps.groups 必须是非空字符串列表")
+        groups = tuple(dict.fromkeys(groups_spec))
+        if parent is not None and parent_mode == MODE_USER and not set(groups) <= set(parent_caps.groups):
+            raise VMMemoryError("组不可提权：用户态对话只能创建同组或更少组的子对话")
+
+    if mode == MODE_KERNEL:
+        roots = {MEM_ROOT_NAME: ()}
+    else:
+        grants = {}
+        roots_spec = spec.get("roots") or []
+        if not isinstance(roots_spec, list) or not all(isinstance(x, str) for x in roots_spec):
+            raise IllegalOperationError(
+                "程序 caps.roots 必须是根名列表（名字来自镜像 security.roots 注册表）"
+            )
+        for name in roots_spec:
+            check_root_name(name)
+            if name == MEM_ROOT_NAME:
+                raise IllegalOperationError("程序 caps.roots 不能声明 MEM 根")
+            target = core.root_registry.get(name)
+            if target is None:
+                raise VMMemoryError(f"程序 caps.roots 引用了未注册的根：{name!r}")
+            grants[name] = tuple(target)
+        same_domain = is_sub or (parent is not None and parent_mode == MODE_USER)
+        if same_domain:
+            inherited = {n: t for n, t in parent_caps.roots.items() if n != MEM_ROOT_NAME}
+            for name, target in grants.items():
+                if inherited.get(name) != target:
+                    raise VMMemoryError(f"不能向子对话授予父对话没有的根：{name!r}")
+            roots = inherited
+        else:
+            roots = grants
+        if not same_domain and workspace_name in roots:
+            raise VMMemoryError(f"工作空间根名与授予根重名：{workspace_name!r}")
+
+    caps = Capability(mode=mode, groups=groups, roots=roots, tools=tools)
+    needs_workspace = mode == MODE_USER and not same_domain
+    return caps, (workspace_name if needs_workspace else None)
+
+
+def _build_conversation(core: 'Core', system_ref: str, para_ref: str, parent: Conversation, is_sub: bool,
+                        space=None, is_init: bool = False) -> Conversation:
+    node = core.unwrap(system_ref, for_llm=False, space=space)
     # 程序节点校验：与 Python 对话要求 ctrl.type='python' 对等，LLM 对话要求 ctrl.type='settingup'。
     # str 节点、无类型 dict 节点（如参考手册）都不是程序，create_cmd/create_sub 不接受。
     node_type = (node.get_ctrl() or {}).get("type") if isinstance(node, MetaDict) else None
@@ -1100,21 +1370,37 @@ def _build_conversation(core: 'Core', system_ref: str, para_ref: str, parent: Co
     system = content
     is_python = (node_type == "python")
     messages = [SystemMessage(content=system)]
-    para_node = core.unwrap(para_ref, for_llm=False)
+    para_node = core.unwrap(para_ref, for_llm=False, space=space)
     para_type = (para_node.get_ctrl() or {}).get("type") if isinstance(para_node, MetaDict) else None
     if para_type != "para":
         raise VMMemoryError(
             f"{para_ref} 不是参数节点：para_ref 必须指向 ctrl.type='para' 的 dict 节点"
         )
     _check_model_namespace(core, node_type, para_node, para_ref)
+    caps, workspace_name = _derive_child_caps(core, parent, node, is_sub, is_init=is_init)
+    if workspace_name is not None:
+        if parent is None:
+            raise VMMemoryError("用户态对话需要一个创建者来分配工作空间")
+        target = core._allocate_workspace(parent.cid)
+        roots = dict(caps.roots)
+        roots[workspace_name] = target
+        caps = caps.copy(roots=roots)
     conv = Conversation(
         messages=messages,
         cid=0,
         is_sub=is_sub,
         parent=parent,
         is_root=False,
+        caps=caps,
     )
+    # 批次一 S4 用：用户态对话创建工作空间时绑定的根名（内部属性，不进检查点）
+    conv.workspace_root_name = workspace_name
     core._register(conv)
+    if conv.caps.mode == MODE_USER:
+        # 能力自述：保留根 caps 绑定到 $MEM.caps.<cid>，由 Core 拥有，不参与授予
+        roots = dict(conv.caps.roots)
+        roots["caps"] = ("caps", str(conv.cid))
+        conv.caps = conv.caps.copy(roots=roots)
     conv.para_ref = para_ref
     conv.is_python = is_python
     return conv
@@ -1209,7 +1495,7 @@ class LMU:
 
         extra_para = self._filter_api_params(para.to_dict())
         use_tool = para.get("use_tool")
-        tools = _build_tools()
+        tools = _build_tools(conversation)
         model = para.get("model", "gpt-4")
 
         start = time.time()
@@ -1318,6 +1604,9 @@ class Core:
         # 与宿主内建的 PLM_REGISTRY 并列，内建优先（镜像不得同名覆盖，装载期拒绝）。
         # 放在这里是因为本函数末尾的 install_model_catalog 要枚举它。
         self.plms: Dict[str, type] = {}
+        # 安全配置（批次一 S4）：根注册表（名字 -> 真实段）与工作空间区域（真实段）
+        self.root_registry: Dict[str, tuple] = {}
+        self.workspace_region: tuple = ("workspaces",)
         self.debug: bool = False
         self.monitor: Monitor = Monitor()
         self.para_ref: str = "$MEM.model_params"
@@ -1335,6 +1624,8 @@ class Core:
         self.mem.mount("memory", MemorySummaryDevice(self))
         self.mem.mount("monitor", MonitorDevice(self))
         self.mem.mount("listeners", ListenersDevice(self))
+        self.mem.mount("roots", RootsDevice(self))
+        self.mem.mount("caps", CapsDevice(self))
         # 启动自带的内存节点：模型目录（静态部分；LLM 清单由宿主 refresh_model_catalog 填）
         self.install_model_catalog()
 
@@ -1342,6 +1633,146 @@ class Core:
     def is_hidden_cid(cid) -> bool:
         """宿主/面板保留 cid：对话侧不可见、不可寻址。"""
         return cid == PANEL_CID
+
+    # ------------------------------------------------------------------
+    # 安全配置：根注册表与工作空间区域（批次一 S4）
+    # ------------------------------------------------------------------
+
+    def _resolve_real_segments(self, segments):
+        try:
+            return self.mem.resolve_path([MEM_ROOT_NAME] + list(segments), for_llm=False)
+        except VMMemoryError:
+            return None
+
+    def _ensure_region_node(self, segments):
+        """确保工作空间区域存在（缺失时逐段建空 MetaDict），返回区域节点。"""
+        node = self.mem._data
+        path = []
+        for seg in segments:
+            path.append(seg)
+            if isinstance(node, LinkNode):
+                raise VMMemoryError(f"工作空间区域不能落在链接里：$MEM.{'.'.join(path)}")
+            if not isinstance(node, MetaDict):
+                raise VMMemoryError(f"工作空间区域的父段不是 dict：$MEM.{'.'.join(path[:-1])}")
+            if seg in node:
+                node = node[seg]
+            else:
+                created = MetaDict(data={})
+                node[seg] = created
+                node = created
+        return node
+
+    def _validate_workspace_region_subtree(self, node, path: list) -> None:
+        """区域子树不得含链接节点（设备挂载会物化为链接）：否则工作空间可逃逸。"""
+        if isinstance(node, LinkNode):
+            raise VMMemoryError(
+                f"工作空间区域内不能有链接节点（设备挂载请移到区域外）：$MEM.{'.'.join(path)}"
+            )
+        if isinstance(node, MetaDict):
+            for key, child in node.items():
+                self._validate_workspace_region_subtree(child, path + [str(key)])
+        elif isinstance(node, MetaList):
+            for i, child in enumerate(node):
+                self._validate_workspace_region_subtree(child, path + [str(i)])
+
+    def _validate_root_specs(self, roots_spec: dict, region: tuple,
+                             check_live: bool = True) -> dict:
+        """校验根注册表：名字、目标语法、前缀无关、保留区、工作空间与存活对话。
+
+        镜像装载（check_live=False）与运行期替换（check_live=True）共用。
+        """
+        checked = {}
+        for name, target in roots_spec.items():
+            check_root_name(name)
+            target = tuple(target)
+            if name == MEM_ROOT_NAME:
+                raise VMMemoryError("security.roots 不能注册 MEM 根")
+            if not target:
+                raise VMMemoryError(f"根 {name!r} 的目标不能是 $MEM 根本身")
+            if (path_is_prefix(region, target) or path_is_prefix(target, region)):
+                raise VMMemoryError(f"根 {name!r} 的目标与工作空间区域重叠")
+            if target and target[0] in CONTROL_DEVICE_ROOTS:
+                raise VMMemoryError(
+                    f"根 {name!r} 的目标落在内核控制面设备路径 $MEM.{target[0]}"
+                )
+            if not targets_prefix_free(list(checked.values()), target):
+                raise VMMemoryError(f"根 {name!r} 的目标与已注册根前缀冲突")
+            checked[name] = target
+        if check_live:
+            others = []
+            for conv in self._conv_by_cid.values():
+                for root_name, root_target in conv.caps.roots.items():
+                    if root_name == MEM_ROOT_NAME:
+                        continue
+                    others.append((conv.cid, tuple(root_target),
+                                   path_is_prefix(region, tuple(root_target))))
+            for name, target in checked.items():
+                for cid, other_target, other_is_workspace in others:
+                    if target == other_target:
+                        if other_is_workspace:
+                            raise VMMemoryError(
+                                f"根 {name!r} 不能绑定对话 {cid} 的工作空间目标"
+                            )
+                        continue
+                    if path_is_prefix(target, other_target) or path_is_prefix(other_target, target):
+                        if other_is_workspace:
+                            raise VMMemoryError(
+                                f"根 {name!r} 与其他对话 {cid} 的工作空间目标重叠"
+                            )
+                        raise VMMemoryError(f"根 {name!r} 的目标与存活对话根表前缀冲突")
+        return checked
+
+    def install_security_config(self, roots_spec: dict, workspace_region: tuple) -> None:
+        """装载镜像 security 段：校验并安装根注册表与工作空间区域。
+
+        校验项：根名规则、目标前缀无关、与工作空间区域不重叠、区域存在的形态、
+        区域子树不含链接。失败抛 VMMemoryError（镜像装载器翻成 ImageError）。
+        """
+        region = tuple(workspace_region)
+        if not region:
+            raise VMMemoryError("security.workspace_region 不能是 $MEM 根本身")
+        checked = self._validate_root_specs(roots_spec, region, check_live=False)
+
+        node = self._resolve_real_segments(list(region))
+        if node is None:
+            node = self._ensure_region_node(list(region))
+        if not isinstance(node, MetaDict):
+            raise VMMemoryError("security.workspace_region 必须指向 dict 节点")
+        self._validate_workspace_region_subtree(node, list(region))
+        self.root_registry = checked
+        self.workspace_region = region
+
+    def replace_root_registry(self, roots_spec: dict) -> None:
+        """运行期整体替换根注册表（$MEM.roots 控制面），先校验后提交。"""
+        checked = self._validate_root_specs(roots_spec, self.workspace_region,
+                                            check_live=True)
+        self.root_registry = checked
+
+    def _all_special_targets(self):
+        """当前占用中的可授予目标：根注册表 + 存活对话的根表（不含 MEM）。"""
+        targets = [tuple(t) for t in self.root_registry.values()]
+        for conv in self._conv_by_cid.values():
+            for name, segments in conv.caps.roots.items():
+                if name != MEM_ROOT_NAME:
+                    targets.append(tuple(segments))
+        return targets
+
+    def _allocate_workspace(self, owner_cid: int) -> tuple:
+        """在工作空间区域分配一块新子树并返回目标段序列（不含 MEM 根）。"""
+        region = tuple(self.workspace_region)
+        parent = self._ensure_region_node(list(region))
+        if not isinstance(parent, MetaDict):
+            raise VMMemoryError("工作空间区域必须是 dict 节点，无法分配")
+        used = set(parent.keys())
+        n = 0
+        while f"w{n}" in used:
+            n += 1
+        target = region + (f"w{n}",)
+        if not targets_prefix_free(self._all_special_targets(), target):
+            raise VMMemoryError("工作空间分配失败：目标与其他根前缀冲突")
+        node = MetaDict(data={}, metadata=f"工作空间（创建者 cid {owner_cid}）", ctrl={"owner": str(owner_cid)})
+        parent[f"w{n}"] = node
+        return target
 
     def _register(self, conv: Conversation, cid: Optional[int] = None) -> Conversation:
         conv.cid = self._next_cid if cid is None else cid
@@ -1431,6 +1862,17 @@ class Core:
             if not isinstance(call_id, str) or not call_id:
                 # 没有 call_id 就无法写配对响应，也不能伪造一个（assistant 那侧的 id 不是它）
                 _report_tool_error(conv, f"工具 {cmd_type} 缺少可配对的 call_id，跳过")
+                continue
+            if not conv.caps.tool_allowed(cmd_type):
+                # 能力边界：schema 与 PLM 注入已裁剪，这里再兜一道实际调度
+                _report_tool_error(
+                    conv,
+                    f"工具 {cmd_type} 未授权给本对话（mode={conv.caps.mode}），参数: "
+                    f"{json.dumps(args, ensure_ascii=False)}",
+                )
+                conv.user_batch.add_tool_response(
+                    f"Error: 工具 {cmd_type} 未授权给本对话", call_id
+                )
                 continue
             instr_cls = registry[cmd_type]
             error = _validate_instruction_args(instr_cls, args)
@@ -2104,6 +2546,10 @@ class Core:
                 "activation_instructions": self._activation_instructions,
             },
             "memory": memory,
+            "security": {
+                "roots": {name: list(target) for name, target in self.root_registry.items()},
+                "workspace_region": list(self.workspace_region),
+            },
             "conversations": [
                 self._conversation_dump(self._conv_by_cid[cid], limit)
                 for cid in sorted(self._conv_by_cid)
@@ -2144,6 +2590,8 @@ class Core:
             "parent": conv.parent.cid if conv.parent is not None else None,
             "para_ref": conv.para_ref,
             "metadata": dict(conv.metadata or {}),
+            "caps": caps_to_dict(conv.caps),
+            "attrs": dict(conv.attrs or {}),
             "message_count": total,
             "messages": messages[-limit:] if limit else [],
             "messages_truncated": total > limit,
@@ -2174,6 +2622,67 @@ class Core:
                 raise
             self.advance_conversation()
 
+    def _canonical_ref_without_final(self, target, space=None):
+        """canonical 化的变体：不跟随最终段的链接（删链接时裁决对象是链接节点）。"""
+        try:
+            split = self.mem.split_path(target, space=space)
+        except Exception:
+            return None
+        if split[0] == "device":
+            return ("device", split[1], tuple(split[2]))
+        segments = list(split[1])
+        if not segments:
+            return ("memory", ())
+        parent_ref = "$MEM" if len(segments) == 1 else "$MEM." + ".".join(segments[:-1])
+        try:
+            follow = self.mem.follow_link_target(parent_ref, space=space)
+        except Exception:
+            return ("memory", tuple(segments))
+        if follow[0] == "memory":
+            return ("memory", tuple(follow[1]) + (segments[-1],))
+        return ("device", follow[1], tuple(follow[2]) + (segments[-1],))
+
+    def canonical_ref(self, target, space=None, follow_final: bool = True):
+        """把请求别名规范化为真实目标引用（跟随链接；不存在时取最长存在前缀）。
+
+        follow_final=False：只跟随父路径上的链接，最终段保持原样（删除链接时用）。
+        
+
+        返回 ("memory", 真实段序列) / ("device", 挂载键, 剩余段)；
+        无法解析返回 None。只用于事件匹配与权限判定，不展示给普通处理器。
+        """
+        if not isinstance(target, str) or not target.startswith("$"):
+            return None
+        if not follow_final:
+            return self._canonical_ref_without_final(target, space=space)
+        # 先尝试整条路径决议（会跟随链接与 LinkDevice 透明挂载）
+        try:
+            follow = self.mem.follow_link_target(target, space=space)
+        except Exception:
+            follow = None
+        if follow is not None:
+            if follow[0] == "memory":
+                return ("memory", tuple(follow[1]))
+            return ("device", follow[1], tuple(follow[2]))
+        try:
+            split = self.mem.split_path(target, space=space)
+        except Exception:
+            return None
+        if split[0] == "device":
+            return ("device", split[1], tuple(split[2]))
+        segments = list(split[1])
+        for i in range(len(segments), -1, -1):
+            ref = "$MEM" if i == 0 else "$MEM." + ".".join(segments[:i])
+            try:
+                follow = self.mem.follow_link_target(ref, space=space)
+            except Exception:
+                continue
+            suffix = tuple(segments[i:])
+            if follow[0] == "memory":
+                return ("memory", tuple(follow[1]) + suffix)
+            return ("device", follow[1], tuple(follow[2]) + suffix)
+        return ("memory", tuple(segments))
+
     def emit_device_event(self, device_path: str, target: str, payload: dict) -> dict:
         """设备自改事件入口（v1）。
 
@@ -2195,12 +2704,13 @@ class Core:
             target=target,
             payload=payload,
             source={"kind": "device", "path": "$MEM." + device_path},
+            target_ref=("device", split[1], tuple(split[2])),
         )
         event = self.events.dispatch(event)
         self.events.deliver_notifies(event)
         return event
 
-    def unwrap(self, value, for_llm=True):
+    def unwrap(self, value, for_llm=True, space=None):
         if not value.startswith("$"):
             return value
         # TODO(issue): 这里一次把整条引用按点号切分，设备拿到的是散开的段
@@ -2209,8 +2719,12 @@ class Core:
         # 剩余的原字符串整段交给设备、由设备自己定义子路径语法——现在不能确定；
         # 它与 split_path 的最长挂载键匹配、设备授权是同一件事，要一起想。
         value = [value[0], *value[1:].split(".")]
-        if value[1] in ("conv", "batch"):
+        if len(value) > 1 and value[1] in ("conv", "batch"):
             assert value[0] == "$"
+            if space is not None and not space.has_mem():
+                raise VMMemoryError(
+                    f"引用根不可用：{value[1]!r}（本对话根表不含 MEM）"
+                )
             try:
                 cid = int(value[2])
             except (IndexError, ValueError):
@@ -2220,4 +2734,4 @@ class Core:
                 raise VMMemoryError(f"对话 {cid} 不存在：${value[1]}.{cid}")
             return conv if value[1] == "conv" else conv.user_batch
         else:
-            return self.mem.unwrap(value, for_llm=for_llm)
+            return self.mem.unwrap(value, for_llm=for_llm, space=space)

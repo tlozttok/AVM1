@@ -56,6 +56,7 @@ class PLMServer(ABC):
     def __init__(self):
         self._prev_input: List[dict] = []
         self._tools: dict = {}  # 工具定义：name → {"description", "parameters"}
+        self._tools_declared: bool = False  # params 里是否显式给了 tools（空列表表示"没有工具"）
         self._call_records: dict = {}  # 基类保证的函数调用记录：call_id → {"name", "arguments"}，用于返回与调用配对
 
     def _new_input_messages(self, raw_messages: List[dict]) -> List[dict]:
@@ -68,6 +69,7 @@ class PLMServer(ABC):
 
     def _capture_tools(self, params: dict) -> None:
         """解析工具定义（OpenAI 格式的 tools 列表，通常来自 params），按名字存入实例字段。"""
+        self._tools_declared = "tools" in params
         self._tools = {}
         for t in params.get("tools") or []:
             fn = t.get("function") or {}
@@ -77,6 +79,12 @@ class PLMServer(ABC):
                     "description": fn.get("description"),
                     "parameters": fn.get("parameters"),
                 }
+
+    def _tool_allowed(self, name) -> bool:
+        """当前对话工具集是否允许该指令名（未声明 tools 时保持旧行为：允许）。"""
+        if not self._tools_declared:
+            return True
+        return name in self._tools
 
     def _dispatch(self, msg) -> None:
         """按消息类型派发执行；system 不返回，user/tool 可以返回消息。"""
@@ -205,7 +213,8 @@ PYTHON_TOOL_SPECS = {
     "create_sub": (("system_ref", "user_ref", "para_ref"), ()),
     "send_instruction": (("cid", "content"), ()),
     "close_conversation": (("cid",), ()),
-    "listen_event": (("action",), ("event_type", "target", "handler_ref", "listener_id", "phase")),
+    "listen_event": (("action",), ("event_type", "target", "handler_ref", "listener_id", "phase",
+                                  "priority", "tier")),
 }
 
 
@@ -239,7 +248,8 @@ class PythonPLM(PLMServer):
     def _reset_namespace(self):
         extra = {"math": math, "json": json, "re": re}
         for name in PYTHON_TOOL_SPECS:
-            extra[name] = self._make_tool(name)
+            if self._tool_allowed(name):
+                extra[name] = self._make_tool(name)
         self.namespace = safe_globals(extra)
 
     def _make_tool(self, name):
@@ -599,9 +609,9 @@ class StateMachinePLM(PLMServer):
             if not guard:
                 raise _MachineParseError(f"第 {lineno} 行: if 后缺少 guard 表达式")
 
-        if self._tools:
+        if self._tools_declared:
             for tool in tools:
-                if tool["name"] not in self._tools:
+                if not self._tool_allowed(tool["name"]):
                     raise _MachineParseError(
                         f"第 {lineno} 行: 未知工具 {tool['name']}（可用: {sorted(self._tools)}）"
                     )
@@ -684,7 +694,7 @@ class StateMachinePLM(PLMServer):
         # 工具名校验（若已捕获 tools 定义）
         try:
             for tool in chosen["tools"]:
-                if tool["name"] not in self._tools:
+                if not self._tool_allowed(tool["name"]):
                     raise ValueError(f"未知工具 {tool['name']}")
         except Exception as e:
             self._last_tool_output = ""
@@ -808,9 +818,12 @@ class CommandPLM(PLMServer):
     def _error(self, message: str) -> str:
         return f"错误: CommandPLM: {message}"
 
+    def _allowed_command_tools(self) -> dict:
+        return {name: fn for name, fn in COMMAND_TOOLS.items() if self._tool_allowed(name)}
+
     def _fresh_namespace(self) -> dict:
         extra = {"math": math, "json": json, "re": re}
-        extra.update(COMMAND_TOOLS)
+        extra.update(self._allowed_command_tools())
         return safe_globals(extra)
 
     def _abandon(self) -> None:
@@ -832,13 +845,13 @@ class CommandPLM(PLMServer):
             return value
         return self._error(f"handle 必须返回字符串，得到 {type(value).__name__}")
 
-    @staticmethod
-    def _as_tool_call(yielded):
+    def _as_tool_call(self, yielded):
         """校验生成器 yield 出的工具请求，返回 (name, args) 或 None。"""
         if not isinstance(yielded, (tuple, list)) or len(yielded) != 2:
             return None
         name, args = yielded
-        if not isinstance(name, str) or name not in COMMAND_TOOLS:
+        allowed = self._allowed_command_tools()
+        if not isinstance(name, str) or name not in allowed:
             return None
         if not isinstance(args, dict):
             return None
@@ -860,7 +873,7 @@ class CommandPLM(PLMServer):
         if parsed is None:
             self._abandon()
             return self._error(
-                f"非法工具调用: {yielded!r}（可用: {sorted(COMMAND_TOOLS)}）"
+                f"非法工具调用: {yielded!r}（可用: {sorted(self._allowed_command_tools())}）"
             )
         name, args = parsed
         call_id = f"cmd-{self._call_seq}"
