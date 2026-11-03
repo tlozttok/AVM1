@@ -15,8 +15,6 @@ AVM 不是 Agent 框架。它不预设编排模式，不提供业务提示词，
 - [docs/programming-guide.md](docs/programming-guide.md) — 如何设计 AVM 程序
 - [docs/philosophy.md](docs/philosophy.md) — 设计哲学
 - [docs/system-image.md](docs/system-image.md) — 系统镜像格式规范
-- [docs/apps](docs/apps) — AVM 应用套件（实际性测试镜像：传令站 / 金库守卫 / 账本服务）
-- [docs/games](docs/games) — AVM 游戏（echo_mine 回声矿洞）
 - [docs/examples/python_as_conversation.md](docs/examples/python_as_conversation.md) — 示例：Python 程序如何无损表示为"对话 + 工具调用"
 - [docs/capabilities.md](docs/capabilities.md) — 能力模型与权限机制：根表/工作空间/工具面/事件策略/ACL 示例
 
@@ -31,4 +29,4 @@ python main.py                   # 启动入口
 python main.py <image.json>      # 加载并运行系统镜像
 ```
 
-示例镜像见 `images/demo.json`、`images/calc_driver.json`；权限体系示例见 `images/security_demo.json`（内核态 init + 用户态工作对话 + 私有工作空间）与 `images/permission_acl_demo.json`（全 PLM 的镜像层 ACL 演示：允许/默认拒绝/写保护）；应用套件见 `images/apps/`（启动方式见 [docs/apps](docs/apps)）；AI 小游戏见 `images/games/echo_mine/`；读本仓库自测的镜像见 `images/repo_tester.json`（对话经只读设备 `$MEM.AVMRepo` 读仓库跟踪文件，用法由设备自述给出），打包版见 `images/repo_tester_packed.json`（0 号是 `plm.python` 打包器，启动时按 `$MEM.file_list` 给出的清单读文档、把系统提示词组装好再建并启动测试对话，测试者不必再读这些文档；程序与清单在 `images/repo_tester_packed/`）。系统镜像的组成与要点见 [docs/runtime.md](docs/runtime.md) 的「系统镜像」一节。
+示例镜像见 `images/demo.json`、`images/calc_driver.json`；权限体系示例见 `images/security_demo.json`（内核态 init + 用户态工作对话 + 私有工作空间）与 `images/permission_acl_demo.json`（全 PLM 的镜像层 ACL 演示：允许/默认拒绝/写保护）；读本仓库自测的镜像见 `images/repo_tester.json`（对话经只读设备 `$MEM.AVMRepo` 读仓库跟踪文件，用法由设备自述给出），打包版见 `images/repo_tester_packed.json`（0 号是 `plm.python` 打包器，启动时按 `$MEM.file_list` 给出的清单读文档、把系统提示词组装好再建并启动测试对话，测试者不必再读这些文档；程序与清单在 `images/repo_tester_packed/`）。系统镜像的组成与要点见 [docs/runtime.md](docs/runtime.md) 的「系统镜像」一节。

@@ -15,8 +15,6 @@ Terminology is defined in [CONTEXT.md](CONTEXT.md).
 - [docs/programming-guide.md](docs/programming-guide.md) — designing AVM programs
 - [docs/philosophy.md](docs/philosophy.md) — design philosophy
 - [docs/system-image.md](docs/system-image.md) — system image format specification
-- [docs/apps](docs/apps) — AVM application suite (practical test images: courier_office / vault_guard / plm_ledger)
-- [docs/games](docs/games) — AVM games (echo_mine)
 - [docs/examples/python_as_conversation.md](docs/examples/python_as_conversation.md) — example: how a Python program is represented losslessly as "conversation + tool calls"
 
 ## Quick Start
@@ -31,7 +29,7 @@ python main.py <image.json> --frames      # print monitor frame summary after ru
 python main.py <image.json> --transcript api.txt  # write full API calls to a file
 ```
 
-Debug settings live in `debug.json` (`image` / `frames` / `transcript` / `checkpoint_in`) so the command line does not need to change (VSCode runs `python main.py` fixed; `--debug-config <file>` selects another config file). Example images: `images/demo.json`, `images/calc_driver.json`; application suite: `images/apps/` (see [docs/apps](docs/apps) for how to start them); AI mini-game: `images/games/echo_mine/`; the image that reads this repository is `images/repo_tester.json` (the conversation reads tracked files through the read-only `$MEM.AVMRepo` device, whose usage is stated by the device itself). See the "System Images" section of [docs/runtime.md](docs/runtime.md) for the composition and key points.
+Debug settings live in `debug.json` (`image` / `frames` / `transcript` / `checkpoint_in`) so the command line does not need to change (VSCode runs `python main.py` fixed; `--debug-config <file>` selects another config file). Example images: `images/demo.json`, `images/calc_driver.json`; the image that reads this repository is `images/repo_tester.json` (the conversation reads tracked files through the read-only `$MEM.AVMRepo` device, whose usage is stated by the device itself). See the "System Images" section of [docs/runtime.md](docs/runtime.md) for the composition and key points.
 
 ### Debug Panel
 

@@ -116,7 +116,7 @@ python -m avm.image <image.json>
 
 挂载点在 `$MEM` 根读里以键的形式可见（键就是链接节点），但读取经过链接不会提示跨越，链接自身也不返回描述：设备是这条边界的唯一信息来源；第一次接触设备的对话应当一次读取拿到完整接口。运行时不为此增加机制：读设备本身已经走 `to_llm_string()`，残缺的段已经交给 `resolve_path()`。
 
-参考现有设备：Core 内建的 `avm/memory_device.py`（`InputsListDevice`、`OutputsListDevice`、`LinkDevice` 等），以及镜像层的例子 `images/devices/`（`io.py`、`avm_repo.py`）和 `images/apps/*/devices/`。
+参考现有设备：Core 内建的 `avm/memory_device.py`（`InputsListDevice`、`OutputsListDevice`、`LinkDevice` 等），以及镜像层的例子 `images/devices/`（`io.py`、`avm_repo.py`）。
 
 #### 链接节点声明示例
 
