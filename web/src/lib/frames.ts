@@ -1,4 +1,5 @@
 import type { Schedule, SseEntry, SseFrame } from '../api/types'
+import { extractLink, type LogLink } from './correlation'
 
 /**
  * 事件流的纯 reducer。
@@ -42,6 +43,8 @@ export interface LogEntry {
   time: number
   text: string
   detail: unknown
+  /** 从 detail 提取的关联键；本地提示没有关联键，故为可选。SseFrame 联合类型不因此变化。 */
+  link?: LogLink
 }
 
 export interface FrameState {
@@ -134,6 +137,7 @@ function entryFromFrame(frame: Exclude<SseFrame, { type: 'schedule' }>): LogEntr
     time: entry.time,
     text: formatEntry(frame.type as LogKind, entry.data),
     detail: entry.data,
+    link: extractLink(frame.type as LogKind, entry.data),
   }
 }
 

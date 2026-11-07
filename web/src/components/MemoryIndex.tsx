@@ -17,6 +17,11 @@ interface Props {
   onRefresh: () => void
   onSelect: (ref: string, node: MemoryNode) => void
   onReadRef: (ref: string, signal: AbortSignal) => Promise<MemoryNode>
+  /** 复制该行地址到剪贴板与面板暂存区。 */
+  onCopy: (value: string) => void
+  traySelected: string | null
+  /** 事件流里出现过内存类事件、树可能已旧：只打标记，由人点刷新。 */
+  dirty: boolean
 }
 
 /** 设备伪列表的阻塞读取：末段是已知会阻塞的命名子键（当前只有 InputsListDevice 的 `next`）。 */
@@ -58,6 +63,9 @@ export default function MemoryIndex({
   onRefresh,
   onSelect,
   onReadRef,
+  onCopy,
+  traySelected,
+  dirty,
 }: Props) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set(['$MEM']))
   const [refInput, setRefInput] = useState('')
@@ -142,6 +150,15 @@ export default function MemoryIndex({
             >
               看
             </button>
+            <button
+              type="button"
+              className="link small"
+              data-testid="copy-memory-ref"
+              title={`复制 ${ref}`}
+              onClick={() => onCopy(ref)}
+            >
+              复制
+            </button>
           </div>
         </div>
       )
@@ -165,6 +182,15 @@ export default function MemoryIndex({
           <button type="button" className="link" onClick={() => onSelect(ref, node)}>
             看
           </button>
+          <button
+            type="button"
+            className="link small"
+            data-testid="copy-memory-ref"
+            title={`复制 ${ref}`}
+            onClick={() => onCopy(ref)}
+          >
+            复制
+          </button>
         </div>
         {isContainer && open ? (
           <div>
@@ -185,6 +211,11 @@ export default function MemoryIndex({
     <div className="pane" data-testid="memory-tree">
       <div className="pane-title">
         内存
+        {dirty ? (
+          <span className="tag tag-warn" data-testid="memory-dirty" title="事件流里出现过内存类事件，树可能已旧">
+            有变更
+          </span>
+        ) : null}
         <button type="button" className="link" onClick={onRefresh} disabled={busy}>
           {busy ? '读取中…' : '刷新'}
         </button>
@@ -201,6 +232,17 @@ export default function MemoryIndex({
         />
         <button type="button" data-testid="ref-read" onClick={() => void read()} disabled={readState.pending}>
           读路径
+        </button>
+        <button
+          type="button"
+          className="link small"
+          data-testid="ref-fill"
+          title="把值暂存区选中的文本填进这个路径框"
+          onClick={() => {
+            if (traySelected !== null) setRefInput(traySelected)
+          }}
+        >
+          填入
         </button>
         {readState.pending ? (
           <button type="button" className="link" onClick={cancel}>

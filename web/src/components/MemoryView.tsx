@@ -85,11 +85,28 @@ function NodeBody({ node, depth }: { node: MemoryNode; depth: number }) {
   )
 }
 
-export default function MemoryView({ refName, node }: { refName: string; node: MemoryNode }) {
+export default function MemoryView({
+  refName,
+  node,
+  onCopy,
+}: {
+  refName: string
+  node: MemoryNode
+  onCopy: (value: string) => void
+}) {
   return (
     <div className="pane-body" data-testid="memory-view">
       <div className="detail-head">
         <span className="mono">{refName}</span>
+        <button
+          type="button"
+          className="link small"
+          data-testid="copy-view-ref"
+          title={`复制 ${refName}`}
+          onClick={() => onCopy(refName)}
+        >
+          复制地址
+        </button>
       </div>
       <NodeBody node={node} depth={0} />
     </div>

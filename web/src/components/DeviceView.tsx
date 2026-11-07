@@ -4,13 +4,29 @@ import type { DeviceInfo } from '../api/types'
  * 设备详情：第一轮只读——类型、挂载键、LLM 表示，以及设备自己声明的调试动作清单。
  * 动作的调用（R10 全量）留到下一轮；`$MEM.inputs` 的喂输入框在右栏动作区。
  */
-export default function DeviceView({ device }: { device: DeviceInfo | undefined }) {
+export default function DeviceView({
+  device,
+  onCopy,
+}: {
+  device: DeviceInfo | undefined
+  onCopy: (value: string) => void
+}) {
   if (!device) return <div className="pane-body muted">这个设备已经不在挂载表里（可能被屏蔽了）</div>
+  const mountRef = `$MEM.${device.mount}`
   return (
     <div className="pane-body" data-testid="device-view">
       <div className="detail-head">
-        <span className="mono">$MEM.{device.mount}</span>
+        <span className="mono">{mountRef}</span>
         <span>{device.type}</span>
+        <button
+          type="button"
+          className="link small"
+          data-testid="copy-device-mount"
+          title={`复制 ${mountRef}`}
+          onClick={() => onCopy(mountRef)}
+        >
+          复制地址
+        </button>
       </div>
       {device.error ? <div className="hint error">{device.error}</div> : null}
       <div className="kv">

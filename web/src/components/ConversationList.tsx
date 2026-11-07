@@ -12,14 +12,21 @@ interface Props {
   conversations: ConversationBrief[]
   panelCid: number | null
   selectedCid: number | null
+  /** 当前活跃 cid 与最近一条事件里的 cid：谁在跑、谁刚发了指令。 */
+  activeCid: number | null
+  recentCid: number | null
   onSelect: (cid: number) => void
+  onCopy: (value: string) => void
 }
 
 export default function ConversationList({
   conversations,
   panelCid,
   selectedCid,
+  activeCid,
+  recentCid,
   onSelect,
+  onCopy,
 }: Props) {
   return (
     <div className="pane" data-testid="conversation-list">
@@ -48,6 +55,24 @@ export default function ConversationList({
                 <td>
                   {conv.cid}
                   {conv.cid === panelCid ? <span className="tag">面板</span> : null}
+                  {conv.cid === activeCid ? (
+                    <span className="tag" data-testid="conversation-active">活跃</span>
+                  ) : null}
+                  {conv.cid === recentCid && conv.cid !== activeCid ? (
+                    <span className="tag" data-testid="conversation-recent">最近事件</span>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="link small"
+                    data-testid="copy-conversation-cid"
+                    title={`复制 cid ${conv.cid}`}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      onCopy(String(conv.cid))
+                    }}
+                  >
+                    复制
+                  </button>
                 </td>
                 <td title={conv.identity}>
                   {conv.name ?? conv.identity}

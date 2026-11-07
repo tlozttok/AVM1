@@ -1,18 +1,30 @@
-import { useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { apiSend, describeError } from '../api/client'
 import type { ToolTable } from '../api/tools'
 import type { DeviceInfo, PauseResponse, Schedule, State } from '../api/types'
+import type { FrameState } from '../lib/frames'
+import { pairAction, startTrace, type ActionTrace, type SubmittedAction } from '../lib/correlation'
+import type { TrayValue } from '../lib/valueTray'
+import ActionCard from './ActionCard'
 import ActionForm from './ActionForm'
 import InputFeed from './InputFeed'
+import ValueTray from './ValueTray'
 
 interface Props {
   state: State | null
   /** SSE 里最近一帧 schedule：横幅不必等 1s 轮询。 */
   schedule: Schedule | null
+  frames: FrameState
   tools: ToolTable
   devices: DeviceInfo[]
+  tray: TrayValue[]
+  traySelected: string | null
+  onSelectTray: (value: string) => void
+  copyNote: string | null
   onRefresh: () => void
   onDevicesChanged: () => void
+  /** 动作卡配对到 tool_result：这一刻才补刷内存树与设备清单。 */
+  onToolResult: () => void
 }
 
 function lastDispatchText(state: State | null): string {
@@ -31,14 +43,21 @@ function lastDispatchText(state: State | null): string {
 export default function ActionPanel({
   state,
   schedule,
+  frames,
   tools,
   devices,
+  tray,
+  traySelected,
+  onSelectTray,
+  copyNote,
   onRefresh,
   onDevicesChanged,
+  onToolResult,
 }: Props) {
   const [message, setMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [trace, setTrace] = useState<ActionTrace | null>(null)
 
   const paused = schedule !== null && schedule.active_cid === schedule.panel_cid
   const running = state?.running ?? false
@@ -79,6 +98,26 @@ export default function ActionPanel({
     }
   }
 
+  // 提交成功时起一条待配对动作；随后每来一批新帧就试着按序配对。
+  // pairAction 是纯函数且已到终态返回原引用，所以这里不会形成 setState 循环。
+  const onSubmitted = useCallback((info: SubmittedAction) => {
+    setTrace(startTrace(info.tool, info.args, info.knownTool, info.seqAfter))
+    onRefresh()
+  }, [onRefresh])
+
+  useEffect(() => {
+    if (!trace) return
+    const next = pairAction(trace, frames.entries)
+    if (next.phase === 'responded' && trace.phase !== 'responded') onToolResult()
+    if (next !== trace) setTrace(next)
+  }, [frames.entries, trace, onToolResult])
+
+  const guidance = paused
+    ? trace?.phase === 'responded'
+      ? '执行权在面板，响应已到：可继续提交，或点继续让出执行权'
+      : '执行权在面板：提交动作后等工具响应，再点继续让出执行权'
+    : '执行权不在面板：提交动作会自动请求中断，在下一个安全点生效'
+
   return (
     <div className="action-panel">
       <div className={bannerClass} data-testid="status-banner">
@@ -111,10 +150,18 @@ export default function ActionPanel({
         </span>
       </div>
       <div className="hint muted small">{lastDispatchText(state)}</div>
+      <div className="hint muted small" data-testid="action-guidance">{guidance}</div>
       {message ? <div className="hint ok">{message}</div> : null}
       {error ? <div className="hint error">{error}</div> : null}
 
-      <ActionForm tools={tools} onSubmitted={onRefresh} />
+      <ActionCard trace={trace} />
+      <ValueTray values={tray} selected={traySelected} onSelect={onSelectTray} note={copyNote} />
+      <ActionForm
+        tools={tools}
+        currentSeq={frames.lastSeq}
+        traySelected={traySelected}
+        onSubmitted={onSubmitted}
+      />
       <InputFeed devices={devices} onDevicesChanged={onDevicesChanged} />
     </div>
   )

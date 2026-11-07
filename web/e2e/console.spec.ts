@@ -125,6 +125,121 @@ test('三步交互：暂停 → 提交动作 → 继续', async ({ page }) => {
   await expect(page.getByTestId('status-banner')).toContainText('运行中')
 })
 
+test('事件流：搜索、cid / 工具过滤、配对摘要与点事件切中栏', async ({ page }) => {
+  await page.goto('/')
+  const log = page.getByTestId('event-log')
+  await expect(log.getByTestId('log-entry-event').first()).toBeVisible()
+
+  // 文本搜索：命中与不匹配；过滤只影响可见条目，不清帧
+  await page.getByTestId('log-search').fill('memory_write')
+  await expect(log.getByTestId('log-entry-event').first()).toBeVisible()
+  await page.getByTestId('log-search').fill('绝对不存在的串 zzzz')
+  await expect(log.getByTestId('log-entry-event')).toHaveCount(0)
+  await expect(log).toContainText('还没有事件')
+  await page.getByTestId('log-search').fill('')
+
+  // 关联键来自 SSE 既有字段：before 的 source.initiator_cid / after 的 payload.actor_cid
+  await expect(page.getByTestId('log-filter-cid').locator('option[value="0"]')).toHaveCount(1)
+  await page.getByTestId('log-filter-cid').selectOption('0')
+  await expect(log.getByTestId('log-entry-event').first()).toBeVisible()
+  await page.getByTestId('log-filter-cid').selectOption('')
+  await expect(page.getByTestId('log-filter-tool').locator('option[value="memory_write"]')).toHaveCount(1)
+  await page.getByTestId('log-filter-tool').selectOption('memory_write')
+  await expect(log.getByTestId('log-entry-event').first()).toBeVisible()
+  await page.getByTestId('log-filter-tool').selectOption('')
+
+  // 点事件带 cid 切中栏对话，并留下「来自哪条事件」
+  await log.getByTestId('log-locate').first().click()
+  await expect(page.getByTestId('conversation-detail')).toContainText('cid 0')
+  await expect(page.getByTestId('selection-source')).toContainText('来自 事件')
+
+  // 手动上滚关闭跟随，回到底部自动恢复
+  const follow = page.locator('.filters input[type="checkbox"]').first()
+  const scroll = log.locator('.log-scroll')
+  await expect(follow).toBeChecked()
+  await scroll.hover()
+  await page.mouse.wheel(0, -300)
+  await expect(follow).not.toBeChecked()
+  await scroll.evaluate((el) => {
+    el.scrollTop = el.scrollHeight
+  })
+  await expect(follow).toBeChecked()
+})
+
+test('复制出口：对话 cid、事件参数、ref-input 与参数框共用暂存值', async ({ page }) => {
+  await page.goto('/')
+
+  await page.getByTestId('conversation-item-0').getByTestId('copy-conversation-cid').click()
+  await expect(page.getByTestId('value-tray')).toContainText('cid')
+  await expect(page.getByTestId('value-tray-selected')).toContainText('0')
+
+  const log = page.getByTestId('event-log')
+  await expect(log.getByTestId('copy-arguments').first()).toBeVisible()
+  await log.getByTestId('copy-arguments').first().click()
+  await expect(page.getByTestId('value-tray-selected')).toContainText('ref')
+
+  // 左栏读过的地址直接送进 ref-input；右栏参数框用同一份暂存值
+  const tree = page.getByTestId('memory-tree')
+  await tree.locator('[data-ref="$MEM.note"]').getByTestId('copy-memory-ref').click()
+  await page.getByTestId('ref-fill').click()
+  await expect(page.getByTestId('ref-input')).toHaveValue('$MEM.note')
+  await page.getByTestId('action-tool').selectOption('memory_read')
+  await page.getByTestId('action-fill-ref').click()
+  await expect(page.getByTestId('action-field-ref')).toHaveValue('$MEM.note')
+
+  // 中栏两个视图的头部也各有复制出口
+  await tree.locator('[data-ref="$MEM.note"]').getByRole('button', { name: '看' }).click()
+  await page.getByTestId('copy-view-ref').click()
+  await expect(page.getByTestId('value-tray-selected')).toContainText('$MEM.note')
+})
+
+test('参数随手可得：复制地址 → 填入 → 摘要确认 → 动作卡看到响应', async ({ page }) => {
+  await page.goto('/')
+
+  const tree = page.getByTestId('memory-tree')
+  await tree.locator('[data-ref="$MEM.note"]').getByTestId('copy-memory-ref').click()
+  await expect(page.getByTestId('value-tray')).toContainText('$MEM.note')
+
+  await page.getByTestId('action-tool').selectOption('memory_write')
+  await page.getByTestId('action-fill-ref').click()
+  await expect(page.getByTestId('action-field-ref')).toHaveValue('$MEM.note')
+  await page.getByTestId('action-field-content').fill('来自暂存值的一次写入')
+
+  await page.getByTestId('pause-button').click()
+  await expect(page.getByTestId('status-banner')).toContainText('已暂停')
+
+  // 从暂存值填入过的提交先看 payload 摘要，返回修改与取消都不发 /api/action
+  await page.getByTestId('action-submit').click()
+  await expect(page.getByTestId('action-summary')).toContainText('$MEM.note')
+  await expect(page.getByTestId('action-result')).toHaveCount(0)
+  await page.getByTestId('action-summary-back').click()
+  await expect(page.getByTestId('action-summary')).toHaveCount(0)
+  await page.getByTestId('action-submit').click()
+  await page.getByTestId('action-summary-cancel').click()
+  await expect(page.getByTestId('action-result')).toHaveCount(0)
+
+  // 重新点一次填入，再走确认路径
+  await page.getByTestId('action-fill-ref').click()
+  await page.getByTestId('action-submit').click()
+  await page.getByTestId('action-summary-confirm').click()
+  await expect(page.getByTestId('action-result')).toContainText('已提交 memory_write')
+  await expect(page.getByTestId('action-card')).toContainText('按序关联')
+  await expect(page.getByTestId('action-card-content')).toContainText('Success set')
+
+  // 同一 call_id 的调用与响应在事件流里互相标出配对摘要，两行 testid 仍在
+  const log = page.getByTestId('event-log')
+  await expect(log.getByTestId('log-entry-tool_call').first()).toBeVisible()
+  await expect(log.getByTestId('log-entry-tool_result').first()).toBeVisible()
+  await expect(log.getByTestId('log-pair-summary').first()).toBeVisible()
+
+  // tool_result 到达时内存树补刷（裁决三 A）。这里不断言「有变更」标记消失：
+  // 脚本化 MockLMU 每 0.5s 还在写 $MEM.state.tick，标记会随新事件再次亮起，
+  // 那是「显式刷新」约定的自然结果，不是补刷没发生。
+  await expect(page.getByTestId('memory-tree')).toBeVisible()
+  await page.getByTestId('resume-button').click()
+  await expect(page.getByTestId('status-banner')).toContainText('运行中')
+})
+
 test('喂输入：多行文本整段进队列，被下一次读取取走', async ({ page }) => {
   await page.goto('/')
 
