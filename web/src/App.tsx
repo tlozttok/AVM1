@@ -3,7 +3,13 @@ import { apiGet, describeError } from './api/client'
 import { loadTools, type ToolTable } from './api/tools'
 import { useConsoleState } from './api/useConsoleState'
 import { useEventStream } from './api/useEventStream'
+import { useIoStream } from './api/useIoStream'
 import type { DevicesResponse, DeviceInfo, MemoryNode, MemoryResponse } from './api/types'
+import InputComposer from './components/InputComposer'
+import ListenerEditor from './components/ListenerEditor'
+import LoginGate from './components/LoginGate'
+import OperationBar from './components/OperationBar'
+import OutputConsole from './components/OutputConsole'
 import ActionPanel from './components/ActionPanel'
 import ConversationList from './components/ConversationList'
 import ConversationView from './components/ConversationView'
@@ -51,6 +57,10 @@ export default function App() {
   const [traySelected, setTraySelected] = useState<string | null>(null)
   const [copyNote, setCopyNote] = useState<string | null>(null)
   const seenSeq = useRef(0)
+  const io = useIoStream()
+  const [needLogin, setNeedLogin] = useState(false)
+  // 默认展开：既有 e2e 的 testid 与断言都在三栏里，收起是操作员自己的选择
+  const [debugOpen, setDebugOpen] = useState(true)
 
   const refreshMemory = useCallback(async () => {
     setMemoryBusy(true)
@@ -95,6 +105,13 @@ export default function App() {
     void refreshMemory()
     void refreshDevices()
   }, [refreshMemory, refreshDevices])
+
+  // 401 驱动登录：未启用认证的后端（单测 / e2e mock）不会触发
+  useEffect(() => {
+    const onUnauthorized = () => setNeedLogin(true)
+    window.addEventListener('avm:unauthorized', onUnauthorized)
+    return () => window.removeEventListener('avm:unauthorized', onUnauthorized)
+  }, [])
 
   const schedule = frames.schedule ?? state?.schedule ?? null
   const conversations = state?.conversations ?? []
@@ -192,18 +209,45 @@ export default function App() {
   const maskDevices = state?.mask.devices ?? []
   const panelCid = state?.panel.cid ?? null
 
+  if (needLogin) {
+    return <LoginGate onLogin={() => window.location.reload()} />
+  }
+
   return (
-    <div className="app">
+    <div className="app operation-app">
       <header className="app-head">
-        <span className="title">AVM 调试面板</span>
+        <span className="title">AVM 操作面板</span>
         <span className="muted small">
-          观测与介入都走控制台后端；页面不直接读 Core
+          输出与输入走宿主侧 IO 总线；调试能力在下方抽屉
         </span>
         {stateError ? <span className="hint error inline">状态轮询失败：{stateError}</span> : null}
         {deviceError ? <span className="hint error inline">设备清单失败：{deviceError}</span> : null}
       </header>
 
-      <div className="columns">
+      <OperationBar state={state} schedule={schedule} onRefresh={refresh} />
+
+      <div className="operation-main">
+        <OutputConsole entries={io.entries} connected={io.connected} onClear={io.clear} />
+        <InputComposer
+          conversations={conversations}
+          activeCid={schedule?.active_cid ?? null}
+          onSent={refresh}
+        />
+      </div>
+
+      <div className="debug-toggle">
+        <button type="button" data-testid="debug-toggle" onClick={() => setDebugOpen((v) => !v)}>
+          {debugOpen ? '收起调试能力' : '展开调试能力'}
+        </button>
+        <span className="muted small">内存树、对话详情、动作、设备、事件流、监听器编辑与值暂存区</span>
+      </div>
+
+      {debugOpen ? <ListenerEditor /> : null}
+
+      <div
+        className={debugOpen ? 'columns' : 'columns debug-collapsed'}
+        data-testid="debug-drawer"
+      >
         <div className="col-left">
           <ConversationList
             conversations={conversations}

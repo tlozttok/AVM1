@@ -1655,6 +1655,17 @@ class Core:
         # 由 load_image 在挂载设备之前写入，核心启动后不再变化。设备在 attach_core 里读，
         # 核心不读、不校验、不监督。
         self.host_flags: Dict[str, Any] = {}
+        # 宿主侧 IO 总线：由 console 宿主安装。与 host_flags 一样是宿主事实，
+        # 不属于镜像内容、不进 $MEM；旧 $MEM.inputs / $MEM.outputs 设备不读它，
+        # 操作面板宿主的 IO 设备由 Console 单独挂载（见 avm/io_devices.py）。
+        self.io_bus = None
+        # 操作面板的生命周期：宿主请求停止（关机的安全点标志）。
+        self._stop_requested: bool = False
+        # 本次启动的恢复摘要（boot 填写；/api/state 暴露给面板首屏）。
+        self.recovery: Dict[str, Any] = {
+            "source": "cold", "snapshot_seq": None, "replayed": 0,
+            "restored": {}, "warnings": [],
+        }
         # 镜像声明的 PLM 实现：model 名 → 类，由 load_image 按镜像的 plms 段装载。
         # 与宿主内建的 PLM_REGISTRY 并列，内建优先（镜像不得同名覆盖，装载期拒绝）。
         # 放在这里是因为本函数末尾的 install_model_catalog 要枚举它。
@@ -2837,6 +2848,16 @@ class Core:
         }
         return brief
 
+    # -- 操作面板生命周期 ------------------------------------------------
+
+    def request_stop(self) -> None:
+        """宿主请求停止：run() 在下一个安全点返回，交宿主写快照。
+
+        只置标志、不动当前回合——半截回合不能拍快照。若对话正阻塞在设备读里，
+        这一轮到不了安全点；那是宿主侧的阻塞态问题，不在这里处理。
+        """
+        self._stop_requested = True
+
     def run(self):
         self._pick_next_active()
 
@@ -2852,6 +2873,9 @@ class Core:
             except KernelPanic as e:
                 self.monitor.record(self, error=e)
                 raise
+            if self._stop_requested:
+                # 停在安全点：上一轮已完整提交，宿主可以拍快照后干净退出。
+                return
             self.advance_conversation()
 
     def _canonical_ref_without_final(self, target, space=None):

@@ -17,6 +17,15 @@ from avm.memory_device import InputsListDevice, MemoryDevice
 from avm.types import MetaDict
 
 
+def make_console(core):
+    """本文件测的是标准设备与控制台的动作派发，不换成操作面板宿主的 IO 设备。
+
+    新 IO 设备的覆盖在 tests/test_io_bus.py；这里保持 InputsListDevice 原样，
+    才能断言它的 _panel_inputs / _pending_input 等标准设备内部状态。
+    """
+    return Console(core, mount_io_devices=False)
+
+
 class EchoDevice(MemoryDevice):
     """有自己内部状态的设备：用来验证卸载重挂不会重建实例。"""
 
@@ -176,7 +185,7 @@ class TestDeviceDebugActions:
 
     def test_console_lists_actions_without_calling_them(self):
         core = make_core()
-        console = Console(core)
+        console = make_console(core)
         listing = console.devices()
         echo = [d for d in listing["devices"] if d["mount"] == "echo"][0]
         assert [a["name"] for a in echo["actions"]] == ["自增", "爆炸"]
@@ -185,7 +194,7 @@ class TestDeviceDebugActions:
 
     def test_console_invokes_run_directly(self):
         core = make_core()
-        console = Console(core)
+        console = make_console(core)
         record = console.invoke_device_action("echo", 0, {"reason": "冒烟"})
         assert record["error"] is None
         assert record["result"] == {"n": 1}
@@ -197,21 +206,21 @@ class TestDeviceDebugActions:
         core = make_core()
         seen = []
         core.events.add_observer(seen.append)
-        console = Console(core)
+        console = make_console(core)
         console.invoke_device_action("echo", 0, {})
         assert seen == []
         assert core._turn_events == []
 
     def test_device_action_error_is_captured(self):
         core = make_core()
-        console = Console(core)
+        console = make_console(core)
         record = console.invoke_device_action("echo", 1, {})
         assert record["result"] is None
         assert "设备自己炸了" in record["error"]
 
     def test_unknown_device_or_action(self):
         core = make_core()
-        console = Console(core)
+        console = make_console(core)
         with pytest.raises(KeyError):
             console.invoke_device_action("nope", 0, {})
         with pytest.raises(KeyError):
@@ -219,7 +228,7 @@ class TestDeviceDebugActions:
 
     def test_masked_device_cannot_be_debugged(self):
         core = make_core()
-        console = Console(core)
+        console = make_console(core)
         console.mask_device("echo")
         with pytest.raises(KeyError, match="未挂载"):
             console.invoke_device_action("echo", 0, {})
@@ -249,7 +258,7 @@ class TestInputsDevicePanelInput:
         core.mem.mount("inputs", device)
         monkeypatch.setattr(device, "_terminal_prompt",
                             lambda: pytest.fail("有面板输入时不该碰终端"))
-        console = Console(core)
+        console = make_console(core)
 
         record = console.invoke_device_action("inputs", 0, {"content": "从面板来的"})
         assert record["error"] is None
@@ -281,7 +290,7 @@ class TestInputsDevicePanelInput:
         core.mem.mount("inputs", device)
         monkeypatch.setattr(device, "_terminal_prompt",
                             lambda: pytest.fail("队列非空时不该碰终端"))
-        console = Console(core)
+        console = make_console(core)
         for line in ("一", "二"):
             console.invoke_device_action("inputs", 0, {"content": line})
         assert core.mem["inputs"]["next"] == "一"
@@ -301,7 +310,7 @@ class TestInputsDevicePanelInput:
         core, device = self._console_device()
         monkeypatch.setattr(device, "_terminal_prompt",
                             lambda: pytest.fail("托管时不该碰终端"))
-        console = Console(core)
+        console = make_console(core)
         assert device._console_input is True
         got = []
 
@@ -327,7 +336,7 @@ class TestInputsDevicePanelInput:
         core, device = self._console_device()
         monkeypatch.setattr(device, "_terminal_prompt",
                             lambda: pytest.fail("托管时不该碰终端"))
-        console = Console(core)
+        console = make_console(core)
         thread = threading.Thread(target=lambda: core.mem["inputs"]["next"])
         thread.start()
         for _ in range(300):
@@ -368,7 +377,7 @@ class TestInputsDevicePanelInput:
         core.mem.mount("inputs", InputsListDevice(data=[]))
         seen = []
         core.events.add_observer(seen.append)
-        console = Console(core)
+        console = make_console(core)
         console.invoke_device_action("inputs", 0, {"content": "x"})
         core.mem["inputs"]["next"]
         assert seen == [], "设备自己的调试台不产生事件"
@@ -377,7 +386,7 @@ class TestInputsDevicePanelInput:
     def test_content_must_be_a_string(self):
         core = Core()
         core.mem.mount("inputs", InputsListDevice(data=[]))
-        console = Console(core)
+        console = make_console(core)
         record = console.invoke_device_action("inputs", 0, {})
         assert record["result"] is None
         assert "content 必须是字符串" in record["error"]
@@ -387,7 +396,7 @@ class TestInputsDevicePanelInput:
         core = Core()
         device = InputsListDevice(data=[])
         core.mem.mount("inputs", device)
-        console = Console(core)
+        console = make_console(core)
         assert console.invoke_device_action("inputs", 1, {})["result"] == {
             "queued": 0, "waiting": False}
         console.invoke_device_action("inputs", 0, {"content": "x"})
@@ -397,7 +406,7 @@ class TestInputsDevicePanelInput:
     def test_input_box_shows_up_on_the_console(self):
         core = Core()
         core.mem.mount("inputs", InputsListDevice(data=[]))
-        console = Console(core)
+        console = make_console(core)
         entry = [d for d in console.devices()["devices"] if d["mount"] == "inputs"][0]
         assert [a["name"] for a in entry["actions"]] == ["投喂一行输入", "查询队列"]
 
@@ -405,7 +414,7 @@ class TestInputsDevicePanelInput:
 class TestConsoleMaskLedger:
     def test_mask_memory_then_unmask(self):
         core = make_core()
-        console = Console(core)
+        console = make_console(core)
         console.mask_memory("$MEM.tree.leaf")
         assert console.state()["mask"]["memory"] == ["$MEM.tree.leaf"]
         with pytest.raises(VMMemoryError):
@@ -417,7 +426,7 @@ class TestConsoleMaskLedger:
 
     def test_double_mask_refused(self):
         core = make_core()
-        console = Console(core)
+        console = make_console(core)
         console.mask_memory("$MEM.tree.leaf")
         with pytest.raises(ValueError, match="已经被屏蔽"):
             console.mask_memory("$MEM.tree.leaf")
@@ -425,7 +434,7 @@ class TestConsoleMaskLedger:
     def test_unmask_conflict_keeps_the_ledger(self):
         """还原失败时账本不能丢，否则那条路径就永远回不来了。"""
         core = make_core()
-        console = Console(core)
+        console = make_console(core)
         console.mask_memory("$MEM.tree.leaf")
         core.mem["tree"]["leaf"] = "对话重建的"
         with pytest.raises(VMMemoryError, match="还原冲突"):
@@ -435,20 +444,20 @@ class TestConsoleMaskLedger:
 
     def test_mask_failure_does_not_touch_the_ledger(self):
         core = make_core()
-        console = Console(core)
+        console = make_console(core)
         with pytest.raises(VMMemoryError):
             console.mask_memory("$MEM.tree.nope")
         assert console.state()["mask"]["memory"] == []
 
     def test_unmask_unknown_ref(self):
         core = make_core()
-        console = Console(core)
+        console = make_console(core)
         with pytest.raises(KeyError):
             console.unmask_memory("$MEM.tree.leaf")
 
     def test_device_mask_ledger(self):
         core = make_core()
-        console = Console(core)
+        console = make_console(core)
         console.mask_device("echo")
         assert console.state()["mask"]["devices"] == ["echo"]
         assert "echo" not in core.mem.mounted_devices()

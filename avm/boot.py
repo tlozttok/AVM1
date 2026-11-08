@@ -121,12 +121,15 @@ def _declared_snapshot_path(image_path: str) -> Optional[str]:
     )
 
 
-def _restore_from_journal(core: Core, label: str) -> None:
-    """挂日志并从已应用位置重放（幂等；重放失败是恢复输入损坏，翻成镜像错误）。"""
+def _restore_from_journal(core: Core, label: str) -> int:
+    """挂日志并从已应用位置重放，返回重放条数。
+
+    幂等；重放失败是恢复输入损坏，翻成镜像错误。返回值供 boot() 写恢复报告。
+    """
     from .journal import JournalError
 
     if not core.journal_path:
-        return
+        return 0
     core.attach_journal(core.journal_path)
     try:
         applied = core.replay_journal()
@@ -134,6 +137,7 @@ def _restore_from_journal(core: Core, label: str) -> None:
         raise ImageError(f"日志重放失败：{e}") from e
     if applied:
         print(f"[AVM] {label}：重放日志 {applied} 条（seq={core._journal_seq}）", file=sys.stderr)
+    return applied
 
 
 def boot(
@@ -152,6 +156,12 @@ def boot(
     不传时按"快照是缓存"处理：镜像声明了 `snapshot_to` 且文件可读就自动用它，缺失或
     损坏只警告，退回"镜像 + 日志"重放。日志始终是持久化依据；快照只省重放时间。
     """
+    # 恢复报告（F）：来源、快照 seq、重放条数、重建数量与警告。
+    # 面板首屏从 /api/state 读它；装载期的终端输出照旧，不吞错。
+    recovery = {
+        "source": "cold", "snapshot_seq": None, "replayed": 0,
+        "restored": {}, "warnings": [],
+    }
     explicit = restore is not None
     candidate = restore
     if not explicit:
@@ -160,10 +170,9 @@ def boot(
             try:
                 read_snapshot(candidate)
             except (OSError, ValueError) as e:
-                print(
-                    f"[AVM] 重启快照不可用（{e}），改为从镜像 + 日志重建",
-                    file=sys.stderr,
-                )
+                warning = f"重启快照不可用（{e}），改为从镜像 + 日志重建"
+                recovery["warnings"].append(warning)
+                print(f"[AVM] {warning}", file=sys.stderr)
                 candidate = None
     core = load_image(
         Core(), image_path,
@@ -174,14 +183,20 @@ def boot(
             doc = core.restore_from(candidate)
         except ValueError as e:  # SnapshotError 是 ValueError
             raise ImageError(f"重启快照恢复失败：{e}") from e
+        recovery["source"] = "snapshot"
+        recovery["snapshot_seq"] = doc.get("seq", 0)
+        recovery["restored"] = _restored_counts(core)
         print(
             f"[AVM] 已从重启快照恢复（seq={doc.get('seq', 0)}，"
             f"{len(core._conv_by_cid)} 个对话）",
             file=sys.stderr,
         )
         if core.journal_path:
-            _restore_from_journal(core, "重启恢复")
+            recovery["replayed"] = _restore_from_journal(core, "重启恢复")
         else:
+            recovery["warnings"].append(
+                "镜像没有 journal_to，快照之后的日志尾部无法重放"
+            )
             print(
                 "[AVM] 警告：镜像没有 journal_to，快照之后的日志尾部无法重放",
                 file=sys.stderr,
@@ -190,10 +205,26 @@ def boot(
         if core.journal_path:
             core.attach_journal(core.journal_path)
             if core.journal.last_seq() > 0:
-                _restore_from_journal(core, "从日志恢复")
+                recovery["source"] = "journal"
+                recovery["replayed"] = _restore_from_journal(core, "从日志恢复")
+    core.recovery = recovery
     return start_core(
         core,
         refresh_models=refresh_models,
         timeout=timeout,
         api_error_policy=api_error_policy,
     )
+
+
+def _restored_counts(core: Core) -> dict:
+    """快照恢复后重建了什么：数量只做展示，取不到就给 0，不影响启动。"""
+    listeners = getattr(core.events, "_listeners", None)
+    try:
+        listener_count = len(listeners) if listeners is not None else 0
+    except TypeError:
+        listener_count = 0
+    return {
+        "conversations": len(core._conv_by_cid),
+        "listeners": listener_count,
+        "devices": len(core.mem.mounted_devices()),
+    }

@@ -79,6 +79,46 @@ export interface MaskState {
   devices: string[]
 }
 
+/** 操作面板：本次启动的恢复摘要（`/api/state.recovery`）。 */
+export interface RecoveryState {
+  source: 'cold' | 'snapshot' | 'journal'
+  snapshot_seq: number | null
+  replayed: number
+  restored: Record<string, number>
+  warnings: string[]
+}
+
+export interface IoStreamStatus {
+  next_seq: number
+  buffered: number
+  dropped: number
+}
+
+export interface IoStatus {
+  input: IoStreamStatus
+  output: IoStreamStatus
+}
+
+/** `GET /api/io/stream` 的一条输出记录：seq 单调递增，重连用 after 续读。 */
+export interface IOEntry {
+  seq: number
+  time: number
+  kind: string
+  source: number | string | null
+  target: string | null
+  text: string
+  meta: Record<string, unknown>
+}
+
+/** 单客户端准入：本宿主当前席位状态（`/api/state.client`）。 */
+export interface ClientState {
+  single_client: boolean
+  held: boolean
+  client_id: string | null
+  since: number | null
+  lease_seconds: number
+}
+
 export interface State {
   running: boolean
   schedule: Schedule
@@ -87,6 +127,13 @@ export interface State {
   interrupts: InterruptsState
   mask: MaskState
   snapshots: number
+  // 操作面板后端新增；可选是为了兼容不提供这些字段的旧后端 / e2e mock
+  lifecycle?: string
+  recovery?: RecoveryState
+  io?: IoStatus
+  force_stop_after?: number
+  force_stop_remaining?: number
+  client?: ClientState
 }
 
 /** `/api/memory` 的节点：dict / list / str / device / link 五种 kind。 */

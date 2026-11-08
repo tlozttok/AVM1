@@ -3,8 +3,10 @@
 
 起真后端（`avm.console` 的 `Console` + `serve`），执行器是脚本化的 MockLMU：
 
-- init 对话（cid 0）每轮写一次 `$MEM.note`，产出可观测的内存变化与事件；
-- 面板输入队列里有货时改读 `$MEM.inputs.next`，把喂进来的那一段取走。
+- init 对话（cid 0）每轮写一次 `$MEM.state.tick`，产出可观测的内存变化与事件；
+- 面板输入队列里有货时改读 `$MEM.inputs.next`，把喂进来的那一段取走；
+- `$MEM.inputs` / `$MEM.outputs` 直接挂操作面板宿主的 IO 设备（`avm/io_devices.py`），
+  走宿主侧总线；标准终端设备（`avm/memory_device.py`）在这个宿主里完全不参与。
 
 它不在 `avm/` 里改任何东西，也不给 `python -m avm.console` 加标志：这是测试基建。
 由 `playwright.config.ts` 的 webServer 拉起，端口由 `--port` 指定。
@@ -26,14 +28,15 @@ if str(ROOT) not in sys.path:
 
 from avm.console import Console, serve  # noqa: E402
 from avm.core import Core  # noqa: E402
-from avm.memory_device import InputsListDevice  # noqa: E402
-from avm.types import MetaDict  # noqa: E402
+from avm.io_devices import IOInputDevice, IOOutputDevice  # noqa: E402
+from avm.memory_device import StringDevice  # noqa: E402
+from avm.types import LinkNode, MetaDict  # noqa: E402
 
 
 class ScriptedLMU:
     """按 cid 记账的假执行器：产出真实的指令、事件与内存变化。"""
 
-    def __init__(self, inputs: InputsListDevice, tick_seconds: float = 0.5):
+    def __init__(self, inputs: IOInputDevice, tick_seconds: float = 0.5):
         self.inputs = inputs
         self.tick_seconds = tick_seconds
         self.rounds: dict = {}
@@ -76,25 +79,48 @@ def build(port: int, host: str, tick: float) -> None:
     # 脚本执行器写这里：$MEM.note 的元数据留给 e2e 断言，别被 tick 覆盖
     core.mem["state"] = MetaDict(data={"tick": ""}, metadata="脚本执行器的计数", ctrl={"owner": "0"})
     # 内存树链接节点（非挂载）：左栏要画成一行 link，读它进入 $MEM.note
-    from avm.types import LinkNode  # noqa: PLC0415
-
     core.mem._data["alias"] = LinkNode(target="$MEM.note", metadata="指向 note 的链接")
 
-    # 启动标志要在 attach_core 之前就位：被控制台托管时输入设备只等面板队列
-    core.host_flags = {"console": True}
-    inputs = InputsListDevice(data=[], metadata="输入")
+    # 操作面板宿主的两台 IO 设备：Console 发现已经是这两台，只登记引用不再替换。
+    inputs = IOInputDevice(data=[], metadata="输入")
     core.mem.mount("inputs", inputs)
     inputs.mount_path = "inputs"
     inputs.attach_core(core)
-    # 嵌套挂载：左栏那行的位置由树给出（$MEM.state 展开后是 log 一行），不靠父段算法另注入
-    from avm.memory_device import StringDevice  # noqa: PLC0415
+    outputs = IOOutputDevice(data=[], metadata="输出")
+    core.mem.mount("outputs", outputs)
+    outputs.mount_path = "outputs"
+    outputs.attach_core(core)
 
+    # 嵌套挂载：左栏那行的位置由树给出（$MEM.state 展开后是 log 一行），不靠父段算法另注入
     core.mem.mount("state.log", StringDevice("最后一行"))
+
+    # 监听器编辑界面要有一条可改的记录；用不会触发的 memory_delete 事件，
+    # 避免拦截 ScriptedLMU 每轮的 memory_write。
+    core.mem["handler"] = MetaDict(
+        data={"content": "def handle(event):\n    return {}\n"},
+        ctrl={"type": "handler"},
+    )
+    core.events.register(
+        owner_cid=0, event_type="memory_delete", target="$MEM.state.tick",
+        handler_ref="$MEM.handler", phase="before",
+    )
+
+    # 独立线程造输出：不改 ScriptedLMU 的指令序列，既有事件流断言不受影响。
+    def emit_output():
+        seq = 0
+        while True:
+            seq += 1
+            outputs.append(f"mock 输出 #{seq}", notify=(seq % 2 == 0))
+            time.sleep(0.5)
+
+    threading.Thread(target=emit_output, name="mock-output", daemon=True).start()
     core.lmu = ScriptedLMU(inputs, tick)
 
     init = core.start("你是 init 对话，按脚本行动。", "开始", "$MEM.model_params")
     init.name = "init"
 
+    # 单客户端准入是真实宿主策略；e2e 共用一个服务被多个 test 的页面轮流打开，
+    # 所以这里保持默认（不启用）。
     console = Console(core)
     server = serve(console, host, port)
 

@@ -545,3 +545,213 @@ pre.content {
 .kind-note .log-kind {
   color: var(--fg-muted);
 }
+
+/* -------------------------------------------------------------------- */
+/* 操作面板：顶栏 + 输出/输入主区 + 默认展开的调试抽屉                     */
+/* -------------------------------------------------------------------- */
+
+/* 两段各占固定高度，整页可滚动；原来的 .app 是满屏不可滚动的三栏布局。 */
+.operation-app {
+  height: auto;
+  min-height: 100%;
+}
+
+/* 三栏给固定足高，整页滚动。若按视口比例压缩，右栏 ActionPanel 会溢出到
+   事件流上方、拦住点击（e2e 实测），所以这里不随视口缩。 */
+.operation-app .columns {
+  flex: none;
+  height: 620px;
+  min-height: 620px;
+}
+
+.columns.debug-collapsed {
+  display: none;
+}
+
+.operation-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-soft);
+}
+
+.operation-status {
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-weight: 600;
+  color: var(--ok);
+}
+
+.operation-status.status-stopping {
+  color: var(--warn);
+}
+
+.operation-status.status-stopped {
+  color: var(--fg-muted);
+}
+
+.operation-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.operation-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.operation-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1.7fr) minmax(300px, 1fr);
+  gap: 1px;
+  height: 260px;
+  min-height: 240px;
+  background: var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.output-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.output-scroll {
+  padding: 4px 0;
+}
+
+.output-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 3px 12px;
+  border-bottom: 1px solid var(--line);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.output-row-notify {
+  background: rgba(224, 179, 76, 0.12);
+  border-left: 3px solid var(--warn);
+}
+
+.output-seq {
+  min-width: 42px;
+}
+
+.output-source {
+  min-width: 64px;
+}
+
+.output-text {
+  flex: 1;
+}
+
+.composer-body {
+  gap: 10px;
+}
+
+.composer-field {
+  flex: 1;
+  min-height: 0;
+}
+
+.composer-field textarea {
+  flex: 1;
+  min-height: 90px;
+  resize: vertical;
+}
+
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.debug-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-soft);
+}
+
+.login-gate {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+.login-card {
+  width: min(420px, 92vw);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg-pane);
+}
+
+.login-card .pane-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.client-gate {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+/* 监听器编辑是抽屉里的整行面板：给固定上限，不挤三栏的高度。 */
+.listener-editor {
+  max-height: 240px;
+  border-bottom: 1px solid var(--line);
+}
+
+.listener-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.listener-row {
+  border-bottom: 1px solid var(--line);
+  padding: 4px 0;
+}
+
+.listener-summary,
+.listener-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.listener-form {
+  padding: 6px 0;
+}
+
+.listener-form .field {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+
+.listener-form .field input[type='text'],
+.listener-form .field input[type='number'] {
+  width: 140px;
+}

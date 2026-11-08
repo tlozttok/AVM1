@@ -45,10 +45,10 @@ test('观测：调度、对话详情、内存索引与设备信息', async ({ pa
   // 挂载点：行来自内存树（链接节点），标出设备类型，`看` 进设备视图；只画一行
   const inputs = tree.locator('[data-ref="$MEM.inputs"]')
   await expect(inputs).toHaveCount(1)
-  await expect(inputs).toContainText('device InputsListDevice')
+  await expect(inputs).toContainText('device IOInputDevice')
   await inputs.getByRole('button', { name: '看' }).click()
   const device = page.getByTestId('device-view')
-  await expect(device).toContainText('InputsListDevice')
+  await expect(device).toContainText('IOInputDevice')
   await expect(device).toContainText('投喂一行输入')
 
   // 嵌套挂载：$MEM.state 展开后，log 那行也在树里（不是父段算法另注入的行）
@@ -263,6 +263,50 @@ test('喂输入：多行文本整段进队列，被下一次读取取走', async
   const view = page.getByTestId('memory-view')
   await expect(view).toContainText('第一行')
   await expect(view).toContainText('第二行')
+})
+
+test('操作面板：顶栏、输出流、定向输入与调试抽屉', async ({ page }) => {
+  await page.goto('/')
+
+  // 顶栏回答「现在健康吗、跑到哪了」；恢复摘要来自 /api/state.recovery
+  await expect(page.getByTestId('operation-bar')).toBeVisible()
+  await expect(page.getByTestId('operation-status')).toContainText('运行中')
+  await expect(page.getByTestId('operation-recovery')).toContainText('冷启动')
+
+  // 输出流是宿主侧的另一条 SSE：普通输出与通知两条都在，通知有独立标记
+  const out = page.getByTestId('output-console')
+  await expect(out.getByTestId('output-entry').first()).toBeVisible()
+  await expect(out.getByTestId('output-notify').first()).toBeVisible()
+  await expect(out.getByTestId('output-connected')).toContainText('SSE 已连接')
+
+  // 定向输入只走 /api/io/input，不经面板对话、不发起工具调用
+  await page.getByTestId('input-target').selectOption('0')
+  await page.getByTestId('input-text').fill('给 cid 0 的一句话')
+  await page.getByTestId('input-send').click()
+  await expect(page.getByTestId('input-result')).toContainText('cid 0')
+
+  // 关机入口：确认流程出现后取消，不真的关掉共用的 mock 服务。
+  // 强制退出不是常驻按钮：只有请求关机并等满后端给的收尾时间才出现。
+  await expect(page.getByTestId('operation-force-stop')).toHaveCount(0)
+  await page.getByTestId('operation-shutdown').click()
+  await expect(page.getByTestId('operation-shutdown-confirm')).toBeVisible()
+  await page.locator('.operation-confirm').getByRole('button', { name: '取消' }).click()
+
+  // 抽屉里的监听器编辑：改 enabled 走 PATCH /api/listeners/<id>
+  const editor = page.getByTestId('listener-editor')
+  await expect(editor.getByTestId('listener-row')).toHaveCount(1)
+  await editor.getByTestId('listener-edit').click()
+  await editor.getByTestId('listener-field-enabled').uncheck()
+  await editor.getByTestId('listener-save').click()
+  await expect(editor.getByTestId('listener-result')).toContainText('已更新')
+  await expect(editor.getByTestId('listener-row')).toContainText('停用')
+
+  // 调试能力默认展开（既有 testid 都在这里），可一键收起再展开
+  await expect(page.getByTestId('memory-tree')).toBeVisible()
+  await page.getByTestId('debug-toggle').click()
+  await expect(page.getByTestId('debug-drawer')).toBeHidden()
+  await page.getByTestId('debug-toggle').click()
+  await expect(page.getByTestId('memory-tree')).toBeVisible()
 })
 
 test('构建产物由 console 自己托管：同一个面板从 8791 打开', async ({ page }) => {
