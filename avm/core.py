@@ -17,16 +17,48 @@ from .capabilities import (
 )
 from .exceptions import IllegalOperationError, VMSyntaxError, VMMemoryError, APIError, RunnerStop, KernelPanic
 from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, message_to_api_dict, LinkNode
+from .types import message_to_dict, batch_to_dict
 from .memory import Memory, check_new_key
 from .memory_device import MemoryDevice
 from .monitor import Monitor
 from .python_server import HOST_ONLY_PLMS, PLM_REGISTRY, create_plm
 from .events import EventSystem, build_event, EVENT_TYPES
+from .journal import (
+    Journal, JournalError, apply as apply_journal_record,
+    conversation_create_payload, scheduler_to_snapshot,
+)
 from .info_devices import (
     CapsDevice, ConversationsDevice, RootsDevice, SchedulerDevice,
     ListenersDevice, MemorySummaryDevice, MonitorDevice,
 )
 from .interrupts import InterruptTable
+
+
+def _effect_space(conv: Conversation) -> dict:
+    """把对话的地址空间写成日志效果可重放形状（根名 → 真实段）。"""
+    return {name: list(segments) for name, segments in conv.caps.space().as_roots().items()}
+
+
+def _note_memory_write(core: 'Core', conv: Conversation, ref: str, content: str) -> None:
+    """内存写（含追加）的日志效果。
+
+    目标是设备（或 legacy LinkDevice 透明挂载）时只记审计条目：设备内部状态不在
+    `$MEM` 里，重放不访问设备。LinkDevice 把写委托进内存树的路径因此不会被重放——
+    它是"不要用于新设计"的兼容设备，日志不承诺覆盖（见 docs/runtime.md）。
+    """
+    if not core._journaling():
+        return
+    try:
+        split = core.mem.split_path(ref, space=conv.caps.space())
+    except (VMMemoryError, IllegalOperationError, ValueError):
+        split = None
+    if split is not None and split[0] == "device":
+        core.note_effect("device_write", ref=ref, mount=split[1])
+        return
+    core.note_effect(
+        "memory_set", ref=ref, value=content, owner_cid=conv.cid,
+        space=_effect_space(conv),
+    )
 
 
 # 操作员对话的系统消息：说明这条对话的执行器是操作员而不是模型。
@@ -372,6 +404,7 @@ class MemoryWriteInstruction(Instruction):
         except _INSTRUCTION_ERRORS as e:
             _respond_error(conv, self.call_id, e)
             return
+        _note_memory_write(core, conv, self.ref, content)
         after_payload = {"ref": self.ref, "content": content, "actor_cid": conv.cid}
         if address is not None:
             # 列表追加：-1 换成了真实下标，响应给出可寻址地址
@@ -441,6 +474,11 @@ class MemoryMakeInstruction(Instruction):
         except _INSTRUCTION_ERRORS as e:
             _respond_error(conv, self.call_id, e)
             return
+        if core._journaling():
+            core.note_effect(
+                "memory_make", ref=self.ref, key=self.key, mem_type=self.mem_type,
+                owner_cid=conv.cid, space=_effect_space(conv),
+            )
         # 真实地址：链上新建的段与 -1 追加段都带真实下标，调用者据此可寻址
         if self.key == "-1":
             conv.user_batch.add_tool_response(f"Success created {self.mem_type} at {address}", self.call_id)
@@ -509,6 +547,8 @@ class MemoryDeleteInstruction(Instruction):
         except _INSTRUCTION_ERRORS as e:
             _respond_error(conv, self.call_id, e)
             return
+        if core._journaling():
+            core.note_effect("memory_delete", ref=self.ref, space=_effect_space(conv))
         conv.user_batch.add_tool_response(f"Success deleted {deleted_type} at {address}", self.call_id)
         _publish_core_after_safely(
             core,
@@ -599,6 +639,11 @@ class EditMetadataInstruction(Instruction):
                 return
             ctrl[key] = value
             node.set_ctrl(ctrl)
+            if core._journaling():
+                core.note_effect(
+                    "edit_metadata", ref=self.ref, type="set", key=key, value=value,
+                    space=_effect_space(conv),
+                )
             conv.user_batch.add_tool_response(f"ctrl.{key} = {value!r} 已写入", self.call_id)
             _publish_core_after_safely(core, 
                 "edit_metadata",
@@ -649,6 +694,11 @@ class EditMetadataInstruction(Instruction):
                 return
             del ctrl[key]
             node.set_ctrl(ctrl)
+            if core._journaling():
+                core.note_effect(
+                    "edit_metadata", ref=self.ref, type="del", key=key,
+                    space=_effect_space(conv),
+                )
             conv.user_batch.add_tool_response(f"ctrl.{key} 已删除", self.call_id)
             _publish_core_after_safely(core, 
                 "edit_metadata",
@@ -705,6 +755,8 @@ class CreateInstruction(Instruction):
         # 子对话创建后进入休眠，等待 send_instruction 投递指令
         if child.cid not in core._dormant_cids:
             core._dormant_cids.append(child.cid)
+        if core._journaling():
+            core.note_effect("conversation_create", **conversation_create_payload(core, child))
         _publish_core_after_safely(core,
             "create_cmd",
             conv,
@@ -766,6 +818,8 @@ class CreateSubInstruction(Instruction):
         core._ready_cids.insert(0, sub.cid)
         if conv.cid not in core._dormant_cids:
             core._dormant_cids.append(conv.cid)
+        if core._journaling():
+            core.note_effect("conversation_create", **conversation_create_payload(core, sub))
         _publish_core_after_safely(core,
             "create_sub",
             conv,
@@ -861,6 +915,7 @@ class SendInstruction(Instruction):
             content = event["payload"]["content"]
             # 简单投递：内容原样放入目标对话的输入批次，不包装 JSON 信封
             target.user_batch.add_user_content(content)
+            core.note_effect("delivery", to_cid=target.cid, user_contents=[content])
             delivered_cids.append(target.cid)
             delivered += 1
             # 事实事件按"消息已被接受"发布：等待返回的目标只入批次、也照样有 after。
@@ -1619,6 +1674,20 @@ class Core:
         self.events: EventSystem = EventSystem(self)
         self.interrupts: InterruptTable = InterruptTable(self)  # 中断向量表：外部（控制台）发起的控制权转移
         self._turn_events: List[dict] = []
+        # 持久运行：回合级效果日志（journal）与重启快照（snapshot）。
+        # journal 为 None 时所有记录点是空操作——无日志镜像行为不变。
+        self.journal: Optional[Journal] = None
+        self.journal_path: Optional[str] = None   # 镜像 journal_to（load_image 解析后写入）
+        self.snapshot_path: Optional[str] = None  # 镜像 snapshot_to（load_image 解析后写入）
+        self._journal_seq: int = 0                # 已提交/已重放到的日志位置
+        self._turn_effects: List[dict] = []       # 本轮指令产生的语义效果（回合结束提交）
+        self._replaying: bool = False             # 重放期间禁止再记录
+        self._recording: bool = False             # 只在回合执行体内记录
+        # 恢复出来的对话（快照/日志）：Python 执行器首次创建时要预热一次
+        self._warmup_needed: set = set()
+        # 设备来源表：挂载地址 → 设备 spec（文件/类/参数/标识符；内建设备 builtin）。
+        # 快照要覆盖热装设备，而设备表里只有实例，没有"这是从哪来的"。
+        self.device_specs: Dict[str, dict] = {}
         self.mem.mount("conversations", ConversationsDevice(self))
         self.mem.mount("scheduler", SchedulerDevice(self))
         self.mem.mount("memory", MemorySummaryDevice(self))
@@ -1626,6 +1695,12 @@ class Core:
         self.mem.mount("listeners", ListenersDevice(self))
         self.mem.mount("roots", RootsDevice(self))
         self.mem.mount("caps", CapsDevice(self))
+        for mount in ("conversations", "scheduler", "memory", "monitor",
+                      "listeners", "roots", "caps"):
+            self.device_specs[mount] = {
+                "builtin": True,
+                "class": type(self.mem._devices[mount]).__name__,
+            }
         # 启动自带的内存节点：模型目录（静态部分；LLM 清单由宿主 refresh_model_catalog 填）
         self.install_model_catalog()
 
@@ -1829,6 +1904,119 @@ class Core:
             self._dormant_cids.append(conv.cid)
         return conv
 
+    # ------------------------------------------------------------------
+    # 回合级效果日志（journal，批次 A）
+    # ------------------------------------------------------------------
+
+    def attach_journal(self, path: str) -> "Journal":
+        """挂上回合日志（后续回合从这里追加）。重放用 `replay_journal`。"""
+        self.detach_journal()
+        self.journal = Journal(path)
+        return self.journal
+
+    def detach_journal(self) -> None:
+        """摘掉日志（之后的回合不再记录；已提交的记录留在文件里）。"""
+        self.journal = None
+
+    def _journaling(self) -> bool:
+        """当前是否正在为回合日志记录（无日志/重放/非回合执行期都是假）。
+
+        记录点先问这一句再构造载荷：无日志镜像不该为日志做序列化工作。
+        """
+        return self.journal is not None and not self._replaying and self._recording
+
+    def note_effect(self, kind: str, **payload) -> None:
+        """记一条语义效果：无日志、重放期间、非回合执行期都是空操作。"""
+        if not self._journaling():
+            return
+        self._turn_effects.append({"kind": kind, **payload})
+
+    def note_effects(self, effects: List[dict]) -> None:
+        """批量记效果（程序包安装/卸载等一步产生多条状态变化的操作用）。"""
+        if not self._journaling():
+            return
+        self._turn_effects.extend(effects)
+
+    def _commit_journal_record(self, conv: Conversation, history_delta: List[dict]) -> None:
+        """回合结束提交一条记录（安全点调用；异常回合不提交）。"""
+        effects = self._turn_effects
+        self._turn_effects = []
+        if self.journal is None:
+            return
+        history = list(history_delta)
+        call = None
+        if history and history[-1].get("role") == "assistant":
+            call = {key: value for key, value in history.pop().items() if key != "role"}
+        record = {
+            "cid": conv.cid,
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "history": history,
+            "call": call,
+            "batch": (
+                batch_to_dict(conv.user_batch)
+                if conv.cid in self._conv_by_cid else None
+            ),
+            "scheduler": scheduler_to_snapshot(self),
+            "effects": effects,
+        }
+        self._journal_seq = self.journal.append(record)
+
+    def replay_journal(self, records: Optional[List[dict]] = None) -> int:
+        """按 seq 顺序重放日志（默认从日志文件续在已应用位置之后）。
+
+        幂等：应用位置由 `_journal_seq` 推进，同一段日志重放两次第二次是空操作。
+        返回本次实际应用的记录数。日志不连续（缺记录）直接报错。
+        """
+        if self.journal is None:
+            raise JournalError("没有挂载日志：先 attach_journal")
+        pending = (
+            self.journal.read(after_seq=self._journal_seq)
+            if records is None else list(records)
+        )
+        applied = 0
+        for record in pending:
+            seq = record.get("seq")
+            if not isinstance(seq, int):
+                raise JournalError(f"日志记录缺少合法 seq：{record!r}")
+            if seq <= self._journal_seq:
+                continue
+            if seq != self._journal_seq + 1:
+                raise JournalError(
+                    f"日志不连续：当前已应用到 seq={self._journal_seq}，"
+                    f"下一条是 seq={seq}（缺记录，拒绝重放）"
+                )
+            apply_journal_record(self, record)
+            self._journal_seq = seq
+            applied += 1
+        return applied
+
+    # ------------------------------------------------------------------
+    # 重启快照（snapshot，批次 A）
+    # ------------------------------------------------------------------
+
+    def snapshot_to(self, path: Optional[str] = None) -> str:
+        """写重启快照（默认镜像声明的 snapshot_to）；返回落点。"""
+        from .snapshot import snapshot, write_atomic
+
+        target = path or self.snapshot_path
+        if not target:
+            raise ValueError("没有快照路径：传 path 或让镜像声明 snapshot_to")
+        write_atomic(target, snapshot(self))
+        return target
+
+    def restore_from(self, path: str) -> dict:
+        """从重启快照恢复（替换调度/对话/内存/监听器/设备表）；返回快照文档。"""
+        from .snapshot import read_snapshot, restore
+
+        doc = read_snapshot(path)
+        restore(self, doc)
+        return doc
+
+    def unmount_device(self, mount: str) -> None:
+        """卸载设备：设备表与设备来源表一起删（包卸载、日志重放、宿主共用）。"""
+        self.device_specs.pop(mount, None)
+        self.mem.unmount(mount)
+
     @staticmethod
     def _respond_unexecuted(conv: Conversation, call_id):
         """协议层拒绝：写一条中性工具响应保住配对；call_id 不可用时无法配对，只记 stderr。"""
@@ -1893,6 +2081,10 @@ class Core:
                     # 亚对话紧耦合：完成即自动写回并唤醒父
                     call_id = conv.metadata.get("call_id", "direct_output")
                     parent.user_batch.add_tool_response(result, call_id)
+                    self.note_effect(
+                        "delivery", to_cid=parent.cid,
+                        tool_responses=[{"content": result, "tool_call_id": call_id}],
+                    )
                     conv.metadata["returned"] = True
                 # 用完即删：返回通道只用一次，个体不再保留
                 self._delete_conversation(conv.cid)
@@ -1936,6 +2128,7 @@ class Core:
         """
         if cid in self._finished:
             return
+        self.note_effect("conversation_close", cid=cid)
         conv = self._conv_by_cid.get(cid)
         if conv is not None and conv.is_sub:
             # 亚对话用完即删：先给等待中的父补响应，再移除个体
@@ -1958,6 +2151,7 @@ class Core:
         级联：以它为父的亚对话一并删除（它们已经没有返回通道）。create_cmd 子对话
         是独立个体（is_sub=False），不在此列。
         """
+        self.note_effect("conversation_delete", cid=cid)
         for child in list(self._conv_by_cid.values()):
             if child.is_sub and child.parent is not None and child.parent.cid == cid:
                 self._delete_conversation(child.cid)
@@ -1981,6 +2175,13 @@ class Core:
         call_id = sub.metadata.get("call_id", "direct_output")
         parent.user_batch.add_tool_response(
             f"Error: 亚对话（cid={sub.cid}）在返回结果前被关闭", call_id
+        )
+        self.note_effect(
+            "delivery", to_cid=parent.cid,
+            tool_responses=[{
+                "content": f"Error: 亚对话（cid={sub.cid}）在返回结果前被关闭",
+                "tool_call_id": call_id,
+            }],
         )
         sub.metadata["returned"] = True
         # 同一轮多个 create_sub：父还有别的待答调用时只补响应，等全部返回后再唤醒
@@ -2025,36 +2226,48 @@ class Core:
 
     def advance_conversation(self):
         self._turn_events.clear()
+        self._turn_effects.clear()  # 只记录本轮；异常回合的效果随下一轮一起丢弃
         conv = self._conv_by_cid[self._active_cid]
         executor = None
         attempt = 0
+        history_delta: List[dict] = []
         while True:
             try:
                 # 取 para 与选执行器也放进 try：它们会因为配置错配抛错，
                 # 原先在 try 之外，逃出去连监测帧都没有（问题 1）。
                 para = self._get_para(conv)
                 executor = self._get_executor(conv, para)
+                before_count = len(conv.messages)
                 result, return_calls, _ = executor.exec(conv, para)
+                # 本轮写进历史的"实际消息"（消费进历史的批次 + 新的 assistant 消息）。
+                # 日志按实际消息记而不是按生成它的效果推导：before 事件可以改写 payload。
+                history_delta = [
+                    message_to_dict(m) for m in conv.messages[before_count:]
+                ]
                 conv.user_batch.clear()
 
-                if return_calls:
-                    self._process_return_calls(return_calls, conv)
-                    self._activation_instructions += len(return_calls)
-                    if conv.cid in self._finished or conv.cid not in self._conv_by_cid:
-                        # 内核级关闭或亚对话用完即删：本轮结束后选择下一个活跃对话
-                        self._active_cid = None
-                        self._pick_next_active()
-                    elif conv.cid in self._dormant_cids:
-                        # 对话自己让出（等待返回/子完成）
-                        self._pick_next_active()
-                    elif self._activation_instructions >= self._instruction_budget:
-                        # 核心中断：工具返回已加入 batch、状态完整；让出执行权，进就绪队列末尾
-                        self._activation_instructions = 0  # 链被中断，重新计数
-                        if conv.cid not in self._ready_cids:
-                            self._ready_cids.append(conv.cid)
-                        self._pick_next_active()
-                else:
-                    self._on_conversation_finished(conv, result)
+                self._recording = True
+                try:
+                    if return_calls:
+                        self._process_return_calls(return_calls, conv)
+                        self._activation_instructions += len(return_calls)
+                        if conv.cid in self._finished or conv.cid not in self._conv_by_cid:
+                            # 内核级关闭或亚对话用完即删：本轮结束后选择下一个活跃对话
+                            self._active_cid = None
+                            self._pick_next_active()
+                        elif conv.cid in self._dormant_cids:
+                            # 对话自己让出（等待返回/子完成）
+                            self._pick_next_active()
+                        elif self._activation_instructions >= self._instruction_budget:
+                            # 核心中断：工具返回已加入 batch、状态完整；让出执行权，进就绪队列末尾
+                            self._activation_instructions = 0  # 链被中断，重新计数
+                            if conv.cid not in self._ready_cids:
+                                self._ready_cids.append(conv.cid)
+                            self._pick_next_active()
+                    else:
+                        self._on_conversation_finished(conv, result)
+                finally:
+                    self._recording = False
             except APIError as e:
                 # 外部失败：记帧，然后停下问运行者。失败时历史与输入批次都没动过，
                 # 选 retry/reload 就重跑本轮（attempt 只用于提示，不自动放弃）。
@@ -2068,6 +2281,7 @@ class Core:
                 raise
             else:
                 self.monitor.record(self, last_call=self._last_call_for(executor))
+                self._commit_journal_record(conv, history_delta)
                 return
 
     def _last_call_for(self, executor):
@@ -2119,8 +2333,25 @@ class Core:
                 )
             executor = PLMExecutor(create_plm(model, extra=self.plms))
             self._executors[conv.cid] = executor
+            self._warm_restored_python_executor(executor, conv)
             return executor
         return self.lmu
+
+    def _warm_restored_python_executor(self, executor: PLMExecutor, conv: Conversation) -> None:
+        """恢复出来的 Python 对话：重建执行器后重放 system 消息、把已有历史标记为已处理。
+
+        PLM 的命名空间不序列化（计划 A5 待定夺第 1 项的默认取舍）：跨轮状态必须由
+        程序自己落在 `$MEM`；执行器重建后 setup 代码要再执行一遍，而历史里的 user/tool
+        消息不能再执行（否则副作用重复发生）。新对话（历史只有 system）不走这里。
+        """
+        if conv.cid not in self._warmup_needed:
+            return
+        self._warmup_needed.discard(conv.cid)
+        messages = conv.to_api_messages()
+        restore_state = getattr(executor.plm, "restore_state", None)
+        if not callable(restore_state):
+            return
+        restore_state(messages, {"tools": _build_tools(conv)})
 
     def _get_para(self, conv: Conversation):
         """按对话自己的 para_ref 读取模型调用参数（缺省用 Core.para_ref）"""
@@ -2463,7 +2694,7 @@ class Core:
     ) -> Optional[str]:
         """把死亡现场写成一个 JSON，返回写入路径；失败返回 None。
 
-        诊断快照，**不是恢复输入**（恢复只走检查点）。全程不抛：任何一段序列化失败
+        诊断快照，**不是恢复输入**（恢复依据是回合日志，快照是它的缓存）。全程不抛：任何一段序列化失败
         都降级为占位——转储绝不能成为新的内核退出路径。
         """
         target = path or self.core_dump_to or self.core_dump_path()
@@ -2592,6 +2823,7 @@ class Core:
             "metadata": dict(conv.metadata or {}),
             "caps": caps_to_dict(conv.caps),
             "attrs": dict(conv.attrs or {}),
+            "workspace_root_name": getattr(conv, "workspace_root_name", None),
             "message_count": total,
             "messages": messages[-limit:] if limit else [],
             "messages_truncated": total > limit,

@@ -16,6 +16,7 @@ import json
 import sys
 from typing import Any, Dict, List, Optional
 
+from .capabilities import AddressSpace
 from .exceptions import IllegalOperationError, VMMemoryError
 from .sandbox import safe_globals, exec_safe
 from .types import MetaDict, MetaList
@@ -66,6 +67,57 @@ MUTABLE_PAYLOAD_KEYS = {
 }
 
 DEFAULT_REPLACE_RESPONSE = "事件被监听器拦截"
+
+
+# ----------------------------------------------------------------------
+# 监听器记录的序列化（重启快照与回合日志共用）
+# ----------------------------------------------------------------------
+
+def _to_tuple_ref(value):
+    """canonical 引用 / 条件引用在内存里是 tuple，JSON 里是 list；读回时换回 tuple。"""
+    if isinstance(value, (list, tuple)):
+        return tuple(_to_tuple_ref(item) for item in value)
+    return value
+
+
+def listener_to_snapshot(listener: dict) -> dict:
+    """监听器记录 → JSON 安全形状。
+
+    内存记录里 `space` 是 AddressSpace 对象（不可 JSON 化），`target_ref` 与条件里的
+    引用是 tuple；快照/日志存成根表 dict 与 list，读回由 listener_from_snapshot 还原。
+    """
+    out = {}
+    for key, value in listener.items():
+        if key == "space":
+            out["space"] = (
+                {name: list(segments) for name, segments in value.as_roots().items()}
+                if value is not None else None
+            )
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
+
+
+def listener_from_snapshot(data: dict) -> dict:
+    """listener_to_snapshot 的逆操作（返回可放回 events.listeners 的记录）。"""
+    if not isinstance(data, dict):
+        raise ValueError(f"监听器快照必须是对象，得到 {type(data).__name__}")
+    listener = copy.deepcopy(data)
+    roots = listener.get("space")
+    listener["space"] = (
+        AddressSpace({name: tuple(segments) for name, segments in roots.items()})
+        if isinstance(roots, dict) else None
+    )
+    if listener.get("target_ref") is not None:
+        listener["target_ref"] = _to_tuple_ref(listener["target_ref"])
+    condition = listener.get("condition")
+    if isinstance(condition, dict):
+        target = condition.get("target")
+        if isinstance(target, dict) and isinstance(target.get("refs"), dict):
+            target["refs"] = {
+                key: _to_tuple_ref(ref) for key, ref in target["refs"].items()
+            }
+    return listener
 
 
 class EventHandlerError(Exception):
@@ -234,6 +286,17 @@ class EventSystem:
     # 注册 / 修改 / 取消
     # ------------------------------------------------------------------
 
+    def _journaling(self) -> bool:
+        """当前是否正在为回合日志记录（无日志/重放/非回合执行期为假）。"""
+        check = getattr(self._core, "_journaling", None)
+        return bool(check()) if callable(check) else False
+
+    def _note(self, kind: str, **payload) -> None:
+        """把监听器变化记进回合日志（无日志/重放/非回合执行期时是空操作）。"""
+        note = getattr(self._core, "note_effect", None)
+        if callable(note):
+            note(kind, **payload)
+
     def register(self, owner_cid: int, event_type: str, target: str, handler_ref: str, phase: str = "all",
                  space=None, tier: str = NORMAL_TIER, priority: int = 0,
                  kernel_mode: bool = False) -> int:
@@ -288,6 +351,8 @@ class EventSystem:
             "priority": priority,
             "space": space,
         })
+        if self._journaling():
+            self._note("listener_register", listener=listener_to_snapshot(self.listeners[-1]))
         return listener_id
 
     def modify(self, listener_id: int, owner_cid: int, handler_ref: str = None, space=None,
@@ -313,11 +378,16 @@ class EventSystem:
             if priority > 0 and listener.get("tier") != KERNEL_TIER:
                 raise IllegalOperationError("priority>0 只有内核级监听器可以设置")
             listener["priority"] = priority
+        if self._journaling():
+            self._note("listener_modify", listener_id=listener_id,
+                       listener=listener_to_snapshot(listener))
 
     def cancel(self, listener_id: int, owner_cid: int) -> None:
         listener = self._get_listener(listener_id)
         self._check_owner(listener, owner_cid)
         self.listeners.remove(listener)
+        if self._journaling():
+            self._note("listener_cancel", listener_id=listener_id)
 
     @staticmethod
     def _note_listener_error(listener: dict, message: str) -> None:
@@ -327,6 +397,8 @@ class EventSystem:
 
     def cancel_all_for_owner(self, owner_cid: int) -> None:
         self.listeners = [l for l in self.listeners if l.get("owner_cid") != owner_cid]
+        if self._journaling():
+            self._note("listener_cancel_all", owner_cid=owner_cid)
 
     # ------------------------------------------------------------------
     # 宿主侧就地编辑（调试控制台）
@@ -1272,6 +1344,8 @@ class EventSystem:
             "space": space,
             "condition": condition,
         })
+        if self._journaling():
+            self._note("listener_register", listener=listener_to_snapshot(self.listeners[-1]))
         return listener_id
 
     def _actor_conv(self, event: dict):

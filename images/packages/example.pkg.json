@@ -1,0 +1,45 @@
+{
+  "meta": {
+    "format": "avm.package",
+    "version": 1,
+    "name": "demo",
+    "package_version": "1_0_0",
+    "description": "示例程序包：把 $MEM.example.input 加前缀后写回 output"
+  },
+  "mem": {
+    "programs": {
+      "kind": "dict",
+      "value": {
+        "pack": {
+          "kind": "dict",
+          "ctrl": {
+            "type": "python"
+          },
+          "value": {
+            "content": {
+              "kind": "str",
+              "value": "def pack():\n    text = memory_read('$MEM.example.input')\n    memory_write('$MEM.example.output', '来自程序包: ' + str(text))\n    print('pack 完成')\n"
+            },
+            "para_ref": {
+              "kind": "str",
+              "value": "$MEM.packages.demo.1_0_0.params"
+            }
+          }
+        }
+      }
+    },
+    "params": {
+      "kind": "dict",
+      "ctrl": {
+        "type": "para"
+      },
+      "value": {
+        "model": {
+          "kind": "str",
+          "value": "plm.python"
+        }
+      }
+    }
+  },
+  "devices": []
+}

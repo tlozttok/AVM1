@@ -1,0 +1,110 @@
+{
+  "meta": {
+    "version": 1
+  },
+  "para_ref": "$MEM.model_params",
+  "mem": {
+    "model_params": {
+      "kind": "dict",
+      "ctrl": {
+        "type": "para"
+      },
+      "value": {
+        "model": {
+          "kind": "str",
+          "value": "unused"
+        }
+      }
+    },
+    "guard_params": {
+      "kind": "dict",
+      "ctrl": {
+        "type": "para"
+      },
+      "value": {
+        "model": {
+          "kind": "str",
+          "value": "plm.python"
+        }
+      }
+    },
+    "programs": {
+      "kind": "dict",
+      "value": {
+        "guard_setup": {
+          "kind": "dict",
+          "ctrl": {
+            "type": "python"
+          },
+          "value": {
+            "content": {
+              "kind": "str",
+              "value": "def register():\n    print(listen_event(action='listen',\n                       handler_ref='$MEM.handlers.loader_guard',\n                       tier='kernel', priority=100))\n"
+            },
+            "para_ref": {
+              "kind": "str",
+              "value": "$MEM.guard_params"
+            }
+          }
+        }
+      }
+    },
+    "handlers": {
+      "kind": "dict",
+      "meta": "内核态安全监听器：只放行操作员写装载设备",
+      "value": {
+        "loader_guard": {
+          "kind": "dict",
+          "ctrl": {
+            "type": "handler"
+          },
+          "value": {
+            "content": {
+              "kind": "str",
+              "value": "def handle(event):\n    source = event.get(\"source\") or {}\n    cid = source.get(\"initiator_cid\")\n    if cid == -1:\n        # -1 是控制台操作员对话的保留 cid：装载命令只能由操作员发出\n        return {\"action\": \"execute\"}\n    return {\"action\": \"replace\", \"response\": \"只有操作员对话可以写装载设备\"}\n"
+            },
+            "condition": {
+              "kind": "str",
+              "value": "{\"events\": [\"memory_write\"], \"phase\": [\"before\"], \"target\": {\"kind\": \"exact\", \"ref\": \"$MEM.loader\"}}"
+            }
+          }
+        }
+      }
+    },
+    "loader": {
+      "kind": "device"
+    },
+    "example": {
+      "kind": "dict",
+      "meta": "示例包的输入输出",
+      "value": {
+        "input": {
+          "kind": "str",
+          "value": "演示输入"
+        },
+        "output": {
+          "kind": "str",
+          "value": ""
+        }
+      }
+    }
+  },
+  "devices": [
+    {
+      "path": "loader",
+      "file": "loader.py",
+      "class": "LoaderDevice",
+      "args": {
+        "password_sha256": "9437e87fae95c03d3778f2575bb18ce30e647e51d86a8c37963364e1fc4f374e"
+      }
+    }
+  ],
+  "init": {
+    "name": "guard",
+    "system_ref": "$MEM.programs.guard_setup",
+    "user": "register()"
+  },
+  "journal_to": "out/packages_demo.journal",
+  "snapshot_to": "out/packages_demo.snapshot.json",
+  "persist_to": "out/packages_demo_mem.json"
+}

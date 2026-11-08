@@ -23,6 +23,8 @@ python -m avm.image <image.json>
 | `security` | 否 | 权限段：根注册表 `roots` 与工作空间区域 `workspace_region`（见下文） |
 | `init` | 否 | 启动对话配置（缺省时不启动任何对话） |
 | `persist_to` | 否 | 运行结束后内存写回路径（相对镜像文件所在目录） |
+| `journal_to` | 否 | 回合级效果日志路径（JSONL；相对镜像文件所在目录）。声明后每个提交回合追加一条，是持久化的依据；启动时非空日志会被重放 |
+| `snapshot_to` | 否 | 重启快照路径（相对镜像文件所在目录）。正常退出（`run()` 返回或运行者选择退出）时写一份；启动时若存在且可读会先恢复，缺失或损坏时自动回退到日志重放——它是缓存，不是必需 |
 
 ## mem 节点格式
 
@@ -188,9 +190,13 @@ init 强制内核态：程序 `ctrl.caps.mode` 声明 `user` 时装载报 `Image
 5. 解析并安装 `security` 段（根注册表、工作空间区域；错误抛 `ImageError`）；
 6. 启动 init 对话（cid 0，`name`；LLM 入口或 PLM 入口）。`init` 缺失或为空时给一行 stderr 诊断，不启动任何对话。
 
+恢复路径（`boot(image, restore=snapshot)` 或 `load_image(..., restore=True)`）**跳过第 6 步**：对话、内存、调度、监听器与设备表稍后由快照恢复，再按 `journal_to` 重放快照之后的日志尾部。`boot` 不显式传快照时，镜像声明了 `snapshot_to` 且文件可读会自动使用它；快照缺失或损坏只警告，退回"镜像 + 整段日志"重放（进程崩溃、快照落后或损坏时的路径）。
+
 **启动核心**依次做：拉一次上游 `GET /models` 填模型目录（失败只警告，不拦启动）；装 API 失败的运行者策略（终端三选项：更新环境 / 继续 / 退出）。
 
-之后 `core.run()`；若声明 `persist_to`，在 `finally` 中写回内存（异常也写）。
+之后 `core.run()`；若声明 `persist_to`，在 `finally` 中写回内存（异常也写）；若声明 `snapshot_to`，在安全点退出时写重启快照（中断与未捕获异常不写，避免把半截回合拍进缓存）。
+
+恢复与快照的语义见 [runtime.md 的「持久运行」](runtime.md#持久运行重启恢复--回合日志--程序包)。宿主入口：`python -m avm.image <image.json> --restore <snapshot>` 与 `python main.py <image.json> --restore <snapshot>`。
 
 错误不吞：格式错误输出到 stderr，CLI 退出码 1。
 

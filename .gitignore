@@ -14,3 +14,6 @@ web/node_modules/
 web/dist/
 web/test-results/
 web/playwright-report/
+
+# 持久运行演示镜像的落点（journal / snapshot / mem 写回）
+images/packages/out/

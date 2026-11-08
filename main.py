@@ -5,10 +5,11 @@
     python main.py <image.json>             # 加载镜像并运行
     python main.py <image.json> --frames    # 运行结束后打印监测帧摘要（stderr）
     python main.py <image.json> --transcript api.txt  # API 调用全文落盘
-    python main.py <image.json> --checkpoint-in cp.json  # 启动时加载单对话检查点（跳过 init）
+    python main.py <image.json> --checkpoint-in cp.json  # 启动时加载单对话检查点（跳过 init，调试用）
+    python main.py <image.json> --restore snap.json      # 从重启快照恢复（随后按 journal_to 重放日志尾部）
 
 文件内配置调试（VSCode 里固定运行 python main.py，参数改 debug.json 即可）:
-    python main.py                          # 从 debug.json 读取 image/frames/transcript/checkpoint_in
+    python main.py                          # 从 debug.json 读取 image/frames/transcript/checkpoint_in/restore
     python main.py --debug-config other.json
 """
 import argparse
@@ -16,7 +17,7 @@ import json
 import os
 import sys
 
-from avm.boot import add_core_dump_args, boot, dump_on_death
+from avm.boot import add_core_dump_args, add_restore_arg, boot, dump_on_death, write_snapshot
 from avm.exceptions import VMMemoryError, RunnerStop
 from avm.image import ImageError
 from avm.monitor import Monitor
@@ -68,11 +69,13 @@ def main(argv=None) -> int:
     parser.add_argument("--debug-config", metavar="PATH", default="debug.json",
                         help="无 image 参数时的配置文件（默认 debug.json）")
     add_core_dump_args(parser)
+    add_restore_arg(parser)
     args = parser.parse_args(argv)
 
     frames = args.frames
     transcript = args.transcript
     checkpoint_in = args.checkpoint_in
+    restore = args.restore
     image = args.image
     config_dir = os.getcwd()
     if image is None:
@@ -91,13 +94,16 @@ def main(argv=None) -> int:
         frames = frames or bool(cfg.get("frames"))
         transcript = transcript or cfg.get("transcript")
         checkpoint_in = checkpoint_in or cfg.get("checkpoint_in")
+        restore = restore or cfg.get("restore")
     if transcript and not os.path.isabs(transcript):
         transcript = os.path.join(config_dir, transcript)
     if checkpoint_in and not os.path.isabs(checkpoint_in):
         checkpoint_in = os.path.join(config_dir, checkpoint_in)
+    if restore and not os.path.isabs(restore):
+        restore = os.path.join(config_dir, restore)
 
     try:
-        core = boot(image, checkpoint_in=checkpoint_in)
+        core = boot(image, checkpoint_in=checkpoint_in, restore=restore)
     except (ImageError, VMMemoryError, OSError, ValueError) as e:
         print(f"[AVM] 镜像错误: {e}", file=sys.stderr)
         return 1
@@ -108,6 +114,7 @@ def main(argv=None) -> int:
         core.core_dump_enabled = False
 
     status = 0
+    snapshot_ok = True  # 只有安全点退出才写重启快照
     try:
         core.run()
     except RunnerStop as e:
@@ -115,11 +122,15 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print("[AVM] 收到中断，写回后退出", file=sys.stderr)
         status = 130
+        snapshot_ok = False
     except BaseException as e:
         # 内核死亡（不变量被破坏或未捕获缺陷）：先落现场快照，再保留原始 traceback 往上抛
         dump_on_death(core, e, args.core_dump)
+        snapshot_ok = False
         raise
     finally:
+        if snapshot_ok:
+            write_snapshot(core)
         persist_to = getattr(core, "persist_to", None)
         if persist_to:
             try:

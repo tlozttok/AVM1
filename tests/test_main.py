@@ -101,3 +101,34 @@ def test_main_checkpoint_in_flag(tmp_path, capsys, monkeypatch):
 
     rc = main([path, "--checkpoint-in", cp])
     assert rc == 0
+
+
+def _make_snapshot(tmp_path):
+    """造一份与镜像匹配的重启快照（镜像没有 init，空核心直接拍）。"""
+    from avm.core import Core
+    from avm.image import load_image
+
+    image_path = _write(tmp_path, _no_init_image())
+    core = load_image(Core(), image_path)
+    path = tmp_path / "snap.json"
+    core.snapshot_to(str(path))
+    return image_path, str(path)
+
+
+def test_main_restore_snapshot(tmp_path, capsys):
+    image_path, snap = _make_snapshot(tmp_path)
+    rc = main([image_path, "--restore", snap])
+    assert rc == 0
+    assert "已从重启快照恢复" in capsys.readouterr().err
+
+
+def test_main_writes_snapshot_on_clean_exit(tmp_path, capsys):
+    image = _no_init_image()
+    image["snapshot_to"] = "out/run.snapshot.json"
+    path = _write(tmp_path, image)
+    rc = main([path])
+    assert rc == 0
+    snap = tmp_path / "out" / "run.snapshot.json"
+    assert snap.is_file()
+    assert json.loads(snap.read_text(encoding="utf-8"))["format"] == "avm.snapshot"
+    assert "重启快照已写入" in capsys.readouterr().err

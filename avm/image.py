@@ -8,7 +8,9 @@
 3. 按 para_ref 校验 para 节点（ctrl.type == "para"）并配置 Core；
 4. 按 devices 段加载设备插件文件（必须继承 MemoryDevice）并挂载；
 5. 启动 init 对话（0 号，默认名 "init"；入口可以是 settingup LLM 程序，也可以是 python PLM 程序）；
-6. run() 执行；若镜像声明 persist_to，结束后写回内存。
+   重启恢复路径（restore=True）跳过这一步，对话与内存随后由快照/日志接管；
+6. run() 执行；若镜像声明 persist_to 写回内存、journal_to 逐回合记日志、
+   snapshot_to 在正常退出时写重启快照。
 """
 
 import argparse
@@ -148,54 +150,91 @@ def _load_plms(core: Core, image_path: str, plms: list):
         core.plms[model] = cls
 
 
+def resolve_device_entry(dev: dict, base: Optional[str], subject: str = "设备"):
+    """解析一条 devices 条目（镜像 devices 段或程序包 devices 段）→ (cls, args, id, spec)。
+
+    纯解析 + 加载设备模块，不挂载。spec 是设备来源表条目（快照/日志重放用）：
+    绝对路径 + 类名 + 构造参数 + 标识符 + 是否内建。
+    """
+    if not isinstance(dev, dict):
+        raise ImageError(f"{subject}条目必须是对象，得到 {type(dev).__name__}")
+    path = dev.get("path")
+    if not isinstance(path, str) or not path:
+        raise ImageError(f"{subject}条目必须包含非空 path")
+    subject = f"设备 {path}"
+    class_name = dev.get("class")
+    args = dev.get("args") or {}
+    if not isinstance(args, dict):
+        raise ImageError(f"{subject}: args 必须是对象")
+    builtin = bool(dev.get("builtin", False))
+    file_path = None
+    if builtin:
+        if not isinstance(class_name, str) or class_name not in BUILTIN_DEVICE_CLASSES:
+            raise ImageError(
+                f"{subject}: builtin=true 时 class 必须是内建注册表中的类（{list(BUILTIN_DEVICE_CLASSES)}）"
+            )
+        if dev.get("file") is not None:
+            raise ImageError(f"{subject}: builtin=true 不允许提供 file")
+        cls = BUILTIN_DEVICE_CLASSES[class_name]
+    else:
+        if not isinstance(dev.get("file"), str) or not isinstance(class_name, str):
+            raise ImageError(f"{subject}: 必须包含 file 和 class")
+        file_rel = dev["file"]
+        file_path = file_rel if os.path.isabs(file_rel) else os.path.join(base or os.getcwd(), file_rel)
+        if not os.path.isfile(file_path):
+            raise ImageError(f"{subject}: 设备文件不存在 {file_path}")
+        module = _load_device_module(file_path, path)
+        cls = getattr(module, class_name, None)
+        if not isinstance(cls, type) or not issubclass(cls, MemoryDevice):
+            raise ImageError(f"{subject}: {class_name} 必须是继承 MemoryDevice 的类")
+    spec = {
+        "path": file_path,
+        "file": dev.get("file"),
+        "class": class_name,
+        "args": args,
+        "id": dev.get("id"),
+        "builtin": builtin,
+    }
+    return cls, args, dev.get("id"), spec
+
+
+def instantiate_device(cls, args: dict, device_id, subject: str = "设备"):
+    """实例化一台设备并设置标识符（args 与构造函数不匹配是镜像/包格式错误）。"""
+    try:
+        device = cls(**args)
+    except TypeError as e:
+        raise ImageError(f"{subject}: 实例化失败（args 与构造函数不匹配）: {e}")
+    if device_id is not None:
+        if not isinstance(device_id, str) or not device_id:
+            raise ImageError(f"{subject}: id 必须是非空字符串")
+        device.device_id = device_id
+    return device
+
+
+def mount_device_entry(core: Core, dev: dict, base: Optional[str] = None) -> dict:
+    """装载一台设备：解析 → 实例化 → 挂载 → 登记设备来源表。返回 spec。
+
+    挂载是纯内存操作（Memory.mount 只改设备表与挂载点链接节点，不发事件），
+    所以在指令执行中途调用是安全的；程序包装载、日志重放与镜像装载共用这一条路径。
+    """
+    cls, args, device_id, spec = resolve_device_entry(dev, base)
+    path = dev["path"]
+    device = instantiate_device(cls, args, device_id, subject=f"设备 {path}")
+    core.mem.mount(path, device)
+    device.mount_path = path
+    # 调试用：把 Core 引用交给设备（检查点 /save 等调试命令需要访问运行时状态）
+    device.attach_core(core)
+    core.device_specs[path] = spec
+    return spec
+
+
 def _mount_devices(core: Core, image_path: str, devices: list, mem_device_paths: list):
     base = os.path.dirname(os.path.abspath(image_path))
     mounted = set()
     for dev in devices:
-        if not isinstance(dev, dict):
-            # devices 段是数组但条目不是对象（如 ["a"]）时，dev.get 抛 AttributeError
-            raise ImageError(f"devices 条目必须是对象，得到 {type(dev).__name__}")
-        path = dev.get("path")
-        if not isinstance(path, str) or not path:
-            raise ImageError("devices 条目必须包含非空 path")
-        class_name = dev.get("class")
-        args = dev.get("args") or {}
-        if not isinstance(args, dict):
-            raise ImageError(f"设备 {path}: args 必须是对象")
-        builtin = bool(dev.get("builtin", False))
-        if builtin:
-            if not isinstance(class_name, str) or class_name not in BUILTIN_DEVICE_CLASSES:
-                raise ImageError(
-                    f"设备 {path}: builtin=true 时 class 必须是内建注册表中的类（{list(BUILTIN_DEVICE_CLASSES)}）"
-                )
-            if dev.get("file") is not None:
-                raise ImageError(f"设备 {path}: builtin=true 不允许提供 file")
-            cls = BUILTIN_DEVICE_CLASSES[class_name]
-        else:
-            if not isinstance(dev.get("file"), str) or not isinstance(class_name, str):
-                raise ImageError(f"设备 {path}: 必须包含 file 和 class")
-            file_rel = dev["file"]
-            file_path = file_rel if os.path.isabs(file_rel) else os.path.join(base, file_rel)
-            if not os.path.isfile(file_path):
-                raise ImageError(f"设备 {path}: 设备文件不存在 {file_path}")
-            module = _load_device_module(file_path, path)
-            cls = getattr(module, class_name, None)
-            if not isinstance(cls, type) or not issubclass(cls, MemoryDevice):
-                raise ImageError(f"设备 {path}: {class_name} 必须是继承 MemoryDevice 的类")
-        try:
-            device = cls(**args)
-        except TypeError as e:
-            raise ImageError(f"设备 {path}: 实例化失败（args 与构造函数不匹配）: {e}")
-        device_id = dev.get("id")
-        if device_id is not None:
-            if not isinstance(device_id, str) or not device_id:
-                raise ImageError(f"设备 {path}: id 必须是非空字符串")
-            device.device_id = device_id
-        core.mem.mount(path, device)
-        device.mount_path = path
-        # 调试用：把 Core 引用交给设备（检查点 /save 等调试命令需要访问运行时状态）
-        device.attach_core(core)
-        mounted.add(path)
+        mount_device_entry(core, dev, base)
+        if isinstance(dev, dict) and isinstance(dev.get("path"), str):
+            mounted.add(dev["path"])
 
     for mp in mem_device_paths:
         if mp not in mounted:
@@ -342,13 +381,15 @@ def _start_init(core: Core, init: dict):
 
 
 def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
-               host_flags: Optional[dict] = None) -> Core:
+               host_flags: Optional[dict] = None, restore: bool = False) -> Core:
     """把系统镜像加载进一个空核心并完成全部装载配置（不运行）。
 
     生命周期三段里的第二段：创建空核心（Core()）→ 加载镜像（本函数）→ 启动核心
     （avm/boot.py 的 start_core；宿主通常直接用加载区的 boot() 走完三段）。
 
     checkpoint_in：调试用——启动时加载单对话检查点（跳过 init，恢复为就绪对话）。
+    restore：重启恢复——跳过 init（对话与内存稍后由重启快照/日志恢复）。镜像其余段
+    （设备、安全配置、para）照常装载，因为恢复路径也要按当前镜像/设备文件重建。
     host_flags：启动标志——本次运行由哪个宿主托管（如 {"console": True}）。宿主事实，
     不属于镜像内容，不进 $MEM。在挂载设备之前写入 Core，设备可在 attach_core 里读；
     核心启动后不再变化。不传则空，设备行为与从前一致。
@@ -417,7 +458,11 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
     _parse_security(core, image)
 
     init = image.get("init")
-    if checkpoint_in:
+    if restore:
+        if checkpoint_in:
+            raise ImageError("restore 与 checkpoint_in 不能同时使用（重启恢复与单对话恢复是两条路径）")
+        # 重启恢复：对话与内存由快照/日志接管，这里不启动 init
+    elif checkpoint_in:
         # 调试用：后续启动加载已保存的对话，而不是重新从 init 开始
         if not isinstance(checkpoint_in, str) or not checkpoint_in:
             raise ImageError("checkpoint_in 必须是文件路径")
@@ -436,6 +481,18 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
             file=sys.stderr,
         )
 
+    journal_to = image.get("journal_to")
+    if journal_to is not None:
+        if not isinstance(journal_to, str) or not journal_to:
+            raise ImageError("journal_to 必须是非空字符串路径")
+        core.journal_path = journal_to if os.path.isabs(journal_to) else os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(image_path)), journal_to))
+    snapshot_to = image.get("snapshot_to")
+    if snapshot_to is not None:
+        if not isinstance(snapshot_to, str) or not snapshot_to:
+            raise ImageError("snapshot_to 必须是非空字符串路径")
+        core.snapshot_path = snapshot_to if os.path.isabs(snapshot_to) else os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(image_path)), snapshot_to))
     persist_to = image.get("persist_to")
     if persist_to is not None:
         if not isinstance(persist_to, str):
@@ -463,19 +520,21 @@ def main(argv=None) -> int:
     parser.add_argument("image", help="系统镜像 JSON 文件路径")
     parser.add_argument("--checkpoint-in", metavar="PATH",
                         help="调试用：启动时加载单对话检查点（跳过 init，恢复为就绪对话）")
-    from .boot import add_core_dump_args
+    from .boot import add_core_dump_args, add_restore_arg
     add_core_dump_args(parser)
+    add_restore_arg(parser)
     args = parser.parse_args(argv)
     # 局部导入：boot 依赖本模块的 load_image，模块级导入会成环
-    from .boot import boot, dump_on_death
+    from .boot import boot, dump_on_death, write_snapshot
     try:
-        core = boot(args.image, checkpoint_in=args.checkpoint_in)
+        core = boot(args.image, checkpoint_in=args.checkpoint_in, restore=args.restore)
     except (ImageError, VMMemoryError, OSError, json.JSONDecodeError) as e:
         print(f"[AVM] 镜像错误: {e}", file=sys.stderr)
         return 1
     if args.no_core_dump:
         core.core_dump_enabled = False
     status = 0
+    snapshot_ok = True  # 只有安全点退出才写重启快照
     try:
         core.run()
     except RunnerStop as e:
@@ -483,11 +542,15 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print("[AVM] 收到中断，写回后退出", file=sys.stderr)
         status = 130
+        snapshot_ok = False
     except BaseException as e:
         # 内核死亡：先落现场快照，再保留原始 traceback 往上抛
         dump_on_death(core, e, args.core_dump)
+        snapshot_ok = False
         raise
     finally:
+        if snapshot_ok:
+            write_snapshot(core)
         persist_to = getattr(core, "persist_to", None)
         if persist_to:
             try:

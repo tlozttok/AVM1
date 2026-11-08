@@ -159,6 +159,27 @@ class PLMServer(ABC):
             }
         return response
 
+    # ------------------------------------------------------------------
+    # 重启快照恢复
+    # ------------------------------------------------------------------
+
+    def restore_state(self, raw_messages: List[dict], params: Optional[dict] = None) -> None:
+        """从已有历史恢复执行器状态（重启快照恢复用）。
+
+        - 重放 system 消息（setup 代码）：执行器重建后程序要重新进入可用状态；
+        - 把当前历史标记为"已处理"（`_prev_input`）：下一次调用的新增输入只从批次
+          开始，历史里的 user/tool 消息不会被重新执行——副作用不能重复发生。
+
+        跨轮状态不在这里恢复：Python 程序的跨轮状态必须落在 `$MEM`（见
+        docs/runtime.md 的"Python 程序"一节）。
+        """
+        if params is not None:
+            self._capture_tools(params)
+        for item in raw_messages:
+            if isinstance(item, dict) and item.get("role") == "system":
+                self._execute_system_message(item.get("content") or "")
+        self._prev_input = list(raw_messages)
+
 
 class SimplePLM(PLMServer):
     """最简单的 PLM：计算器。只接受一行表达式，eval 求值后直接返回。

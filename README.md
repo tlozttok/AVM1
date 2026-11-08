@@ -76,3 +76,4 @@ Windows 上如果控制台是英文 locale（cp1252），入口脚本打印的�
 - [docs/system-image.md](docs/system-image.md) — 系统镜像格式规范
 - [docs/examples/python_as_conversation.md](docs/examples/python_as_conversation.md) — 示例：Python 程序如何无损表示为"对话 + 工具调用"
 - [docs/capabilities.md](docs/capabilities.md) — 能力模型与权限机制：根表/工作空间/工具面/事件策略/ACL 示例
+- [docs/porting-contract.md](docs/porting-contract.md) — 移植契约：把外部编排方案写成 AVM 程序包的交付约定

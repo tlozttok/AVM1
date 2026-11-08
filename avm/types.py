@@ -24,6 +24,64 @@ def _tool_call_to_dict(tc) -> dict:
     }
 
 
+def message_to_dict(msg: "Message") -> dict:
+    """消息的无损 JSON 形状（检查点、重启快照、回合日志共用；字段顺序固定）。
+
+    保留每条消息的全部字段：content 空串照写、tool_calls 原样、reasoning_content
+    区分 None 与空串、tool_call_id 原样。恢复后发给 API 的前缀逐字节一致。
+    """
+    d = {"role": msg.role, "content": msg.content}
+    if isinstance(msg, ToolMessage):
+        d["tool_call_id"] = msg.tool_call_id
+    if isinstance(msg, AssistantMessage):
+        if msg.tool_calls:
+            d["tool_calls"] = [_tool_call_to_dict(tc) for tc in msg.tool_calls]
+        if msg.reasoning_content is not None:
+            d["reasoning_content"] = msg.reasoning_content
+    return d
+
+
+def message_from_dict(d: dict) -> "Message":
+    """message_to_dict 的逆操作（未知角色按普通 Message 保留）。"""
+    role = d.get("role")
+    content = d.get("content", "")
+    if role == "assistant":
+        return AssistantMessage(
+            content=content,
+            tool_calls=d.get("tool_calls"),
+            reasoning_content=d.get("reasoning_content"),
+        )
+    if role == "tool":
+        return ToolMessage(content=content, tool_call_id=d.get("tool_call_id", ""))
+    if role == "user":
+        return UserMessage(content=content)
+    if role == "system":
+        return SystemMessage(content=content)
+    return Message(content=content, role=role or "")
+
+
+def batch_to_dict(batch: 'UserMessageBatch') -> dict:
+    """待发批次的 JSON 形状（快照、回合日志共用）。"""
+    return {
+        "tool_responses": [
+            {"content": r.content, "tool_call_id": r.tool_call_id}
+            for r in batch.tool_responses
+        ],
+        "user_contents": list(batch.user_contents),
+    }
+
+
+def batch_from_dict(data) -> 'UserMessageBatch':
+    """batch_to_dict 的逆操作。"""
+    batch = UserMessageBatch()
+    data = data or {}
+    for item in data.get("tool_responses") or []:
+        batch.add_tool_response(item.get("content", ""), item.get("tool_call_id", ""))
+    for content in data.get("user_contents") or []:
+        batch.add_user_content(content)
+    return batch
+
+
 class StrNode(str):
     """字符串叶子 + 控制数据（ctrl）。
 
@@ -467,17 +525,6 @@ class Conversation:
         tool_call_id），字段顺序固定，保证恢复后 to_api_messages() 与保存时逐字节一致
         （前缀缓存命中的前提）。
         """
-        def _msg(m: Message) -> dict:
-            d = {"role": m.role, "content": m.content}
-            if isinstance(m, ToolMessage):
-                d["tool_call_id"] = m.tool_call_id
-            if isinstance(m, AssistantMessage):
-                if m.tool_calls:
-                    d["tool_calls"] = [_tool_call_to_dict(tc) for tc in m.tool_calls]
-                if m.reasoning_content is not None:
-                    d["reasoning_content"] = m.reasoning_content
-            return d
-
         return {
             "version": CHECKPOINT_VERSION,
             "name": self.name,
@@ -488,8 +535,23 @@ class Conversation:
             "metadata": dict(self.metadata or {}),
             "caps": caps_to_dict(self.caps),
             "attrs": dict(self.attrs or {}),
-            "messages": [_msg(m) for m in self.messages],
+            "messages": [message_to_dict(m) for m in self.messages],
         }
+
+    def to_snapshot(self) -> dict:
+        """重启快照里的单对话形状：检查点 + cid/parent/工作空间根名 + 待发批次。
+
+        与 to_checkpoint 的差别（计划 A5）：
+        - 带 `cid` 与 `parent_cid`：重启恢复保留 cid，父子引用按 cid 重建；
+        - 带 `batch`：待发批次是"结束态"的一部分（投递后目标还没跑的输入必须活下来）；
+        - 不拒绝 Python 对话：Python 对话的跨轮状态按约定落在 `$MEM`，命名空间不序列化。
+        """
+        doc = self.to_checkpoint()
+        doc["cid"] = self.cid
+        doc["parent_cid"] = self.parent.cid if self.parent is not None else None
+        doc["workspace_root_name"] = getattr(self, "workspace_root_name", None)
+        doc["batch"] = batch_to_dict(self.user_batch)
+        return doc
 
     @classmethod
     def from_checkpoint(cls, cp: dict) -> 'Conversation':
@@ -497,24 +559,7 @@ class Conversation:
         version = cp.get("version")
         if version != CHECKPOINT_VERSION:
             raise ValueError(f"不支持的检查点版本 {version}（当前支持 {CHECKPOINT_VERSION}）")
-        msgs = []
-        for d in cp.get("messages", []):
-            role = d.get("role")
-            content = d.get("content", "")
-            if role == "assistant":
-                msgs.append(AssistantMessage(
-                    content=content,
-                    tool_calls=d.get("tool_calls"),
-                    reasoning_content=d.get("reasoning_content"),
-                ))
-            elif role == "tool":
-                msgs.append(ToolMessage(content=content, tool_call_id=d.get("tool_call_id", "")))
-            elif role == "user":
-                msgs.append(UserMessage(content=content))
-            elif role == "system":
-                msgs.append(SystemMessage(content=content))
-            else:
-                msgs.append(Message(content=content, role=role or ""))
+        msgs = [message_from_dict(d) for d in cp.get("messages", [])]
         conv = cls(
             messages=msgs,
             is_sub=bool(cp.get("is_sub", False)),
@@ -528,6 +573,20 @@ class Conversation:
         caps = cp.get("caps")
         conv.caps = caps_from_dict(caps) if caps is not None else default_kernel_caps()
         conv.attrs = dict(cp.get("attrs") or {})
+        return conv
+
+    @classmethod
+    def from_snapshot(cls, doc: dict) -> 'Conversation':
+        """从重启快照的单对话形状恢复（to_snapshot 的逆操作；cid/parent 由调用方接回）。
+
+        parent 只按 parent_cid 记录，由 snapshot.restore 在全部对话建好之后统一接；
+        这里 parent 保持 None。
+        """
+        conv = cls.from_checkpoint(doc)
+        conv.cid = doc.get("cid", 0)
+        conv.workspace_root_name = doc.get("workspace_root_name")
+        batch = doc.get("batch") or {}
+        conv.user_batch = batch_from_dict(batch)
         return conv
 
     @classmethod
@@ -621,6 +680,10 @@ __all__ = [
     'AssistantMessage',
     'ToolMessage',
     'message_to_api_dict',
+    'message_to_dict',
+    'message_from_dict',
+    'batch_to_dict',
+    'batch_from_dict',
     'Conversation',
     'UserMessageBatch',
 ]

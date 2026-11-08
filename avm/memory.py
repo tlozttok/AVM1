@@ -1183,33 +1183,35 @@ class Memory:
         """返回底层字典的副本"""
         return self._data.copy()
 
+    @staticmethod
+    def serialize_node(value) -> dict:
+        """单个内存节点的显式表示（与镜像 mem 段、persist_to、日志效果同格式）。"""
+        if isinstance(value, MetaDict):
+            node = {"kind": "dict", "value": {k: Memory.serialize_node(v) for k, v in value.items()}}
+        elif isinstance(value, MetaList):
+            node = {"kind": "list", "value": [Memory.serialize_node(v) for v in value]}
+        elif isinstance(value, LinkNode):
+            node = {"kind": "link", "target": value.target, "value": None}
+        else:
+            node = {"kind": "str", "value": str(value)}
+            ctrl = value.get_ctrl() if isinstance(value, StrNode) else None
+            if ctrl is not None:
+                node["ctrl"] = ctrl
+            return node
+        meta = value.get_metadata() if hasattr(value, "get_metadata") else None
+        ctrl = value.get_ctrl() if hasattr(value, "get_ctrl") else None
+        if meta is not None:
+            node["meta"] = meta
+        if ctrl is not None:
+            node["ctrl"] = ctrl
+        return node
+
     def to_image_dict(self) -> dict:
         """内存树的显式节点表示（与镜像 mem 段、persist_to、内核转储同格式）。
 
         不可 JSON 化的值降级为 `str(value)`（与既有行为一致）。
         """
-        def _serialize(value):
-            if isinstance(value, MetaDict):
-                node = {"kind": "dict", "value": {k: _serialize(v) for k, v in value.items()}}
-            elif isinstance(value, MetaList):
-                node = {"kind": "list", "value": [_serialize(v) for v in value]}
-            elif isinstance(value, LinkNode):
-                node = {"kind": "link", "target": value.target, "value": None}
-            else:
-                node = {"kind": "str", "value": str(value)}
-                ctrl = value.get_ctrl() if isinstance(value, StrNode) else None
-                if ctrl is not None:
-                    node["ctrl"] = ctrl
-                return node
-            meta = value.get_metadata() if hasattr(value, "get_metadata") else None
-            ctrl = value.get_ctrl() if hasattr(value, "get_ctrl") else None
-            if meta is not None:
-                node["meta"] = meta
-            if ctrl is not None:
-                node["ctrl"] = ctrl
-            return node
-
-        return _serialize(self._data)
+        return self.serialize_node(self._data)
 
     def save(self, filepath: str) -> None:
         """将内存数据持久化到 JSON 文件（仅 _data，不含设备）。
@@ -1273,6 +1275,11 @@ class Memory:
                     metadata=value.get("meta"),
                 )
         return value
+
+    @classmethod
+    def deserialize_node(cls, value):
+        """单个显式节点 → 内存树节点（_deserialize_node 的公开别名）。"""
+        return cls._deserialize_node(value)
 
     @classmethod
     def from_tree(cls, tree: dict) -> "Memory":
