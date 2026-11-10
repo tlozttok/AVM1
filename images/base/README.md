@@ -1,10 +1,10 @@
 # base 母板镜像
 
-第一块长期运行的镜像：不带业务，只带持久化、装载设备、可编辑的引导与空分区。
-其余基础由作者在系统内手动搭建（见「手动搭建」）。
+第一块长期运行的镜像：不带业务，只带持久化、装载设备、OS 程序（引导/空闲/关机
+监督/设备事件钟/面板服务）与空分区。其余基础由作者在系统内手动搭建。
 
 ```bash
-python images/base/build_image.py          # 生成 base.json
+python images/base/build_image.py          # 重新生成 base.json（首次生成后 base.json 是种子）
 python -m avm.console images/base/base.json
 ```
 
@@ -14,11 +14,14 @@ python -m avm.console images/base/base.json
 
 | 路径 | 内容 |
 |---|---|
-| `$MEM.sys.boot.state` / `prior` | 启动标记与上次状态；boot 程序每次启动把它改成 `running` |
-| `$MEM.sys.boot.manifest` | 常驻服务清单（JSON 字符串，初始 `[]`）；boot 程序按它创建对话 |
-| `$MEM.sys.registry` | 名字 → cid；每次启动由 boot 程序重写 |
-| `$MEM.sys.programs.boot` | 最小引导程序（`plm.python`，可编辑）；镜像 `init` 指向它 |
-| `$MEM.sys.inbox` / `outbox` | 面板输入的唯一落点（空 list）/ 持久输出（空 list） |
+| `$MEM.sys.power.request` / `.state` | OS 关机请求（写 `shutdown`）/ 断电标记（`on` / `off`）；只有 OS 写 `off`，宿主才正常断电退出 |
+| `$MEM.sys.boot.state` / `.prior` / `.id` / `.report` | 启动标记（`running` / `clean`）、上次状态、上电序号、最近一次恢复报告 |
+| `$MEM.sys.boot.manifest` | 常驻服务清单（JSON 字符串，初始 `[]`）；boot 程序按它创建缺失对话 |
+| `$MEM.sys.registry` | 名字 → cid；boot 程序重写（只记 manifest 服务；OS 服务的 cid 不落持久 MEM） |
+| `$MEM.sys.programs.*` | OS 程序节点（`boot` / `idle` / `supervisor` / `panel_shell` / `clock_a` / `clock_b`），可在系统内改写 |
+| `$MEM.sys.inbox` / `outbox` | 面板输入的唯一落点（str 列表，元素是 JSON）/ 持久输出 |
+| `$MEM.sys.idle.state` | `waiting` = OS 在空闲等待宿主中断；内核不判严重错误 |
+| `$MEM.sys.clock` | 设备事件钟：`tick` / `target` / `interval` / `timeouts` / `state` |
 | `$MEM.sys.handbook` | 分区与自举约定 |
 | `$MEM.para.python` / `.command` | 两个内建 PLM 的参数档 |
 | `$MEM.packages` / `package_records` | 由装载设备管理 |
@@ -27,58 +30,62 @@ python -m avm.console images/base/base.json
 | `$MEM.AVMRepo` | 仓库只读设备（查文档用） |
 | `$MEM.inputs` / `$MEM.outputs` | 标准 IO 设备；操作面板宿主会替换成总线设备 |
 
-顶层声明 `journal_to` / `snapshot_to` / `persist_to`，落点在 `images/base/out/`；`meta.snapshot_every=200` 表示每 200 个已提交回合写一次定时快照。
+程序节点里 `ctrl.type="python"`、`value.content` 是程序源、`value.para_ref` 指向
+`$MEM.para.python`；服务节点的 `value.name`（`panel_shell` / `clock_a` / `clock_b`）
+会成为对话身份。顶层声明 `journal_to` / `snapshot_to` / `persist_to`，落点在
+`images/base/out/`；`meta.snapshot_every=200`。
 
-## 自举
+## OS 程序与自举
 
-- boot 程序是内存节点：在系统内改写 `$MEM.sys.programs.boot` 的 content，下一次启动就运行新内容。
-- 常驻服务清单也是内存节点：给 `$MEM.sys.boot.manifest` 写入 JSON 数组，下一次启动 boot 程序按它创建对话并写 registry。
-- 装载设备让作者在系统内装入新设备代码；持久化保证这些改写跨重启存活。
+`meta.guest_programs` 声明三个 guest 角色（内核创建对话并注册同名中断向量）：
 
-## 手动搭建第一个服务（示例）
+| 角色 | 程序节点 | 入口 | 何时运行 |
+|---|---|---|---|
+| `boot` | `$MEM.sys.programs.boot` | `yield from boot()` | 冷启动由就绪队列；resume 时宿主用中断唤醒并把 `last_exit` 放进入口 payload |
+| `idle` | `$MEM.sys.programs.idle` | `yield from idle()` | 系统空闲时内核挂 `idle` 中断 |
+| `shutdown` | `$MEM.sys.programs.supervisor` | `yield from shutdown()` | 宿主看到 `power.request == "shutdown"` 后挂中断 |
 
-1. 在系统内创建一个程序节点，例如 `$MEM.sys.programs.echo`：
-   - `ctrl.type = "python"`，`content` 是 `plm.command` 程序；
-   - 或 `ctrl.type = "settingup"`，`content` 是提示词。
-2. 建一个 para 节点，比如 `$MEM.para.echo`（`ctrl.type="para"`，`model=plm.command`）。
-3. 往 `$MEM.sys.boot.manifest` 写：
-   ```json
-   [{"name": "echo", "program": "$MEM.sys.programs.echo", "para": "$MEM.para.echo"}]
-   ```
-4. 用面板的调试抽屉提交动作：`memory_write $MEM.sys.boot.manifest`（content 是上面的 JSON）。
-5. 重启（`python -m avm.console ...` 自动恢复快照；或 `--restart` 类入口）后，boot 程序创建它并写入 `$MEM.sys.registry.echo`。
+- **init** 是 `yield from init()`：boot 程序里的一个空入口，真正的引导在 guest
+  `boot` 角色；作者可以在系统内改写它加早期步骤。
+- **boot**：写 `running` / 递增 `boot.id` / 清掉上次关机留下的
+  `power.request` 与 `power.state = off`（否则 resume 后第二次关机没有边沿）/
+  按 manifest 创建缺失服务 / 创建缺失的 OS 服务对话（`panel_shell` / `clock_a` /
+  `clock_b`）/ 写 `boot.report` / 休眠。
+  服务 cid 不写持久 MEM：运行期通过 `$MEM.conversations` 按名字查找。
+- **idle**：读 `$MEM.sys.inbox`，有 `status == "new"` 的输入就唤醒 `panel_shell`
+  （`send_instruction`）；没有输入就把 `idle.state` 写成 `waiting` 并结束本轮，
+  内核停在安全点等宿主中断，不 panic。
+- **panel_shell**：消费 inbox 的新条目，把结果写到 outbox / outputs，条目标记
+  `done`。它是 boot 创建的普通服务对话，不是内核保留对话。
+- **shutdown（supervisor）**：检查 `$MEM.conversations` 里是否还有非 OS 对话处于
+  active / ready；有就启/保持设备事件钟、写等待/超时记录，**不写 off**；全部收尾
+  才停钟 → 写 `boot.state = "clean"` → 写 `power.state = "off"`。宿主在安全点看到
+  off 才写快照并退出。
+- **clock_a / clock_b**：两个互相激活的 `plm.python` 乒乓；每轮一个逻辑 tick，
+  跨过 `target` 就把超时通知投给 supervisor 并把 target 后移。只有 supervisor
+  能启停（`$MEM.sys.clock.state`）。
 
-## 装载新设备（今天的路）
+## 面板输入
 
-面板的调试抽屉里提交一个动作：
+`POST /api/input` 由保留对话把条目写进 `$MEM.sys.inbox`（进日志、可重放），
+宿主随后给 `idle` 挂中断；inbox 写入的 after 事件也会再挂一次，保证 idle 在
+写入之后才被唤醒去消费。`POST /api/io/input` 仍是不进日志的调试通道。
 
-- 工具：`memory_write`
-- 参数：`{"ref": "$MEM.loader", "content": "<JSON 命令>"}`
+## 关机
 
-JSON 命令：
-
-```json
-{"action": "load_device", "approved_sha256": "<设备文件 sha256>",
- "path": "echo", "file": "devices/echo.py", "class": "EchoDevice", "args": {}}
-```
-
-`path` 是挂载点（`$MEM.echo`），`file` 相对镜像目录（或绝对路径）。装载成功后设备在
-`$MEM.echo`，对话用 `memory_read` / `memory_write` 读写它。装载是纯内存操作、进回合日志，
-重启后按来源表重新加载；设备文件必须留在原路径。
-
-> 操作面板的「装载设备（审批）」先只读检查文件哈希，再由操作员在全屏弹窗里允许；
-> 批准值随 `memory_write $MEM.loader` 命令进内核，装载时重新核对。
+`POST /api/system/shutdown` 只写 `$MEM.sys.power.request = "shutdown"`；真正的
+断电由 supervisor 写 `$MEM.sys.power.state = "off"`。没收尾或 supervisor 卡住时
+进程保持运行，操作员可在 `force_stop_after` 秒后走 `/api/system/force-stop`
+强制退出（不写快照、不写 clean）。
 
 ## 还没接上的部分
 
-- 输入消费者：`$MEM.sys.inbox` 现在只有落点，没有 handler；消费者由作者手动搭建。
-- boot-check：脏关闭的恢复程序由作者在系统内写（启动生命周期计划提供标记约定）。
-- 启动模式（复苏/重启/重置）与日志代际：见 `plan-boot-lifecycle-2026-11-08.md`。
+- boot-check 的业务报告（作者写个人系统时完善）；base 只保留 `boot.report` 约定。
+- 配置层/前端对关机中、超时次数的展示。
 - 设备审批的强制力是人的仪式：内核不检查发起者（任何能写 `$MEM.loader` 的对话知道哈希即可装载）。
-- 输入路径的正式化（宿主对话从隐藏 cid -1 换成普通 cid）：见 `plan-panel-input-path-2026-11-08.md`。
 
 ## 测试
 
 ```bash
-python -m pytest tests/test_base_image.py -q   # base 冒烟（不调真实 API）
+python -m pytest tests/test_base_image.py tests/test_os_shutdown.py -q
 ```

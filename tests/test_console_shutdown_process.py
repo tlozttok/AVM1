@@ -230,6 +230,13 @@ def test_os_power_off_writes_snapshot_and_restart_recovers(tmp_path):
     proc, port = _spawn(driver, image_path, tmp_path)
     try:
         token = _token(tmp_path)
+
+        def _running_state():
+            code, body = _request(port, "/api/state", token=token)
+            return body if code == 200 and body.get("lifecycle") == "running" else None
+
+        _wait_for(_running_state, timeout=30,
+                  message="宿主没有进入 running（可能还在启动/重放）")
         code, state = _request(port, "/api/state", token=token)
         assert code == 200
         assert state["recovery"]["source"] == "cold"

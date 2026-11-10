@@ -1,12 +1,21 @@
-"""base 镜像的最小引导程序（`plm.python`）。
+"""base 镜像的引导程序（`plm.python`）。
 
-镜像 `init` 指向 `$MEM.sys.programs.boot`，user 是 `boot()`。
-它只做四件事，然后结束本轮（对话休眠）：
+镜像 `init` 入口是 `yield from init()`：只保留一条空回合，真正的引导在 guest
+`boot` 角色里（`meta.guest_programs.boot`，内核对话入口是 `yield from boot()`）。
+
+`boot()` 做六件事，然后结束本轮（对话休眠）：
 
 1. 把 `$MEM.sys.boot.state` 从旧值改成 `"running"`，并把旧值记到 `prior`；
-2. 读 `$MEM.sys.boot.manifest`（JSON 字符串），按清单创建缺失的常驻对话；
-3. 把 `名字 → cid` 写进 `$MEM.sys.registry`；
-4. 往 `$MEM.sys.outbox` 与 `$MEM.outputs` 写一条启动记录。
+2. 递增 `$MEM.sys.boot.id`（每次上电/恢复一次）；
+3. 按 `$MEM.sys.boot.manifest` 创建缺失的常驻对话，名字 → cid 写 registry；
+4. 创建缺失的 OS 服务对话 `panel_shell` / `clock_a` / `clock_b`；服务 cid 不写
+   持久 MEM，运行期由 OS 程序按名字查 `$MEM.conversations`（运行期视图）；
+5. 写 `$MEM.sys.boot.report`（boot id、上次状态、宿主给的 last_exit、本次新建的服务）；
+6. 往 `$MEM.sys.outbox` 与 `$MEM.outputs` 写一条启动记录。
+
+resume 时宿主用中断唤醒 boot，把 last_exit 放进入口 payload（形如
+`yield from boot('normal')`）；冷启动用默认 `"unknown"`。正常关机由 supervisor
+写 `clean`，boot 只读旧值、不写 clean。
 
 这个节点本身是内存数据：作者在系统内改写它，下一次启动就运行新内容。
 清单条目：`{"name": "...", "program": "$MEM...", "para": "$MEM..."}`，
@@ -21,10 +30,84 @@ def _ok(response):
     return not (text.startswith("Error:") or text.startswith("Illegal:"))
 
 
-def boot():
+def _int_at(ref, default=0):
+    raw = yield from memory_read(ref)
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return default
+
+
+def _conversations():
+    """运行期视图：当前对话的 (cid, 名字, 状态)。名字是对话 identity。"""
+    listing = yield from memory_read("$MEM.conversations")
+    rows = []
+    state = ""
+    for line in str(listing).splitlines():
+        text = line.strip()
+        if text in ("active:", "ready:", "dormant:", "finished:"):
+            state = text[:-1]
+            continue
+        match = re.search(r"cid=(\d+)\s+(\S+)", text)
+        if match is not None:
+            rows.append((int(match.group(1)), match.group(2), state))
+    return rows
+
+
+def _find_cid(name):
+    rows = yield from _conversations()
+    for cid, identity, state in rows:
+        if identity == name and state != "finished":
+            return cid
+    return None
+
+
+def _live_cid(cid):
+    rows = yield from _conversations()
+    for row_cid, _identity, state in rows:
+        if row_cid == cid and state != "finished":
+            return True
+    return False
+
+
+def _ensure_service(name, program_ref, created, existing):
+    cid = yield from _find_cid(name)
+    if cid is not None:
+        existing.append(name)
+        return
+    response = yield from create_cmd(program_ref, "$MEM.para.python")
+    if _ok(response):
+        created.append(name)
+    else:
+        print("boot: 创建服务 " + name + " 失败: " + str(response))
+
+
+def init():
+    """最小的镜像 init 入口；真正的引导由 guest boot 角色执行。"""
+    yield from ()
+
+
+def boot(last_exit="unknown"):
     prior = yield from memory_read("$MEM.sys.boot.state")
     yield from memory_write("$MEM.sys.boot.prior", str(prior))
     yield from memory_write("$MEM.sys.boot.state", "running")
+    boot_id = (yield from _int_at("$MEM.sys.boot.id", 0)) + 1
+    yield from memory_write("$MEM.sys.boot.id", str(boot_id))
+
+    # 新上电：清掉上次关机留下的电源标记。否则 resume 恢复出来的 request=shutdown
+    # / state=off 会让宿主看不到"新请求 → 新断电"的边沿，第二次关机永远不生效。
+    yield from memory_write("$MEM.sys.power.request", "")
+    yield from memory_write("$MEM.sys.power.state", "on")
+
+    # 服务对话只建一次：先按运行期视图找，找到就不再建（resume 时 cid 已在快照里）。
+    os_created = []
+    os_existing = []
+    for name, program_ref in (
+        ("panel_shell", "$MEM.sys.programs.panel_shell"),
+        ("clock_a", "$MEM.sys.programs.clock_a"),
+        ("clock_b", "$MEM.sys.programs.clock_b"),
+    ):
+        yield from _ensure_service(name, program_ref, os_created, os_existing)
 
     raw = str((yield from memory_read("$MEM.sys.boot.manifest"))).strip()
     specs = []
@@ -40,6 +123,7 @@ def boot():
         specs = []
 
     created = []
+    skipped = []
     failed = []
     for spec in specs:
         if not isinstance(spec, dict):
@@ -54,6 +138,16 @@ def boot():
         if not isinstance(program, str) or not isinstance(para, str):
             failed.append(name + ": program/para 必须是引用字符串")
             continue
+        registered = yield from memory_read("$MEM.sys.registry." + name)
+        if _ok(registered):
+            cid = str(registered).strip()
+            try:
+                live = bool(cid) and (yield from _live_cid(int(cid)))
+            except Exception:
+                live = False
+            if live:
+                skipped.append(name)
+                continue
         resp = yield from create_cmd(program, para)
         if not _ok(resp):
             failed.append(name + ": " + str(resp))
@@ -70,10 +164,22 @@ def boot():
             continue
         created.append(name)
 
+    report = (
+        "boot_id=" + str(boot_id) + " prior=" + str(prior)
+        + " last_exit=" + str(last_exit)
+        + " services=" + (",".join(os_existing + os_created) or "-")
+        + " manifest_created=" + str(len(created))
+        + " manifest_skipped=" + str(len(skipped))
+        + " manifest_failed=" + str(len(failed))
+    )
+    yield from memory_write("$MEM.sys.boot.report", report)
     summary = ("boot: 创建 " + str(len(created)) + " 个常驻对话，"
-               + str(len(failed)) + " 个失败；上次状态=" + str(prior))
+               + str(len(failed)) + " 个失败；上次状态=" + str(prior)
+               + "；last_exit=" + str(last_exit))
     if manifest_error:
         summary = summary + "；" + manifest_error
+    if os_created:
+        summary = summary + "；OS 服务=" + ",".join(os_created)
     yield from memory_write("$MEM.sys.outbox.-1", summary)
     yield from memory_write("$MEM.outputs.out", summary)
     return

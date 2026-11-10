@@ -3109,6 +3109,58 @@ class Core:
         self.monitor.record(self, error=error)
         raise error
 
+    def _os_idle_waiting(self) -> bool:
+        """OS 是否在空闲约定节点上声明了等待：`$MEM.sys.idle.state == "waiting"`。
+
+        节点不存在/不是字符串时一律不等待（按空闲严重错误处理）：等待约定必须由
+        镜像程序显式写出，内核不替镜像猜。
+        """
+        try:
+            value = self.unwrap("$MEM.sys.idle.state", for_llm=False)
+        except VMMemoryError:
+            return False
+        return isinstance(value, str) and value == "waiting"
+
+    def _wait_for_host_or_work(self) -> None:
+        """OS 声明空闲等待后，内核停在安全点等宿主动作/新就绪对话。
+
+        不派发中断、不推进回合；只轮询三件事：宿主中断（面板输入/暂停等）、
+        新就绪对话（时钟/事件 notify 可能随后续动作出现）、停止请求。等待期间
+        内存与日志都是完整的，宿主可以随时安全退出。
+        """
+        while not (
+            self._stop_requested
+            or self._active_cid is not None
+            or self._ready_cids
+            or self.interrupts.pending_count
+        ):
+            time.sleep(0.01)
+
+    def _wake_resumed_boot(self) -> None:
+        """resume 后让声明的 boot 角色再跑一次，并把 last_exit 放进入口 payload。
+
+        快照恢复不跑 init、也不自动运行 boot（冷启动由就绪队列驱动）。但 OS 的
+        boot-check 需要知道这次是正常恢复还是脏关闭；VM 只提供 `recovery["last_exit"]`
+        数据面，用中断把 boot 唤醒是宿主不代替 guest 发指令的既有规则。payload 的
+        形状由 guest 程序类型决定（python：入口正文；LLM：角色名 + 数据行）。
+        """
+        mode = self.recovery.get("mode")
+        resumed = mode == "resume" or (
+            mode in (None, "auto") and self.recovery.get("source") == "snapshot"
+        )
+        if not resumed:
+            return
+        info = self.guest_roles.get("boot")
+        if info is None:
+            return
+        last_exit = str(self.recovery.get("last_exit") or "unknown")
+        entry = info.get("entry") or ""
+        if info.get("kind") == "python":
+            payload = "yield from boot(" + repr(last_exit) + ")"
+        else:
+            payload = entry + "\nlast_exit=" + last_exit
+        self.interrupts.raise_("boot", payload=payload)
+
     def run(self):
         self._pick_next_active()
 
@@ -3116,6 +3168,8 @@ class Core:
         # 启动时的存量断电/关机请求不是新请求：边沿基线从安全点第一次观察开始。
         self._power_state_seen = self.read_power_state()
         self._power_request_seen = self.read_power_request()
+        # resume：boot 角色由中断唤醒，宿主的事实 last_exit 随 payload 进入口。
+        self._wake_resumed_boot()
         idle_retry = False
         idle_cid = None
 
@@ -3148,16 +3202,23 @@ class Core:
                 if not self.strict_scheduler:
                     # 旧镜像（没有声明 guest 程序）：队列空了就是"跑完了"，保持旧语义。
                     return
-                if idle_retry:
-                    self._panic_idle(
-                        "系统空闲：guest idle 处理程序本轮没有让系统离开空闲"
-                        "（活跃为空、就绪为空、无待派发中断）"
-                    )
                 idle = self.guest_roles.get("idle")
                 if idle is None:
                     self._panic_idle(
                         "系统空闲，但镜像没有声明 idle guest 程序"
                         "（meta.guest_programs.idle）：空闲是 guest 活体错误"
+                    )
+                if self._os_idle_waiting():
+                    # OS 空闲处理程序显式声明"在等待"：不 panic、不重复挂 idle 中断，
+                    # 内核停在安全点轮询宿主中断/新就绪对话。OS 再次被唤醒时自己把
+                    # idle.state 写回非 waiting；写回后仍空闲却没让系统离开，才回到
+                    # 下面的严重错误判定。
+                    self._wait_for_host_or_work()
+                    continue
+                if idle_retry:
+                    self._panic_idle(
+                        "系统空闲：guest idle 处理程序本轮没有让系统离开空闲"
+                        "（活跃为空、就绪为空、无待派发中断）"
                     )
                 idle_cid = idle.get("cid")
                 self.interrupts.raise_("idle", payload=idle.get("entry"))

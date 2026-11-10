@@ -344,13 +344,15 @@ class Console:
 
     # -- 单客户端准入 --------------------------------------------------
 
-    def _lease_expired(self, lease: dict, now: float) -> bool:
-        return now - lease["last_seen"] > self.client_lease_seconds
+    def _lease_expired(self, lease: dict) -> bool:
+        # 用单调时钟判定过期：租约是宿主策略，不受系统墙钟校正影响。
+        return (time.monotonic() - lease["last_seen_mono"]
+                > self.client_lease_seconds)
 
     def client_status(self) -> dict:
         with self._client_lock:
             lease = self._client_lease
-            if lease is not None and self._lease_expired(lease, time.time()):
+            if lease is not None and self._lease_expired(lease):
                 self._client_lease = None
                 lease = None
             return {
@@ -371,16 +373,16 @@ class Console:
         with self._client_lock:
             lease = self._client_lease
             if (lease is not None and lease["client_id"] != client_id
-                    and not self._lease_expired(lease, now)):
+                    and not self._lease_expired(lease)):
                 raise ConsoleConflict(
                     f"已有客户端连接（{lease['client_id']}，"
                     f"自 {time.strftime('%H:%M:%S', time.localtime(lease['since']))} 起）；"
                     f"关闭它或等待租约 {self.client_lease_seconds:g} 秒过期"
                 )
             since = lease["since"] if (lease and lease["client_id"] == client_id
-                                       and not self._lease_expired(lease, now)) else now
+                                       and not self._lease_expired(lease)) else now
             self._client_lease = {"client_id": client_id, "since": since,
-                                  "last_seen": now}
+                                  "last_seen": now, "last_seen_mono": time.monotonic()}
         return {"client_id": client_id, "single_client": True, "since": since}
 
     def release_client(self, client_id: Optional[str]) -> dict:
@@ -402,19 +404,58 @@ class Console:
         now = time.time()
         with self._client_lock:
             lease = self._client_lease
-            if lease is None or self._lease_expired(lease, now):
+            if lease is None or self._lease_expired(lease):
                 self._client_lease = {"client_id": client_id, "since": now,
-                                      "last_seen": now}
+                                      "last_seen": now,
+                                      "last_seen_mono": time.monotonic()}
                 return True
             if lease["client_id"] != client_id:
                 return False
             lease["last_seen"] = now
+            lease["last_seen_mono"] = time.monotonic()
             return True
 
     # -- 事件观察 ------------------------------------------------------
 
     def _on_event(self, event: dict) -> None:
         self.channel.publish("event", _jsonable(event))
+        # 正式输入落进 inbox 后唤醒 OS 空闲处理程序。放在事件观察者里而不是只放在
+        # `/api/input` 的提交瞬间：写入由保留对话在稍后的回合执行，提交瞬间挂中断
+        # 可能让 idle 先跑、看不到输入，把状态写回 waiting 后就没有人再消费。
+        self._wake_idle_on_inbox_write(event)
+
+    def _wake_idle_on_inbox_write(self, event: dict) -> None:
+        """inbox 写了新输入 → 给声明的 idle 角色挂一次中断。
+
+        只对 memory_write after 事件生效；target 是写入地址（追加仍是 `...inbox.-1`）。
+        内容能解析成对象时只对 `status == "new"` 唤醒：panel_shell 把条目标记
+        done 的写不会再叫醒 idle。没有 idle 角色的旧镜像保持原行为（不会出现
+        无向量中断的告警）。
+        """
+        if self.core.guest_roles.get("idle") is None:
+            return
+        if event.get("event_type") != "memory_write" or event.get("phase") != "after":
+            return
+        target = event.get("target")
+        if not isinstance(target, str):
+            return
+        if target != "$MEM.sys.inbox" and not target.startswith("$MEM.sys.inbox."):
+            return
+        content = (event.get("payload") or {}).get("content")
+        if isinstance(content, str) and content:
+            try:
+                entry = json.loads(content)
+            except ValueError:
+                entry = None
+            if isinstance(entry, dict) and entry.get("status") != "new":
+                return
+        self.core.interrupts.raise_("idle", payload=self._idle_entry())
+
+    def _idle_entry(self) -> Optional[str]:
+        """唤醒 idle 角色的入口正文；中断不给 payload 时 guest 程序不会开始本轮。"""
+        info = self.core.guest_roles.get("idle") or {}
+        entry = info.get("entry")
+        return entry if isinstance(entry, str) else None
 
     # -- 观测 ----------------------------------------------------------
 
@@ -783,6 +824,10 @@ class Console:
              "arguments": {"ref": "$MEM.sys.inbox.-1", "content": payload}},
             {"end": True},  # 结束本轮：Core 在回合结束提交日志
         ], interrupt_payload=None)  # 输入不是"暂停"：不给面板投假正文
+        if self.core.guest_roles.get("idle") is not None:
+            # OS 空闲处理程序由 idle 中断唤醒；真正的唤醒点还在 inbox 写入的
+            # after 事件里（_wake_idle_on_inbox_write），这里保留提交后的第一次通知。
+            self.core.interrupts.raise_("idle", payload=self._idle_entry())
         return {"accepted": True, "entry_id": entry["id"]}
 
     def _require_inbox(self) -> None:

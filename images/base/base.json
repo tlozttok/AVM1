@@ -2,9 +2,14 @@
   "meta": {
     "name": "base",
     "version": 1,
-    "description": "母板镜像：持久化三件套 + 装载设备 + 可编辑的引导程序与常驻服务清单 + 空分区骨架。不带业务；其余基础由作者在系统内手动搭建。",
+    "description": "母板镜像：持久化三件套 + 装载设备 + OS 程序（boot/idle/shutdown 角色与 panel_shell/clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架。不带业务；其余基础由作者在系统内手动搭建。",
     "instruction_budget": 100,
-    "snapshot_every": 200
+    "snapshot_every": 200,
+    "guest_programs": {
+      "boot": "$MEM.sys.programs.boot",
+      "idle": "$MEM.sys.programs.idle",
+      "shutdown": "$MEM.sys.programs.supervisor"
+    }
   },
   "para_ref": "$MEM.para.python",
   "mem": {
@@ -43,6 +48,20 @@
     "sys": {
       "kind": "dict",
       "value": {
+        "power": {
+          "kind": "dict",
+          "value": {
+            "request": {
+              "kind": "str",
+              "value": ""
+            },
+            "state": {
+              "kind": "str",
+              "value": "on"
+            }
+          },
+          "meta": "OS 电源约定节点"
+        },
         "boot": {
           "kind": "dict",
           "value": {
@@ -54,17 +73,25 @@
               "kind": "str",
               "value": ""
             },
+            "id": {
+              "kind": "str",
+              "value": ""
+            },
+            "report": {
+              "kind": "str",
+              "value": ""
+            },
             "manifest": {
               "kind": "str",
               "value": "[]"
             }
           },
-          "meta": "启动状态与清单（作者可编辑）"
+          "meta": "启动状态、名单与恢复报告（作者可编辑）"
         },
         "registry": {
           "kind": "dict",
           "value": {},
-          "meta": "名字 → cid；每次启动由 boot 程序重写"
+          "meta": "名字 → cid；每次启动由 boot 程序重写（仅 manifest 服务）"
         },
         "programs": {
           "kind": "dict",
@@ -74,30 +101,167 @@
               "value": {
                 "content": {
                   "kind": "str",
-                  "value": "\"\"\"base 镜像的最小引导程序（`plm.python`）。\n\n镜像 `init` 指向 `$MEM.sys.programs.boot`，user 是 `boot()`。\n它只做四件事，然后结束本轮（对话休眠）：\n\n1. 把 `$MEM.sys.boot.state` 从旧值改成 `\"running\"`，并把旧值记到 `prior`；\n2. 读 `$MEM.sys.boot.manifest`（JSON 字符串），按清单创建缺失的常驻对话；\n3. 把 `名字 → cid` 写进 `$MEM.sys.registry`；\n4. 往 `$MEM.sys.outbox` 与 `$MEM.outputs` 写一条启动记录。\n\n这个节点本身是内存数据：作者在系统内改写它，下一次启动就运行新内容。\n清单条目：`{\"name\": \"...\", \"program\": \"$MEM...\", \"para\": \"$MEM...\"}`，\n`program` 指向 settingup/python 程序节点，`para` 指向 para 节点。\n\n注意：plm.python 的沙箱禁止 import；`json` / `re` / `math` 由运行时注入。\n\"\"\"\n\n\ndef _ok(response):\n    text = str(response)\n    return not (text.startswith(\"Error:\") or text.startswith(\"Illegal:\"))\n\n\ndef boot():\n    prior = yield from memory_read(\"$MEM.sys.boot.state\")\n    yield from memory_write(\"$MEM.sys.boot.prior\", str(prior))\n    yield from memory_write(\"$MEM.sys.boot.state\", \"running\")\n\n    raw = str((yield from memory_read(\"$MEM.sys.boot.manifest\"))).strip()\n    specs = []\n    manifest_error = \"\"\n    if raw:\n        try:\n            specs = json.loads(raw)\n        except Exception as e:\n            manifest_error = \"manifest 不是合法 JSON: \" + str(e)\n            specs = []\n    if not isinstance(specs, list):\n        manifest_error = manifest_error or \"manifest 必须是 JSON 数组\"\n        specs = []\n\n    created = []\n    failed = []\n    for spec in specs:\n        if not isinstance(spec, dict):\n            failed.append(\"条目不是对象\")\n            continue\n        name = spec.get(\"name\")\n        program = spec.get(\"program\")\n        para = spec.get(\"para\")\n        if not isinstance(name, str) or not name:\n            failed.append(\"条目缺少 name: \" + str(spec))\n            continue\n        if not isinstance(program, str) or not isinstance(para, str):\n            failed.append(name + \": program/para 必须是引用字符串\")\n            continue\n        resp = yield from create_cmd(program, para)\n        if not _ok(resp):\n            failed.append(name + \": \" + str(resp))\n            continue\n        match = re.search(r\"cid=(\\d+)\", str(resp))\n        if match is None:\n            failed.append(name + \": 回执里没有 cid: \" + str(resp))\n            continue\n        cid = match.group(1)\n        yield from memory_make(\"$MEM.sys.registry\", name, \"str\")  # 已存在时返回 Illegal，由下面覆盖\n        write_resp = yield from memory_write(\"$MEM.sys.registry.\" + name, cid)\n        if not _ok(write_resp):\n            failed.append(name + \": 写 registry 失败: \" + str(write_resp))\n            continue\n        created.append(name)\n\n    summary = (\"boot: 创建 \" + str(len(created)) + \" 个常驻对话，\"\n               + str(len(failed)) + \" 个失败；上次状态=\" + str(prior))\n    if manifest_error:\n        summary = summary + \"；\" + manifest_error\n    yield from memory_write(\"$MEM.sys.outbox.-1\", summary)\n    yield from memory_write(\"$MEM.outputs.out\", summary)\n    return\n"
+                  "value": "\"\"\"base 镜像的引导程序（`plm.python`）。\n\n镜像 `init` 入口是 `yield from init()`：只保留一条空回合，真正的引导在 guest\n`boot` 角色里（`meta.guest_programs.boot`，内核对话入口是 `yield from boot()`）。\n\n`boot()` 做六件事，然后结束本轮（对话休眠）：\n\n1. 把 `$MEM.sys.boot.state` 从旧值改成 `\"running\"`，并把旧值记到 `prior`；\n2. 递增 `$MEM.sys.boot.id`（每次上电/恢复一次）；\n3. 按 `$MEM.sys.boot.manifest` 创建缺失的常驻对话，名字 → cid 写 registry；\n4. 创建缺失的 OS 服务对话 `panel_shell` / `clock_a` / `clock_b`；服务 cid 不写\n   持久 MEM，运行期由 OS 程序按名字查 `$MEM.conversations`（运行期视图）；\n5. 写 `$MEM.sys.boot.report`（boot id、上次状态、宿主给的 last_exit、本次新建的服务）；\n6. 往 `$MEM.sys.outbox` 与 `$MEM.outputs` 写一条启动记录。\n\nresume 时宿主用中断唤醒 boot，把 last_exit 放进入口 payload（形如\n`yield from boot('normal')`）；冷启动用默认 `\"unknown\"`。正常关机由 supervisor\n写 `clean`，boot 只读旧值、不写 clean。\n\n这个节点本身是内存数据：作者在系统内改写它，下一次启动就运行新内容。\n清单条目：`{\"name\": \"...\", \"program\": \"$MEM...\", \"para\": \"$MEM...\"}`，\n`program` 指向 settingup/python 程序节点，`para` 指向 para 节点。\n\n注意：plm.python 的沙箱禁止 import；`json` / `re` / `math` 由运行时注入。\n\"\"\"\n\n\ndef _ok(response):\n    text = str(response)\n    return not (text.startswith(\"Error:\") or text.startswith(\"Illegal:\"))\n\n\ndef _int_at(ref, default=0):\n    raw = yield from memory_read(ref)\n    try:\n        return int(str(raw).strip())\n    except Exception:\n        return default\n\n\ndef _conversations():\n    \"\"\"运行期视图：当前对话的 (cid, 名字, 状态)。名字是对话 identity。\"\"\"\n    listing = yield from memory_read(\"$MEM.conversations\")\n    rows = []\n    state = \"\"\n    for line in str(listing).splitlines():\n        text = line.strip()\n        if text in (\"active:\", \"ready:\", \"dormant:\", \"finished:\"):\n            state = text[:-1]\n            continue\n        match = re.search(r\"cid=(\\d+)\\s+(\\S+)\", text)\n        if match is not None:\n            rows.append((int(match.group(1)), match.group(2), state))\n    return rows\n\n\ndef _find_cid(name):\n    rows = yield from _conversations()\n    for cid, identity, state in rows:\n        if identity == name and state != \"finished\":\n            return cid\n    return None\n\n\ndef _live_cid(cid):\n    rows = yield from _conversations()\n    for row_cid, _identity, state in rows:\n        if row_cid == cid and state != \"finished\":\n            return True\n    return False\n\n\ndef _ensure_service(name, program_ref, created, existing):\n    cid = yield from _find_cid(name)\n    if cid is not None:\n        existing.append(name)\n        return\n    response = yield from create_cmd(program_ref, \"$MEM.para.python\")\n    if _ok(response):\n        created.append(name)\n    else:\n        print(\"boot: 创建服务 \" + name + \" 失败: \" + str(response))\n\n\ndef init():\n    \"\"\"最小的镜像 init 入口；真正的引导由 guest boot 角色执行。\"\"\"\n    yield from ()\n\n\ndef boot(last_exit=\"unknown\"):\n    prior = yield from memory_read(\"$MEM.sys.boot.state\")\n    yield from memory_write(\"$MEM.sys.boot.prior\", str(prior))\n    yield from memory_write(\"$MEM.sys.boot.state\", \"running\")\n    boot_id = (yield from _int_at(\"$MEM.sys.boot.id\", 0)) + 1\n    yield from memory_write(\"$MEM.sys.boot.id\", str(boot_id))\n\n    # 新上电：清掉上次关机留下的电源标记。否则 resume 恢复出来的 request=shutdown\n    # / state=off 会让宿主看不到\"新请求 → 新断电\"的边沿，第二次关机永远不生效。\n    yield from memory_write(\"$MEM.sys.power.request\", \"\")\n    yield from memory_write(\"$MEM.sys.power.state\", \"on\")\n\n    # 服务对话只建一次：先按运行期视图找，找到就不再建（resume 时 cid 已在快照里）。\n    os_created = []\n    os_existing = []\n    for name, program_ref in (\n        (\"panel_shell\", \"$MEM.sys.programs.panel_shell\"),\n        (\"clock_a\", \"$MEM.sys.programs.clock_a\"),\n        (\"clock_b\", \"$MEM.sys.programs.clock_b\"),\n    ):\n        yield from _ensure_service(name, program_ref, os_created, os_existing)\n\n    raw = str((yield from memory_read(\"$MEM.sys.boot.manifest\"))).strip()\n    specs = []\n    manifest_error = \"\"\n    if raw:\n        try:\n            specs = json.loads(raw)\n        except Exception as e:\n            manifest_error = \"manifest 不是合法 JSON: \" + str(e)\n            specs = []\n    if not isinstance(specs, list):\n        manifest_error = manifest_error or \"manifest 必须是 JSON 数组\"\n        specs = []\n\n    created = []\n    skipped = []\n    failed = []\n    for spec in specs:\n        if not isinstance(spec, dict):\n            failed.append(\"条目不是对象\")\n            continue\n        name = spec.get(\"name\")\n        program = spec.get(\"program\")\n        para = spec.get(\"para\")\n        if not isinstance(name, str) or not name:\n            failed.append(\"条目缺少 name: \" + str(spec))\n            continue\n        if not isinstance(program, str) or not isinstance(para, str):\n            failed.append(name + \": program/para 必须是引用字符串\")\n            continue\n        registered = yield from memory_read(\"$MEM.sys.registry.\" + name)\n        if _ok(registered):\n            cid = str(registered).strip()\n            try:\n                live = bool(cid) and (yield from _live_cid(int(cid)))\n            except Exception:\n                live = False\n            if live:\n                skipped.append(name)\n                continue\n        resp = yield from create_cmd(program, para)\n        if not _ok(resp):\n            failed.append(name + \": \" + str(resp))\n            continue\n        match = re.search(r\"cid=(\\d+)\", str(resp))\n        if match is None:\n            failed.append(name + \": 回执里没有 cid: \" + str(resp))\n            continue\n        cid = match.group(1)\n        yield from memory_make(\"$MEM.sys.registry\", name, \"str\")  # 已存在时返回 Illegal，由下面覆盖\n        write_resp = yield from memory_write(\"$MEM.sys.registry.\" + name, cid)\n        if not _ok(write_resp):\n            failed.append(name + \": 写 registry 失败: \" + str(write_resp))\n            continue\n        created.append(name)\n\n    report = (\n        \"boot_id=\" + str(boot_id) + \" prior=\" + str(prior)\n        + \" last_exit=\" + str(last_exit)\n        + \" services=\" + (\",\".join(os_existing + os_created) or \"-\")\n        + \" manifest_created=\" + str(len(created))\n        + \" manifest_skipped=\" + str(len(skipped))\n        + \" manifest_failed=\" + str(len(failed))\n    )\n    yield from memory_write(\"$MEM.sys.boot.report\", report)\n    summary = (\"boot: 创建 \" + str(len(created)) + \" 个常驻对话，\"\n               + str(len(failed)) + \" 个失败；上次状态=\" + str(prior)\n               + \"；last_exit=\" + str(last_exit))\n    if manifest_error:\n        summary = summary + \"；\" + manifest_error\n    if os_created:\n        summary = summary + \"；OS 服务=\" + \",\".join(os_created)\n    yield from memory_write(\"$MEM.sys.outbox.-1\", summary)\n    yield from memory_write(\"$MEM.outputs.out\", summary)\n    return\n"
+                },
+                "para_ref": {
+                  "kind": "str",
+                  "value": "$MEM.para.python"
                 }
               },
-              "meta": "最小引导程序（可编辑；镜像 init 指向它）",
+              "meta": "OS 程序节点（可编辑）",
+              "ctrl": {
+                "type": "python"
+              }
+            },
+            "idle": {
+              "kind": "dict",
+              "value": {
+                "content": {
+                  "kind": "str",
+                  "value": "\"\"\"base 镜像的空闲处理程序（guest `idle` 角色，`plm.python`）。\n\n内核在\"活跃为空、就绪为空、无待派发中断\"时向 idle 角色挂中断。程序做三件事：\n\n1. 把 `$MEM.sys.idle.state` 从 `\"waiting\"` 改回 `\"active\"`（OS 自己负责离开等待态）；\n2. 看 `$MEM.sys.inbox` 有没有 `status == \"new\"` 的输入；\n3. 有输入就按名字找到服务对话 `panel_shell`（cid 不持久化，运行期查\n   `$MEM.conversations`），发一条 `yield from panel_shell()` 唤醒它；\n   没有输入就写 `$MEM.sys.idle.state = \"waiting\"` 后结束本轮，交给内核等待宿主中断。\n\n输入刚由保留对话写入、而 idle 先被唤醒的竞态由宿主处理（`/api/input` 先挂 idle\n再挂 operator，保证面板先写完 inbox）。这里只按当前内存做判断。\n\n注意：plm.python 的沙箱禁止 import；`json` / `re` / `math` 由运行时注入。\n\"\"\"\n\n\ndef _ok(response):\n    text = str(response)\n    return not (text.startswith(\"Error:\") or text.startswith(\"Illegal:\"))\n\n\ndef _list_len(text):\n    match = re.search(r\"len=(\\d+)\", str(text))\n    if match is None:\n        return 0\n    return int(match.group(1))\n\n\ndef _conversations():\n    listing = yield from memory_read(\"$MEM.conversations\")\n    rows = []\n    state = \"\"\n    for line in str(listing).splitlines():\n        text = line.strip()\n        if text in (\"active:\", \"ready:\", \"dormant:\", \"finished:\"):\n            state = text[:-1]\n            continue\n        match = re.search(r\"cid=(\\d+)\\s+(\\S+)\", text)\n        if match is not None:\n            rows.append((int(match.group(1)), match.group(2), state))\n    return rows\n\n\ndef _find_cid(name):\n    rows = yield from _conversations()\n    for cid, identity, state in rows:\n        if identity == name and state != \"finished\":\n            return cid\n    return None\n\n\ndef _pending_inputs():\n    summary = yield from memory_read(\"$MEM.sys.inbox\")\n    count = _list_len(summary)\n    pending = 0\n    for index in range(count):\n        raw = yield from memory_read(\"$MEM.sys.inbox.\" + str(index))\n        text = str(raw)\n        if text.startswith(\"Error:\"):\n            continue\n        try:\n            entry = json.loads(text)\n        except Exception:\n            continue\n        if isinstance(entry, dict) and entry.get(\"status\") == \"new\":\n            pending += 1\n    return pending\n\n\ndef idle():\n    yield from memory_write(\"$MEM.sys.idle.state\", \"active\")\n\n    pending = yield from _pending_inputs()\n    if pending > 0:\n        shell = yield from _find_cid(\"panel_shell\")\n        if shell is not None:\n            response = yield from send_instruction(shell, \"yield from panel_shell()\")\n            if _ok(response):\n                return\n            notice = \"idle: 唤醒 panel_shell 失败: \" + str(response)\n        else:\n            notice = (\"idle: inbox 有 \" + str(pending)\n                      + \" 条新输入，但 panel_shell 不存在\")\n        yield from memory_write(\"$MEM.sys.outbox.-1\", notice)\n        yield from memory_write(\"$MEM.outputs.out\", notice)\n\n    # 没有可交给服务对话的工作：声明\"在等待\"，由内核停在安全点等宿主中断。\n    yield from memory_write(\"$MEM.sys.idle.state\", \"waiting\")\n"
+                },
+                "para_ref": {
+                  "kind": "str",
+                  "value": "$MEM.para.python"
+                }
+              },
+              "meta": "OS 程序节点（可编辑）",
+              "ctrl": {
+                "type": "python"
+              }
+            },
+            "supervisor": {
+              "kind": "dict",
+              "value": {
+                "content": {
+                  "kind": "str",
+                  "value": "\"\"\"base 镜像的 OS 监督程序（guest `shutdown` 角色，`plm.python`）。\n\n宿主在安全点看到 `$MEM.sys.power.request == \"shutdown\"` 后，用 `shutdown` 中断\n把它唤醒（入口 `yield from shutdown()`）。它判断\"应用是否全部收尾\"：\n\n- 收尾 = 对话结束本轮、不再排工作、进入休眠。运行期视图 `$MEM.conversations`\n  里状态为 active / ready 的**非 OS 对话**都算未收尾；OS 自己的对话\n  （init、guest-boot、guest-idle、guest-shutdown、panel_shell、clock_a、clock_b）\n  不是应用，不阻塞关机。\n- 有未收尾对话：确保设备事件钟在跑（两个互相激活的 PLM，超时通知会再唤醒本程序），\n  往 outbox/outputs 写一条等待/超时记录，然后结束本轮；**不写 off**。\n- 全部收尾：停钟 → 写 `$MEM.sys.boot.state = \"clean\"` → 写\n  `$MEM.sys.power.state = \"off\"` → 结束本轮。宿主看到 off 后写快照并退出。\n\nOS 软件缺席或一直收不尾时，关机停在挂起；操作员可以走宿主的强制退出。\n超时次数、间隔由 `$MEM.sys.clock.interval` 等 OS 约定节点配置；发多少次超时都\n不会自动断电，只有这里写 off 才会。\n\n注意：plm.python 的沙箱禁止 import；`json` / `re` / `math` 由运行时注入。\n\"\"\"\n\n_OS_NAMES = (\n    \"init\", \"guest-boot\", \"guest-idle\", \"guest-shutdown\",\n    \"panel_shell\", \"clock_a\", \"clock_b\",\n)\n\n\ndef _conversations():\n    listing = yield from memory_read(\"$MEM.conversations\")\n    rows = []\n    state = \"\"\n    for line in str(listing).splitlines():\n        text = line.strip()\n        if text in (\"active:\", \"ready:\", \"dormant:\", \"finished:\"):\n            state = text[:-1]\n            continue\n        match = re.search(r\"cid=(\\d+)\\s+(\\S+)\", text)\n        if match is not None:\n            rows.append((int(match.group(1)), match.group(2), state))\n    return rows\n\n\ndef _find_cid(name):\n    rows = yield from _conversations()\n    for cid, identity, state in rows:\n        if identity == name and state != \"finished\":\n            return cid\n    return None\n\n\ndef _int_at(ref, default=0):\n    raw = yield from memory_read(ref)\n    try:\n        return int(str(raw).strip())\n    except Exception:\n        return default\n\n\ndef _start_clock():\n    tick = yield from _int_at(\"$MEM.sys.clock.tick\", 0)\n    interval = yield from _int_at(\"$MEM.sys.clock.interval\", 5)\n    if interval < 1:\n        interval = 1\n    yield from memory_write(\"$MEM.sys.clock.timeouts\", \"0\")\n    yield from memory_write(\"$MEM.sys.clock.target\", str(tick + interval))\n    yield from memory_write(\"$MEM.sys.clock.state\", \"running\")\n    clock_a = yield from _find_cid(\"clock_a\")\n    if clock_a is not None:\n        response = yield from send_instruction(clock_a, \"yield from clock_a()\")\n        if not str(response).startswith((\"Error:\", \"Illegal:\")):\n            return\n    # clock_a 缺席：状态留着 running，下一轮超时唤醒本程序时会再尝试。\n    print(\"shutdown: 设备事件钟无法启动（clock_a 不存在或投递失败）\")\n\n\ndef shutdown():\n    request = yield from memory_read(\"$MEM.sys.power.request\")\n    if str(request).strip() != \"shutdown\":\n        # 不是关机中断的内容：不执行断电语义。\n        return\n\n    rows = yield from _conversations()\n    waiting = []\n    for cid, identity, state in rows:\n        if identity in _OS_NAMES:\n            continue\n        if state in (\"active\", \"ready\"):\n            waiting.append(identity + \"(cid=\" + str(cid) + \")\")\n\n    clock_state = str((yield from memory_read(\"$MEM.sys.clock.state\"))).strip()\n\n    if waiting:\n        if clock_state != \"running\":\n            yield from _start_clock()\n            notice = (\"shutdown: 等待 \" + str(len(waiting)) + \" 个对话收尾: \"\n                      + \",\".join(waiting))\n        else:\n            timeouts = yield from _int_at(\"$MEM.sys.clock.timeouts\", 0)\n            notice = (\"shutdown: 超时 #\" + str(timeouts) + \"，仍有 \"\n                      + str(len(waiting)) + \" 个对话未收尾: \" + \",\".join(waiting))\n        yield from memory_write(\"$MEM.sys.outbox.-1\", notice)\n        yield from memory_write(\"$MEM.outputs.out\", notice)\n        return\n\n    # 全部收尾：停钟 → 写 clean → 记录一条总结 → 最后写断电标记。off 必须最后写：\n    # 宿主在下一个安全点看到 off 就退出，这之后的指令不会再有执行机会。\n    yield from memory_write(\"$MEM.sys.clock.state\", \"stopped\")\n    yield from memory_write(\"$MEM.sys.clock.target\", \"0\")\n    yield from memory_write(\"$MEM.sys.boot.state\", \"clean\")\n    summary = \"shutdown: 全部对话已收尾，写 clean 并断电\"\n    yield from memory_write(\"$MEM.sys.outbox.-1\", summary)\n    yield from memory_write(\"$MEM.outputs.out\", summary)\n    yield from memory_write(\"$MEM.sys.power.state\", \"off\")\n"
+                },
+                "para_ref": {
+                  "kind": "str",
+                  "value": "$MEM.para.python"
+                }
+              },
+              "meta": "OS 程序节点（可编辑）",
+              "ctrl": {
+                "type": "python"
+              }
+            },
+            "panel_shell": {
+              "kind": "dict",
+              "value": {
+                "content": {
+                  "kind": "str",
+                  "value": "\"\"\"base 镜像的面板服务对话（`plm.python`，由 guest boot 在冷启动时创建）。\n\n它不是内核的保留对话：是 OS 在系统内创建的普通服务对话，名字 `panel_shell`\n由 boot 的 `create_cmd` 写进对话身份。idle 处理程序按运行期视图找到它，投递\n`yield from panel_shell()` 唤醒；它消费 `$MEM.sys.inbox` 里 `status == \"new\"`\n的条目，把结果追加到 `$MEM.sys.outbox` 与 `$MEM.outputs`，再把条目标记完成。\n\n不做阻塞读：没有输入就结束本轮，由 idle 程序写\"等待\"并交给内核。\n\n注意：plm.python 的沙箱禁止 import；`json` / `re` / `math` 由运行时注入。\n\"\"\"\n\n\ndef _list_len(text):\n    match = re.search(r\"len=(\\d+)\", str(text))\n    if match is None:\n        return 0\n    return int(match.group(1))\n\n\ndef panel_shell():\n    summary = yield from memory_read(\"$MEM.sys.inbox\")\n    count = _list_len(summary)\n    processed = 0\n    for index in range(count):\n        raw = yield from memory_read(\"$MEM.sys.inbox.\" + str(index))\n        text = str(raw)\n        if text.startswith(\"Error:\"):\n            continue\n        try:\n            entry = json.loads(text)\n        except Exception:\n            continue\n        if not isinstance(entry, dict) or entry.get(\"status\") != \"new\":\n            continue\n        content = entry.get(\"text\")\n        if not isinstance(content, str):\n            content = str(content)\n        line = \"panel_shell: \" + content\n        entry[\"status\"] = \"done\"\n        entry[\"output\"] = line\n        yield from memory_write(\n            \"$MEM.sys.inbox.\" + str(index), json.dumps(entry, ensure_ascii=False)\n        )\n        yield from memory_write(\"$MEM.sys.outbox.-1\", line)\n        yield from memory_write(\"$MEM.outputs.out\", line)\n        processed += 1\n\n    if processed:\n        yield from memory_write(\n            \"$MEM.sys.outbox.-1\", \"panel_shell: 本轮处理 \" + str(processed) + \" 条输入\"\n        )\n"
+                },
+                "para_ref": {
+                  "kind": "str",
+                  "value": "$MEM.para.python"
+                },
+                "name": {
+                  "kind": "str",
+                  "value": "panel_shell"
+                }
+              },
+              "meta": "OS 程序节点（可编辑）",
+              "ctrl": {
+                "type": "python"
+              }
+            },
+            "clock_a": {
+              "kind": "dict",
+              "value": {
+                "content": {
+                  "kind": "str",
+                  "value": "\"\"\"base 镜像的全局设备事件钟 A（`plm.python`，由 OS 监督程序启停）。\n\n两个互相激活的 PLM 做乒乓：clock_a 每跑一次算一个逻辑 tick 并写 `$MEM.sys.clock`，\n然后把下一次激活投给 clock_b；clock_b 只把激活投回 clock_a。tick 是普通内存\n写入（进日志、可重放），逻辑时间与关机超时都建立在这套 tick 上。\n\n- 启动：supervisor 写 `$MEM.sys.clock.state = \"running\"`、设 target，然后唤醒\n  clock_a；clock_a/clock_b 自身不主动启动。\n- 超时：tick 跨过 target 时把 `shutdown_timeout` 通知投给 supervisor（按运行期\n  视图找 `guest-shutdown`），并把 target 后移一个 interval；发多少次都不等于\n  断电，只有 supervisor 写 off 才会关机。\n- 停止：任何一方发现 `state != \"running\"` 就不再投递下一次激活，两个 PLM 休眠。\n\n注意：plm.python 的沙箱禁止 import；`json` / `re` / `math` 由运行时注入。\n\"\"\"\n\n\ndef _conversations():\n    listing = yield from memory_read(\"$MEM.conversations\")\n    rows = []\n    state = \"\"\n    for line in str(listing).splitlines():\n        text = line.strip()\n        if text in (\"active:\", \"ready:\", \"dormant:\", \"finished:\"):\n            state = text[:-1]\n            continue\n        match = re.search(r\"cid=(\\d+)\\s+(\\S+)\", text)\n        if match is not None:\n            rows.append((int(match.group(1)), match.group(2), state))\n    return rows\n\n\ndef _find_cid(name):\n    rows = yield from _conversations()\n    for cid, identity, state in rows:\n        if identity == name and state != \"finished\":\n            return cid\n    return None\n\n\ndef _int_at(ref, default=0):\n    raw = yield from memory_read(ref)\n    try:\n        return int(str(raw).strip())\n    except Exception:\n        return default\n\n\ndef clock_a():\n    state = str((yield from memory_read(\"$MEM.sys.clock.state\"))).strip()\n    if state != \"running\":\n        return\n\n    tick = (yield from _int_at(\"$MEM.sys.clock.tick\", 0)) + 1\n    yield from memory_write(\"$MEM.sys.clock.tick\", str(tick))\n\n    target = yield from _int_at(\"$MEM.sys.clock.target\", 0)\n    interval = yield from _int_at(\"$MEM.sys.clock.interval\", 5)\n    if interval < 1:\n        interval = 1\n    if target <= 0:\n        target = tick + interval\n        yield from memory_write(\"$MEM.sys.clock.target\", str(target))\n\n    if tick >= target:\n        count = (yield from _int_at(\"$MEM.sys.clock.timeouts\", 0)) + 1\n        yield from memory_write(\"$MEM.sys.clock.timeouts\", str(count))\n        yield from memory_write(\"$MEM.sys.clock.target\", str(tick + interval))\n        notice = \"clock: 设备事件钟超时 #\" + str(count) + \"（tick=\" + str(tick) + \"）\"\n        yield from memory_write(\"$MEM.sys.outbox.-1\", notice)\n        supervisor = yield from _find_cid(\"guest-shutdown\")\n        if supervisor is not None:\n            yield from send_instruction(supervisor, \"yield from shutdown()\")\n\n    state = str((yield from memory_read(\"$MEM.sys.clock.state\"))).strip()\n    if state != \"running\":\n        return\n    peer = yield from _find_cid(\"clock_b\")\n    if peer is not None:\n        yield from send_instruction(peer, \"yield from clock_b()\")\n"
+                },
+                "para_ref": {
+                  "kind": "str",
+                  "value": "$MEM.para.python"
+                },
+                "name": {
+                  "kind": "str",
+                  "value": "clock_a"
+                }
+              },
+              "meta": "OS 程序节点（可编辑）",
+              "ctrl": {
+                "type": "python"
+              }
+            },
+            "clock_b": {
+              "kind": "dict",
+              "value": {
+                "content": {
+                  "kind": "str",
+                  "value": "\"\"\"base 镜像的全局设备事件钟 B（`plm.python`，由 OS 监督程序启停）。\n\n与 clock_a 互相激活：clock_b 不计数，只把下一次激活投回 clock_a，形成两个\nPLM 的乒乓。这样\"设备事件钟\"是两只会休眠的普通对话，不是内核周期定时器；\nsupervisor 写 `$MEM.sys.clock.state = \"stopped\"` 后两边都不再投递，钟就停了。\n\n注意：plm.python 的沙箱禁止 import；`json` / `re` / `math` 由运行时注入。\n\"\"\"\n\n\ndef _conversations():\n    listing = yield from memory_read(\"$MEM.conversations\")\n    rows = []\n    state = \"\"\n    for line in str(listing).splitlines():\n        text = line.strip()\n        if text in (\"active:\", \"ready:\", \"dormant:\", \"finished:\"):\n            state = text[:-1]\n            continue\n        match = re.search(r\"cid=(\\d+)\\s+(\\S+)\", text)\n        if match is not None:\n            rows.append((int(match.group(1)), match.group(2), state))\n    return rows\n\n\ndef _find_cid(name):\n    rows = yield from _conversations()\n    for cid, identity, state in rows:\n        if identity == name and state != \"finished\":\n            return cid\n    return None\n\n\ndef clock_b():\n    state = str((yield from memory_read(\"$MEM.sys.clock.state\"))).strip()\n    if state != \"running\":\n        return\n    peer = yield from _find_cid(\"clock_a\")\n    if peer is not None:\n        yield from send_instruction(peer, \"yield from clock_a()\")\n"
+                },
+                "para_ref": {
+                  "kind": "str",
+                  "value": "$MEM.para.python"
+                },
+                "name": {
+                  "kind": "str",
+                  "value": "clock_b"
+                }
+              },
+              "meta": "OS 程序节点（可编辑）",
               "ctrl": {
                 "type": "python"
               }
             }
           },
-          "meta": "系统程序节点"
+          "meta": "系统程序节点（OS 程序 + 作者程序）"
         },
         "inbox": {
           "kind": "list",
           "value": [],
-          "meta": "面板输入的唯一落点（空；消费者由作者手动搭建）"
+          "meta": "面板输入的唯一落点（空；消费由 idle/panel_shell 负责）"
         },
         "outbox": {
           "kind": "list",
           "value": [],
           "meta": "持久输出（作者约定怎么用）"
         },
+        "idle": {
+          "kind": "dict",
+          "value": {
+            "state": {
+              "kind": "str",
+              "value": ""
+            }
+          },
+          "meta": "空闲处理程序与内核的等待约定"
+        },
+        "clock": {
+          "kind": "dict",
+          "value": {
+            "tick": {
+              "kind": "str",
+              "value": "0"
+            },
+            "target": {
+              "kind": "str",
+              "value": "0"
+            },
+            "interval": {
+              "kind": "str",
+              "value": "5"
+            },
+            "timeouts": {
+              "kind": "str",
+              "value": "0"
+            },
+            "state": {
+              "kind": "str",
+              "value": "stopped"
+            }
+          },
+          "meta": "全局设备事件钟（两个乒乓 PLM 自用）"
+        },
         "handbook": {
           "kind": "str",
-          "value": "base 约定：sys.boot.manifest 是常驻服务清单（JSON 字符串）；sys.registry 是名字→cid；sys.inbox 是面板输入落点；改 sys.programs.boot 的内容就是改下一次启动运行的引导程序。"
+          "value": "base 约定：sys.boot.manifest 是常驻服务清单（JSON 字符串）；sys.registry 是名字→cid；sys.inbox 是面板输入落点；sys.idle.state=waiting 表示 OS 在空闲等待，内核不判严重错误；sys.clock 是设备事件钟；sys.power.request/state 是关机约定；改 sys.programs.boot 的内容就是改下一次启动运行的引导程序。"
         }
       },
       "meta": "系统分区"
@@ -162,9 +326,9 @@
     }
   ],
   "init": {
-    "name": "boot",
+    "name": "init",
     "system_ref": "$MEM.sys.programs.boot",
-    "user": "yield from boot()",
+    "user": "yield from init()",
     "para_ref": "$MEM.para.python"
   },
   "journal_to": "out/base.journal",

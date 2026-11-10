@@ -1,19 +1,33 @@
 """生成 base 镜像：`python images/base/build_image.py`。
 
-base 只放六样：持久化三件套、装载设备 + 只读仓库设备、可编辑的 boot 程序节点、
+base 只放六样：持久化三件套、装载设备 + 只读仓库设备、OS 程序节点
+（boot/idle/shutdown 三个 guest 角色程序 + panel_shell/clock_a/clock_b 服务程序）、
 可编辑的常驻服务清单、空分区骨架、标准 IO 设备。其余基础由作者在系统内手动搭建，
 见 README.md。
 
 设备文件按相对路径引用（`../packages/loader.py`、`../devices/*`），因此镜像可以
 直接放在仓库里运行；装载设备/程序包必须带面板审批得到的 `approved_sha256`。
+
+base.json 由本脚本首次生成后就是种子：仓库里的 base.json 已提交，作者在系统内
+改它；只有需要从程序源重建镜像时才重新运行本脚本。
 """
 
 import json
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BOOT_SOURCE = os.path.join(HERE, "programs", "boot.py")
+PROGRAM_DIR = os.path.join(HERE, "programs")
 TARGET = os.path.join(HERE, "base.json")
+
+# 程序节点：镜像内键名 → (源文件, 显示名)。guest 角色由 meta.guest_programs 引用。
+OS_PROGRAMS = (
+    ("boot", "boot.py", None),
+    ("idle", "idle.py", None),
+    ("supervisor", "supervisor.py", None),
+    ("panel_shell", "panel_shell.py", "panel_shell"),
+    ("clock_a", "clock_a.py", "clock_a"),
+    ("clock_b", "clock_b.py", "clock_b"),
+)
 
 
 def _str(value, meta=None):
@@ -45,28 +59,46 @@ def _para(model):
     )
 
 
-def _program_python(source, meta):
-    return _dict(
-        {"content": _str(source)},
-        meta=meta,
-        ctrl={"type": "python"},
-    )
+def _program_python(source, meta, name=None):
+    value = {
+        "content": _str(source),
+        "para_ref": _str("$MEM.para.python"),
+    }
+    if name is not None:
+        value["name"] = _str(name)
+    return _dict(value, meta=meta, ctrl={"type": "python"})
+
+
+def _read_program(filename):
+    with open(os.path.join(PROGRAM_DIR, filename), "r", encoding="utf-8") as f:
+        return f.read()
 
 
 def build():
-    with open(BOOT_SOURCE, "r", encoding="utf-8") as f:
-        boot_source = f.read()
+    programs = {}
+    for key, filename, name in OS_PROGRAMS:
+        programs[key] = _program_python(
+            _read_program(filename),
+            "OS 程序节点（可编辑）",
+            name=name,
+        )
 
     image = {
         "meta": {
             "name": "base",
             "version": 1,
             "description": (
-                "母板镜像：持久化三件套 + 装载设备 + 可编辑的引导程序与常驻服务清单 + "
-                "空分区骨架。不带业务；其余基础由作者在系统内手动搭建。"
+                "母板镜像：持久化三件套 + 装载设备 + OS 程序（boot/idle/shutdown 角色与 "
+                "panel_shell/clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架。"
+                "不带业务；其余基础由作者在系统内手动搭建。"
             ),
             "instruction_budget": 100,
             "snapshot_every": 200,
+            "guest_programs": {
+                "boot": "$MEM.sys.programs.boot",
+                "idle": "$MEM.sys.programs.idle",
+                "shutdown": "$MEM.sys.programs.supervisor",
+            },
         },
         "para_ref": "$MEM.para.python",
         "mem": {
@@ -79,32 +111,49 @@ def build():
             ),
             "sys": _dict(
                 {
+                    "power": _dict(
+                        {
+                            "request": _str("", "OS 关机请求：写 shutdown；由 supervisor 处理"),
+                            "state": _str("on", "on / off；只有 OS 写 off，宿主才正常断电退出"),
+                        },
+                        meta="OS 电源约定节点",
+                    ),
                     "boot": _dict(
                         {
-                            "state": _str("clean", "running / clean；启动程序写 running"),
-                            "prior": _str("", "上一次启动时读到的旧状态"),
+                            "state": _str("clean", "running / clean；启动程序写 running，正常收尾写 clean"),
+                            "prior": _str("", "本次启动时读到的旧状态"),
+                            "id": _str("", "上电序号；每次 boot 程序递增"),
+                            "report": _str("", "最近一次启动的恢复报告摘要"),
                             "manifest": _str(
                                 "[]",
                                 '常驻服务清单（JSON 字符串）：[{"name","program","para"}]',
                             ),
                         },
-                        meta="启动状态与清单（作者可编辑）",
+                        meta="启动状态、名单与恢复报告（作者可编辑）",
                     ),
-                    "registry": _dict({}, meta="名字 → cid；每次启动由 boot 程序重写"),
-                    "programs": _dict(
-                        {
-                            "boot": _program_python(
-                                boot_source,
-                                "最小引导程序（可编辑；镜像 init 指向它）",
-                            ),
-                        },
-                        meta="系统程序节点",
-                    ),
-                    "inbox": _list([], "面板输入的唯一落点（空；消费者由作者手动搭建）"),
+                    "registry": _dict({}, meta="名字 → cid；每次启动由 boot 程序重写（仅 manifest 服务）"),
+                    "programs": _dict(programs, meta="系统程序节点（OS 程序 + 作者程序）"),
+                    "inbox": _list([], "面板输入的唯一落点（空；消费由 idle/panel_shell 负责）"),
                     "outbox": _list([], "持久输出（作者约定怎么用）"),
+                    "idle": _dict(
+                        {"state": _str("", "waiting = OS 声明在等待宿主中断；其它值表示不在等待")},
+                        meta="空闲处理程序与内核的等待约定",
+                    ),
+                    "clock": _dict(
+                        {
+                            "tick": _str("0", "逻辑 tick 计数"),
+                            "target": _str("0", "下一次超时通知的 tick 目标"),
+                            "interval": _str("5", "超时通知间隔（tick）；OS 软件可变配置"),
+                            "timeouts": _str("0", "本轮关机已经发出的超时通知次数"),
+                            "state": _str("stopped", "running / stopped；由 supervisor 启停"),
+                        },
+                        meta="全局设备事件钟（两个乒乓 PLM 自用）",
+                    ),
                     "handbook": _str(
                         "base 约定：sys.boot.manifest 是常驻服务清单（JSON 字符串）；"
                         "sys.registry 是名字→cid；sys.inbox 是面板输入落点；"
+                        "sys.idle.state=waiting 表示 OS 在空闲等待，内核不判严重错误；"
+                        "sys.clock 是设备事件钟；sys.power.request/state 是关机约定；"
                         "改 sys.programs.boot 的内容就是改下一次启动运行的引导程序。",
                         "分区与自举约定；作者可编辑",
                     ),
@@ -147,9 +196,9 @@ def build():
             },
         ],
         "init": {
-            "name": "boot",
+            "name": "init",
             "system_ref": "$MEM.sys.programs.boot",
-            "user": "yield from boot()",
+            "user": "yield from init()",
             "para_ref": "$MEM.para.python",
         },
         "journal_to": "out/base.journal",
