@@ -7,7 +7,7 @@ user 消息是文件列表（`images/repo_tester_packed/file_list.txt`），也�
 `create_cmd` 出测试对话 → `send_instruction` 把 `$MEM.user` 投给它 → 写打包报告 → 关闭自己。
 
 沙箱约束（见 avm/sandbox.py）：禁 import / open / 双下划线属性；工具函数由 plm.python 注入，
-名字与参数同 9 条指令。写入类调用在重放时按记录返回，不会重复执行。
+名字与参数同 9 条指令。工具调用写成 yield from，挂起后从断点继续，不重放前缀。
 """
 
 SKELETON = """你是这个系统中的一个对话。系统提供内存树和一组工具：memory_read、memory_write、memory_make、edit_metadata、create_cmd、create_sub、send_instruction、close_conversation、listen_event。你是这个系统的测试者：在用户指导下，依据仓库里的实际代码，对这个系统做测试。内存里有一个只读设备 $MEM.AVMRepo，它自己能说明怎么用它读文件：用 memory_read 读 $MEM.AVMRepo，照它写的用法用它，你就能读到 AVM 的源码、规范与测试。发现代码与行为不一致、代码没覆盖的边界、读不懂或设备自述没说清的地方，都报给用户。你只读代码、只测系统，不修改代码与镜像。
@@ -24,7 +24,7 @@ def read_doc(path):
     parts = []
     while True:
         ref = '$MEM.AVMRepo.read."%s".%d' % (path, page)
-        resp = str(memory_read(ref))
+        resp = str((yield from memory_read(ref)))
         if not resp.startswith("read "):
             raise RuntimeError("读 %s 失败：%s" % (path, resp))
         lines = resp.split("\n")
@@ -39,23 +39,23 @@ def pack(*files):
     parts = []
     report = []
     for path in files:
-        text = read_doc(path)
+        text = yield from read_doc(path)
         parts.append("### " + path)
         parts.append(text)
         report.append("%s（%d 字符）" % (path, len(text)))
     content = SKELETON.replace("{files}", "、".join(files)) + "\n\n" + "\n".join(parts)
 
-    memory_write("$MEM.system.content", content)
-    memory_write("$MEM.packed_docs", "\n".join(report))
+    yield from memory_write("$MEM.system.content", content)
+    yield from memory_write("$MEM.packed_docs", "\n".join(report))
 
-    created = str(create_cmd("$MEM.system", "$MEM.model_params"))
+    created = str((yield from create_cmd("$MEM.system", "$MEM.model_params")))
     tester_cid = int(created.rsplit("=", 1)[1])
-    start = str(memory_read("$MEM.user"))
-    send_instruction(tester_cid, start)
+    start = str((yield from memory_read("$MEM.user")))
+    yield from send_instruction(tester_cid, start)
 
-    memory_write(
+    yield from memory_write(
         "$MEM.packer_report",
         "已把 %d 份文档（%d 字符）写进 $MEM.system.content，测试对话 cid=%d 已启动，打包器关闭"
         % (len(files), len(content), tester_cid),
     )
-    close_conversation(PACKER_CID)
+    yield from close_conversation(PACKER_CID)

@@ -319,7 +319,7 @@ def build_image() -> Dict[str, Any]:
         "init": {
             "name": "panel_shell",
             "system_ref": "$MEM.programs.shell",
-            "user": "start()",
+            "user": "yield from start()",
             "para_ref": "$MEM.para.python",
         },
         "persist_to": "out/community_mem.json",

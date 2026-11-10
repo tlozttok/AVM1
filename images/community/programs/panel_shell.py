@@ -29,16 +29,16 @@ exit 结束 shell。
 
 
 def start():
-    memory_write("$MEM.outputs.out", WELCOME)
+    yield from memory_write("$MEM.outputs.out", WELCOME)
     while True:
-        raw = memory_read("$MEM.inputs.next")
+        raw = yield from memory_read("$MEM.inputs.next")
         text = raw if isinstance(raw, str) else str(raw)
         text = text.strip()
         if text == "":
-            memory_write("$MEM.outputs.out", "（空输入 / EOF：面板 shell 结束）")
+            yield from memory_write("$MEM.outputs.out", "（空输入 / EOF：面板 shell 结束）")
             return
         if text in ("exit", "quit", "stop"):
-            memory_write("$MEM.outputs.out", "面板 shell 结束。")
+            yield from memory_write("$MEM.outputs.out", "面板 shell 结束。")
             return
         lines = text.split("\n")
         head = lines[0].strip()
@@ -53,14 +53,14 @@ def start():
             author = at[1:].strip()
             head = rest.strip()
         if head == "":
-            memory_write("$MEM.outputs.out", "（只有正文没有命令，忽略）")
+            yield from memory_write("$MEM.outputs.out", "（只有正文没有命令，忽略）")
             continue
         request = head + ("\n" + body if body else "")
         if author != "":
             request = "AS " + author + "\n" + request
-        memory_write("$MEM.run.svc_request.panel", request)
-        reply = create_sub(
+        yield from memory_write("$MEM.run.svc_request.panel", request)
+        reply = yield from create_sub(
             "$MEM.programs.svc_panel", "$MEM.run.svc_request.panel", "$MEM.para.svc"
         )
-        memory_write("$MEM.outputs.out", "> " + head)
-        memory_write("$MEM.outputs.out", reply if isinstance(reply, str) else str(reply))
+        yield from memory_write("$MEM.outputs.out", "> " + head)
+        yield from memory_write("$MEM.outputs.out", reply if isinstance(reply, str) else str(reply))

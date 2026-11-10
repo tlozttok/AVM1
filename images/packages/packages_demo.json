@@ -39,7 +39,7 @@
           "value": {
             "content": {
               "kind": "str",
-              "value": "def register():\n    print(listen_event(action='listen',\n                       handler_ref='$MEM.handlers.loader_guard',\n                       tier='kernel', priority=100))\n"
+              "value": "def register():\n    print((yield from listen_event(action='listen',\n                                   handler_ref='$MEM.handlers.loader_guard',\n                                   tier='kernel', priority=100)))\n"
             },
             "para_ref": {
               "kind": "str",
@@ -61,7 +61,7 @@
           "value": {
             "content": {
               "kind": "str",
-              "value": "def handle(event):\n    source = event.get(\"source\") or {}\n    cid = source.get(\"initiator_cid\")\n    if cid == -1:\n        # -1 是控制台操作员对话的保留 cid：装载命令只能由操作员发出\n        return {\"action\": \"execute\"}\n    return {\"action\": \"replace\", \"response\": \"只有操作员对话可以写装载设备\"}\n"
+              "value": "def handle(event):\n    source = event.get(\"source\") or {}\n    cid = source.get(\"initiator_cid\")\n    if cid == -1:\n        # -1 是保留对话 cid（作者规定）：装载命令只能由操作员发出\n        return {\"action\": \"execute\"}\n    return {\"action\": \"replace\", \"response\": \"只有操作员对话可以写装载设备\"}\n"
             },
             "condition": {
               "kind": "str",
@@ -102,7 +102,7 @@
   "init": {
     "name": "guard",
     "system_ref": "$MEM.programs.guard_setup",
-    "user": "register()"
+    "user": "yield from register()"
   },
   "journal_to": "out/packages_demo.journal",
   "snapshot_to": "out/packages_demo.snapshot.json",

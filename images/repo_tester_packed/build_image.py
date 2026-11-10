@@ -7,7 +7,7 @@
 
 镜像形状：
 - `init` 指向 `$MEM.packer`（`ctrl.type="python"`，para 是 `plm.python`）——**启动对话是 PLM**；
-- 它的 user 消息是 `$MEM.file_list`，内容就是打包清单那一次调用 `pack("CONTEXT.md", …)`；
+- 它的 user 消息是 `$MEM.file_list`，内容就是打包清单那一次调用 `yield from pack("CONTEXT.md", …)`；
 - 打包器启动时经 `$MEM.AVMRepo` 逐页读这 6 份文档，拼成测试对话的系统提示词写进
   `$MEM.system.content`，再 `create_cmd` 出测试对话、`send_instruction` 启动它、写报告、关闭自己；
 - 文档不在镜像里，每次启动现读，所以文档改动不需要重新生成镜像（改的是程序或清单才要）。
@@ -39,9 +39,9 @@ FILES = [
 
 
 def file_list_code(files=None):
-    """init 的 user 消息：plm.python 把 user 消息当代码执行，所以清单写成一次 pack(...) 调用。"""
+    """init 的 user 消息：plm.python 把 user 消息当程序执行，清单写成一次 yield from pack(...) 调用。"""
     files = list(FILES if files is None else files)
-    return "pack(" + ", ".join(json.dumps(f, ensure_ascii=False) for f in files) + ")"
+    return "yield from pack(" + ", ".join(json.dumps(f, ensure_ascii=False) for f in files) + ")"
 
 
 def build_image():

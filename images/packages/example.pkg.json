@@ -18,7 +18,7 @@
           "value": {
             "content": {
               "kind": "str",
-              "value": "def pack():\n    text = memory_read('$MEM.example.input')\n    memory_write('$MEM.example.output', '来自程序包: ' + str(text))\n    print('pack 完成')\n"
+              "value": "def pack():\n    text = yield from memory_read('$MEM.example.input')\n    yield from memory_write('$MEM.example.output', '来自程序包: ' + str(text))\n    print('pack 完成')\n"
             },
             "para_ref": {
               "kind": "str",

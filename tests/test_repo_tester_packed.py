@@ -77,7 +77,7 @@ def test_user_message_is_file_list(builder):
         "user_ref": "$MEM.file_list",
     }
     assert image["mem"]["file_list"]["value"] == (
-        'pack("CONTEXT.md", "README.md", "AGENTS.md", "docs/system-image.md", '
+        'yield from pack("CONTEXT.md", "README.md", "AGENTS.md", "docs/system-image.md", '
         '"docs/philosophy.md", "docs/programming-guide.md")'
     )
     assert image["mem"]["packer_params"]["value"]["model"]["value"] == "plm.python"

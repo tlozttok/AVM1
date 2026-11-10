@@ -1,0 +1,175 @@
+{
+  "meta": {
+    "name": "base",
+    "version": 1,
+    "description": "母板镜像：持久化三件套 + 装载设备 + 可编辑的引导程序与常驻服务清单 + 空分区骨架。不带业务；其余基础由作者在系统内手动搭建。",
+    "instruction_budget": 100,
+    "snapshot_every": 200
+  },
+  "para_ref": "$MEM.para.python",
+  "mem": {
+    "para": {
+      "kind": "dict",
+      "value": {
+        "python": {
+          "kind": "dict",
+          "value": {
+            "model": {
+              "kind": "str",
+              "value": "plm.python"
+            }
+          },
+          "meta": "模型调用参数",
+          "ctrl": {
+            "type": "para"
+          }
+        },
+        "command": {
+          "kind": "dict",
+          "value": {
+            "model": {
+              "kind": "str",
+              "value": "plm.command"
+            }
+          },
+          "meta": "模型调用参数",
+          "ctrl": {
+            "type": "para"
+          }
+        }
+      },
+      "meta": "模型档位；新的 para 由作者在系统内添加"
+    },
+    "sys": {
+      "kind": "dict",
+      "value": {
+        "boot": {
+          "kind": "dict",
+          "value": {
+            "state": {
+              "kind": "str",
+              "value": "clean"
+            },
+            "prior": {
+              "kind": "str",
+              "value": ""
+            },
+            "manifest": {
+              "kind": "str",
+              "value": "[]"
+            }
+          },
+          "meta": "启动状态与清单（作者可编辑）"
+        },
+        "registry": {
+          "kind": "dict",
+          "value": {},
+          "meta": "名字 → cid；每次启动由 boot 程序重写"
+        },
+        "programs": {
+          "kind": "dict",
+          "value": {
+            "boot": {
+              "kind": "dict",
+              "value": {
+                "content": {
+                  "kind": "str",
+                  "value": "\"\"\"base 镜像的最小引导程序（`plm.python`）。\n\n镜像 `init` 指向 `$MEM.sys.programs.boot`，user 是 `boot()`。\n它只做四件事，然后结束本轮（对话休眠）：\n\n1. 把 `$MEM.sys.boot.state` 从旧值改成 `\"running\"`，并把旧值记到 `prior`；\n2. 读 `$MEM.sys.boot.manifest`（JSON 字符串），按清单创建缺失的常驻对话；\n3. 把 `名字 → cid` 写进 `$MEM.sys.registry`；\n4. 往 `$MEM.sys.outbox` 与 `$MEM.outputs` 写一条启动记录。\n\n这个节点本身是内存数据：作者在系统内改写它，下一次启动就运行新内容。\n清单条目：`{\"name\": \"...\", \"program\": \"$MEM...\", \"para\": \"$MEM...\"}`，\n`program` 指向 settingup/python 程序节点，`para` 指向 para 节点。\n\n注意：plm.python 的沙箱禁止 import；`json` / `re` / `math` 由运行时注入。\n\"\"\"\n\n\ndef _ok(response):\n    text = str(response)\n    return not (text.startswith(\"Error:\") or text.startswith(\"Illegal:\"))\n\n\ndef boot():\n    prior = yield from memory_read(\"$MEM.sys.boot.state\")\n    yield from memory_write(\"$MEM.sys.boot.prior\", str(prior))\n    yield from memory_write(\"$MEM.sys.boot.state\", \"running\")\n\n    raw = str((yield from memory_read(\"$MEM.sys.boot.manifest\"))).strip()\n    specs = []\n    manifest_error = \"\"\n    if raw:\n        try:\n            specs = json.loads(raw)\n        except Exception as e:\n            manifest_error = \"manifest 不是合法 JSON: \" + str(e)\n            specs = []\n    if not isinstance(specs, list):\n        manifest_error = manifest_error or \"manifest 必须是 JSON 数组\"\n        specs = []\n\n    created = []\n    failed = []\n    for spec in specs:\n        if not isinstance(spec, dict):\n            failed.append(\"条目不是对象\")\n            continue\n        name = spec.get(\"name\")\n        program = spec.get(\"program\")\n        para = spec.get(\"para\")\n        if not isinstance(name, str) or not name:\n            failed.append(\"条目缺少 name: \" + str(spec))\n            continue\n        if not isinstance(program, str) or not isinstance(para, str):\n            failed.append(name + \": program/para 必须是引用字符串\")\n            continue\n        resp = yield from create_cmd(program, para)\n        if not _ok(resp):\n            failed.append(name + \": \" + str(resp))\n            continue\n        match = re.search(r\"cid=(\\d+)\", str(resp))\n        if match is None:\n            failed.append(name + \": 回执里没有 cid: \" + str(resp))\n            continue\n        cid = match.group(1)\n        yield from memory_make(\"$MEM.sys.registry\", name, \"str\")  # 已存在时返回 Illegal，由下面覆盖\n        write_resp = yield from memory_write(\"$MEM.sys.registry.\" + name, cid)\n        if not _ok(write_resp):\n            failed.append(name + \": 写 registry 失败: \" + str(write_resp))\n            continue\n        created.append(name)\n\n    summary = (\"boot: 创建 \" + str(len(created)) + \" 个常驻对话，\"\n               + str(len(failed)) + \" 个失败；上次状态=\" + str(prior))\n    if manifest_error:\n        summary = summary + \"；\" + manifest_error\n    yield from memory_write(\"$MEM.sys.outbox.-1\", summary)\n    yield from memory_write(\"$MEM.outputs.out\", summary)\n    return\n"
+                }
+              },
+              "meta": "最小引导程序（可编辑；镜像 init 指向它）",
+              "ctrl": {
+                "type": "python"
+              }
+            }
+          },
+          "meta": "系统程序节点"
+        },
+        "inbox": {
+          "kind": "list",
+          "value": [],
+          "meta": "面板输入的唯一落点（空；消费者由作者手动搭建）"
+        },
+        "outbox": {
+          "kind": "list",
+          "value": [],
+          "meta": "持久输出（作者约定怎么用）"
+        },
+        "handbook": {
+          "kind": "str",
+          "value": "base 约定：sys.boot.manifest 是常驻服务清单（JSON 字符串）；sys.registry 是名字→cid；sys.inbox 是面板输入落点；改 sys.programs.boot 的内容就是改下一次启动运行的引导程序。"
+        }
+      },
+      "meta": "系统分区"
+    },
+    "packages": {
+      "kind": "dict",
+      "value": {},
+      "meta": "已安装程序包（由装载设备管理）"
+    },
+    "package_records": {
+      "kind": "dict",
+      "value": {},
+      "meta": "程序包安装记录"
+    },
+    "workshop": {
+      "kind": "dict",
+      "value": {},
+      "meta": "系统内生长、试验新程序节点的区域"
+    },
+    "home": {
+      "kind": "dict",
+      "value": {},
+      "meta": "个人持久数据区"
+    },
+    "loader": {
+      "kind": "device"
+    },
+    "AVMRepo": {
+      "kind": "device"
+    },
+    "inputs": {
+      "kind": "device"
+    },
+    "outputs": {
+      "kind": "device"
+    }
+  },
+  "devices": [
+    {
+      "path": "loader",
+      "file": "../packages/loader.py",
+      "class": "LoaderDevice",
+      "args": {
+        "password_sha256": "2ccd6aa93ef11c1bf3fccbe372c0d8a4b041c2fd4f7b17e71237ae2ffbcd0892"
+      }
+    },
+    {
+      "path": "AVMRepo",
+      "file": "../devices/avm_repo.py",
+      "class": "RepoDevice",
+      "args": {}
+    },
+    {
+      "path": "inputs",
+      "file": "../devices/io.py",
+      "class": "InputsListDevice",
+      "args": {}
+    },
+    {
+      "path": "outputs",
+      "file": "../devices/io.py",
+      "class": "OutputsListDevice",
+      "args": {}
+    }
+  ],
+  "init": {
+    "name": "boot",
+    "system_ref": "$MEM.sys.programs.boot",
+    "user": "yield from boot()",
+    "para_ref": "$MEM.para.python"
+  },
+  "journal_to": "out/base.journal",
+  "snapshot_to": "out/base.snapshot.json",
+  "persist_to": "out/base_mem.json"
+}

@@ -38,22 +38,22 @@ DRIVER_CODE = '''
 def run_requests():
     i = 0
     while True:
-        req = memory_read("$MEM.test.requests." + str(i))
+        req = yield from memory_read("$MEM.test.requests." + str(i))
         if not isinstance(req, str) or req.startswith("Error:"):
             return
         if req.startswith("__CORRUPT_CARD__"):
             pid = req.split(" ")[1]
             ref = "$MEM.forum.posts." + pid + ".meta"
-            meta = json.loads(memory_read(ref))
+            meta = json.loads((yield from memory_read(ref)))
             meta["card"] = "BROKEN CARD"
             meta["stats"]["comments"] = 999
-            memory_write(ref, json.dumps(meta, ensure_ascii=False))
+            yield from memory_write(ref, json.dumps(meta, ensure_ascii=False))
         else:
-            memory_write("$MEM.run.svc_request.panel", req)
-            reply = create_sub(
+            yield from memory_write("$MEM.run.svc_request.panel", req)
+            reply = yield from create_sub(
                 "$MEM.programs.svc_panel", "$MEM.run.svc_request.panel", "$MEM.para.svc"
             )
-            memory_write("$MEM.test.results.-1", str(reply))
+            yield from memory_write("$MEM.test.results.-1", str(reply))
         i = i + 1
 '''.strip()
 
@@ -91,7 +91,7 @@ def _make_test_image(tmp_path: Path, requests) -> Path:
     image["init"] = {
         "name": "test_driver",
         "system_ref": "$MEM.programs.test_driver",
-        "user": "run_requests()",
+        "user": "yield from run_requests()",
         "para_ref": "$MEM.para.python",
     }
     path = tmp_path / "community_test.json"

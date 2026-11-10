@@ -47,7 +47,7 @@
           "value": {
             "content": {
               "kind": "str",
-              "value": "WORKER_CID = None\nWORK_RESULT = None\n\nWORKER_TASK = \"\"\"def run_checks():\n    allowed = memory_read(\"$lib.greeting\")\n    denied_secret = memory_read(\"$lib.secret\")\n    denied_write = memory_write(\"$lib.greeting\", \"hacked\")\n    memory_make(\"$work\", \"result\", \"str\")\n    memory_write(\n        \"$work.result\",\n        \"greeting=%s | secret=%s | write=%s\"\n        % (str(allowed), str(denied_secret), str(denied_write)),\n    )\n\nrun_checks()\n\"\"\"\n\n\ndef setup_acl():\n    # 条件在 handler 节点里声明；这里只登记 handler\n    listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.read_greeting\",\n                 tier=\"kernel\", priority=10)\n    listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.read_secret\",\n                 tier=\"kernel\", priority=10)\n    listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.write_greeting\",\n                 tier=\"kernel\", priority=10)\n\n\ndef on_done():\n    result = str(memory_read(WORK_RESULT))\n    greeting = str(memory_read(\"$MEM.lib.greeting\"))\n    memory_write(\n        \"$MEM.report\",\n        \"ACL 演示报告\\n工作对话结果: \" + result + \"\\n库节点 greeting: \" + greeting,\n    )\n    close_conversation(WORKER_CID)\n    close_conversation(0)\n\n\ndef main():\n    global WORKER_CID, WORK_RESULT\n    setup_acl()\n    created = str(create_cmd(\"$MEM.programs.worker\", \"$MEM.model_params\"))\n    WORKER_CID = int(created.rsplit(\"=\", 1)[1])\n    roots = json.loads(str(memory_read(\"$MEM.conversations.%d.roots\" % WORKER_CID)))\n    WORK_RESULT = roots[\"work\"][\"target\"] + \".result\"\n    # 工作结果写入后的 after 事实事件：通知 init 醒来收尾（条件在 handler 节点里）\n    listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.done\")\n    send_instruction(WORKER_CID, WORKER_TASK)\n"
+              "value": "WORKER_CID = None\nWORK_RESULT = None\n\nWORKER_TASK = \"\"\"def run_checks():\n    allowed = yield from memory_read(\"$lib.greeting\")\n    denied_secret = yield from memory_read(\"$lib.secret\")\n    denied_write = yield from memory_write(\"$lib.greeting\", \"hacked\")\n    yield from memory_make(\"$work\", \"result\", \"str\")\n    yield from memory_write(\n        \"$work.result\",\n        \"greeting=%s | secret=%s | write=%s\"\n        % (str(allowed), str(denied_secret), str(denied_write)),\n    )\n\nyield from run_checks()\n\"\"\"\n\n\ndef setup_acl():\n    # 条件在 handler 节点里声明；这里只登记 handler\n    yield from listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.read_greeting\",\n                            tier=\"kernel\", priority=10)\n    yield from listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.read_secret\",\n                            tier=\"kernel\", priority=10)\n    yield from listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.write_greeting\",\n                            tier=\"kernel\", priority=10)\n\n\ndef on_done():\n    result = str((yield from memory_read(WORK_RESULT)))\n    greeting = str((yield from memory_read(\"$MEM.lib.greeting\")))\n    yield from memory_write(\n        \"$MEM.report\",\n        \"ACL 演示报告\\n工作对话结果: \" + result + \"\\n库节点 greeting: \" + greeting,\n    )\n    yield from close_conversation(WORKER_CID)\n    yield from close_conversation(0)\n\n\ndef main():\n    global WORKER_CID, WORK_RESULT\n    yield from setup_acl()\n    created = str((yield from create_cmd(\"$MEM.programs.worker\", \"$MEM.model_params\")))\n    WORKER_CID = int(created.rsplit(\"=\", 1)[1])\n    roots = json.loads(str((yield from memory_read(\"$MEM.conversations.%d.roots\" % WORKER_CID))))\n    WORK_RESULT = roots[\"work\"][\"target\"] + \".result\"\n    # 工作结果写入后的 after 事实事件：通知 init 醒来收尾（条件在 handler 节点里）\n    yield from listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.done\")\n    yield from send_instruction(WORKER_CID, WORKER_TASK)\n"
             }
           },
           "ctrl": {
@@ -173,7 +173,7 @@
           "value": {
             "content": {
               "kind": "str",
-              "value": "def handle(event):\n    return {\"notify\": [{\"cid\": 0, \"content\": \"on_done()\"}]}\n"
+              "value": "def handle(event):\n    return {\"notify\": [{\"cid\": 0, \"content\": \"yield from on_done()\"}]}\n"
             },
             "condition": {
               "kind": "str",
@@ -188,7 +188,7 @@
     },
     "init_user": {
       "kind": "str",
-      "value": "main()"
+      "value": "yield from main()"
     },
     "report": {
       "kind": "str",

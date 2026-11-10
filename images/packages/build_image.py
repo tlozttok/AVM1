@@ -6,8 +6,8 @@
 
 演示内容（计划 B4）：
 - `loader` 设备（密码 demo-operator）挂在 `$MEM.loader`，装载命令一次写入；
-- 内核态安全监听器 `$MEM.handlers.loader_guard`：只放行操作员对话（保留 cid -1，
-  控制台的操作员面板）写 `$MEM.loader`，其余对话的写入被 replace；
+- 内核态安全监听器 `$MEM.handlers.loader_guard`：只放行操作员对话（保留 cid `-1`）
+  写 `$MEM.loader`，其余对话的写入被 replace；
 - 示例程序包 `example.pkg.json`：装到 `$MEM.packages.demo.1_0_0`，含一个
   `plm.python` 程序（读 `$MEM.example.input`，把结果写 `$MEM.example.output`）；
 - `loader` 路径不写进 `security.roots` 注册表：用户态对话拿不到这个根名。
@@ -18,7 +18,7 @@
     1. memory_write $MEM.loader '{"action": "install_package",
          "password": "demo-operator", "path": "example.pkg.json"}'
     2. create_cmd $MEM.packages.demo.1_0_0.programs.pack $MEM.packages.demo.1_0_0.params
-    3. send_instruction <cid> "pack()"
+    3. send_instruction <cid> "yield from pack()"
 """
 
 import hashlib
@@ -37,7 +37,7 @@ def handle(event):
     source = event.get("source") or {}
     cid = source.get("initiator_cid")
     if cid == -1:
-        # -1 是控制台操作员对话的保留 cid：装载命令只能由操作员发出
+        # -1 是保留对话 cid（作者规定）：装载命令只能由操作员发出
         return {"action": "execute"}
     return {"action": "replace", "response": "只有操作员对话可以写装载设备"}
 """
@@ -50,15 +50,15 @@ GUARD_CONDITION = json.dumps({
 
 GUARD_SETUP = """\
 def register():
-    print(listen_event(action='listen',
-                       handler_ref='$MEM.handlers.loader_guard',
-                       tier='kernel', priority=100))
+    print((yield from listen_event(action='listen',
+                                   handler_ref='$MEM.handlers.loader_guard',
+                                   tier='kernel', priority=100)))
 """
 
 PACKAGE_PROGRAM = """\
 def pack():
-    text = memory_read('$MEM.example.input')
-    memory_write('$MEM.example.output', '来自程序包: ' + str(text))
+    text = yield from memory_read('$MEM.example.input')
+    yield from memory_write('$MEM.example.output', '来自程序包: ' + str(text))
     print('pack 完成')
 """
 
@@ -146,7 +146,7 @@ def build_image():
         "init": {
             "name": "guard",
             "system_ref": "$MEM.programs.guard_setup",
-            "user": "register()",
+            "user": "yield from register()",
         },
         "journal_to": "out/packages_demo.journal",
         "snapshot_to": "out/packages_demo.snapshot.json",

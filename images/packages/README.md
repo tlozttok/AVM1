@@ -13,7 +13,7 @@ python -m avm.console images/packages/packages_demo.json
 | 文件 | 内容 |
 |---|---|
 | `loader.py` | `LoaderDevice`：把"装包 / 卸包 / 热装设备"变成对 `$MEM.loader` 的一次 `memory_write` |
-| `example.pkg.json` | 示例程序包：`$MEM.packages.demo.1_0_0`，含一个 `plm.python` 程序（读 `$MEM.example.input`，把结果写 `$MEM.example.output`） |
+| `example.pkg.json` | 示例程序包：`$MEM.packages.demo.1_0_0`，含一个 `plm.python` 程序（`yield from` 工具调用：读 `$MEM.example.input`，把结果写 `$MEM.example.output`） |
 | `build_image.py` | 生成上面两个 JSON（loader 的密码 sha256 写进镜像 `devices.args`） |
 | `packages_demo.json` | 内核态安全监听器只放行操作员对话（保留 cid `-1`）写 `$MEM.loader`，其他对话的写入被拦截 |
 
@@ -24,7 +24,7 @@ python -m avm.console images/packages/packages_demo.json
 1. `memory_write $MEM.loader`
    `{"action": "install_package", "password": "demo-operator", "path": "example.pkg.json"}`
 2. `create_cmd $MEM.packages.demo.1_0_0.programs.pack $MEM.packages.demo.1_0_0.params`
-3. `send_instruction <上一步的 cid> "pack()"`
+3. `send_instruction <上一步的 cid> "yield from pack()"`
 4. 用 `memory_read $MEM.example.output` 看结果
 
 恢复：镜像声明了 `journal_to` / `snapshot_to` / `persist_to`。正常退出后

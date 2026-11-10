@@ -13,51 +13,51 @@ INIT_SETUP = '''WORKER_CID = None
 WORK_RESULT = None
 
 WORKER_TASK = """def run_checks():
-    allowed = memory_read("$lib.greeting")
-    denied_secret = memory_read("$lib.secret")
-    denied_write = memory_write("$lib.greeting", "hacked")
-    memory_make("$work", "result", "str")
-    memory_write(
+    allowed = yield from memory_read("$lib.greeting")
+    denied_secret = yield from memory_read("$lib.secret")
+    denied_write = yield from memory_write("$lib.greeting", "hacked")
+    yield from memory_make("$work", "result", "str")
+    yield from memory_write(
         "$work.result",
         "greeting=%s | secret=%s | write=%s"
         % (str(allowed), str(denied_secret), str(denied_write)),
     )
 
-run_checks()
+yield from run_checks()
 """
 
 
 def setup_acl():
     # 条件在 handler 节点里声明；这里只登记 handler
-    listen_event(action="listen", handler_ref="$MEM.handlers.read_greeting",
-                 tier="kernel", priority=10)
-    listen_event(action="listen", handler_ref="$MEM.handlers.read_secret",
-                 tier="kernel", priority=10)
-    listen_event(action="listen", handler_ref="$MEM.handlers.write_greeting",
-                 tier="kernel", priority=10)
+    yield from listen_event(action="listen", handler_ref="$MEM.handlers.read_greeting",
+                            tier="kernel", priority=10)
+    yield from listen_event(action="listen", handler_ref="$MEM.handlers.read_secret",
+                            tier="kernel", priority=10)
+    yield from listen_event(action="listen", handler_ref="$MEM.handlers.write_greeting",
+                            tier="kernel", priority=10)
 
 
 def on_done():
-    result = str(memory_read(WORK_RESULT))
-    greeting = str(memory_read("$MEM.lib.greeting"))
-    memory_write(
+    result = str((yield from memory_read(WORK_RESULT)))
+    greeting = str((yield from memory_read("$MEM.lib.greeting")))
+    yield from memory_write(
         "$MEM.report",
         "ACL 演示报告\\n工作对话结果: " + result + "\\n库节点 greeting: " + greeting,
     )
-    close_conversation(WORKER_CID)
-    close_conversation(0)
+    yield from close_conversation(WORKER_CID)
+    yield from close_conversation(0)
 
 
 def main():
     global WORKER_CID, WORK_RESULT
-    setup_acl()
-    created = str(create_cmd("$MEM.programs.worker", "$MEM.model_params"))
+    yield from setup_acl()
+    created = str((yield from create_cmd("$MEM.programs.worker", "$MEM.model_params")))
     WORKER_CID = int(created.rsplit("=", 1)[1])
-    roots = json.loads(str(memory_read("$MEM.conversations.%d.roots" % WORKER_CID)))
+    roots = json.loads(str((yield from memory_read("$MEM.conversations.%d.roots" % WORKER_CID))))
     WORK_RESULT = roots["work"]["target"] + ".result"
     # 工作结果写入后的 after 事实事件：通知 init 醒来收尾（条件在 handler 节点里）
-    listen_event(action="listen", handler_ref="$MEM.handlers.done")
-    send_instruction(WORKER_CID, WORKER_TASK)
+    yield from listen_event(action="listen", handler_ref="$MEM.handlers.done")
+    yield from send_instruction(WORKER_CID, WORKER_TASK)
 '''
 
 ACL_READ_HANDLER = '''def handle(event):
@@ -116,7 +116,7 @@ ACL_WRITE_HANDLER = '''def handle(event):
 '''
 
 DONE_HANDLER = '''def handle(event):
-    return {"notify": [{"cid": 0, "content": "on_done()"}]}
+    return {"notify": [{"cid": 0, "content": "yield from on_done()"}]}
 '''
 
 WORKER_SETUP = ""
@@ -211,7 +211,7 @@ def build_image():
                     "target": {"kind": "subtree", "ref": "$MEM.workspaces"},
                 }),
             }),
-            "init_user": node_str("main()"),
+            "init_user": node_str("yield from main()"),
             "report": node_str(""),
         },
         "security": {
