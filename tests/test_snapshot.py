@@ -333,3 +333,24 @@ class TestRestoredInvariants:
         restored = load_core(image)
         restored.restore_from(snap)
         restored._check_invariants()  # 不抛即通过
+
+
+class TestRemovedWorkspaceCompatibility:
+    def test_old_snapshot_workspace_fields_ignored(self, tmp_path):
+        """旧快照的 security.workspace_region 与 workspace_root_name 按未知字段忽略。"""
+        image = write_image(tmp_path)
+        mine = _run(image, TWO_TURNS)
+        path = str(tmp_path / "old.json")
+        mine.snapshot_to(path)
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+        doc["security"]["workspace_region"] = ["workspaces"]
+        doc["conversations"][0]["workspace_root_name"] = "work"
+        write_atomic(path, doc)
+
+        restored = load_core(image)
+        restored.restore_from(path)
+        assert restored.mem["src"] == "v1"
+        assert not hasattr(restored, "workspace_region")
+        assert not hasattr(restored._conv_by_cid[0], "workspace_root_name")
+        assert "workspaces" not in restored.mem._data

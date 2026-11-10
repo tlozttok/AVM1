@@ -249,16 +249,25 @@ def _mount_devices(core: Core, image_path: str, devices: list, mem_device_paths:
                 raise ImageError(f"链接 {device.mount_path} 目标不可达: {e}")
 
 
-_SECURITY_KEYS = frozenset({"roots", "workspace_region"})
+_SECURITY_KEYS = frozenset({"roots"})
 
 
 def _parse_security(core: Core, image: dict) -> None:
-    """解析并安装镜像顶层 security 段；缺省时保持空注册表与默认工作空间区域。"""
+    """解析并安装镜像顶层 security 段；缺省时保持空注册表。
+
+    工作目录不再由内核分配：security.workspace_region 已移除，目录由软件用
+    memory_make 建，根由 `$MEM.conversations.<cid>.roots` 动态授予。
+    """
     security = image.get("security")
     if security is None:
         return
     if not isinstance(security, dict):
         raise ImageError("security 必须是对象")
+    if "workspace_region" in security:
+        raise ImageError(
+            "security.workspace_region 已移除：内核不再分配工作空间。"
+            "改用软件建目录（memory_make）后写 $MEM.conversations.<cid>.roots 动态加根"
+        )
     unknown = sorted(set(security) - _SECURITY_KEYS)
     if unknown:
         raise ImageError(f"security 含未知字段：{unknown}（允许：{sorted(_SECURITY_KEYS)}）")
@@ -273,15 +282,8 @@ def _parse_security(core: Core, image: dict) -> None:
             roots_spec[name] = grant_target_segments(ref)
         except (IllegalOperationError, VMMemoryError) as e:
             raise ImageError(f"security.roots.{name}: {e}")
-    region_ref = security.get("workspace_region", "$MEM.workspaces")
-    if not isinstance(region_ref, str) or not region_ref:
-        raise ImageError(f"security.workspace_region 必须是非空字符串，得到 {region_ref!r}")
     try:
-        region = grant_target_segments(region_ref)
-    except (IllegalOperationError, VMMemoryError) as e:
-        raise ImageError(f"security.workspace_region: {e}")
-    try:
-        core.install_security_config(roots_spec, region)
+        core.install_security_config(roots_spec)
     except (IllegalOperationError, VMMemoryError) as e:
         raise ImageError(f"security 段非法：{e}")
 
@@ -372,11 +374,10 @@ def _start_init(core: Core, init: dict):
     if node is not None:
         # LLM 入口同样按程序 ctrl.caps 计算 init 能力；init 强制内核态
         try:
-            caps, workspace_name = _derive_child_caps(core, None, node, is_sub=False, is_init=True)
+            caps = _derive_child_caps(core, None, node, is_sub=False, is_init=True)
         except (VMMemoryError, IllegalOperationError) as e:
             raise ImageError(f"init 程序的能力声明非法：{e}")
         conv.caps = caps
-        conv.workspace_root_name = workspace_name
     conv.name = name
 
 

@@ -539,7 +539,7 @@ class Conversation:
         }
 
     def to_snapshot(self) -> dict:
-        """重启快照里的单对话形状：检查点 + cid/parent/工作空间根名 + 待发批次。
+        """重启快照里的单对话形状：检查点 + cid/parent + 待发批次。
 
         与 to_checkpoint 的差别（计划 A5）：
         - 带 `cid` 与 `parent_cid`：重启恢复保留 cid，父子引用按 cid 重建；
@@ -549,7 +549,6 @@ class Conversation:
         doc = self.to_checkpoint()
         doc["cid"] = self.cid
         doc["parent_cid"] = self.parent.cid if self.parent is not None else None
-        doc["workspace_root_name"] = getattr(self, "workspace_root_name", None)
         doc["batch"] = batch_to_dict(self.user_batch)
         return doc
 
@@ -584,7 +583,7 @@ class Conversation:
         """
         conv = cls.from_checkpoint(doc)
         conv.cid = doc.get("cid", 0)
-        conv.workspace_root_name = doc.get("workspace_root_name")
+        # 旧快照可能带 workspace_root_name：内核已不分配工作空间，按未知字段忽略。
         batch = doc.get("batch") or {}
         conv.user_batch = batch_from_dict(batch)
         return conv

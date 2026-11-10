@@ -47,7 +47,7 @@
           "value": {
             "content": {
               "kind": "str",
-              "value": "WORKER_CID = None\nWORK_RESULT = None\n\nWORKER_TASK = \"\"\"def run_checks():\n    allowed = yield from memory_read(\"$lib.greeting\")\n    denied_secret = yield from memory_read(\"$lib.secret\")\n    denied_write = yield from memory_write(\"$lib.greeting\", \"hacked\")\n    yield from memory_make(\"$work\", \"result\", \"str\")\n    yield from memory_write(\n        \"$work.result\",\n        \"greeting=%s | secret=%s | write=%s\"\n        % (str(allowed), str(denied_secret), str(denied_write)),\n    )\n\nyield from run_checks()\n\"\"\"\n\n\ndef setup_acl():\n    # 条件在 handler 节点里声明；这里只登记 handler\n    yield from listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.read_greeting\",\n                            tier=\"kernel\", priority=10)\n    yield from listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.read_secret\",\n                            tier=\"kernel\", priority=10)\n    yield from listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.write_greeting\",\n                            tier=\"kernel\", priority=10)\n\n\ndef on_done():\n    result = str((yield from memory_read(WORK_RESULT)))\n    greeting = str((yield from memory_read(\"$MEM.lib.greeting\")))\n    yield from memory_write(\n        \"$MEM.report\",\n        \"ACL 演示报告\\n工作对话结果: \" + result + \"\\n库节点 greeting: \" + greeting,\n    )\n    yield from close_conversation(WORKER_CID)\n    yield from close_conversation(0)\n\n\ndef main():\n    global WORKER_CID, WORK_RESULT\n    yield from setup_acl()\n    created = str((yield from create_cmd(\"$MEM.programs.worker\", \"$MEM.model_params\")))\n    WORKER_CID = int(created.rsplit(\"=\", 1)[1])\n    roots = json.loads(str((yield from memory_read(\"$MEM.conversations.%d.roots\" % WORKER_CID))))\n    WORK_RESULT = roots[\"work\"][\"target\"] + \".result\"\n    # 工作结果写入后的 after 事实事件：通知 init 醒来收尾（条件在 handler 节点里）\n    yield from listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.done\")\n    yield from send_instruction(WORKER_CID, WORKER_TASK)\n"
+              "value": "WORKER_CID = None\nWORK_RESULT = None\n\nWORKDIR = \"$MEM.workdirs.w0\"\n\nWORKER_TASK = \"\"\"def run_checks():\n    allowed = yield from memory_read(\"$lib.greeting\")\n    denied_secret = yield from memory_read(\"$lib.secret\")\n    denied_write = yield from memory_write(\"$lib.greeting\", \"hacked\")\n    yield from memory_make(\"$work\", \"result\", \"str\")\n    yield from memory_write(\n        \"$work.result\",\n        \"greeting=%s | secret=%s | write=%s\"\n        % (str(allowed), str(denied_secret), str(denied_write)),\n    )\n\nyield from run_checks()\n\"\"\"\n\n\ndef setup_acl():\n    # 条件在 handler 节点里声明；这里只登记 handler\n    yield from listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.read_greeting\",\n                            tier=\"kernel\", priority=10)\n    yield from listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.read_secret\",\n                            tier=\"kernel\", priority=10)\n    yield from listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.write_greeting\",\n                            tier=\"kernel\", priority=10)\n\n\ndef on_done():\n    result = str((yield from memory_read(WORK_RESULT)))\n    greeting = str((yield from memory_read(\"$MEM.lib.greeting\")))\n    yield from memory_write(\n        \"$MEM.report\",\n        \"ACL 演示报告\\n工作对话结果: \" + result + \"\\n库节点 greeting: \" + greeting,\n    )\n    yield from close_conversation(WORKER_CID)\n    yield from close_conversation(0)\n\n\ndef main():\n    global WORKER_CID, WORK_RESULT\n    yield from setup_acl()\n    # 工作目录属于软件策略：内核只保留根表与校验。软件建目录，再动态加根。\n    yield from memory_make(\"$MEM\", \"workdirs\", \"dict\")\n    yield from memory_make(\"$MEM.workdirs\", \"w0\", \"dict\")\n    created = str((yield from create_cmd(\"$MEM.programs.worker\", \"$MEM.model_params\")))\n    WORKER_CID = int(created.rsplit(\"=\", 1)[1])\n    # 根表写入是完整替换：软件自己持有\"该对话应有哪些根\"的完整映射，\n    # 所以把程序 caps 里授过的 $lib 与新建的 $work 一起写回。\n    yield from memory_write(\n        \"$MEM.conversations.%d.roots\" % WORKER_CID,\n        json.dumps({\"work\": WORKDIR, \"lib\": \"$MEM.lib\"}),\n    )\n    roots = json.loads(str((yield from memory_read(\"$MEM.conversations.%d.roots\" % WORKER_CID))))\n    WORK_RESULT = roots[\"work\"][\"target\"] + \".result\"\n    # 工作结果写入后的 after 事实事件：通知 init 醒来收尾（条件在 handler 节点里）\n    yield from listen_event(action=\"listen\", handler_ref=\"$MEM.handlers.done\")\n    yield from send_instruction(WORKER_CID, WORKER_TASK)\n"
             }
           },
           "ctrl": {
@@ -67,10 +67,6 @@
                 "mode": {
                   "kind": "str",
                   "value": "user"
-                },
-                "workspace": {
-                  "kind": "str",
-                  "value": "work"
                 },
                 "groups": {
                   "kind": "list",
@@ -113,7 +109,7 @@
           "ctrl": {
             "type": "python"
           },
-          "meta": "用户态工作程序：只持有 $work 与只读库根 $lib"
+          "meta": "用户态工作程序：只读库根 $lib；工作目录由软件动态加根后可见"
         }
       }
     },
@@ -177,7 +173,7 @@
             },
             "condition": {
               "kind": "str",
-              "value": "{\"events\": [\"memory_write\"], \"phase\": [\"after\"], \"target\": {\"kind\": \"subtree\", \"ref\": \"$MEM.workspaces\"}}"
+              "value": "{\"events\": [\"memory_write\"], \"phase\": [\"after\"], \"target\": {\"kind\": \"subtree\", \"ref\": \"$MEM.workdirs.w0\"}}"
             }
           },
           "ctrl": {
@@ -198,8 +194,7 @@
   "security": {
     "roots": {
       "lib": "$MEM.lib"
-    },
-    "workspace_region": "$MEM.workspaces"
+    }
   },
   "para_ref": "$MEM.model_params",
   "init": {

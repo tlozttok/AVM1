@@ -17,9 +17,8 @@ from avm.types import MetaDict, MetaList, StrNode
 
 def _caps_node(caps):
     data = {}
-    for key in ("mode", "workspace"):
-        if key in caps:
-            data[key] = StrNode(str(caps[key]))
+    if "mode" in caps:
+        data["mode"] = StrNode(str(caps["mode"]))
     for key in ("groups", "roots", "tools"):
         if key in caps:
             data[key] = MetaList([StrNode(str(x)) for x in caps[key]])
@@ -144,12 +143,11 @@ class TestStrInImage:
 
 class TestStrOwnerFixesWorkspaceListener:
     def test_user_owned_str_can_be_listened(self):
-        """工作空间根 owner 是内核创建者；用户对话自己建的 str 带自己的 owner。"""
+        """动态授予的工作目录由软件建成；用户对话自己建的 str 带自己的 owner。"""
         core = Core()
         core.mem["model_params"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         parent = core.start("sys", "parent", para_ref="$MEM.model_params")
         core._active_cid = parent.cid
-        core.install_security_config({}, ("workspaces",))
         prog = MetaDict(data={"content": "sys"}, ctrl={"type": "settingup"})
         prog["caps"] = _caps_node({"mode": "user"})
         core.mem["prog"] = prog
@@ -160,8 +158,11 @@ class TestStrOwnerFixesWorkspaceListener:
         }], parent)
         child = core.get_conversation(int(parent.user_batch.tool_responses[-1].content.split("=")[-1]))
         core._active_cid = child.cid
+        # 工作目录由软件建、根动态授予（内核不再分配工作空间）
+        core.mem["ws"] = MetaDict(data={})
+        core.set_conversation_roots(child.cid, {"work": ["ws"]})
         assert child.caps.tools == ALL_TOOL_NAMES or child.caps.mode == "user"
-        # 用户对话在自己的工作空间建 str，owner 应是它自己
+        # 用户对话在自己的工作目录建 str，owner 应是它自己
         child.user_batch.tool_responses.clear()
         core._process_return_calls([{
             "cmd_type": "memory_make", "call_id": "c2",

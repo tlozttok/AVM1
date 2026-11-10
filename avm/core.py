@@ -1270,7 +1270,7 @@ def _check_model_namespace(core: 'Core', program_type: str, para: MetaDict, para
         )
 
 
-_CAPS_SPEC_KEYS = frozenset({"mode", "groups", "roots", "tools", "workspace"})
+_CAPS_SPEC_KEYS = frozenset({"mode", "groups", "roots", "tools"})
 
 
 def _read_caps_value(caps_node, key: str):
@@ -1315,6 +1315,11 @@ def _program_caps_spec(node) -> dict:
     if not isinstance(caps_node, MetaDict):
         raise IllegalOperationError("程序节点的 value.caps 必须是 dict 数据节点")
     unknown = sorted(set(caps_node.keys()) - _CAPS_SPEC_KEYS)
+    if "workspace" in unknown:
+        raise IllegalOperationError(
+            "程序节点的 value.caps.workspace 已移除：工作目录不再由内核分配。"
+            "改用软件建目录（memory_make）后写 $MEM.conversations.<cid>.roots 动态加根"
+        )
     if unknown:
         raise IllegalOperationError(
             f"程序节点的 value.caps 含未知字段：{unknown}（允许：{sorted(_CAPS_SPEC_KEYS)}）"
@@ -1323,15 +1328,16 @@ def _program_caps_spec(node) -> dict:
 
 
 def _derive_child_caps(core: 'Core', parent: Optional[Conversation], node, is_sub: bool,
-                       is_init: bool = False):
-    """按程序 ctrl.caps 与父能力计算子对话能力，返回 (Capability, workspace_root_name)。
+                       is_init: bool = False) -> Capability:
+    """按程序 ctrl.caps 与父能力计算子对话能力。
 
     规则（批次一）：
     - 模式：缺省继承；用户态不能创建内核态；亚对话不能跨模式；init 强制内核态。
     - 工具集：缺省继承；显式声明时必须 ⊆ 父工具集。
     - 组：缺省继承；用户态父对话只能给子对话父已有的组（内核态父可指定）。
     - 根：内核态子对话固定 `{MEM: ()}`；用户态子对话的授予根来自 caps.roots 的
-      `根名 -> $MEM 路径`（同域创建时只能沿用父根，不能新增）。
+      `根名 -> $MEM 路径`（同域创建时只能沿用父根，不能新增）。用户态对话的工作
+      目录不再由内核分配：目录由软件建，根由 `$MEM.conversations.<cid>.roots` 动态授予。
     """
     spec = _program_caps_spec(node)
     parent_caps = parent.caps if parent is not None else default_kernel_caps()
@@ -1347,11 +1353,6 @@ def _derive_child_caps(core: 'Core', parent: Optional[Conversation], node, is_su
             raise VMMemoryError("模式不可提权：用户态对话只能创建用户态对话")
         if is_sub and mode != parent_mode:
             raise VMMemoryError("亚对话不能跨模式创建")
-
-    workspace_name = spec.get("workspace", "work")
-    if not isinstance(workspace_name, str) or not workspace_name:
-        raise IllegalOperationError(f"程序 caps.workspace 必须是非空字符串，得到 {workspace_name!r}")
-    check_root_name(workspace_name)
 
     tools_spec = spec.get("tools")
     if tools_spec is None:
@@ -1400,12 +1401,8 @@ def _derive_child_caps(core: 'Core', parent: Optional[Conversation], node, is_su
             roots = inherited
         else:
             roots = grants
-        if not same_domain and workspace_name in roots:
-            raise VMMemoryError(f"工作空间根名与授予根重名：{workspace_name!r}")
 
-    caps = Capability(mode=mode, groups=groups, roots=roots, tools=tools)
-    needs_workspace = mode == MODE_USER and not same_domain
-    return caps, (workspace_name if needs_workspace else None)
+    return Capability(mode=mode, groups=groups, roots=roots, tools=tools)
 
 
 def _build_conversation(core: 'Core', system_ref: str, para_ref: str, parent: Conversation, is_sub: bool,
@@ -1434,14 +1431,7 @@ def _build_conversation(core: 'Core', system_ref: str, para_ref: str, parent: Co
             f"{para_ref} 不是参数节点：para_ref 必须指向 ctrl.type='para' 的 dict 节点"
         )
     _check_model_namespace(core, node_type, para_node, para_ref)
-    caps, workspace_name = _derive_child_caps(core, parent, node, is_sub, is_init=is_init)
-    if workspace_name is not None:
-        if parent is None:
-            raise VMMemoryError("用户态对话需要一个创建者来分配工作空间")
-        target = core._allocate_workspace(parent.cid)
-        roots = dict(caps.roots)
-        roots[workspace_name] = target
-        caps = caps.copy(roots=roots)
+    caps = _derive_child_caps(core, parent, node, is_sub, is_init=is_init)
     conv = Conversation(
         messages=messages,
         cid=0,
@@ -1450,8 +1440,6 @@ def _build_conversation(core: 'Core', system_ref: str, para_ref: str, parent: Co
         is_root=False,
         caps=caps,
     )
-    # 批次一 S4 用：用户态对话创建工作空间时绑定的根名（内部属性，不进检查点）
-    conv.workspace_root_name = workspace_name
     core._register(conv)
     if conv.caps.mode == MODE_USER:
         # 能力自述：保留根 caps 绑定到 $MEM.caps.<cid>，由 Core 拥有，不参与授予
@@ -1672,9 +1660,9 @@ class Core:
         # 与宿主内建的 PLM_REGISTRY 并列，内建优先（镜像不得同名覆盖，装载期拒绝）。
         # 放在这里是因为本函数末尾的 install_model_catalog 要枚举它。
         self.plms: Dict[str, type] = {}
-        # 安全配置（批次一 S4）：根注册表（名字 -> 真实段）与工作空间区域（真实段）
+        # 安全配置（批次一 S4）：根注册表（名字 -> 真实段）。
+        # 用户态对话的根表由软件动态授予（$MEM.conversations.<cid>.roots），内核不分配目录。
         self.root_registry: Dict[str, tuple] = {}
-        self.workspace_region: tuple = ("workspaces",)
         self.debug: bool = False
         self.monitor: Monitor = Monitor()
         self.para_ref: str = "$MEM.model_params"
@@ -1727,49 +1715,11 @@ class Core:
         return cid == PANEL_CID
 
     # ------------------------------------------------------------------
-    # 安全配置：根注册表与工作空间区域（批次一 S4）
+    # 安全配置：根注册表与动态授予根（批次一 S4）
     # ------------------------------------------------------------------
 
-    def _resolve_real_segments(self, segments):
-        try:
-            return self.mem.resolve_path([MEM_ROOT_NAME] + list(segments), for_llm=False)
-        except VMMemoryError:
-            return None
-
-    def _ensure_region_node(self, segments):
-        """确保工作空间区域存在（缺失时逐段建空 MetaDict），返回区域节点。"""
-        node = self.mem._data
-        path = []
-        for seg in segments:
-            path.append(seg)
-            if isinstance(node, LinkNode):
-                raise VMMemoryError(f"工作空间区域不能落在链接里：$MEM.{'.'.join(path)}")
-            if not isinstance(node, MetaDict):
-                raise VMMemoryError(f"工作空间区域的父段不是 dict：$MEM.{'.'.join(path[:-1])}")
-            if seg in node:
-                node = node[seg]
-            else:
-                created = MetaDict(data={})
-                node[seg] = created
-                node = created
-        return node
-
-    def _validate_workspace_region_subtree(self, node, path: list) -> None:
-        """区域子树不得含链接节点（设备挂载会物化为链接）：否则工作空间可逃逸。"""
-        if isinstance(node, LinkNode):
-            raise VMMemoryError(
-                f"工作空间区域内不能有链接节点（设备挂载请移到区域外）：$MEM.{'.'.join(path)}"
-            )
-        if isinstance(node, MetaDict):
-            for key, child in node.items():
-                self._validate_workspace_region_subtree(child, path + [str(key)])
-        elif isinstance(node, MetaList):
-            for i, child in enumerate(node):
-                self._validate_workspace_region_subtree(child, path + [str(i)])
-
-    def _validate_root_specs(self, roots_spec: dict, region: tuple,
-                             check_live: bool = True) -> dict:
-        """校验根注册表：名字、目标语法、前缀无关、保留区、工作空间与存活对话。
+    def _validate_root_specs(self, roots_spec: dict, check_live: bool = True) -> dict:
+        """校验根注册表：名字、目标语法、前缀无关、保留区、存活对话根表。
 
         镜像装载（check_live=False）与运行期替换（check_live=True）共用。
         """
@@ -1781,8 +1731,6 @@ class Core:
                 raise VMMemoryError("security.roots 不能注册 MEM 根")
             if not target:
                 raise VMMemoryError(f"根 {name!r} 的目标不能是 $MEM 根本身")
-            if (path_is_prefix(region, target) or path_is_prefix(target, region)):
-                raise VMMemoryError(f"根 {name!r} 的目标与工作空间区域重叠")
             if target and target[0] in CONTROL_DEVICE_ROOTS:
                 raise VMMemoryError(
                     f"根 {name!r} 的目标落在内核控制面设备路径 $MEM.{target[0]}"
@@ -1796,75 +1744,129 @@ class Core:
                 for root_name, root_target in conv.caps.roots.items():
                     if root_name == MEM_ROOT_NAME:
                         continue
-                    others.append((conv.cid, tuple(root_target),
-                                   path_is_prefix(region, tuple(root_target))))
+                    others.append((conv.cid, tuple(root_target)))
             for name, target in checked.items():
-                for cid, other_target, other_is_workspace in others:
+                for cid, other_target in others:
                     if target == other_target:
-                        if other_is_workspace:
-                            raise VMMemoryError(
-                                f"根 {name!r} 不能绑定对话 {cid} 的工作空间目标"
-                            )
                         continue
                     if path_is_prefix(target, other_target) or path_is_prefix(other_target, target):
-                        if other_is_workspace:
-                            raise VMMemoryError(
-                                f"根 {name!r} 与其他对话 {cid} 的工作空间目标重叠"
-                            )
-                        raise VMMemoryError(f"根 {name!r} 的目标与存活对话根表前缀冲突")
+                        raise VMMemoryError(
+                            f"根 {name!r} 的目标与存活对话 {cid} 的根表前缀冲突"
+                        )
         return checked
 
-    def install_security_config(self, roots_spec: dict, workspace_region: tuple) -> None:
-        """装载镜像 security 段：校验并安装根注册表与工作空间区域。
+    def install_security_config(self, roots_spec: dict) -> None:
+        """装载镜像 security 段：校验并安装根注册表。
 
-        校验项：根名规则、目标前缀无关、与工作空间区域不重叠、区域存在的形态、
-        区域子树不含链接。失败抛 VMMemoryError（镜像装载器翻成 ImageError）。
+        校验项：根名规则、目标前缀无关、保留区。失败抛 VMMemoryError
+        （镜像装载器翻成 ImageError）。工作目录不再由内核分配：目录由软件用
+        memory_make 建，根由 `$MEM.conversations.<cid>.roots` 动态授予。
         """
-        region = tuple(workspace_region)
-        if not region:
-            raise VMMemoryError("security.workspace_region 不能是 $MEM 根本身")
-        checked = self._validate_root_specs(roots_spec, region, check_live=False)
-
-        node = self._resolve_real_segments(list(region))
-        if node is None:
-            node = self._ensure_region_node(list(region))
-        if not isinstance(node, MetaDict):
-            raise VMMemoryError("security.workspace_region 必须指向 dict 节点")
-        self._validate_workspace_region_subtree(node, list(region))
+        checked = self._validate_root_specs(roots_spec, check_live=False)
         self.root_registry = checked
-        self.workspace_region = region
 
     def replace_root_registry(self, roots_spec: dict) -> None:
         """运行期整体替换根注册表（$MEM.roots 控制面），先校验后提交。"""
-        checked = self._validate_root_specs(roots_spec, self.workspace_region,
-                                            check_live=True)
+        checked = self._validate_root_specs(roots_spec, check_live=True)
         self.root_registry = checked
 
-    def _all_special_targets(self):
-        """当前占用中的可授予目标：根注册表 + 存活对话的根表（不含 MEM）。"""
-        targets = [tuple(t) for t in self.root_registry.values()]
-        for conv in self._conv_by_cid.values():
-            for name, segments in conv.caps.roots.items():
-                if name != MEM_ROOT_NAME:
-                    targets.append(tuple(segments))
-        return targets
+    def _core_roots(self, conv) -> dict:
+        """Core 拥有的根（目前只有能力自述根 caps）：控制面不可覆盖、重放时保留。"""
+        target = conv.caps.roots.get("caps")
+        return {"caps": tuple(target)} if target is not None else {}
 
-    def _allocate_workspace(self, owner_cid: int) -> tuple:
-        """在工作空间区域分配一块新子树并返回目标段序列（不含 MEM 根）。"""
-        region = tuple(self.workspace_region)
-        parent = self._ensure_region_node(list(region))
-        if not isinstance(parent, MetaDict):
-            raise VMMemoryError("工作空间区域必须是 dict 节点，无法分配")
-        used = set(parent.keys())
-        n = 0
-        while f"w{n}" in used:
-            n += 1
-        target = region + (f"w{n}",)
-        if not targets_prefix_free(self._all_special_targets(), target):
-            raise VMMemoryError("工作空间分配失败：目标与其他根前缀冲突")
-        node = MetaDict(data={}, metadata=f"工作空间（创建者 cid {owner_cid}）", ctrl={"owner": str(owner_cid)})
-        parent[f"w{n}"] = node
-        return target
+    def _validate_grants(self, conv, grants: dict) -> None:
+        """授予根的全量校验：保留区、设备路径、新根之间与其他存活根/根注册表的前缀关系。
+
+        `grants` 是"根名 -> 目标段序列"，不含 Core 自述根；先全量校验后提交。
+        """
+        for name, target in grants.items():
+            if not target:
+                raise IllegalOperationError(f"根 {name!r} 的目标不能是 $MEM 根本身")
+            if target[0] in CONTROL_DEVICE_ROOTS:
+                raise IllegalOperationError(
+                    f"根 {name!r} 的目标落在内核控制面设备路径 $MEM.{target[0]}"
+                )
+            for mount in self.mem._devices:
+                mount_segments = tuple(mount.split("."))
+                if target == mount_segments:
+                    continue  # 显式授予设备本身是允许的
+                if path_is_prefix(target, mount_segments) or path_is_prefix(mount_segments, target):
+                    raise IllegalOperationError(
+                        f"根 {name!r} 的目标落在保留的内核设备路径 $MEM.{mount}"
+                    )
+        # 新根之间前缀无关（相等目标允许共享）
+        items = list(grants.items())
+        for i, (n1, t1) in enumerate(items):
+            for n2, t2 in items[i + 1:]:
+                if t1 == t2:
+                    continue
+                if path_is_prefix(t1, t2) or path_is_prefix(t2, t1):
+                    raise IllegalOperationError(f"根 {n1!r} 与 {n2!r} 的目标前缀冲突")
+        # 与其他存活对话的根表、根注册表比较
+        others = []
+        for cid, other in self._conv_by_cid.items():
+            if cid == conv.cid:
+                continue
+            for other_name, other_target in other.caps.roots.items():
+                if other_name == MEM_ROOT_NAME:
+                    continue
+                others.append((cid, other_name, tuple(other_target)))
+        for name, target in self.root_registry.items():
+            others.append((None, name, tuple(target)))
+        for name, target in items:
+            for cid, other_name, other_target in others:
+                if target == other_target:
+                    continue  # 相同目标允许共享
+                if path_is_prefix(target, other_target) or path_is_prefix(other_target, target):
+                    raise IllegalOperationError(
+                        f"根 {name!r} 与已有根 {other_name!r} 的目标前缀冲突"
+                    )
+
+    def set_conversation_roots(self, cid: int, roots_map: dict) -> None:
+        """整体替换用户态对话的非 core 根表（控制面 `$MEM.conversations.<cid>.roots`）。
+
+        `roots_map` 是"根名 -> 目标段序列（list/tuple，不含 MEM 根）"的完整映射；
+        控制面语义是替换，不是合并。Core 自述根（caps）不可覆盖。
+        校验通过后先记 conversation_roots 效果、再写 caps（日志与内存一致）。
+        """
+        conv = self._conv_by_cid.get(cid)
+        if conv is None:
+            raise VMMemoryError(f"对话 {cid} 不存在")
+        if cid in self._finished:
+            raise VMMemoryError(f"对话 {cid} 已关闭")
+        if conv.caps.mode == MODE_KERNEL:
+            raise IllegalOperationError(
+                "内核态对话的根表固定含 MEM，不能通过控制面改写（用户态对话才可授予根）"
+            )
+        if not isinstance(roots_map, dict):
+            raise IllegalOperationError("roots 必须是映射（根名 -> 目标段序列）")
+        core_roots = self._core_roots(conv)
+        grants: Dict[str, tuple] = {}
+        for name, segments in roots_map.items():
+            if not isinstance(name, str) or not name:
+                raise IllegalOperationError(f"根名必须是非空字符串，得到 {name!r}")
+            if name in core_roots:
+                raise IllegalOperationError(f"根名 {name!r} 由 Core 分配，不能通过控制面覆盖")
+            check_root_name(name)
+            if isinstance(segments, str) or not isinstance(segments, (list, tuple)):
+                raise IllegalOperationError(
+                    f"根 {name!r} 的目标必须是段序列（list/tuple），得到 {type(segments).__name__}"
+                )
+            target = tuple(segments)
+            if not target:
+                raise IllegalOperationError(f"根 {name!r} 的目标不能是 $MEM 根本身")
+            if any(not isinstance(seg, str) or not seg for seg in target):
+                raise IllegalOperationError(f"根 {name!r} 的目标段必须是非空字符串：{target!r}")
+            grants[name] = target
+        self._validate_grants(conv, grants)
+        new_roots = dict(core_roots)
+        new_roots.update(grants)
+        self.note_effect(
+            "conversation_roots", cid=cid,
+            roots={name: list(target) for name, target in grants.items()},
+        )
+        conv.caps = conv.caps.copy(roots=new_roots)
 
     def _register(self, conv: Conversation, cid: Optional[int] = None) -> Conversation:
         conv.cid = self._next_cid if cid is None else cid
@@ -2891,7 +2893,6 @@ class Core:
             "memory": memory,
             "security": {
                 "roots": {name: list(target) for name, target in self.root_registry.items()},
-                "workspace_region": list(self.workspace_region),
             },
             "conversations": [
                 self._conversation_dump(self._conv_by_cid[cid], limit)
@@ -2935,7 +2936,6 @@ class Core:
             "metadata": dict(conv.metadata or {}),
             "caps": caps_to_dict(conv.caps),
             "attrs": dict(conv.attrs or {}),
-            "workspace_root_name": getattr(conv, "workspace_root_name", None),
             "message_count": total,
             "messages": messages[-limit:] if limit else [],
             "messages_truncated": total > limit,

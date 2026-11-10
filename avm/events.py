@@ -166,11 +166,6 @@ LIFECYCLE_EVENTS = ("create_cmd", "create_sub", "close_conversation", "listen_ev
 
 # 用户态对话可用的命名条件子集（名称是机制常量；名单待作者细化，见 issue-2026-11-01）
 USER_CONDITION_PRESETS = {
-    "own_work.memory": {
-        "events": list(MEMORY_EVENTS),
-        "phase": ["before", "after"],
-        "target": {"kind": "subtree", "workspace_root": True},
-    },
     "own_nodes.memory": {
         "events": list(MEMORY_EVENTS),
         "phase": ["before", "after"],
@@ -1216,7 +1211,7 @@ class EventSystem:
     # ------------------------------------------------------------------
 
     def _resolve_condition(self, node, owner_cid: int, owner_kernel: bool,
-                           space=None, owner_conv=None) -> dict:
+                           space=None) -> dict:
         """把 handler 节点的 condition 数据解析成内部条件（canonical 目标）。"""
         raw = _condition_leaf(node)
         if raw is None:
@@ -1230,6 +1225,11 @@ class EventSystem:
             raise IllegalOperationError(f"handler 节点 condition 含未知字段：{unknown}")
         if "preset" in raw:
             preset = raw["preset"]
+            if preset == "own_work.memory":
+                raise IllegalOperationError(
+                    "条件 preset 'own_work.memory' 已移除：工作空间不再由内核分配。"
+                    "改用 own_nodes.memory（自己拥有的节点），或由软件动态加根后自定义条件"
+                )
             if preset not in USER_CONDITION_PRESETS:
                 raise IllegalOperationError(
                     f"未知的用户态条件子集 {preset!r}（可用：{sorted(USER_CONDITION_PRESETS)}）"
@@ -1237,9 +1237,6 @@ class EventSystem:
             raw = dict(USER_CONDITION_PRESETS[preset])
             raw["target"] = dict(raw.get("target") or {})
             raw["preset"] = preset
-            if raw["target"].get("workspace_root"):
-                root_name = getattr(owner_conv, "workspace_root_name", None) or "work"
-                raw["target"] = {"kind": "subtree", "ref": "$" + root_name}
         elif not owner_kernel:
             raise IllegalOperationError(
                 "用户态对话只能使用命名条件子集（preset），不能自定义 condition"
@@ -1316,9 +1313,7 @@ class EventSystem:
         if priority > 0 and not kernel_mode:
             raise IllegalOperationError("priority>0 只有内核态对话可以设置")
         node = self._core.unwrap(handler_ref, for_llm=False, space=space)
-        owner_conv = self._core._conv_by_cid.get(owner_cid)
-        condition = self._resolve_condition(node, owner_cid, kernel_mode, space=space,
-                                            owner_conv=owner_conv)
+        condition = self._resolve_condition(node, owner_cid, kernel_mode, space=space)
         handler_code = self.resolve_handler(self._core, handler_ref, space=space)
         listener_id = self._next_listener_id
         self._next_listener_id += 1

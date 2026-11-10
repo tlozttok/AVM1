@@ -22,9 +22,8 @@ from avm.types import LinkNode, MetaDict, MetaList, StrNode
 
 def _caps_node(caps):
     data = {}
-    for key in ("mode", "workspace"):
-        if key in caps:
-            data[key] = StrNode(str(caps[key]))
+    if "mode" in caps:
+        data["mode"] = StrNode(str(caps["mode"]))
     for key in ("groups", "roots", "tools"):
         if key in caps:
             data[key] = MetaList([StrNode(str(x)) for x in caps[key]])
@@ -59,18 +58,19 @@ def _make(core, conv, ref, key, mem_type="dict", call_id="m1"):
 
 
 def _user_conv(core, root):
-    """内核 root 创建一个用户态对话（私有工作空间），返回该对话。"""
-    core.install_security_config({}, ("workspaces",))
+    """内核 root 创建一个用户态对话，并用软件建目录 + 动态加根给它一个 $work。"""
     up = MetaDict(data={"content": "sys"}, ctrl={"type": "settingup"})
-    up["caps"] = _caps_node({"mode": "user", "workspace": "work",
-                             "tools": list(ALL_TOOL_NAMES)})
+    up["caps"] = _caps_node({"mode": "user", "tools": list(ALL_TOOL_NAMES)})
     core.mem["up"] = up
     CreateInstruction("c1", root.cid, {
         "system_ref": "$MEM.up", "para_ref": "$MEM.p",
     }).execute(core, root)
     text = root.user_batch.tool_responses[-1].content
     assert text.startswith("Success created: cid="), text
-    return core.get_conversation(int(text.split("=")[-1]))
+    child = core.get_conversation(int(text.split("=")[-1]))
+    core.mem.make("$MEM", "ws", "dict", owner_cid=0)
+    core.set_conversation_roots(child.cid, {"work": ["ws"]})
+    return child
 
 
 def _observe(core):
@@ -227,7 +227,7 @@ class TestC1C2ReservedAreas:
         for target in (("conversations",), ("listeners",), ("roots",), ("caps",),
                        ("conversations", "0", "roots")):
             with pytest.raises(VMMemoryError):
-                core.install_security_config({"admin": target}, ("workspaces",))
+                core.install_security_config({"admin": target})
 
     def test_runtime_roots_rejects_control_devices(self):
         core, root = _core()

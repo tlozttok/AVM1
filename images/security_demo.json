@@ -37,20 +37,20 @@
           "value": {
             "content": {
               "kind": "str",
-              "value": "你是内核态初始化对话。你的职责是建立权限层：用 create_cmd 创建用户态工作对话（system_ref 指向 $MEM.programs.worker），把任务写进 user 消息或之后用 send_instruction 投递。你持有 $MEM 根与全部工具；用户态工作对话只持有 $work 与 $lib。"
+              "value": "你是内核态初始化对话。你的职责是建立权限层：用 create_cmd 创建用户态工作对话（system_ref 指向 $MEM.programs.worker），把任务写进 user 消息或之后用 send_instruction 投递。你持有 $MEM 根与全部工具；用户态工作对话只持有共享库根 $lib。工作目录不由内核分配：需要时由你用 memory_make 建目录，再写 $MEM.conversations.<cid>.roots 动态加根。"
             }
           }
         },
         "worker": {
           "kind": "dict",
-          "meta": "用户态工作程序：只有工作空间与共享库，工具面收窄",
+          "meta": "用户态工作程序：只有共享库根，工具面收窄",
           "ctrl": {
             "type": "settingup"
           },
           "value": {
             "content": {
               "kind": "str",
-              "value": "你是用户态工作对话。你的根只有 $work（你的私有工作空间）与 $lib（共享库，只读使用）。$MEM、其他对话的根、内核设备都不可见。用 $work 存放你的工作数据。"
+              "value": "你是用户态工作对话。你的根只有 $lib（共享库，只读使用）。$MEM、其他对话的根、内核设备都不可见。本示例没有工作目录：需要工作目录时由内核态软件建目录并动态加根，之后你才能看到它。"
             },
             "caps": {
               "kind": "dict",
@@ -99,8 +99,7 @@
   "security": {
     "roots": {
       "lib": "$MEM.lib"
-    },
-    "workspace_region": "$MEM.workspaces"
+    }
   },
   "para_ref": "$MEM.model_params",
   "init": {

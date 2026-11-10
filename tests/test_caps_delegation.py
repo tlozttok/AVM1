@@ -21,14 +21,13 @@ from avm.types import MetaDict, MetaList, StrNode
 
 def _caps_node(caps):
     data = {}
-    for key in ("mode", "workspace"):
-        if key in caps:
-            data[key] = StrNode(str(caps[key]))
+    if "mode" in caps:
+        data["mode"] = StrNode(str(caps["mode"]))
     for key in ("groups", "roots", "tools"):
         if key in caps:
             data[key] = MetaList([StrNode(str(x)) for x in caps[key]])
     for key, value in caps.items():
-        if key not in data and key not in ("mode", "workspace"):
+        if key not in data and key != "mode":
             data[key] = MetaList([StrNode(str(x)) for x in value]) if isinstance(value, list) else StrNode(str(value))
     return MetaDict(data=data)
 
@@ -99,6 +98,20 @@ class TestProgramCapsParsing:
         assert text.startswith("Error:") or text.startswith("Illegal:")
         assert "未知字段" in text
 
+    def test_workspace_key_rejected_with_hint(self):
+        core, conv = _core()
+        node = MetaDict(data={"content": "sys"}, ctrl={"type": "settingup"})
+        node["caps"] = MetaDict(data={
+            "mode": StrNode("user"),
+            "workspace": StrNode("work"),
+        })
+        core.mem["prog"] = node
+        text = _call(core, conv, "create_cmd", {
+            "system_ref": "$MEM.prog", "para_ref": "$MEM.para",
+        })
+        assert text.startswith(("Error:", "Illegal:")), text
+        assert "workspace" in text and "已移除" in text
+
     def test_ctrl_caps_rejected(self):
         core, conv = _core()
         core.mem["prog"] = MetaDict(
@@ -131,9 +144,8 @@ class TestChildCaps:
         assert child.caps.mode == MODE_USER
         assert child.caps.groups == ("worker",)
         assert child.caps.roots["lib"] == ("lib",)
-        assert child.caps.roots["work"][0] == "workspaces"
+        assert "work" not in child.caps.roots  # 内核不再自动分配工作空间
         assert child.caps.tools == frozenset({"memory_read"})
-        assert child.workspace_root_name == "work"
 
     def test_tools_cannot_exceed_parent(self):
         from avm.core import _derive_child_caps
@@ -204,9 +216,8 @@ class TestChildCaps:
 
 def _caps_image_node(caps):
     value = {}
-    for key in ("mode", "workspace"):
-        if key in caps:
-            value[key] = {"kind": "str", "value": str(caps[key])}
+    if "mode" in caps:
+        value["mode"] = {"kind": "str", "value": str(caps["mode"])}
     for key in ("groups", "roots", "tools"):
         if key in caps:
             value[key] = {"kind": "list", "value": [

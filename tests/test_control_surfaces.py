@@ -7,7 +7,6 @@ import json
 
 import pytest
 
-from avm.capabilities import ALL_TOOL_NAMES, Capability
 from avm.core import Core, CreateInstruction, MemoryReadInstruction, MemoryWriteInstruction
 from avm.exceptions import VMMemoryError
 from avm.memory_device import StringDevice
@@ -16,9 +15,8 @@ from avm.types import MetaDict, MetaList, StrNode
 
 def _caps_node(caps):
     data = {}
-    for key in ("mode", "workspace"):
-        if key in caps:
-            data[key] = StrNode(str(caps[key]))
+    if "mode" in caps:
+        data["mode"] = StrNode(str(caps["mode"]))
     for key in ("groups", "roots", "tools"):
         if key in caps:
             data[key] = MetaList([StrNode(str(x)) for x in caps[key]])
@@ -51,10 +49,9 @@ def _read(core, conv, ref, call_id="r1"):
 
 
 def _user_conv(core, root):
-    """内核态 root 创建一个用户态对话（带私有工作空间），返回该对话。"""
-    core.install_security_config({}, ("workspaces",))
+    """内核态 root 创建一个用户态对话，返回该对话。"""
     up = MetaDict(data={"content": "sys"}, ctrl={"type": "settingup"})
-    up["caps"] = _caps_node({"mode": "user", "workspace": "work"})
+    up["caps"] = _caps_node({"mode": "user"})
     core.mem["up"] = up
     conv = CreateInstruction("c1", root.cid, {
         "system_ref": "$MEM.up", "para_ref": "$MEM.p",
@@ -144,41 +141,54 @@ class TestConversationDeviceWrites:
 
 
 class TestRootsControl:
-    def _user_with_work(self):
+    def _user_with_root(self):
         core, root = _core()
         user = _user_conv(core, root)
         return core, root, user
 
-    def test_roots_write_preserves_core_workspace(self):
-        core, root, user = self._user_with_work()
-        work_target = user.caps.roots["work"]
+    def test_roots_write_preserves_caps_root(self):
+        core, root, user = self._user_with_root()
+        caps_target = user.caps.roots["caps"]
         text = _write(core, root, "$MEM.conversations.1.roots", '{"lib": "$MEM.lib"}')
         assert text == "Success set: $MEM.conversations.1.roots", text
         assert user.caps.roots["lib"] == ("lib",)
-        assert user.caps.roots["work"] == work_target
+        assert user.caps.roots["caps"] == caps_target
         data = json.loads(_read(core, root, "$MEM.conversations.1.roots"))
-        assert data["work"]["core"] is True
+        assert data["caps"]["core"] is True
         assert data["lib"] == {"target": "$MEM.lib", "core": False}
 
     def test_granted_root_is_usable_after_write(self):
-        core, root, user = self._user_with_work()
+        core, root, user = self._user_with_root()
         core.mem["lib"] = MetaDict(data={"greeting": "hi"})
         _write(core, root, "$MEM.conversations.1.roots", '{"lib": "$MEM.lib"}')
         assert _read(core, user, "$lib.greeting") == "hi"
 
     def test_roots_validation(self):
-        core, root, user = self._user_with_work()
+        core, root, user = self._user_with_root()
         ref = "$MEM.conversations.1.roots"
         assert _write(core, root, ref, '{"MEM": "$MEM.x"}').startswith("Illegal:")
         assert _write(core, root, ref, '{"lib": "lib"}').startswith("Illegal:")
         assert _write(core, root, ref, '{"lib": "$MEM"}').startswith(("Illegal:", "Error:"))
-        assert _write(core, root, ref, '{"work": "$MEM.lib"}').startswith("Illegal:")  # core 根名
+        assert _write(core, root, ref, '{"caps": "$MEM.lib"}').startswith("Illegal:")  # core 根名
         assert _write(core, root, ref, '{"a": "$MEM.x", "b": "$MEM.x.y"}').startswith("Illegal:")
-        assert _write(core, root, ref, '{"w": "$MEM.workspaces"}').startswith("Illegal:")
-        assert _write(core, root, ref, '{"w": "$MEM.workspaces.w9.x"}').startswith("Illegal:")
+        assert _write(core, root, ref, '{"w": "$MEM.conversations"}').startswith("Illegal:")
+        assert _write(core, root, ref, '{"w": "$MEM.conversations.0.roots"}').startswith("Illegal:")
+        assert _write(core, root, ref, '{"w": "$MEM.roots"}').startswith("Illegal:")
+
+    def test_roots_write_can_remove_root(self):
+        core, root, user = self._user_with_root()
+        core.mem["ws"] = MetaDict(data={"x": "v"})
+        core.set_conversation_roots(user.cid, {"work": ["ws"]})
+        assert _read(core, user, "$work.x") == "v"
+        caps_target = user.caps.roots["caps"]
+        text = _write(core, root, "$MEM.conversations.1.roots", "{}")
+        assert text == "Success set: $MEM.conversations.1.roots", text
+        assert "work" not in user.caps.roots
+        assert user.caps.roots["caps"] == caps_target
+        assert _read(core, user, "$work.x").startswith("Error:")
 
     def test_roots_cannot_cover_device_mount(self):
-        core, root, user = self._user_with_work()
+        core, root, user = self._user_with_root()
         core.mem.mount("box.dev", StringDevice("v"))
         text = _write(core, root, "$MEM.conversations.1.roots", '{"box": "$MEM.box"}')
         assert text.startswith("Illegal:") and "设备" in text
@@ -186,19 +196,18 @@ class TestRootsControl:
         text = _write(core, root, "$MEM.conversations.1.roots", '{"dev": "$MEM.box.dev"}')
         assert text.startswith("Success set"), text
 
-    def test_roots_share_same_target_allowed_but_not_workspace(self):
-        core, root, user = self._user_with_work()
-        # 另一个用户对话：共享非工作空间目标允许
+    def test_roots_share_same_target_allowed_but_not_prefix(self):
+        core, root, user = self._user_with_root()
         other = _user_conv(core, root)
-        other_work = other.caps.roots["work"]
         core.mem["lib"] = MetaDict(data={})
         _write(core, root, "$MEM.conversations.2.roots", '{"lib": "$MEM.lib"}')
         text = _write(core, root, "$MEM.conversations.1.roots", '{"lib": "$MEM.lib"}')
         assert text.startswith("Success set"), text
-        # 绑定别的工作空间 / 与其前缀可比：拒绝
-        target = "$MEM." + ".".join(other_work) + ".sub"
-        text = _write(core, root, "$MEM.conversations.1.roots", json.dumps({"w": target}))
-        assert text.startswith("Illegal:")
+        # 与另一个对话的根目标前缀可比：拒绝
+        core.mem.make("$MEM", "shared", "dict", owner_cid=0)
+        core.set_conversation_roots(other.cid, {"lib": ["lib"], "work": ["shared", "sub"]})
+        text = _write(core, root, "$MEM.conversations.1.roots", '{"w": "$MEM.shared.sub.x"}')
+        assert text.startswith("Illegal:"), text
 
 
 class TestListenerDeviceWrites:

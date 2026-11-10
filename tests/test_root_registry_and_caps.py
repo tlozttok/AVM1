@@ -4,16 +4,15 @@ import json
 
 import pytest
 
-from avm.capabilities import ALL_TOOL_NAMES, Capability
+from avm.capabilities import ALL_TOOL_NAMES
 from avm.core import Core, CreateInstruction, MemoryReadInstruction, MemoryWriteInstruction
 from avm.types import MetaDict, MetaList, StrNode
 
 
 def _caps_node(caps):
     data = {}
-    for key in ("mode", "workspace"):
-        if key in caps:
-            data[key] = StrNode(str(caps[key]))
+    if "mode" in caps:
+        data["mode"] = StrNode(str(caps["mode"]))
     for key in ("groups", "roots", "tools"):
         if key in caps:
             data[key] = MetaList([StrNode(str(x)) for x in caps[key]])
@@ -48,11 +47,8 @@ def _read(core, conv, ref, call_id="r1"):
     return conv.user_batch.tool_responses[-1].content
 
 
-def _user_conv(core, root, caps=None, configure=True):
-    if configure:
-        core.install_security_config({}, ("workspaces",))
-    _program(core, "up", caps or {"mode": "user", "workspace": "work",
-                                  "tools": list(ALL_TOOL_NAMES)})
+def _user_conv(core, root, caps=None):
+    _program(core, "up", caps or {"mode": "user", "tools": list(ALL_TOOL_NAMES)})
     root.user_batch.tool_responses.clear()
     CreateInstruction("c1", root.cid, {
         "system_ref": "$MEM.up", "para_ref": "$MEM.p",
@@ -87,12 +83,11 @@ class TestRuntimeRootRegistry:
     def test_runtime_root_usable_by_program_caps(self):
         core, root = _core()
         core.mem["lib"] = MetaDict(data={"greeting": "hi"})
-        core.install_security_config({}, ("workspaces",))
         _write(core, root, "$MEM.roots.lib", "$MEM.lib")
         user = _user_conv(core, root, {
-            "mode": "user", "workspace": "work", "roots": ["lib"],
+            "mode": "user", "roots": ["lib"],
             "tools": list(ALL_TOOL_NAMES),
-        }, configure=False)
+        })
         assert user.caps.roots["lib"] == ("lib",)
         assert _read(core, user, "$lib.greeting") == "hi"
 
@@ -103,7 +98,6 @@ class TestRuntimeRootRegistry:
             ("$MEM.roots", '{"wat": "lib"}'),                     # 目标不是 $MEM
             ("$MEM.roots", '{"MEM": "$MEM.x"}'),                  # 保留名
             ("$MEM.roots", '{"x": "$MEM"}'),                      # 根本身
-            ("$MEM.roots", '{"x": "$MEM.workspaces"}'),           # 工作空间区域
             ("$MEM.roots", '{"x": "$MEM.conversations"}'),        # 控制面设备
             ("$MEM.roots", '{"lib": "$MEM.lib", "x": "$MEM.lib.sub"}'),  # 与已有根前缀冲突
             ("$MEM.roots.wat", "lib"),                            # 目标不是 $MEM
@@ -113,11 +107,12 @@ class TestRuntimeRootRegistry:
             assert text.startswith(("Illegal:", "Error:")), (ref, content, text)
         assert core.root_registry == {"lib": ("lib",)}
 
-    def test_validation_against_live_workspace(self):
+    def test_validation_against_live_conversation_roots(self):
         core, root = _core()
         user = _user_conv(core, root)
-        work_target = "$MEM." + ".".join(user.caps.roots["work"])
-        text = _write(core, root, "$MEM.roots", json.dumps({"w": work_target}))
+        core.mem.make("$MEM", "ws", "dict", owner_cid=0)
+        core.set_conversation_roots(user.cid, {"work": ["ws"]})
+        text = _write(core, root, "$MEM.roots", '{"w": "$MEM.ws.sub"}')
         assert text.startswith("Illegal:"), text
 
     def test_user_conversation_cannot_name_roots_device(self):
@@ -161,21 +156,22 @@ class TestCapsSelfDescription:
     def test_user_reads_own_caps(self):
         core, root = _core()
         user = _user_conv(core, root, {
-            "mode": "user", "groups": ["worker"], "workspace": "work",
+            "mode": "user", "groups": ["worker"],
             "roots": [], "tools": ["memory_read"],
         })
+        core.mem.make("$MEM", "ws", "dict", owner_cid=0)
+        core.set_conversation_roots(user.cid, {"work": ["ws"]})
         data = json.loads(_read(core, user, "$caps"))
         assert data["cid"] == user.cid
         assert data["mode"] == "user"
         assert data["groups"] == ["worker"]
         assert data["tools"] == ["memory_read"]
-        assert data["workspace"] == "work"
-        assert data["roots"]["work"]["core"] is True
+        assert "workspace" not in data
+        assert data["roots"]["work"]["core"] is False  # 动态授予根不是 core 根
         assert data["roots"]["caps"]["core"] is True
-        assert "workspaces" not in json.dumps(data)
         assert _read(core, user, "$caps.mode") == "user"
         assert json.loads(_read(core, user, "$caps.tools")) == ["memory_read"]
-        assert json.loads(_read(core, user, "$caps.roots"))["work"]["core"] is True
+        assert json.loads(_read(core, user, "$caps.roots"))["work"]["core"] is False
 
     def test_groups_change_visible_immediately(self):
         core, root = _core()

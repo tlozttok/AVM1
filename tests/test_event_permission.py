@@ -33,9 +33,8 @@ def _core():
 
 def _caps_node(caps):
     data = {}
-    for key in ("mode", "workspace"):
-        if key in caps:
-            data[key] = StrNode(str(caps[key]))
+    if "mode" in caps:
+        data["mode"] = StrNode(str(caps["mode"]))
     for key in ("groups", "roots", "tools"):
         if key in caps:
             data[key] = MetaList([StrNode(str(x)) for x in caps[key]])
@@ -320,15 +319,17 @@ class TestKernelSupervisionAcrossSpaces:
         from avm.core import MemoryMakeInstruction, _canonical_ref
 
         core, root = _core()
-        core.install_security_config({}, ("workspaces",))
         prog = MetaDict(data={"content": "sys"}, ctrl={"type": "settingup"})
-        prog["caps"] = _caps_node({"mode": "user", "workspace": "work"})
+        prog["caps"] = _caps_node({"mode": "user"})
         core.mem["prog"] = prog
         CreateInstruction("c1", 0, {
             "system_ref": "$MEM.prog", "para_ref": "$MEM.p",
         }).execute(core, root)
         child = core.get_conversation(int(root.user_batch.tool_responses[-1].content.split("=")[-1]))
         assert child.caps.mode == "user"
+        # 工作目录由软件建、根由控制面动态授予（内核不再分配工作空间）
+        core.mem.make("$MEM", "ws", "dict", owner_cid=0)
+        core.set_conversation_roots(child.cid, {"work": ["ws"]})
         real = ("MEM",) + tuple(child.caps.roots["work"]) + ("x",)
         real_ref = "$" + ".".join(real)
 

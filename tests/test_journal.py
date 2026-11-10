@@ -496,3 +496,128 @@ class TestPeriodicSnapshot:
         assert restored.replay_journal() == 2
         assert_same_state(core, restored)
         assert restored._journal_seq == core._journal_seq
+
+
+def _user_image(tmp_path):
+    """根对话（LLM 脚本） + 一个用户态程序节点：用于动态授予根的日志测试。"""
+    mem = {
+        "model_params": {
+            "kind": "dict", "ctrl": {"type": "para"},
+            "value": {"model": {"kind": "str", "value": "test-model"}},
+        },
+        "programs": {"kind": "dict", "value": {
+            "main": {
+                "kind": "dict", "ctrl": {"type": "settingup"},
+                "value": {"content": {"kind": "str", "value": "sys"}},
+            },
+            "worker": {
+                "kind": "dict", "ctrl": {"type": "settingup"},
+                "value": {
+                    "content": {"kind": "str", "value": "worker sys"},
+                    "caps": {"kind": "dict", "value": {
+                        "mode": {"kind": "str", "value": "user"},
+                    }},
+                },
+            },
+        }},
+        "src": {"kind": "str", "value": "hello"},
+    }
+    return write_image(tmp_path, mem=mem)
+
+
+CREATE_AND_GRANT = [
+    ("", [
+        {"call_id": "c1", "cmd_type": "create_cmd",
+         "args": {"system_ref": "$MEM.programs.worker",
+                  "para_ref": "$MEM.model_params"}},
+        {"call_id": "c2", "cmd_type": "memory_make",
+         "args": {"ref": "$MEM", "key": "workdirs", "mem_type": "dict"}},
+        {"call_id": "c3", "cmd_type": "memory_make",
+         "args": {"ref": "$MEM.workdirs", "key": "w0", "mem_type": "dict"}},
+        {"call_id": "c4", "cmd_type": "memory_write",
+         "args": {"ref": "$MEM.conversations.1.roots",
+                  "content": '{"work": "$MEM.workdirs.w0"}'}},
+    ]),
+    ("done", []),
+]
+
+REMOVE_GRANT = [
+    CREATE_AND_GRANT[0],
+    ("", [{"call_id": "c5", "cmd_type": "memory_write",
+           "args": {"ref": "$MEM.conversations.1.roots", "content": "{}"}}]),
+    ("done", []),
+]
+
+
+def _effects(image_path):
+    out = []
+    for record in Journal(out_path(image_path, "run.journal")).read():
+        for change in record.get("changes") or []:
+            if change.get("kind") == "effect":
+                out.append(change["effect"])
+    return out
+
+
+class TestConversationRootsReplay:
+    def test_grant_effect_recorded_and_replays_from_log_only(self, tmp_path):
+        image = _user_image(tmp_path)
+        mine = _run(image, CREATE_AND_GRANT)
+        child = mine._conv_by_cid[1]
+        assert child.caps.roots["work"] == ("workdirs", "w0")
+
+        roots_effects = [e for e in _effects(image) if e["kind"] == "conversation_roots"]
+        assert roots_effects == [{
+            "kind": "conversation_roots", "cid": 1,
+            "roots": {"work": ["workdirs", "w0"]},
+        }]
+
+        # 只靠日志恢复：不读快照
+        replayed, applied = _replay(image)
+        assert applied == 2
+        assert replayed._conv_by_cid[1].caps.roots["work"] == ("workdirs", "w0")
+        assert "w0" in replayed.mem["workdirs"]
+        assert_same_state(mine, replayed)
+
+    def test_removal_effect_replays(self, tmp_path):
+        image = _user_image(tmp_path)
+        mine = _run(image, REMOVE_GRANT)
+        assert "work" not in mine._conv_by_cid[1].caps.roots
+        roots_effects = [e for e in _effects(image) if e["kind"] == "conversation_roots"]
+        assert [e["roots"] for e in roots_effects] == [
+            {"work": ["workdirs", "w0"]}, {},
+        ]
+
+        replayed, applied = _replay(image)
+        assert applied == 3
+        assert "work" not in replayed._conv_by_cid[1].caps.roots
+        assert replayed._conv_by_cid[1].caps.roots["caps"][0] == "caps"
+        assert_same_state(mine, replayed)
+
+    def test_old_log_workspace_payload_still_attached(self, tmp_path):
+        """兼容：旧日志的 conversation_create 载荷里的 workspace 节点仍会挂回内存。"""
+        from avm.journal import apply
+
+        image = write_image(tmp_path)
+        responses = [
+            ("", [{"call_id": "c1", "cmd_type": "create_cmd",
+                   "args": {"system_ref": "$MEM.programs.main",
+                            "para_ref": "$MEM.model_params"}}]),
+            ("done", []),
+        ]
+        _run(image, responses)
+        record = Journal(out_path(image, "run.journal")).read()[0]
+        create = next(
+            change["effect"] for change in record["changes"]
+            if change.get("kind") == "effect"
+            and change.get("effect", {}).get("kind") == "conversation_create"
+        )
+        create["workspace"] = {
+            "root_name": "work",
+            "target": ["workspaces", "w0"],
+            "node": {"kind": "dict", "value": {"x": {"kind": "str", "value": "v"}}},
+        }
+
+        fresh = load_core(image)
+        apply(fresh, record)
+        assert str(fresh.mem.resolve_path(
+            ["MEM", "workspaces", "w0", "x"], for_llm=False)) == "v"

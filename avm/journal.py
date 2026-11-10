@@ -174,26 +174,15 @@ def scheduler_to_snapshot(core) -> dict:
 
 
 def conversation_create_payload(core, conv) -> dict:
-    """新建对话的效果载荷：对话全部字段 + 工作空间分配（若本次创建分配了）。
+    """新建对话的效果载荷：对话全部字段。
 
-    工作空间是 `_build_conversation` 在对话注册前写进内存树的节点；它不是对话字段，
-    快照/日志都必须单独带上，否则恢复后用户态对话的根目标不存在。
+    工作目录不再由内核分配：软件用 memory_make 建目录、再写
+    `$MEM.conversations.<cid>.roots`（`conversation_roots` 效果）动态加根。
+    旧日志的 `conversation_create` 载荷可能仍带 `workspace` 字段，重放侧保留兼容。
     """
     doc = conv.to_snapshot()
     doc.pop("batch", None)  # 新建对话没有待发批次
-    workspace = None
-    root_name = getattr(conv, "workspace_root_name", None)
-    if isinstance(root_name, str) and root_name:
-        target = conv.caps.roots.get(root_name)
-        if target is None:
-            raise JournalError(f"对话 {conv.cid} 声明了工作空间根 {root_name!r} 但能力根表里没有")
-        node = core.mem.resolve_path(["MEM"] + list(target), for_llm=False)
-        workspace = {
-            "root_name": root_name,
-            "target": list(target),
-            "node": Memory.serialize_node(node),
-        }
-    return {"conversation": doc, "workspace": workspace}
+    return {"conversation": doc}
 
 
 def _space_roots(space) -> Optional[dict]:
@@ -470,7 +459,10 @@ def _effect_conversation_create(core, effect) -> None:
 
 
 def _attach_workspace_node(core, target, node_image) -> None:
-    """把工作空间节点挂到真实段路径（父段不存在时补空 dict，与 _ensure_region_node 一致）。"""
+    """旧日志兼容：把工作空间节点挂到真实段路径（父段不存在时补空 dict）。
+
+    内核不再分配工作空间；这段只用于重放本机制移除前写下的日志。
+    """
     parent = core.mem._data
     for key in list(target)[:-1]:
         if not isinstance(parent, (dict, MetaDict)):
@@ -483,6 +475,25 @@ def _attach_workspace_node(core, target, node_image) -> None:
     node = Memory.deserialize_node(node_image) if node_image is not None else None
     if isinstance(parent, (dict, MetaDict)) and node is not None:
         parent[target[-1]] = node
+
+
+def _effect_conversation_roots(core, effect) -> None:
+    """还原一次动态授予根：整体替换对话的非 core 根表（core 自述根保留）。"""
+    cid = effect.get("cid")
+    conv = core._conv_by_cid.get(cid)
+    if conv is None:
+        print(
+            f"[AVM] 日志 conversation_roots 效果：对话 {cid} 不存在（可能已关闭），跳过",
+            file=sys.stderr,
+        )
+        return
+    roots = effect.get("roots")
+    if not isinstance(roots, dict):
+        raise VMMemoryError("conversation_roots 缺少 roots 映射")
+    new_roots = core._core_roots(conv)
+    for name, segments in roots.items():
+        new_roots[name] = tuple(segments)
+    conv.caps = conv.caps.copy(roots=new_roots)
 
 
 def _effect_conversation_close(core, effect) -> None:
@@ -598,6 +609,7 @@ _EFFECTS = {
     "edit_metadata": _effect_edit_metadata,
     "device_write": _effect_device_write,
     "conversation_create": _effect_conversation_create,
+    "conversation_roots": _effect_conversation_roots,
     "conversation_close": _effect_conversation_close,
     "conversation_delete": _effect_conversation_delete,
     "delivery": _effect_delivery,

@@ -15,9 +15,8 @@ from avm.types import MetaDict, MetaList, StrNode
 
 def _caps_node(caps):
     data = {}
-    for key in ("mode", "workspace"):
-        if key in caps:
-            data[key] = StrNode(str(caps[key]))
+    if "mode" in caps:
+        data["mode"] = StrNode(str(caps["mode"]))
     for key in ("groups", "roots", "tools"):
         if key in caps:
             data[key] = MetaList([StrNode(str(x)) for x in caps[key]])
@@ -46,7 +45,6 @@ def _call(core, conv, cmd, args, call_id="c1"):
 
 
 def _user_conv(core, root, caps):
-    core.install_security_config({}, ("workspaces",))
     prog = MetaDict(data={"content": "sys"}, ctrl={"type": "settingup"})
     prog["caps"] = _caps_node(caps)
     core.mem["up"] = prog
@@ -89,25 +87,37 @@ class TestKernelCondition:
 
 
 class TestUserPresets:
-    def _user(self, core, root):
+    def _user(self, core, root, condition):
         user = _user_conv(core, root, {
-            "mode": "user", "workspace": "work", "groups": ["worker"],
+            "mode": "user", "groups": ["worker"],
             "tools": list(ALL_TOOL_NAMES),
         })
-        core.mem["h"] = _handler({"preset": "own_work.memory"})
-        # handler 必须对用户可见：放到其工作空间
-        user.user_batch.tool_responses.clear()
-        root_path = "$MEM." + ".".join(user.caps.roots["work"]) + ".h"
-        node = core.mem.resolve_path(root_path.split(".")[0:0] or ["MEM"] + list(user.caps.roots["work"]), for_llm=False)
-        node["h"] = _handler({"preset": "own_work.memory"})
-        node["h"].set_ctrl({"type": "handler", "owner": str(user.cid)})
-        _call(core, user, "listen_event", {"action": "listen", "handler_ref": "$work.h"})
-        assert user.user_batch.tool_responses[-1].content.startswith("listener_id=")
+        # 工作目录由软件建、根由控制面动态授予：handler 放在用户可见的目录里
+        core.mem.make("$MEM", "workdirs", "dict", owner_cid=0)
+        core.mem.make("$MEM.workdirs", f"w{user.cid}", "dict", owner_cid=0)
+        core.set_conversation_roots(user.cid, {"work": ["workdirs", f"w{user.cid}"]})
+        work = core.mem.resolve_path(["MEM", "workdirs", f"w{user.cid}"], for_llm=False)
+        work["h"] = _handler(condition)
+        work["h"].set_ctrl({"type": "handler", "owner": str(user.cid)})
         return user
 
-    def test_user_preset_registers_and_matches_own_work(self):
+    def _listen(self, core, user):
+        return _call(core, user, "listen_event", {
+            "action": "listen", "handler_ref": "$work.h",
+        })
+
+    def test_own_work_preset_removed(self):
         core, root = _core()
-        user = self._user(core, root)
+        user = self._user(core, root, {"preset": "own_work.memory"})
+        text = self._listen(core, user)
+        assert text.startswith(("Illegal:", "Error:")), text
+        assert "已移除" in text and "own_nodes.memory" in text
+        assert core.events.listeners == []
+
+    def test_user_preset_registers_and_matches_own_nodes(self):
+        core, root = _core()
+        user = self._user(core, root, {"preset": "own_nodes.memory"})
+        assert self._listen(core, user).startswith("listener_id=")
         seen = []
         core.events.add_observer(seen.append)
         _call(core, user, "memory_make", {"ref": "$work", "key": "x", "mem_type": "str"})
@@ -117,10 +127,6 @@ class TestUserPresets:
 
     def test_user_custom_condition_rejected(self):
         core, root = _core()
-        user = _user_conv(core, root, {
-            "mode": "user", "workspace": "work", "tools": list(ALL_TOOL_NAMES),
-        })
-        ws = core.mem.resolve_path(["MEM"] + list(user.caps.roots["work"]), for_llm=False)
-        ws["h"] = _handler({"events": ["memory_read"]})
-        _call(core, user, "listen_event", {"action": "listen", "handler_ref": "$work.h"})
-        assert "命名条件子集" in user.user_batch.tool_responses[-1].content
+        user = self._user(core, root, {"events": ["memory_read"]})
+        text = self._listen(core, user)
+        assert "命名条件子集" in text

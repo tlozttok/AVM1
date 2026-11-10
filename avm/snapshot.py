@@ -61,7 +61,6 @@ def snapshot(core) -> dict:
         "memory": core.mem.to_image_dict(),
         "security": {
             "roots": {name: list(target) for name, target in core.root_registry.items()},
-            "workspace_region": list(core.workspace_region),
         },
         "conversations": [
             core._conv_by_cid[cid].to_snapshot()
@@ -268,10 +267,7 @@ def _restore_security_and_pointer(core, doc: dict) -> None:
     core.root_registry = {
         name: tuple(segments) for name, segments in roots.items()
     }
-    region = security.get("workspace_region")
-    if region is None:
-        region = ["workspaces"]
-    core.workspace_region = tuple(region)
+    # 旧快照可能带 security.workspace_region：内核已不分配工作空间，按未知字段忽略。
     para_ref = doc.get("para_ref")
     if isinstance(para_ref, str) and para_ref:
         core.para_ref = para_ref

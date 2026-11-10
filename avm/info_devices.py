@@ -7,9 +7,7 @@ Core 运行时对象，不写内存树）。设备只做结构校验，授权由
 
 import json
 
-from .capabilities import (
-    CONTROL_DEVICE_ROOTS, check_root_name, grant_target_segments, path_is_prefix,
-)
+from .capabilities import grant_target_segments
 from .exceptions import IllegalOperationError, VMMemoryError
 from .memory_device import MemoryDevice
 
@@ -123,23 +121,13 @@ class ConversationsDevice(MemoryDevice):
         except (TypeError, ValueError):
             raise VMMemoryError(f"cid 必须是数字: {raw}")
 
-    def _in_workspace(self, target) -> bool:
-        region = tuple(self._core.workspace_region)
-        return path_is_prefix(region, tuple(target))
-
-    def _workspace_roots(self, conv):
-        """Core 拥有的根：工作空间根（按 workspace_root_name/区域识别）与能力自述根。"""
-        result = {}
-        name = getattr(conv, "workspace_root_name", None)
-        for root_name, target in conv.caps.roots.items():
-            if root_name == "MEM":
-                continue
-            if root_name in ("caps", name) or self._in_workspace(target):
-                result[root_name] = tuple(target)
-        return result
+    def _core_roots(self, conv):
+        """Core 拥有的根（目前只有能力自述根 caps）：控制面不可覆盖。"""
+        target = conv.caps.roots.get("caps")
+        return {"caps": tuple(target)} if target is not None else {}
 
     def _read_roots_json(self, conv) -> str:
-        core_roots = self._workspace_roots(conv)
+        core_roots = self._core_roots(conv)
         data = {}
         for name, target in conv.caps.roots.items():
             if name == "MEM":
@@ -222,84 +210,18 @@ class ConversationsDevice(MemoryDevice):
         conv.attrs = attrs
 
     def _write_roots(self, conv, value) -> None:
-        if conv.caps.mode == "kernel":
-            raise IllegalOperationError(
-                "内核态对话的根表固定含 MEM，不能通过控制面改写（用户态对话才可授予根）"
-            )
         data = _parse_json_field(value, "roots")
         if not isinstance(data, dict):
             raise IllegalOperationError("roots 必须是 JSON 对象（根名 -> $MEM 路径）")
-        core_roots = self._workspace_roots(conv)
-        new_roots = dict(core_roots)
+        roots_map = {}
         for name, ref in data.items():
             if not isinstance(name, str) or not name:
                 raise IllegalOperationError(f"根名必须是非空字符串，得到 {name!r}")
-            check_root_name(name)
-            if name in core_roots:
-                raise IllegalOperationError(f"根名 {name!r} 由 Core 分配，不能通过控制面覆盖")
             if not isinstance(ref, str):
                 raise IllegalOperationError(f"根 {name!r} 的目标必须是 $MEM 引用字符串")
-            new_roots[name] = grant_target_segments(ref)
-        self._validate_grants(conv, new_roots, core_roots)
-        conv.caps = conv.caps.copy(roots=new_roots)
-
-    def _validate_grants(self, conv, new_roots, core_roots) -> None:
-        """先全量校验后提交：保留区、前缀无关、工作空间绑定、设备路径。"""
-        core = self._core
-        region = tuple(core.workspace_region)
-        grants = [(name, tuple(target)) for name, target in new_roots.items()
-                  if name not in core_roots]
-        for name, target in grants:
-            if not target:
-                raise IllegalOperationError(f"根 {name!r} 的目标不能是 $MEM 根本身")
-            if path_is_prefix(region, target) or path_is_prefix(target, region):
-                raise IllegalOperationError(f"根 {name!r} 的目标落在保留的工作空间区域")
-            if target[0] in CONTROL_DEVICE_ROOTS:
-                raise IllegalOperationError(
-                    f"根 {name!r} 的目标落在内核控制面设备路径 $MEM.{target[0]}"
-                )
-            for mount in core.mem._devices:
-                mount_segments = tuple(mount.split("."))
-                if target == mount_segments:
-                    continue  # 显式授予设备本身是允许的
-                if path_is_prefix(target, mount_segments) or path_is_prefix(mount_segments, target):
-                    raise IllegalOperationError(
-                        f"根 {name!r} 的目标落在保留的内核设备路径 $MEM.{mount}"
-                    )
-        # 新根之间前缀无关（相等目标允许共享）
-        for i, (n1, t1) in enumerate(grants):
-            for n2, t2 in grants[i + 1:]:
-                if t1 == t2:
-                    continue
-                if path_is_prefix(t1, t2) or path_is_prefix(t2, t1):
-                    raise IllegalOperationError(f"根 {n1!r} 与 {n2!r} 的目标前缀冲突")
-        # 与其他存活对话的根表、根注册表比较
-        others = []
-        for cid, other in core._conv_by_cid.items():
-            if cid == conv.cid:
-                continue
-            for name, target in other.caps.roots.items():
-                if name == "MEM":
-                    continue
-                others.append((cid, name, tuple(target), self._in_workspace(target)))
-        for name, target in core.root_registry.items():
-            others.append((None, name, tuple(target), False))
-        for name, target in grants:
-            for cid, other_name, other_target, other_is_workspace in others:
-                if target == other_target:
-                    if other_is_workspace:
-                        raise IllegalOperationError(
-                            f"根 {name!r} 不能绑定对话 {cid} 的工作空间目标"
-                        )
-                    continue  # 相同目标允许共享
-                if path_is_prefix(target, other_target) or path_is_prefix(other_target, target):
-                    if other_is_workspace:
-                        raise IllegalOperationError(
-                            f"根 {name!r} 与其他对话 {cid} 的工作空间目标重叠"
-                        )
-                    raise IllegalOperationError(
-                        f"根 {name!r} 与已有根 {other_name!r} 的目标前缀冲突"
-                    )
+            roots_map[name] = grant_target_segments(ref)
+        # 校验与提交都由 Core 完成（含 conversation_roots 日志效果）
+        self._core.set_conversation_roots(conv.cid, roots_map)
 
     # ------------------------------------------------------------------
     # 设备接口
@@ -624,17 +546,11 @@ class CapsDevice(MemoryDevice):
         return conv
 
     def _summary(self, conv) -> dict:
-        core_roots = {"caps"}
-        for name, target in conv.caps.roots.items():
-            if name in ("MEM", "caps"):
-                continue
-            if path_is_prefix(tuple(self._core.workspace_region), tuple(target)):
-                core_roots.add(name)
         roots = {}
         for name, target in conv.caps.roots.items():
             if name == "MEM":
                 continue
-            roots[name] = {"core": name in core_roots}
+            roots[name] = {"core": name == "caps"}
         return {
             "cid": conv.cid,
             "identity": conv.identity,
@@ -643,7 +559,6 @@ class CapsDevice(MemoryDevice):
             "groups": list(conv.caps.groups),
             "roots": roots,
             "tools": sorted(conv.caps.tools),
-            "workspace": getattr(conv, "workspace_root_name", None),
         }
 
     def to_llm_string(self):
@@ -669,7 +584,7 @@ class CapsDevice(MemoryDevice):
             if path[1] in conv.caps.roots and path[1] != "MEM":
                 return "$" + path[1]
             raise VMMemoryError(
-                "$MEM.caps.<cid> 支持 mode/groups/roots/tools/workspace/identity/name"
+                "$MEM.caps.<cid> 支持 mode/groups/roots/tools/identity/name"
             )
         if len(path) == 3 and path[1] == "roots":
             name = path[2]

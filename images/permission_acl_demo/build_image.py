@@ -12,6 +12,8 @@ OUT = os.path.join(ROOT, "permission_acl_demo.json")
 INIT_SETUP = '''WORKER_CID = None
 WORK_RESULT = None
 
+WORKDIR = "$MEM.workdirs.w0"
+
 WORKER_TASK = """def run_checks():
     allowed = yield from memory_read("$lib.greeting")
     denied_secret = yield from memory_read("$lib.secret")
@@ -51,8 +53,17 @@ def on_done():
 def main():
     global WORKER_CID, WORK_RESULT
     yield from setup_acl()
+    # 工作目录属于软件策略：内核只保留根表与校验。软件建目录，再动态加根。
+    yield from memory_make("$MEM", "workdirs", "dict")
+    yield from memory_make("$MEM.workdirs", "w0", "dict")
     created = str((yield from create_cmd("$MEM.programs.worker", "$MEM.model_params")))
     WORKER_CID = int(created.rsplit("=", 1)[1])
+    # 根表写入是完整替换：软件自己持有"该对话应有哪些根"的完整映射，
+    # 所以把程序 caps 里授过的 $lib 与新建的 $work 一起写回。
+    yield from memory_write(
+        "$MEM.conversations.%d.roots" % WORKER_CID,
+        json.dumps({"work": WORKDIR, "lib": "$MEM.lib"}),
+    )
     roots = json.loads(str((yield from memory_read("$MEM.conversations.%d.roots" % WORKER_CID))))
     WORK_RESULT = roots["work"]["target"] + ".result"
     # 工作结果写入后的 after 事实事件：通知 init 醒来收尾（条件在 handler 节点里）
@@ -141,9 +152,8 @@ def node_dict(value, ctrl=None, meta=None):
 def node_caps(caps):
     """程序能力声明：value.caps 数据节点（不是 ctrl）。"""
     value = {}
-    for key in ("mode", "workspace"):
-        if key in caps:
-            value[key] = node_str(str(caps[key]))
+    if "mode" in caps:
+        value["mode"] = node_str(str(caps["mode"]))
     for key in ("groups", "roots", "tools"):
         if key in caps:
             value[key] = {
@@ -187,10 +197,9 @@ def build_image():
                          "groups": ["worker"],
                          "roots": ["lib"],
                          "tools": ["memory_read", "memory_write", "memory_make"],
-                         "workspace": "work",
                      })},
                     ctrl={"type": "python"},
-                    meta="用户态工作程序：只持有 $work 与只读库根 $lib",
+                    meta="用户态工作程序：只读库根 $lib；工作目录由软件动态加根后可见",
                 ),
             }),
             "handlers": node_dict({
@@ -208,7 +217,7 @@ def build_image():
                 }),
                 "done": node_handler(DONE_HANDLER, {
                     "events": ["memory_write"], "phase": ["after"],
-                    "target": {"kind": "subtree", "ref": "$MEM.workspaces"},
+                    "target": {"kind": "subtree", "ref": "$MEM.workdirs.w0"},
                 }),
             }),
             "init_user": node_str("yield from main()"),
@@ -216,7 +225,6 @@ def build_image():
         },
         "security": {
             "roots": {"lib": "$MEM.lib"},
-            "workspace_region": "$MEM.workspaces",
         },
         "para_ref": "$MEM.model_params",
         "init": {

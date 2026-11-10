@@ -52,8 +52,8 @@ def test_acl_demo_runs_to_completion_without_llm():
     assert str(core.mem["lib"]["secret"]) == "top-secret"
     # 初始程序与工作对话都被关闭
     assert sorted(core._finished) == [0, 1]
-    # 工作空间里留有工作对话的结果节点
-    result = core.mem.resolve_path(["MEM", "workspaces", "w0", "result"], for_llm=False)
+    # 软件建的工作目录里留有工作对话的结果节点
+    result = core.mem.resolve_path(["MEM", "workdirs", "w0", "result"], for_llm=False)
     assert "greeting=hello" in str(result)
 
 
@@ -62,10 +62,11 @@ def test_demo_image_declares_user_caps_and_acl_data():
     worker = core.mem.resolve_path(["MEM", "programs", "worker"], for_llm=False)
     caps_node = worker.get("caps")
     caps = {
-        key: (str(caps_node.get(key)) if key in ("mode", "workspace")
+        key: (str(caps_node.get(key)) if key == "mode"
               else [str(x) for x in caps_node.get(key)])
         for key in caps_node.keys()
     }
+    assert "workspace" not in caps  # 内核不再分配工作空间
     assert caps["mode"] == "user"
     assert caps["roots"] == ["lib"]
     assert caps["groups"] == ["worker"]
