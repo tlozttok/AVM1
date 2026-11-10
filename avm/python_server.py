@@ -1,4 +1,5 @@
 
+import ast
 import contextlib
 import inspect
 import io
@@ -13,7 +14,7 @@ from .types import (
     Conversation, MetaDict, MetaList, Role, message_to_api_dict, Message,
     SystemMessage, UserMessage, AssistantMessage, ToolMessage,
 )
-from .sandbox import safe_globals, exec_safe, check_code
+from .sandbox import SecurityError, safe_globals, exec_safe, check_code
 
 
 def message_list_from_api_dict(messages: List[dict]) -> List[Message]:
@@ -181,6 +182,46 @@ class PLMServer(ABC):
         self._prev_input = list(raw_messages)
 
 
+_NO_RESUME = object()  # 生成器首次推进（next）与续跑（send）的区分哨兵
+
+
+class _GeneratorToolPLM(PLMServer):
+    """生成器程序 PLM 的公共挂起状态：一个程序生成器 + 一个挂起的工具调用。
+
+    子类负责自己的 `_drive`（输出规则不同），这里只收口三件事：
+    - `_gen` / `_pending_call_id` / `_call_seq` 的初始化；
+    - `_abandon()`：关闭挂起的生成器，丢弃其剩余步骤；
+    - `_as_tool_call()`：校验生成器 yield 出的工具请求形状与授权。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._gen = None
+        self._pending_call_id = None
+        self._call_seq = 0
+
+    def _abandon(self) -> None:
+        gen = self._gen
+        self._gen = None
+        self._pending_call_id = None
+        if gen is not None:
+            try:
+                gen.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _as_tool_call(yielded, allowed):
+        if not isinstance(yielded, (tuple, list)) or len(yielded) != 2:
+            return None
+        name, args = yielded
+        if not isinstance(name, str) or name not in allowed:
+            return None
+        if not isinstance(args, dict):
+            return None
+        return name, args
+
+
 class SimplePLM(PLMServer):
     """最简单的 PLM：计算器。只接受一行表达式，eval 求值后直接返回。
 
@@ -209,17 +250,125 @@ class SimplePLM(PLMServer):
         return ""
 
 
-class _PythonToolSuspension(BaseException):
-    """Python 程序请求一次工具调用：注入的工具函数抛出它，PLM 捕获后转成 tool_calls。
+def _bind_tool_args(name, names, required, args, kwargs):
+    """把工具函数收到的参数绑定成指令参数 dict；形状错误抛 TypeError。"""
+    if args and kwargs:
+        raise TypeError(f"{name} 不接受位置参数与关键字参数混用")
+    arguments = {}
+    if kwargs:
+        unknown = [key for key in kwargs if key not in names]
+        if unknown:
+            raise TypeError(f"{name} 不接受参数 {unknown}（可用：{list(names)}）")
+        arguments.update(kwargs)
+    else:
+        if len(args) > len(names):
+            raise TypeError(f"{name} 至多 {len(names)} 个参数，得到 {len(args)} 个")
+        arguments.update(zip(names, args))
+    missing = [key for key in required if key not in arguments]
+    if missing:
+        raise TypeError(f"{name} 缺少参数 {missing}")
+    return arguments
 
-    继承 BaseException：程序里的 `except Exception` 不该吞掉挂起信号；沙箱不发
-    BaseException，程序也无法自己造出这个信号（只有裸 `except:` 拦得下它）。
+
+class _SetupToolScan(ast.NodeVisitor):
+    """扫描 setup 里**会被执行**的代码；函数体不执行，允许在里面定义工具调用。
+
+    setup 本来就是用来定义程序函数的；先前的"任何工具调用都拒绝"会把
+    `def pack(): yield from memory_read(...)` 也拦下。
     """
 
-    def __init__(self, name, arguments):
-        super().__init__(f"{name}({arguments})")
-        self.name = name
-        self.arguments = arguments
+    def __init__(self, tool_names):
+        self._tool_names = set(tool_names)
+
+    def _scan_def_header(self, node):
+        for item in getattr(node, "decorator_list", []) or []:
+            self.visit(item)
+        if hasattr(node, "args") and hasattr(node.args, "defaults"):
+            for item in node.args.defaults:
+                self.visit(item)
+            for item in node.args.kw_defaults:
+                if item is not None:
+                    self.visit(item)
+
+    def visit_FunctionDef(self, node):
+        self._scan_def_header(node)
+
+    def visit_AsyncFunctionDef(self, node):
+        self._scan_def_header(node)
+
+    def visit_Lambda(self, node):
+        pass
+
+    def visit_ClassDef(self, node):
+        self._scan_def_header(node)
+        for stmt in node.body:
+            self.visit(stmt)
+
+    def visit_Call(self, node):
+        if isinstance(node.func, ast.Name) and node.func.id in self._tool_names:
+            raise SecurityError(
+                f"系统提示词（setup 代码）里不能调用工具：{node.func.id}；"
+                f"工具调用放进 init 的 user 消息里"
+            )
+        self.generic_visit(node)
+
+
+def _check_program_tools(source: str, tool_names, allowed, context: str = "program") -> None:
+    """检查用户程序 / 系统提示词里的工具调用位置。
+
+    - setup：会被执行的代码里出现工具调用就拒绝；函数体里的定义允许（不执行）；
+    - 用户程序：工具调用必须正好是 `yield from tool(...)` 的直接值，且工具已授权。
+    """
+    tree = ast.parse(source)
+    if context == "setup":
+        _SetupToolScan(tool_names).visit(tree)
+        return
+    direct = {
+        id(node.value) for node in ast.walk(tree) if isinstance(node, ast.YieldFrom)
+    }
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in tool_names):
+            continue
+        name = node.func.id
+        if name not in allowed:
+            raise SecurityError(f"工具 {name} 未授权给本对话")
+        if id(node) not in direct:
+            raise SecurityError(
+                f"工具调用必须写成 yield from {name}(...)（现在的写法是直接调用"
+                f"或嵌套在其它表达式里）"
+            )
+
+
+def _program_global_names(source: str) -> list:
+    """程序里所有模块级绑定名：包装成函数后要声明 global，保持"顶层赋值进命名空间"。"""
+    tree = ast.parse(source)
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+    return sorted(names)
+
+
+def _wrap_program(source: str) -> str:
+    """把"顶层代码"包成生成器函数：顶层 yield from 与 return 因此合法。
+
+    末尾补一条 `yield from ()`：程序没有任何工具调用时，包装后的函数也必须是生成器，
+    驱动器才能用 next/send 统一推进。
+    """
+    if not source.strip():
+        return "def __avm_main__():\n    yield from ()\n"
+    globals_ = _program_global_names(source)
+    body = "\n".join(
+        ("    " + line) if line.strip() else line for line in source.splitlines()
+    )
+    header = "def __avm_main__():\n"
+    if globals_:
+        header += "    global " + ", ".join(globals_) + "\n"
+    return header + body + "\n    yield from ()\n"
 
 
 # 注入 Python 程序的工具：与指令同名同参，程序按普通函数调用。
@@ -239,28 +388,23 @@ PYTHON_TOOL_SPECS = {
 }
 
 
-class PythonPLM(PLMServer):
-    """图灵完备 PLM：Jupyter 笔记本式——系统/用户提示词都执行进同一个持久命名空间，
-    stdout 全部捕获并按顺序拼接为整体返回。
+class PythonPLM(_GeneratorToolPLM):
+    """图灵完备 PLM：Jupyter 笔记本式命名空间 + 生成器挂起。
 
     固定行为模式：
     - 系统提示词：setup 代码，受限执行进持久命名空间（跨轮次保留）；setup 里不能调用工具；
-    - 用户提示词：代码，也执行进同一个命名空间（与 setup 共享变量、可读写）；
-    - 多个 print 全部执行，输出按顺序拼接为一个整体作为返回；
-    - 工具通道：命名空间注入 9 条指令对应的工具函数（名字与参数同指令），程序像调普通函数一样
-      调用；PLM 把调用变成一次 tool call，工具响应回来后**从同一条用户消息重放**，已记录的
-      调用按序返回响应——写入类调用因此不会重复执行。一次只挂起一个工具调用，id 形如 `py-<n>`；
-      重放会重跑前缀代码，但重跑产生的 stdout 不会重复返回；
-    - 挂起信号继承 BaseException：`except Exception` 吞不掉它；用裸 `except:` 会把它当成程序
-      错误（参数不匹配之类的报错），这是不该用裸 except 的地方；
-    - 沙箱：安全 builtins 白名单 + AST 检查（禁 import、禁双下划线属性、禁危险调用）。
+    - 用户提示词：程序代码，也在同一命名空间里执行；工具调用写成
+      `value = yield from memory_read("$MEM.x")`——工具函数是生成器，挂起一次、
+      工具响应回来后在断点继续，不重放前缀；
+    - 程序结束后返回累计 stdout；`return` 字符串会追加到最终输出；
+    - 一次只挂起一个工具调用，id 形如 `py-<n>`；新用户消息会关闭仍挂起的旧程序；
+    - 沙箱：安全 builtins 白名单 + AST 检查（禁 import、禁双下划线属性、禁危险调用），
+      另加工具调用位置检查（必须 `yield from` 直接调用）。
     """
 
     def __init__(self):
         super().__init__()
-        self._call_seq = 0
         self._reset_namespace()
-        self._reset_round()
 
     # ------------------------------------------------------------------
     # 命名空间与工具注入
@@ -278,115 +422,93 @@ class PythonPLM(PLMServer):
         names = required + optional
 
         def tool(*args, **kwargs):
-            return self._request_tool(name, names, required, args, kwargs)
+            arguments = _bind_tool_args(name, names, required, args, kwargs)
+            return (yield (name, arguments))
 
         tool.__name__ = name
         return tool
 
-    def _reset_round(self):
-        """一轮的状态：已记录的调用与响应、重放游标、正在重放的代码、已返回过的 stdout 长度。"""
-        self._calls = []          # [(call_id, name, arguments)]，按发出顺序
-        self._responses = []      # 工具响应文本，按顺序与 _calls 对齐
-        self._cursor = 0          # 重放游标
-        self._code = None         # 本轮的代码（重放时再执行一遍）
-        self._emitted = 0         # 上次挂起前已产出的 stdout 长度
-        self._pending_call_id = None
-
-    # ------------------------------------------------------------------
-    # 工具调用：记录 + 重放
-    # ------------------------------------------------------------------
-
-    def _request_tool(self, name, names, required, args, kwargs):
-        if args and kwargs:
-            raise TypeError(f"{name} 不接受位置参数与关键字参数混用")
-        arguments = {}
-        if kwargs:
-            unknown = [key for key in kwargs if key not in names]
-            if unknown:
-                raise TypeError(f"{name} 不接受参数 {unknown}（可用：{list(names)}）")
-            arguments.update(kwargs)
-        else:
-            if len(args) > len(names):
-                raise TypeError(f"{name} 至多 {len(names)} 个参数，得到 {len(args)} 个")
-            arguments.update(zip(names, args))
-        missing = [key for key in required if key not in arguments]
-        if missing:
-            raise TypeError(f"{name} 缺少参数 {missing}")
-        if self._cursor < len(self._responses):
-            call_id, recorded_name, recorded_args = self._calls[self._cursor]
-            if recorded_name != name or recorded_args != arguments:
-                raise RuntimeError(
-                    f"重放与记录不一致：第 {self._cursor} 个调用是 "
-                    f"{recorded_name}({recorded_args})，本次是 {name}({arguments})"
-                )
-            self._cursor += 1
-            return self._responses[self._cursor - 1]
-        raise _PythonToolSuspension(name, arguments)
-
-    def _run(self, code):
-        """执行/重放一段代码：挂起返回一次 tool call，跑完返回（增量）stdout。"""
-        self._code = code
-        # 每趟都从代码开头执行，记录游标跟着从头走（_calls / _responses 是跨趟累积的）
-        self._cursor = 0
-        buf = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(buf):
-                exec_safe(code, self.namespace)
-        except _PythonToolSuspension as request:
-            try:
-                payload = json.dumps(request.arguments, ensure_ascii=False)
-            except (TypeError, ValueError) as e:
-                self._reset_round()
-                return f"错误: TypeError: 工具参数不能 JSON 序列化: {e}"
-            call_id = f"py-{self._call_seq}"
-            self._call_seq += 1
-            self._calls.append((call_id, request.name, request.arguments))
-            self._emitted = len(buf.getvalue())
-            self._pending_call_id = call_id
-            return self.make_response("", tool_calls=[{
-                "id": call_id,
-                "type": "function",
-                "function": {"name": request.name, "arguments": payload},
-            }])
-        except Exception as e:
-            self._reset_round()
-            return f"错误: {type(e).__name__}: {e}"
-        text = buf.getvalue()[self._emitted:]
-        self._reset_round()
-        return text
+    def _allowed_tool_names(self) -> set:
+        return {name for name in PYTHON_TOOL_SPECS if self._tool_allowed(name)}
 
     # ------------------------------------------------------------------
     # 消息入口
     # ------------------------------------------------------------------
 
     def _execute_system_message(self, content: str):
-        self._reset_round()
+        self._abandon()
         self._reset_namespace()
-        try:
-            exec_safe(content, self.namespace)
-        except _PythonToolSuspension:
-            raise RuntimeError(
-                "系统提示词（setup 代码）里不能调用工具：工具调用只能出现在用户消息的代码里"
-            ) from None
+        _check_program_tools(content, set(PYTHON_TOOL_SPECS), set(), context="setup")
+        exec_safe(content, self.namespace)
 
     def _execute_user_message(self, content: str):
-        return self._run(content)
+        self._abandon()
+        try:
+            check_code(content)
+            _check_program_tools(
+                content, set(PYTHON_TOOL_SPECS), self._allowed_tool_names(),
+            )
+            wrapped = _wrap_program(content)
+            exec(compile(wrapped, "<python>", "exec"), self.namespace)
+            program = self.namespace.get("__avm_main__")
+            generator = program()
+        except Exception as e:
+            return f"错误: {type(e).__name__}: {e}"
+        return self._drive(generator, _NO_RESUME)
 
     def _execute_tool_message(self, content: str, call_id: str):
-        if self._pending_call_id is None:
+        if self._gen is None:
             # 没有挂起的调用：与其他 PLM 一致，忽略
             return ""
-        if call_id != self._pending_call_id:
-            expected = self._pending_call_id
-            self._reset_round()
+        expected = self._pending_call_id
+        if call_id != expected:
+            self._abandon()
             return f"错误: PythonPLM: 工具响应与挂起的调用不匹配: {call_id!r}（等待 {expected!r}）"
-        code = self._code
-        self._responses.append(content)
+        generator = self._gen
         self._pending_call_id = None
-        if code is None:
-            self._reset_round()
-            return "错误: PythonPLM: 挂起状态缺少用户代码"
-        return self._run(code)
+        return self._drive(generator, content)
+
+    # ------------------------------------------------------------------
+    # 驱动
+    # ------------------------------------------------------------------
+
+    def _finish(self, text: str, value) -> str:
+        if value is None:
+            return text
+        if isinstance(value, str):
+            return text + value
+        return f"错误: TypeError: 程序 return 值必须是字符串或 None，得到 {type(value).__name__}"
+
+    def _drive(self, generator, sent):
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                yielded = next(generator) if sent is _NO_RESUME else generator.send(sent)
+        except StopIteration as stop:
+            self._abandon()
+            return self._finish(buf.getvalue(), stop.value)
+        except Exception as e:
+            self._abandon()
+            return f"错误: {type(e).__name__}: {e}"
+        allowed = self._allowed_tool_names()
+        parsed = self._as_tool_call(yielded, allowed)
+        if parsed is None:
+            self._abandon()
+            return (f"错误: TypeError: 非法工具调用 {yielded!r}"
+                    f"（可用：{sorted(allowed)}）")
+        name, arguments = parsed
+        call_id = f"py-{self._call_seq}"
+        self._call_seq += 1
+        self._gen = generator
+        self._pending_call_id = call_id
+        return self.make_response(buf.getvalue(), tool_calls=[{
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(arguments, ensure_ascii=False),
+            },
+        }])
 
 
 class FunctionPLM(PLMServer):
@@ -788,10 +910,7 @@ COMMAND_TOOLS = {
     "close_conversation": _tool_close_conversation,
 }
 
-_NO_RESUME = object()  # 生成器首次推进（next）与续跑（send）的区分哨兵
-
-
-class CommandPLM(PLMServer):
+class CommandPLM(_GeneratorToolPLM):
     """命令行 PLM：system 是命令处理程序，user 是一行命令与参数，IO 都是字符串。
 
     固定行为模式：
@@ -813,9 +932,6 @@ class CommandPLM(PLMServer):
         super().__init__()
         self._compiled = None
         self._parse_error = None
-        self._gen = None  # 挂起在工具调用上的生成器
-        self._pending_call_id = None
-        self._call_seq = 0
 
     # ------------------------------------------------------------------
     # system 消息：编译程序
@@ -847,17 +963,6 @@ class CommandPLM(PLMServer):
         extra.update(self._allowed_command_tools())
         return safe_globals(extra)
 
-    def _abandon(self) -> None:
-        """丢弃挂起的生成器（其剩余步骤不再执行）。"""
-        gen = self._gen
-        self._gen = None
-        self._pending_call_id = None
-        if gen is not None:
-            try:
-                gen.close()
-            except Exception:
-                pass
-
     def _output(self, value):
         """命令输出：字符串原样返回，None 视为空输出，其它类型报错。"""
         if value is None:
@@ -865,18 +970,6 @@ class CommandPLM(PLMServer):
         if isinstance(value, str):
             return value
         return self._error(f"handle 必须返回字符串，得到 {type(value).__name__}")
-
-    def _as_tool_call(self, yielded):
-        """校验生成器 yield 出的工具请求，返回 (name, args) 或 None。"""
-        if not isinstance(yielded, (tuple, list)) or len(yielded) != 2:
-            return None
-        name, args = yielded
-        allowed = self._allowed_command_tools()
-        if not isinstance(name, str) or name not in allowed:
-            return None
-        if not isinstance(args, dict):
-            return None
-        return name, args
 
     def _drive(self, gen, sent):
         """推进生成器一步：产出工具调用，或结束并返回命令输出。"""
@@ -890,7 +983,7 @@ class CommandPLM(PLMServer):
         except Exception as e:
             self._abandon()
             return self._error(f"{type(e).__name__}: {e}")
-        parsed = self._as_tool_call(yielded)
+        parsed = self._as_tool_call(yielded, set(self._allowed_command_tools()))
         if parsed is None:
             self._abandon()
             return self._error(

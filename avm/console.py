@@ -228,7 +228,9 @@ class Console:
             self._install_io_devices()
 
         self.channel = OperatorChannel()
-        self.panel = core.start_operator_conversation(self.channel)
+        # 保留对话（cid -1）在装载时/重放时已经存在；这里只把操作员通道绑上去。
+        # 没有（例如测试直接构造 Core）时 bind 会创建一条。
+        self.panel = core.bind_console_conversation(self.channel)
         core.interrupts.register("operator", self.panel.cid)
 
         self.auth_token = auth_token

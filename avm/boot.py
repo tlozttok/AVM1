@@ -208,6 +208,7 @@ def boot(
                 recovery["source"] = "journal"
                 recovery["replayed"] = _restore_from_journal(core, "从日志恢复")
     core.recovery = recovery
+    core._last_snapshot_seq = core._journal_seq
     return start_core(
         core,
         refresh_models=refresh_models,

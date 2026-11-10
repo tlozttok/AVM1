@@ -136,9 +136,11 @@ def _publish_memory_after(
 # 不在这套之内的异常是内核缺陷，由 advance_conversation 记帧后向上抛（不在这里吞）。
 _INSTRUCTION_ERRORS = (VMMemoryError, KeyError, IndexError, TypeError, ValueError)
 
-# 面板/宿主对话的保留 cid：魔数、不参与正常分配。它对普通对话隐藏：不出现在
-# $MEM.conversations / $MEM.scheduler 里，也不可用 send_instruction / close_conversation
-# 或 $conv.<cid> / $batch.<cid> 寻址（与"不存在"同样处理）。
+# 保留对话 cid（作者规定）：宿主侧操作员对话的身份，不参与正常分配，也不会撞上
+# `_next_cid` 的正数。它对普通对话隐藏：不出现在 $MEM.conversations / $MEM.scheduler
+# 里，也不可用 send_instruction / close_conversation 或 $conv.<cid> / $batch.<cid>
+# 寻址。隐藏只是显示/寻址策略：对话本身随快照/日志正常恢复，日志里它的回合按普通
+# 回合重放。
 PANEL_CID = -1
 
 
@@ -1691,6 +1693,10 @@ class Core:
         self.journal_path: Optional[str] = None   # 镜像 journal_to（load_image 解析后写入）
         self.snapshot_path: Optional[str] = None  # 镜像 snapshot_to（load_image 解析后写入）
         self._journal_seq: int = 0                # 已提交/已重放到的日志位置
+        self._journal_batch: Dict[int, dict] = {}  # cid → 上次提交的待发批次（增量记录用）
+        self._scheduler_committed: Optional[dict] = None  # 上次提交后的调度状态（增量基线）
+        self.snapshot_every: Optional[int] = None  # 每 N 个已提交回合写一次定时快照；None 关闭
+        self._last_snapshot_seq: int = 0           # 上次写快照对应的日志 seq
         self._turn_effects: List[dict] = []       # 本轮指令产生的语义效果（回合结束提交）
         self._replaying: bool = False             # 重放期间禁止再记录
         self._recording: bool = False             # 只在回合执行体内记录
@@ -1717,7 +1723,7 @@ class Core:
 
     @staticmethod
     def is_hidden_cid(cid) -> bool:
-        """宿主/面板保留 cid：对话侧不可见、不可寻址。"""
+        """保留对话 cid：对普通对话隐藏、不可寻址（显示/寻址策略，不影响恢复）。"""
         return cid == PANEL_CID
 
     # ------------------------------------------------------------------
@@ -1923,6 +1929,9 @@ class Core:
         """挂上回合日志（后续回合从这里追加）。重放用 `replay_journal`。"""
         self.detach_journal()
         self.journal = Journal(path)
+        # 调度增量的基线：从装载后的状态开始记，第一条记录覆盖 run 前的选择与回合内迁移。
+        self._scheduler_committed = self._scheduler_state()
+        self._refresh_journal_batch()
         return self.journal
 
     def detach_journal(self) -> None:
@@ -1948,27 +1957,97 @@ class Core:
             return
         self._turn_effects.extend(effects)
 
+    def _scheduler_state(self) -> dict:
+        """当前调度状态的只读快照（回合开始/提交时各取一次，做增量用）。"""
+        return {
+            "active": self._active_cid,
+            "ready": list(self._ready_cids),
+            "dormant": list(self._dormant_cids),
+            "finished": set(self._finished),
+            "activation_instructions": int(self._activation_instructions),
+            "next_cid": int(self._next_cid),
+        }
+
+    @staticmethod
+    def _scheduler_delta(before: dict, after: dict):
+        """把回合前后的调度状态压成一条增量变化；没有变化返回 None。"""
+        delta = {}
+        if before["active"] != after["active"]:
+            delta["active"] = after["active"]
+        for key in ("ready", "dormant"):
+            before_list = before[key]
+            after_list = after[key]
+            before_set = set(before_list)
+            after_set = set(after_list)
+            added = [cid for cid in after_list if cid not in before_set]
+            removed = [cid for cid in before_list if cid not in after_set]
+            if added:
+                delta[key + "_add"] = added
+            if removed:
+                delta[key + "_remove"] = removed
+        added_finished = sorted(after["finished"] - before["finished"])
+        removed_finished = sorted(before["finished"] - after["finished"])
+        if added_finished:
+            delta["finished_add"] = added_finished
+        if removed_finished:
+            delta["finished_remove"] = removed_finished
+        if before["activation_instructions"] != after["activation_instructions"]:
+            delta["activation_instructions"] = after["activation_instructions"]
+        if before["next_cid"] != after["next_cid"]:
+            delta["next_cid"] = after["next_cid"]
+        if not delta:
+            return None
+        return {"kind": "scheduler", **delta}
+
+    def _refresh_journal_batch(self) -> None:
+        """重放/恢复完成后，把"上次提交的批次"对齐到当前对话状态。"""
+        self._journal_batch = {
+            cid: batch_to_dict(conv.user_batch) for cid, conv in self._conv_by_cid.items()
+        }
+
+    def _refresh_journal_scheduler(self) -> None:
+        """重放/恢复完成后，把调度增量基线对齐到当前调度状态。"""
+        self._scheduler_committed = self._scheduler_state()
+
     def _commit_journal_record(self, conv: Conversation, history_delta: List[dict]) -> None:
-        """回合结束提交一条记录（安全点调用；异常回合不提交）。"""
+        """回合结束提交一条记录（安全点调用；异常回合不提交）。
+
+        记录是**有序变化序列**：本轮追加的消息、指令产生的效果、待发批次的变化、
+        调度队列的变化。顺序即执行顺序；重放只按顺序应用，不再按字段分阶段重组。
+        """
         effects = self._turn_effects
         self._turn_effects = []
         if self.journal is None:
             return
-        history = list(history_delta)
-        call = None
-        if history and history[-1].get("role") == "assistant":
-            call = {key: value for key, value in history.pop().items() if key != "role"}
+        changes: List[dict] = []
+        for item in history_delta:
+            changes.append({"kind": "message", "message": item})
+        for effect in effects:
+            changes.append({"kind": "effect", "effect": effect})
+        cid = conv.cid
+        empty_batch = {"tool_responses": [], "user_contents": []}
+        # 批次变化可能发生在别的对话上（delivery 效果给目标加输入），所以对所有对话
+        # 取差量；数量与对话数同级，单条改动通常为空。
+        for other_cid, other_conv in self._conv_by_cid.items():
+            current_batch = batch_to_dict(other_conv.user_batch)
+            previous = self._journal_batch.get(other_cid, empty_batch)
+            if current_batch != previous:
+                changes.append(
+                    {"kind": "batch", "cid": other_cid, "batch": current_batch}
+                )
+            self._journal_batch[other_cid] = current_batch
+        scheduler_before = self._scheduler_committed
+        if scheduler_before is None:
+            scheduler_before = self._scheduler_state()
+        delta = self._scheduler_delta(scheduler_before, self._scheduler_state())
+        if delta is not None:
+            changes.append(delta)
+        self._scheduler_committed = self._scheduler_state()
         record = {
-            "cid": conv.cid,
+            "v": 2,
+            "cid": cid,
             "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "history": history,
-            "call": call,
-            "batch": (
-                batch_to_dict(conv.user_batch)
-                if conv.cid in self._conv_by_cid else None
-            ),
-            "scheduler": scheduler_to_snapshot(self),
-            "effects": effects,
+            "changes": changes,
         }
         self._journal_seq = self.journal.append(record)
 
@@ -1981,7 +2060,7 @@ class Core:
         if self.journal is None:
             raise JournalError("没有挂载日志：先 attach_journal")
         pending = (
-            self.journal.read(after_seq=self._journal_seq)
+            self.journal.iter_records(after_seq=self._journal_seq)
             if records is None else list(records)
         )
         applied = 0
@@ -1999,6 +2078,9 @@ class Core:
             apply_journal_record(self, record)
             self._journal_seq = seq
             applied += 1
+        if applied:
+            self._refresh_journal_batch()
+            self._refresh_journal_scheduler()
         return applied
 
     # ------------------------------------------------------------------
@@ -2013,6 +2095,7 @@ class Core:
         if not target:
             raise ValueError("没有快照路径：传 path 或让镜像声明 snapshot_to")
         write_atomic(target, snapshot(self))
+        self._last_snapshot_seq = self._journal_seq
         return target
 
     def restore_from(self, path: str) -> dict:
@@ -2293,6 +2376,7 @@ class Core:
             else:
                 self.monitor.record(self, last_call=self._last_call_for(executor))
                 self._commit_journal_record(conv, history_delta)
+                self._maybe_periodic_snapshot()
                 return
 
     def _last_call_for(self, executor):
@@ -2393,19 +2477,18 @@ class Core:
         self._ready_cids.append(conv.cid)
         return conv
 
-    def start_operator_conversation(
-        self,
-        channel,
-        para_ref: str = "$MEM.model_params",
-    ) -> Conversation:
-        """调试用：建一条操作员对话，执行器是控制台持有的操作员。
+    def ensure_operator_conversation(self, para_ref: Optional[str] = None) -> Conversation:
+        """确保保留对话（cid = PANEL_CID）存在并返回它；不绑定执行器。
 
-        - cid 是保留魔数（-1），对普通对话不可见、不可寻址（conversations/scheduler 列表过滤、send/close 报不存在）；
+        - 身份固定：cid 是作者规定的保留值，不参与正常分配，也不依赖创建顺序；
         - 初始进休眠队列、不进就绪队列：它不主动抢占，只有中断能激活它；
-        - 执行器在这里建好并预置，使 _get_executor 直接命中缓存——plm.operator
-          需要注入通道，注册表无参构造出来的实例不能用；
-        - 不可存检查点（save_conversation 拒绝 Python 对话），不需要额外处理。
+        - 装载时、日志重放遇到它的记录时、控制台绑定时都走这里；
+        - 执行器由 bind_console_conversation 在宿主启动后注入（plm.operator 需要通道，
+          注册表无参构造出来的实例不能用）。
         """
+        conv = self._conv_by_cid.get(PANEL_CID)
+        if conv is not None:
+            return conv
         conv = Conversation(
             messages=[SystemMessage(content=_OPERATOR_SYSTEM_PROMPT)],
             cid=0,
@@ -2413,12 +2496,30 @@ class Core:
             parent=None,
             is_root=False,
         )
-        self._register(conv, cid=PANEL_CID)  # 保留魔数 cid：对普通对话隐藏、不可寻址
-        conv.para_ref = para_ref
+        self._register(conv, cid=PANEL_CID)
+        conv.para_ref = para_ref or self.para_ref
         conv.is_python = True
-        self._executors[conv.cid] = PLMExecutor(create_plm("plm.operator", channel=channel))
         self._dormant_cids.append(conv.cid)
         return conv
+
+    def bind_console_conversation(
+        self,
+        channel,
+        para_ref: Optional[str] = None,
+    ) -> Conversation:
+        """把控制台通道绑到保留对话；没有就先建出来，返回该对话。"""
+        conv = self.ensure_operator_conversation(para_ref)
+        conv.para_ref = para_ref or self.para_ref
+        self._executors[conv.cid] = PLMExecutor(create_plm("plm.operator", channel=channel))
+        return conv
+
+    def start_operator_conversation(
+        self,
+        channel,
+        para_ref: Optional[str] = None,
+    ) -> Conversation:
+        """兼容旧入口：绑定控制台通道；没有保留对话时建一条。"""
+        return self.bind_console_conversation(channel, para_ref)
 
     # ------------------------------------------------------------------
     # 安全点自检（六条具名不变量）
@@ -2849,6 +2950,24 @@ class Core:
         return brief
 
     # -- 操作面板生命周期 ------------------------------------------------
+
+    def _maybe_periodic_snapshot(self) -> None:
+        """每 snapshot_every 个已提交回合在安全点写一次定时快照。
+
+        快照是缓存：写失败只警告，不改变运行；日志仍是持久依据。
+        """
+        every = self.snapshot_every
+        if not every or not self.snapshot_path or self.journal is None:
+            return
+        if self._journal_seq - self._last_snapshot_seq < every:
+            return
+        try:
+            self.snapshot_to()
+        except Exception as e:
+            print(
+                f"[AVM] 定时快照写入失败（{type(e).__name__}: {e}）",
+                file=sys.stderr,
+            )
 
     def request_stop(self) -> None:
         """宿主请求停止：run() 在下一个安全点返回，交宿主写快照。

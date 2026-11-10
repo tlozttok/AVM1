@@ -219,7 +219,7 @@ class TestApplyErrors:
         core.attach_journal(core.journal_path)
         run_turns(core, 1)
         record = core.journal.read()[0]
-        record["effects"] = [{"kind": "no_such_effect"}]
+        record["changes"] = [{"kind": "effect", "effect": {"kind": "no_such_effect"}}]
         with pytest.raises(JournalError, match="未知效果"):
             apply(core, record)
 
@@ -337,8 +337,162 @@ class TestFailedTurnsAreNotCommitted:
 
         records = core.journal.read()
         assert [record["seq"] for record in records] == [1, 2]
-        assert records[0]["effects"][0]["kind"] == "memory_set"
+        effects = [
+            change["effect"] for change in records[0]["changes"]
+            if change["kind"] == "effect"
+        ]
+        assert effects[0]["kind"] == "memory_set"
 
         replayed, applied = _replay(image)
         assert applied == 2
         assert_same_state(core, replayed)
+
+
+class TestReservedConversationRecord:
+    """保留对话（cid -1）的回合：按普通回合重放，对话随快照/日志恢复。"""
+
+    def test_operator_turn_replays_into_reserved_conversation(self, tmp_path):
+        from avm.console import OperatorChannel
+        from avm.core import PANEL_CID
+
+        image = write_image(tmp_path)
+        core = load_core(image)
+        core.attach_journal(core.journal_path)
+        channel = OperatorChannel()
+        channel.submit_action({
+            "tool": "memory_write",
+            "arguments": {"ref": "$MEM.dst", "content": "hi"},
+        })
+        panel = core.bind_console_conversation(channel)
+        assert panel.cid == PANEL_CID
+        core._active_cid = panel.cid
+        core.advance_conversation()
+
+        records = core.journal.read()
+        assert len(records) == 1
+        assert records[0]["cid"] == PANEL_CID
+
+        restored = load_core(image)
+        restored.attach_journal(restored.journal_path)
+        assert restored.replay_journal() == 1
+        assert restored.mem["dst"] == "hi"
+        conv = restored.get_conversation(PANEL_CID)
+        assert conv is not None and restored.is_hidden_cid(PANEL_CID)
+
+    def test_reserved_conversation_survives_snapshot_and_journal_tail(self, tmp_path):
+        import json as _json
+
+        from avm.console import OperatorChannel
+        from avm.core import Core, PANEL_CID
+        from avm.image import load_image
+
+        image = write_image(tmp_path)
+        core = load_core(image)
+        core.attach_journal(core.journal_path)
+        channel = OperatorChannel()
+        panel = core.bind_console_conversation(channel)
+        assert panel.cid == PANEL_CID
+
+        def act(ref, value):
+            channel.submit_action({
+                "tool": "memory_write",
+                "arguments": {"ref": ref, "content": value},
+            })
+            core._active_cid = panel.cid
+            core.advance_conversation()
+
+        act("$MEM.dst", "in-snapshot")
+        snap_path = tmp_path / "snap.json"
+        snap_path.write_text(_json.dumps(snapshot(core), ensure_ascii=False), encoding="utf-8")
+        act("$MEM.dst", "in-tail")
+
+        restored = load_image(Core(), image, restore=True)
+        restored.attach_journal(restored.journal_path)
+        restored.restore_from(str(snap_path))
+        assert restored.mem["dst"] == "in-snapshot"
+        assert restored.replay_journal() == 1
+        assert restored.mem["dst"] == "in-tail"
+        conv = restored.get_conversation(PANEL_CID)
+        assert conv is not None and restored.is_hidden_cid(PANEL_CID)
+
+
+FOUR_TURNS = [
+    ("", [{"call_id": "c1", "cmd_type": "memory_write",
+           "args": {"ref": "$MEM.src", "content": "v1"}}]),
+    ("", [{"call_id": "c2", "cmd_type": "memory_write",
+           "args": {"ref": "$MEM.src", "content": "v2"}}]),
+    ("", [{"call_id": "c3", "cmd_type": "memory_write",
+           "args": {"ref": "$MEM.src", "content": "v3"}}]),
+    ("done", []),
+]
+
+
+def _image_with_snapshot_every(tmp_path, every):
+    image = write_image(tmp_path)
+    with open(image, encoding="utf-8") as f:
+        doc = json.load(f)
+    doc.setdefault("meta", {})["snapshot_every"] = every
+    with open(image, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False)
+    return image
+
+
+class TestRecordShape:
+    def test_records_are_ordered_changes(self, tmp_path):
+        image = write_image(tmp_path)
+        core = _run(image, THREE_TURNS)
+        records = core.journal.read()
+        assert records
+        allowed_kinds = {"message", "effect", "batch", "scheduler"}
+        scheduler_keys = {
+            "kind", "active", "ready_add", "ready_remove", "dormant_add",
+            "dormant_remove", "finished_add", "finished_remove",
+            "activation_instructions", "next_cid",
+        }
+        for record in records:
+            assert record["v"] == 2
+            for legacy in ("history", "call", "batch", "scheduler", "effects"):
+                assert legacy not in record
+            assert isinstance(record["changes"], list)
+            for change in record["changes"]:
+                assert change["kind"] in allowed_kinds
+                if change["kind"] == "scheduler":
+                    assert set(change) <= scheduler_keys
+            assert any(c["kind"] in ("message", "effect") for c in record["changes"])
+
+    def test_old_format_record_is_rejected(self, tmp_path):
+        image = write_image(tmp_path)
+        core = load_core(image)
+        core.attach_journal(core.journal_path)
+        core.journal.append({"cid": 0, "history": [], "effects": []})
+        with pytest.raises(JournalError, match="旧格式"):
+            core.replay_journal()
+
+
+class TestPeriodicSnapshot:
+    def test_snapshot_written_every_n_committed_turns(self, tmp_path):
+        from avm.snapshot import read_snapshot
+
+        image = _image_with_snapshot_every(tmp_path, 2)
+        core = load_core(image, FOUR_TURNS)
+        core.attach_journal(core.journal_path)
+        run_turns(core, 4)
+        doc = read_snapshot(core.snapshot_path)
+        assert doc["seq"] == 4
+        assert core.journal.last_seq() == 4
+
+    def test_snapshot_plus_tail_replays_to_same_state(self, tmp_path):
+        image = write_image(tmp_path)
+        core = load_core(image, FOUR_TURNS)
+        core.attach_journal(core.journal_path)
+        run_turns(core, 2)
+        snap_path = str(tmp_path / "snap.json")
+        core.snapshot_to(snap_path)
+        run_turns(core, 2)
+
+        restored = load_core(image)
+        restored.restore_from(snap_path)
+        restored.attach_journal(restored.journal_path)
+        assert restored.replay_journal() == 2
+        assert_same_state(core, restored)
+        assert restored._journal_seq == core._journal_seq

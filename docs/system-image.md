@@ -16,7 +16,7 @@ python -m avm.image <image.json>
 
 | 键 | 必填 | 说明 |
 |---|---|---|
-| `meta` | 否 | 元信息：`version` 必须为 1；`instruction_budget` 可覆盖每轮指令预算（正整数，默认 50） |
+| `meta` | 否 | 元信息：`version` 必须为 1；`instruction_budget` 可覆盖每轮指令预算（正整数，默认 50）；`snapshot_every` 为正整数时每 N 个已提交回合写一次定时快照（缺省不写） |
 | `mem` | 是 | 内存树（对象，顶层键 → 显式节点） |
 | `para_ref` | 否 | para 节点路径，默认 `$MEM.model_params` |
 | `devices` | 否 | 设备挂载列表 |

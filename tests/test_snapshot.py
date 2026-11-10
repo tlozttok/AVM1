@@ -248,8 +248,8 @@ PLM_IMAGE_COUNTER = {
         "value": {
             "content": {"kind": "str", "value": (
                 "def pack():\n"
-                "    n = int(memory_read('$MEM.counter')) + 1\n"
-                "    memory_write('$MEM.counter', str(n))\n"
+                "    n = int((yield from memory_read('$MEM.counter'))) + 1\n"
+                "    yield from memory_write('$MEM.counter', str(n))\n"
                 "    print(n)\n"
             )},
             "para_ref": {"kind": "str", "value": "$MEM.counter_params"},
@@ -277,7 +277,7 @@ class TestPythonConversationResume:
         image = write_image(
             tmp_path, mem=PLM_IMAGE_COUNTER,
             init={"name": "counter", "system_ref": "$MEM.counter_program",
-                  "user": "pack()"},
+                  "user": "yield from pack()"},
         )
         mine = load_core(image)
         mine.attach_journal(mine.journal_path)
@@ -298,7 +298,7 @@ class TestPythonConversationResume:
         assert conv.to_api_messages() == history_after_first
 
         # 续跑：喂一次输入，程序从 $MEM 读跨轮状态
-        conv.user_batch.add_user_content("pack()")
+        conv.user_batch.add_user_content("yield from pack()")
         restored._ready_cids.append(conv.cid)
         run_core(restored)
         assert restored.mem["counter"] == "2"
@@ -309,7 +309,7 @@ class TestPythonConversationResume:
         image = write_image(
             tmp_path, mem=PLM_IMAGE_COUNTER,
             init={"name": "counter", "system_ref": "$MEM.counter_program",
-                  "user": "pack()"},
+                  "user": "yield from pack()"},
         )
         mine = load_core(image)
         run_core(mine)

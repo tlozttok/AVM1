@@ -432,6 +432,12 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
     budget = meta.get("instruction_budget")
     if isinstance(budget, int) and budget > 0:
         core._instruction_budget = budget
+    snapshot_every = meta.get("snapshot_every")
+    if snapshot_every is not None:
+        if (not isinstance(snapshot_every, int) or isinstance(snapshot_every, bool)
+                or snapshot_every < 0):
+            raise ImageError("meta.snapshot_every 必须是非负整数")
+        core.snapshot_every = snapshot_every or None
     device_markers = []
     root = MetaDict(data={})
     for key, node in image["mem"].items():

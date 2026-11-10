@@ -46,14 +46,7 @@ def snapshot(core) -> dict:
     `_journal_seq`——已提交的日志位置，不是日志文件长度：文件里可能存在尚未重放
     的尾部记录，它们不属于当前状态。
     """
-    # 宿主侧对话（面板对话用负 cid）不随快照恢复：新宿主启动时自己建一条，
-    # 而 apply_scheduler 本来就按「引用不存在的对话」把它们丢掉。写进去只会让
-    # 重启时 start_operator_conversation 撞上重复 cid（进程级关机验收发现的）。
     scheduler = scheduler_to_snapshot(core)
-    scheduler["ready"] = [cid for cid in scheduler["ready"] if cid >= 0]
-    scheduler["dormant"] = [cid for cid in scheduler["dormant"] if cid >= 0]
-    if scheduler["active"] is not None and scheduler["active"] < 0:
-        scheduler["active"] = None
     return {
         "format": SNAPSHOT_FORMAT,
         "version": SNAPSHOT_VERSION,
@@ -146,6 +139,8 @@ def restore(core, doc: dict) -> None:
     _restore_security_and_pointer(core, doc)
     apply_scheduler(core, doc.get("scheduler"), source="重启快照")
     core._journal_seq = int(doc.get("seq", 0) or 0)
+    core._last_snapshot_seq = core._journal_seq
+    core._refresh_journal_batch()
     core._check_invariants()
 
 

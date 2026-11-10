@@ -84,15 +84,16 @@ class TestPLMInjection:
         )
 
     def test_python_injection_filtered(self):
-        code = "memory_read('$MEM.x')\n"
+        code = "yield from memory_read('$MEM.x')\n"
         response = self._run_plm("plm.python", "", code, ["memory_read"])
         calls = response.get("tool_calls") or []
         assert calls and calls[0]["function"]["name"] == "memory_read"
 
-    def test_python_ungranted_tool_is_undefined(self):
-        code = "create_cmd('$MEM.p', '$MEM.a')\n"
+    def test_python_ungranted_tool_is_rejected(self):
+        code = "yield from create_cmd('$MEM.p', '$MEM.a')\n"
         response = self._run_plm("plm.python", "", code, ["memory_read"])
         assert "错误" in response["content"] and "create_cmd" in response["content"]
+        assert "未授权" in response["content"]
 
     def test_command_injection_filtered(self):
         system = "def handle(cmd):\n    v = yield from memory_read('$MEM.x')\n    return 'v=' + str(v)\n"

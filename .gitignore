@@ -17,3 +17,4 @@ web/playwright-report/
 
 # 持久运行演示镜像的落点（journal / snapshot / mem 写回）
 images/packages/out/
+images/base/out/

@@ -281,12 +281,12 @@ Python 程序与 LLM 对话对等：都是 AVM 中的一等执行单元，通过
 | `plm.function` | 纯函数：system 定义 `handle(input)`，user 传 JSON，返回可 JSON 序列化的值；每次调用全新受限命名空间，无副作用、无跨调用状态。 |
 | `plm.machine` | 状态机：system 是状态机 DSL，user 是 JSON 事件；状态/变量跨消息保留在 PLM 实例内，可输出全部 10 条指令的 tool calls。 |
 | `plm.command` | 字符串 IO 命令行：system 定义 `handle(cmd)`，user 是命令与参数（整行字符串）；`handle` 可用 `yield from` 调用注入的工具函数，工具响应回到断点继续执行。 |
-| `plm.python` | 图灵完备兜底：Jupyter 笔记本式语义。系统消息与用户消息都执行进同一个持久命名空间（跨轮次保留）；多个 print 全部执行，输出按顺序拼接为整体返回；命名空间注入 10 条指令对应的工具函数，程序按普通函数调用（见下文）。 |
+| `plm.python` | 图灵完备兜底：Jupyter 笔记本式持久命名空间；系统/用户消息都进同一个命名空间；工具调用写成 `yield from`，挂起后从断点继续（不重放前缀）；程序结束后返回 stdout，`return` 字符串追加。 |
 | `plm.operator` | 操作员：执行器由调试面板持有而不是模型——每次"推理"等操作员提交一个动作，工具调用原样透传（未知工具名不在这里拦，留给 Core 报未知工具），或提交结束动作让本轮交互结束。只能由 `Core.start_operator_conversation` 创建（需要注入操作员通道）；镜像里声明同名程序节点会在第一次推理时报错。 |
 
 Python 对话的 `model` 必须是注册表（`PLM_REGISTRY`）中的名字，否则报错，不静默回退到 LLM。
 
-**恢复约定**：PLM 的命名空间不序列化。重启快照恢复后执行器重建，Core 会重放 system 消息（setup 代码）让程序重新进入可用状态，并把已有历史标记为已处理——历史里的 user/tool 消息不会被重新执行（副作用不能重复发生）。因此 **Python 程序的跨轮状态必须落在 `$MEM`**，不能只存在 PLM 命名空间的变量里；镜像里以命名空间存状态的程序在恢复后会丢状态。
+**恢复约定**：PLM 的命名空间不序列化。重启快照恢复后执行器重建，Core 会重放 system 消息（setup 代码）让程序重新进入可用状态，并把已有历史标记为已处理——历史里的 user/tool 消息不会被重新执行（副作用不能重复发生）。因此 **Python 程序的跨轮状态必须落在 `$MEM`**，不能只存在 PLM 命名空间的变量里；镜像里以命名空间存状态的程序在恢复后会丢状态。生成器挂起状态同样不序列化：崩溃或快照恢复发生在一次工具调用中途时，当前程序丢失。
 
 ### plm.function
 
@@ -344,21 +344,24 @@ def handle(cmd):
 
 ### plm.python
 
-system 消息是 setup 代码，user 消息也是代码，两者执行进同一个持久命名空间（跨轮次保留），stdout 按顺序拼接为一个整体作为返回。命名空间注入 10 条指令对应的工具函数，程序按普通 Python 函数调用：
+system 消息是 setup 代码，user 消息是程序代码，两者执行进同一个持久命名空间（跨轮次保留）。程序里的工具调用写成 `yield from`：
 
 ```python
 def pack():
-    text = memory_read('$MEM.AVMRepo.read."CONTEXT.md".0')
-    memory_write('$MEM.system.content', text)
+    text = yield from memory_read('$MEM.AVMRepo.read."CONTEXT.md".0')
+    yield from memory_write('$MEM.system.content', text)
     print('完成：' + str(len(text)) + ' 字符')
+
+yield from pack()
 ```
 
-- 注入的工具：`memory_read(ref)`、`memory_write(ref, content)`、`memory_make(ref, key, mem_type)`、`memory_delete(ref)`、`edit_metadata(ref, type, key=?, value=?)`、`create_cmd(system_ref, para_ref)`、`create_sub(system_ref, user_ref, para_ref)`、`send_instruction(cid, content)`、`close_conversation(cid)`、`listen_event(action, …)`——名字与参数同指令，返回工具响应字符串（包括 `Illegal: ...` / `Error: ...` 文本），由程序自己处理；
-- **调用即挂起 + 重放**：一次工具调用返回 `tool_calls`（id 形如 `py-<n>`，一次只挂起一个）；工具响应回来后，从同一条用户消息重新执行，已记录的调用按序返回响应——**写入类调用不会重复执行**。重放会重跑前缀代码，但重跑产生的 stdout 不会重复返回；
-- 因此程序必须确定性（沙箱已禁时钟、随机、文件、网络）；同一段消息序列重放出的调用序列必须一致，不一致会以 `错误: RuntimeError: 重放与记录不一致…` 结束本轮；
-- setup 代码（system 消息）里不能调用工具，只能在用户消息的代码里调用；setup 出错与其它 PLM 一致，是加载/运行错误；
-- 挂起信号继承 `BaseException`：程序里的 `except Exception` 吞不掉它；用裸 `except:` 会把挂起当成程序错误（参数不匹配一类的报错），这是不该用裸 except 的地方；
-- 程序不直接触碰系统：沙箱只多了这些工具函数，文件/网络/进程仍被封锁。
+- 顶层代码由 PLM 包进一个生成器函数，所以顶层 `yield from` 与 `return` 合法；
+- 注入的工具是 10 条指令：名字与参数同指令，返回工具响应字符串（包括 `Illegal: ...` / `Error: ...` 文本），由程序自己处理；
+- **挂起与继续**：一次工具调用返回 `tool_calls`（id 形如 `py-<n>`，一次只挂起一个）；工具响应回来后从断点继续，不重放前缀代码；
+- 输出：每段 stdout 随该回合返回；程序结束时 `return` 字符串追加到最终输出；`return` 为 `None` 时只返回 stdout，其它类型报错；
+- 工具调用必须是 `yield from tool(...)` 的直接形式；直接调用或嵌套在其它表达式里，在编译检查时以 `错误: SecurityError: ...` 拒绝；setup 里会被执行的代码不能调用工具，但 setup 定义的函数体里可以写 `yield from`（不执行）；
+- 新的 user 消息会关闭仍挂起的旧程序，从新程序开始（确定性边界）；
+- 沙箱：安全 builtins 白名单 + AST 检查（禁 import、禁双下划线属性、禁危险调用），另有工具调用位置检查。
 
 ### 确定性
 
@@ -551,7 +554,7 @@ before 语义：操作被请求，不保证到达执行组件；可被 `allow` �
 
 **软承诺（重建结果，不是契约）**：监听器、调度队列、设备表按日志与快照重建；设备实例重新构造；LLM 对话沿用消息历史，Python 对话重放 system 消息（命名空间变量不恢复）。
 
-**明确不承诺**：设备内部状态与设备副作用；未提交回合的副作用（可能已经发生，日志里没有）；宿主特权操作（控制台屏蔽、直接改监听器、外部输入中未读的部分）；控制台操作员对话（cid -1）；调度队列逐字段一致。
+**明确不承诺**：设备内部状态与设备副作用；未提交回合的副作用（可能已经发生，日志里没有）；宿主特权操作（控制台屏蔽、直接改监听器、外部输入中未读的部分）；调度队列逐字段一致。
 
 日志只对产生它的镜像有效：换镜像视为新的世界。显式 `--restore` 严格——读不出来就报错；不传时按缓存处理：镜像声明了 `snapshot_to` 且文件可读就自动使用；快照文件缺失或读不出来时只警告，退回"镜像 + 日志"重放；快照能读但引用的设备文件缺失时明确失败（世界不完整，退回日志也重建不出那台设备）。
 
@@ -559,23 +562,26 @@ before 语义：操作被请求，不保证到达执行组件；可被 `allow` �
 
 一轮 = 一次推理 + 该轮产生的全部指令。执行完回到 `Core.advance_conversation` 的安全点（`monitor.record` 之后）记一条记录；API 失败重试与未捕获异常不提交，该回合视为未发生。
 
-记录是状态增量，不是操作流水（完整形状见 `avm/journal.py` 模块 docstring）：
+一条记录是**有序变化序列**（`v=2`，完整形状见 `avm/journal.py` 模块 docstring）：`{"v": 2, "cid", "at", "changes": [...]}`。`changes` 按执行顺序列出：
 
-- `history`：本轮真正消费进历史的消息（上一轮指令产生的 tool 响应、投递进来的 user 内容）——按实际追加的消息记，不按生成它的效果推导：before 事件处理器可以改写 payload，指令最终写入的值才是状态；
-- `call`：本轮 assistant 消息（content / reasoning_content / tool_calls）；
-- `batch`：回合结束后本对话的待发批次；
-- `scheduler`：回合结束时的调度状态（活跃/就绪/休眠/finished/预算计数/下一个 cid）。它是重建用的输入，不作为逐字段一致的契约；
-- `effects`：语义效果——内存写/建/删、`edit_metadata`、对话创建/关闭/删除、投递、监听器注册/修改/取消、设备装卸。重放期间不调模型、不派发事件、不访问设备；设备写只记审计条目（`device_write`），重放时跳过。
+- `message`：本轮真正追加进历史的消息（上一轮指令产生的 tool 响应、投递进来的 user 内容、assistant 消息）——按实际追加记，不按生成它的效果推导：before 事件处理器可以改写 payload，指令最终写入的值才是状态；
+- `effect`：语义效果——内存写/建/删、`edit_metadata`、对话创建/关闭/删除、投递、监听器注册/修改/取消、设备装卸。重放期间不调模型、不派发事件、不访问设备；设备写只记审计条目（`device_write`），重放时跳过；
+- `batch`：待发批次；只在相对上次提交有变化时写（带 `cid`，可能落在别的对话上——投递给目标加输入）；
+- `scheduler`：调度增量（活跃对话、就绪/休眠的增删、finished、预算计数、下一个 cid），只在有变化时写。增量基线是该对话上次提交后的调度状态；装载/快照恢复后对齐，所以第一次提交包含 `run()` 之前的活跃选择。
+
+旧格式（带 `history` / `call` / `batch` / `scheduler` / `effects`、没有 `v`）不再读取：启动时直接报错并提示归档旧日志。
 
 记录点：内存写入口在指令执行体里记（带调用者地址空间与事件处理后的真实值）；对话生命周期在 `_build_conversation` 的指令入口、`_close_conversation`、`_delete_conversation` 与亚对话返回/关闭时记投递；监听器在 `EventSystem.register/register_condition/modify/cancel/cancel_all_for_owner` 记。宿主侧特权操作（控制台屏蔽设备、就地编辑监听器）不记录。
 
-重放（`Core.replay_journal`）：按 seq 连续应用，不连续直接报错；应用位置 `_journal_seq` 推进，同一段日志重放两次第二次是空操作（幂等）。日志是 JSONL，每行 flush+fsync；半行/坏行之后的内容按未提交处理——半截日志重放等于上一条提交后的状态。
+重放（`Core.replay_journal`）：按 seq 连续应用，不连续直接报错；流式逐条读、逐条应用（内存只留一条记录）；应用位置 `_journal_seq` 推进，同一段日志重放两次第二次是空操作（幂等）。日志是 JSONL，每行 flush+fsync；半行/坏行之后的内容按未提交处理——半截日志重放等于上一条提交后的状态。
 
 ### 重启快照（snapshot，缓存）
 
 `avm/snapshot.py`；形状与内核转储同源（调度、内存、安全段、对话、监听器、设备表），差别：不截断、带 `seq`（已提交的日志位置）、带 `device_specs`（设备来源表）、对话额外带 cid/parent_cid/工作空间根名/待发批次。它是加速重启的缓存；恢复依据始终是镜像 + 日志。
 
-`Core.snapshot_to(path)` 只在安全点调用（宿主正常退出路径）。`Core.restore_from(path)` 顺序：清空调度/对话/监听器 → 换内存树 → 按来源表重建设备并重新物化挂载点 → 按 cid 重建对话与父子引用 → 恢复监听器 → 安全配置/para_ref/下一个 cid → 跑安全点自检。对话身份与历史按硬承诺保留；设备内部状态不序列化，按 spec 重建实例；设备文件缺失时恢复明确失败。
+`Core.snapshot_to(path)` 只在安全点调用（宿主正常退出路径，以及定时快照触发）。`Core.restore_from(path)` 顺序：清空调度/对话/监听器 → 换内存树 → 按来源表重建设备并重新物化挂载点 → 按 cid 重建对话与父子引用 → 恢复监听器 → 安全配置/para_ref/下一个 cid → 跑安全点自检。对话身份与历史按硬承诺保留；设备内部状态不序列化，按 spec 重建实例；设备文件缺失时恢复明确失败。
+
+**定时快照**：镜像声明 `meta.snapshot_every` 为正整数时，每 N 个已提交回合在安全点写一次快照（写失败只警告，日志仍是依据）。恢复时从最近快照 + 尾部重放，崩溃后最多重放 N 个回合；镜像不声明时只在正常退出写快照。
 
 重启恢复 = 快照（可选）+ 日志尾部：`boot(image, restore=snapshot)` 显式指定时严格；不指定时若镜像声明了 `snapshot_to` 且文件可读，`boot` 自动使用它，然后按 `journal_to` 重放 `seq` 之后的记录；快照缺失或损坏时只警告，装载镜像后重放整段日志（进程崩溃、快照落后或损坏的路径）。
 
@@ -592,7 +598,7 @@ before 语义：操作被请求，不保证到达执行组件；可被 `allow` �
 
 ### 边界
 
-- 不做日志自动压缩（v1 由快照 + 手动 `truncate(seq)` 控制体积）；不做并发与调度状态机改动。
+- 不做日志自动压缩（v1 由定时快照 + 手动 `truncate(seq)` 控制尾部长度）；不做并发与调度状态机改动。
 - 宿主侧外部输入（控制台喂的输入、宿主直接改批次/监听器）不在日志里；恢复后的外部输入从下一次投递开始。
 
 ## 调试与观测
@@ -647,7 +653,7 @@ cd web && npm run dev                    # 开发期：Vite 代理 /api 到 AVM_
 
 面板自身：`cd web && npm run test:unit` 跑纯逻辑用例，`cd web && npm run e2e` 起一个脚本化 MockLMU 的控制台并在浏览器里跑五个场景（观测、工具选择、三步交互、喂输入、产物由 console 托管）。
 
-- **操作员对话**：面板启动时另建一条对话（`plm.operator`），使用保留魔数 cid `-1`、走正常调度；对普通对话隐藏（`$MEM.conversations` / `$MEM.scheduler` 列表过滤，`send_instruction` / `close_conversation` 与 `$conv.-1` 一律按「不存在」处理）。初始进休眠队列、不进就绪队列——只有中断能激活。它活跃就等于全局暂停（其他对话都不推进）。`POST /api/interrupt` 挂起 `operator` 中断（在下一个安全点生效；`core.run()` 已返回时不再生效），`POST /api/resume` 让它结束本轮、让出执行权。`POST /api/action` 提交一条动作，未暂停时先自动中断；未知工具名有意允许（响应里有 `known_tool` 与提示）。
+- **操作员对话（保留 cid -1）**：cid 是作者规定的保留值，不参与正常分配；控制台在 `boot` 返回后、`core.run()` 之前把 `plm.operator` 通道绑到它，没有就创建。对话随快照与日志正常恢复：日志里出现它的回合而它还不存在时（只靠日志恢复），重放先补建它，回合按普通记录应用；快照里它与普通对话一起保存和恢复。对普通对话隐藏：`$MEM.conversations` / `$MEM.scheduler` 列表过滤，`send_instruction` / `close_conversation` 与 `$conv.<cid>` / `$batch.<cid>` 一律按「不存在」处理；隐藏只是显示与寻址策略，不影响恢复。初始进休眠队列、不进就绪队列——只有中断能激活。它活跃就等于全局暂停（其他对话都不推进）。`POST /api/interrupt` 挂起 `operator` 中断（在下一个安全点生效；`core.run()` 已返回时不再生效），`POST /api/resume` 让它结束本轮、让出执行权。`POST /api/action` 提交一条动作，未暂停时先自动中断；未知工具名有意允许（响应里有 `known_tool` 与提示）。
 - **读取端点**：`GET /api/state`（运行状态、调度、中断、屏蔽账本）、`/api/tools`（十条指令表）、`/api/conversations/<cid>`、`/api/memory`（可带 `ref`，整树无分页）、`/api/memory/diff?from=&to=`、`/api/listeners`、`/api/devices`、`/api/events`（SSE：面板输出与调度变化的有序流，按 `seq` 增量读）。
 - **介入端点**：`POST /api/device-action`（调设备自己声明的调试动作，如给 `$inputs` 投喂一行）、`/api/memory/snapshot`、`PATCH /api/listeners/<id>`（就地启停监听器、改 priority/tier）、`POST|DELETE /api/mask/memory`、`/api/mask/device`（临时摘下一个内存节点或卸载一台设备，`DELETE` 还原；调试原语不产生事件）。
 - **界面当前接的**：三栏界面（对话列表 / 内存索引与对话·内存·设备详情 / 暂停与动作·事件流）；对话列表与详情带 caps 摘要（mode/groups/根名/工具集）、暂停与继续、十条指令的结构化动作表单（下拉 +「其它（手输）」+ 原始 JSON 兜底）、事件流、`$inputs` 喂输入框。内存索引照树画：链接节点一行，没有子节点可展开；挂载点那行标出设备类型（`device InputsListDevice`），点它打开设备视图，描述与动作来自 `GET /api/devices`。监听器编辑、屏蔽还原、快照与 diff 视图、设备动作全量都已有后端端点、界面未接。
