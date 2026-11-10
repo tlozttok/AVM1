@@ -69,9 +69,9 @@ def _grant_work(core, conv, extra=None, name="work"):
     """测试辅助：软件建目录 + 动态加根（内核不再自动分配 $work）。"""
     assert "workdirs" not in core.mem or isinstance(core.mem["workdirs"], MetaDict)
     if "workdirs" not in core.mem:
-        core.mem.make("$MEM", "workdirs", "dict", owner_cid=0)
+        core.mem.make("$MEM", "workdirs", "dict")
     dir_key = f"w{conv.cid}"
-    core.mem.make("$MEM.workdirs", dir_key, "dict", owner_cid=0)
+    core.mem.make("$MEM.workdirs", dir_key, "dict")
     roots = {name: ["workdirs", dir_key]}
     roots.update(extra or {})
     core.set_conversation_roots(conv.cid, roots)
@@ -127,7 +127,7 @@ class TestDynamicRoots:
         core, root = _core()
         child = _create_user(core, root)
         _grant_work(core, child)
-        core.mem.make("$MEM", "other", "dict", owner_cid=0)
+        core.mem.make("$MEM", "other", "dict")
         core.set_conversation_roots(child.cid, {"other": ["other"]})
         assert "work" not in child.caps.roots
         assert child.caps.roots["other"] == ("other",)

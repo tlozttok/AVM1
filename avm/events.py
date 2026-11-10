@@ -2,14 +2,17 @@
 
 批次二（权限体系）：10 条指令都产生 before 请求事件与 after 事实事件；
 事件载荷分 normal / kernel 两级，监听器有 priority 与决策动作 allow/replace/execute；
-匹配与所有者判定用 canonical 目标（target_ref），处理器看到的目标仍是请求别名。
+匹配与权限判定用 canonical 目标（target_ref），处理器看到的目标仍是请求别名。
 监听器是 ctrl.type="handler" 节点中的代码，每次事件在全新受限命名空间执行，
 不保留实例状态。
+
+监听注册的 memory 目标授权不在 Core：Core 只提供机制，策略由软件层的 Guard
+监听器（监听 listen_event before）按 caps/roots 实现。设备目标仍由设备授权。
 """
 
 # TODO(issue-2026-11-01): 用户态事件子集（named presets）的名单与粒度是临时方案，待作者
-# 后续细化：preset 是否读写分离、是否允许用户自定义条件子集、own_nodes 依赖 owner 是否
-# 合适、是否把 send_instruction/listen_event 纳入子集。设计见
+# 后续细化：preset 是否读写分离、是否允许用户自定义条件子集、是否把
+# send_instruction/listen_event 纳入子集。设计见
 # docs/private/Agents/implemented/design-unified-event-bus-2026-10-31.md §2.3、§8。
 import copy
 import json
@@ -120,6 +123,37 @@ def listener_from_snapshot(data: dict) -> dict:
     return listener
 
 
+def listener_uses_removed_condition(listener: dict) -> bool:
+    """监听器记录是否使用了已删除的条件形态（owner 相关）。
+
+    旧快照与旧日志里可能残留：target.kind="owned_by_owner" 与 condition.source.cid。
+    两者都依赖创建者 cid，恢复/重放时丢弃监听器而不是让启动失败。
+    """
+    condition = (listener or {}).get("condition")
+    if not isinstance(condition, dict):
+        return False
+    target = condition.get("target")
+    if isinstance(target, dict) and target.get("kind") == "owned_by_owner":
+        return True
+    source = condition.get("source")
+    if isinstance(source, dict) and "cid" in source:
+        return True
+    return False
+
+
+def drop_removed_condition_listener(listener: dict, context: str) -> bool:
+    """旧条件形态的监听器：打 stderr 告警并返回 True（调用方丢弃该记录）。"""
+    if not listener_uses_removed_condition(listener):
+        return False
+    print(
+        f"[AVM] {context}: 丢弃使用已移除条件形态的监听器 "
+        f"listener_id={(listener or {}).get('listener_id')}"
+        "（owned_by_owner/source.cid 依赖已删除的节点所有权）",
+        file=sys.stderr,
+    )
+    return True
+
+
 class EventHandlerError(Exception):
     """before 阶段处理器失败：fail closed，原指令不执行。"""
 
@@ -160,17 +194,11 @@ def build_event(
 # ----------------------------------------------------------------------
 
 CONDITION_KEYS = frozenset({"preset", "events", "phase", "target", "source"})
-MEMORY_EVENTS = ("memory_read", "memory_write", "memory_make", "memory_delete",
-                 "edit_metadata")
 LIFECYCLE_EVENTS = ("create_cmd", "create_sub", "close_conversation", "listen_event")
 
 # 用户态对话可用的命名条件子集（名称是机制常量；名单待作者细化，见 issue-2026-11-01）
+# own_nodes.memory 依赖已删除的节点所有权 cid（owned_by_owner），不再提供。
 USER_CONDITION_PRESETS = {
-    "own_nodes.memory": {
-        "events": list(MEMORY_EVENTS),
-        "phase": ["before", "after"],
-        "target": {"kind": "owned_by_owner"},
-    },
     "inbox": {
         "events": ["send_instruction"],
         "phase": ["before", "after"],
@@ -505,7 +533,7 @@ class EventSystem:
                                  space=None, kernel_mode: bool = False) -> None:
         """按目标路径 kind 检查监听注册权限。
 
-        memory：按 ctrl.owner（内核态注册者直接放行，用于监督与安全）；
+        memory：Core 不做所有者授权——监听策略由软件层的 Guard 监听器负责；
         device：由设备 authorize_listener 决定（内核态不自动越过设备策略）；
         send/close：普通对话只能监听发往自己/关闭自己的事件；
         lifecycle：通配只有内核态可注册，其余按“自己相关”判定。
@@ -514,26 +542,11 @@ class EventSystem:
             if kernel_mode:
                 return
             split = self._core.mem.split_path(target, space=space)
-            kind = split[0]
-            if kind == "device":
+            if split[0] == "device":
                 _, mount_key, remainder = split
                 device = self._core.mem._devices[mount_key]
                 if not device.authorize_listener(event_type, remainder, owner_cid):
                     raise ValueError(f"设备 {mount_key} 未授权对话 {owner_cid} 监听 {target}")
-                return
-            if event_type in ("memory_make", "memory_delete"):
-                parent = self._parent_ref(target)
-                owner = self._owner_of(self._core, parent, space=space)
-                if owner is None:
-                    raise ValueError(f"不能监听无主父路径：{parent}")
-                if owner != owner_cid:
-                    raise ValueError(f"无权监听 {target}：父路径所有者 cid={owner}，当前 cid={owner_cid}")
-                return
-            owner = self._owner_of(self._core, target, space=space)
-            if owner is None:
-                raise ValueError(f"不能监听无主路径：{target}")
-            if owner != owner_cid:
-                raise ValueError(f"无权监听 {target}：路径所有者 cid={owner}，当前 cid={owner_cid}")
             return
 
         if event_type == "send_instruction":
@@ -589,7 +602,8 @@ class EventSystem:
                         return
                     raise ValueError("普通对话只能监听自己相关的事件")
                 if target.startswith("$"):
-                    # action=listen 的 before target 是准备注册的目标：按普通内存/设备权限检查
+                    # action=listen 的 before target 是准备注册的目标（condition 的 canonical
+                    # ref）：memory 目标不做所有者判定（交给 Guard），设备照旧询问设备。
                     split = self._core.mem.split_path(target, space=space)
                     if split[0] == "device":
                         _, mount_key, remainder = split
@@ -597,16 +611,11 @@ class EventSystem:
                         if not device.authorize_listener(event_type, remainder, owner_cid):
                             raise ValueError(f"设备 {mount_key} 未授权对话 {owner_cid} 监听 {target}")
                         return
-                    owner = self._owner_of(self._core, target, space=space)
-                    if owner is None:
-                        raise ValueError(f"不能监听无主路径：{target}")
-                    if owner != owner_cid:
-                        raise ValueError(f"无权监听 {target}：路径所有者 cid={owner}，当前 cid={owner_cid}")
                     return
                 raise IllegalOperationError(
                     f"listen_event 事件的 target 不是可识别的形式：{target}"
                 )
-            # create_cmd / create_sub：target 是程序节点引用
+            # create_cmd / create_sub：target 是程序节点引用（内存节点；不做所有者判定）
             if kernel_mode:
                 return
             if not isinstance(target, str) or not target.startswith("$"):
@@ -614,11 +623,6 @@ class EventSystem:
             split = self._core.mem.split_path(target, space=space)
             if split[0] != "memory":
                 raise ValueError(f"不能监听设备上的程序节点：{target}")
-            owner = self._owner_of(self._core, target, space=space)
-            if owner is None:
-                raise ValueError(f"不能监听无主程序节点：{target}")
-            if owner != owner_cid:
-                raise ValueError(f"无权监听 {target}：程序节点所有者 cid={owner}，当前 cid={owner_cid}")
             return
 
         raise ValueError(f"不支持的事件注册类型：{event_type}")
@@ -982,14 +986,8 @@ class EventSystem:
             return view
         return {k: v for k, v in event.items() if k != "_kernel_payload"}
 
-    @staticmethod
-    def _parent_ref(target: str) -> str:
-        if not target.startswith("$") or "." not in target:
-            raise ValueError("memory_make 的 target 必须是新建完整路径，不能是根")
-        return target.rsplit(".", 1)[0]
-
     # ------------------------------------------------------------------
-    # 所有者解析
+    # 设备前缀检查
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -997,7 +995,7 @@ class EventSystem:
         """路径的任意前缀是否命中已挂载设备。
 
         权限检查不能触发设备 resolve_path（如 $MEM.inputs.next 会阻塞等待输入），
-        因此先做纯注册表检查；含设备前缀的路径走「最近非设备祖先」所有权规则。
+        因此先做纯注册表检查。
         """
         if not isinstance(path, str) or not path.startswith("$MEM."):
             return False
@@ -1009,44 +1007,6 @@ class EventSystem:
             if ".".join(rest[:i]) in core.mem._devices:
                 return True
         return False
-
-    @classmethod
-    def _owner_of(cls, core: 'Core', path: str, space=None) -> Optional[int]:
-        """按 2.6 查找 memory 路径所有者。
-
-        只接受 memory kind；device kind 直接返回 None（设备授权走 authorize_listener）。
-        """
-        if not isinstance(path, str):
-            return None
-        try:
-            kind, segments = core.mem.split_path(path, space=space)[:2]
-        except Exception:
-            return None
-        if kind != "memory":
-            return None
-
-        # 目标路径必须真实存在；不存在时不做祖先兜底。
-        ref = "$MEM" if not segments else "$MEM." + ".".join(segments)
-        try:
-            core.mem.resolve_path(["MEM"] + list(segments), for_llm=False)
-        except Exception:
-            return None
-
-        # 从完整路径向上逐级找第一个带 ctrl.owner 的 MetaDict/MetaList。
-        for i in range(len(segments), -1, -1):
-            prefix = segments[:i]
-            try:
-                node = core.mem.resolve_path(["MEM"] + list(prefix), for_llm=False)
-            except Exception:
-                continue
-            if hasattr(node, "get_ctrl"):
-                owner = (node.get_ctrl() or {}).get("owner")
-                if owner is not None:
-                    try:
-                        return int(owner)
-                    except (TypeError, ValueError):
-                        continue
-        return None
 
     # ------------------------------------------------------------------
     # 处理器解析与执行
@@ -1228,7 +1188,12 @@ class EventSystem:
             if preset == "own_work.memory":
                 raise IllegalOperationError(
                     "条件 preset 'own_work.memory' 已移除：工作空间不再由内核分配。"
-                    "改用 own_nodes.memory（自己拥有的节点），或由软件动态加根后自定义条件"
+                    "改用 self.lifecycle，或由软件动态加根后自定义条件"
+                )
+            if preset == "own_nodes.memory":
+                raise IllegalOperationError(
+                    "条件 preset 'own_nodes.memory' 已移除：节点所有权 cid 不再写进 MEM。"
+                    "改用 self.lifecycle，或改用自定义 target（内核态）"
                 )
             if preset not in USER_CONDITION_PRESETS:
                 raise IllegalOperationError(
@@ -1238,6 +1203,9 @@ class EventSystem:
             raw["target"] = dict(raw.get("target") or {})
             raw["preset"] = preset
         elif not owner_kernel:
+            # TODO(issue): owner 授权删除后用户态仍只能用 preset，无法给出 memory target；
+            # Guard 的 caps/roots 策略因此只能观察到内核态注册的 memory 监听。是否放开
+            # 用户自定义条件属于事件子集策略，留给作者决定（本计划未包含）。
             raise IllegalOperationError(
                 "用户态对话只能使用命名条件子集（preset），不能自定义 condition"
             )
@@ -1260,8 +1228,11 @@ class EventSystem:
             if not isinstance(target, dict):
                 raise IllegalOperationError("condition.target 必须是对象")
             kind = target.get("kind")
-            if kind not in ("exact", "subtree", "owned_by_owner", "cid_owner",
-                            "self_lifecycle"):
+            if kind == "owned_by_owner":
+                raise IllegalOperationError(
+                    "condition.target.kind 'owned_by_owner' 已移除：节点所有权 cid 不再写进 MEM"
+                )
+            if kind not in ("exact", "subtree", "cid_owner", "self_lifecycle"):
                 raise IllegalOperationError(f"condition.target.kind 不支持：{kind!r}")
             resolved = {"kind": kind}
             if kind in ("exact", "subtree"):
@@ -1273,11 +1244,7 @@ class EventSystem:
                 if normal is None:
                     raise IllegalOperationError(f"condition.target.ref 无法解析：{ref}")
                 resolved["refs"] = {"normal": normal, "delete": delete}
-            elif kind == "owned_by_owner":
-                resolved["cid"] = owner_cid
-            elif kind == "cid_owner":
-                resolved["cid"] = owner_cid
-            elif kind == "self_lifecycle":
+            else:
                 resolved["cid"] = owner_cid
             resolved_target = resolved
         source = raw.get("source")
@@ -1285,8 +1252,17 @@ class EventSystem:
         if source is not None:
             if not isinstance(source, dict):
                 raise IllegalOperationError("condition.source 必须是对象")
+            unknown_source = sorted(set(source) - {"mode", "groups"})
+            if unknown_source:
+                if "cid" in unknown_source:
+                    raise IllegalOperationError(
+                        "condition.source.cid 已移除：不能按来源 cid 过滤事件"
+                    )
+                raise IllegalOperationError(
+                    f"condition.source 含未知字段：{unknown_source}（允许：mode/groups）"
+                )
             resolved_source = {}
-            for key in ("mode", "groups", "cid"):
+            for key in ("mode", "groups"):
                 if key in source:
                     value = source[key]
                     if not isinstance(value, list):
@@ -1300,10 +1276,24 @@ class EventSystem:
             "source": resolved_source,
         }
 
+    def parse_condition(self, owner_cid: int, handler_ref: str, space=None,
+                        kernel_mode: bool = False) -> dict:
+        """解析 handler 节点自带的 condition 数据；只解析，不注册监听器。
+
+        listen_event before 事件需要在派发前拿到解析后的 condition（Guard 授权依据），
+        解析结果随后原样交给 register_condition，避免注册时重复解析。
+        """
+        node = self._core.unwrap(handler_ref, for_llm=False, space=space)
+        return self._resolve_condition(node, owner_cid, kernel_mode, space=space)
+
     def register_condition(self, owner_cid: int, handler_ref: str, space=None,
                            tier: str = NORMAL_TIER, priority: int = 0,
-                           kernel_mode: bool = False) -> int:
-        """按 handler 节点自带的 condition 数据注册监听器（新式入口）。"""
+                           kernel_mode: bool = False, condition: Optional[dict] = None) -> int:
+        """按 handler 节点自带的 condition 数据注册监听器（新式入口）。
+
+        condition 是已由 parse_condition 解析好的结果（listen_event 指令先解析再派发
+        before 事件）；缺省时在本函数里解析。
+        """
         if tier not in LISTENER_TIERS:
             raise IllegalOperationError(f"tier 必须是 normal/kernel，得到 {tier!r}")
         if tier == KERNEL_TIER and not kernel_mode:
@@ -1312,8 +1302,10 @@ class EventSystem:
             raise IllegalOperationError(f"priority 必须是非负整数，得到 {priority!r}")
         if priority > 0 and not kernel_mode:
             raise IllegalOperationError("priority>0 只有内核态对话可以设置")
-        node = self._core.unwrap(handler_ref, for_llm=False, space=space)
-        condition = self._resolve_condition(node, owner_cid, kernel_mode, space=space)
+        if condition is None:
+            condition = self.parse_condition(
+                owner_cid, handler_ref, space=space, kernel_mode=kernel_mode,
+            )
         handler_code = self.resolve_handler(self._core, handler_ref, space=space)
         listener_id = self._next_listener_id
         self._next_listener_id += 1
@@ -1367,12 +1359,6 @@ class EventSystem:
             if ref[0] == "memory":
                 return tuple(ev[1][:len(ref[1])]) == tuple(ref[1]) if len(ref[1]) <= len(ev[1]) else False
             return ref[1] == ev[1] and len(ref[2]) <= len(ev[2]) and tuple(ev[2][:len(ref[2])]) == tuple(ref[2])
-        if kind == "owned_by_owner":
-            ev = event.get("target_ref")
-            if not ev or ev[0] != "memory":
-                return False
-            owner = self._owner_of_segments(ev[1])
-            return owner == target.get("cid")
         if kind == "cid_owner":
             ev = event.get("target_ref")
             return bool(ev) and ev[0] == "cid" and ev[1] == target.get("cid")
@@ -1395,15 +1381,7 @@ class EventSystem:
             return False
         if "groups" in source_filter and not (set(source_filter["groups"]) & set(conv.caps.groups)):
             return False
-        if "cid" in source_filter and conv.cid not in source_filter["cid"]:
-            return False
         return True
-
-    def _owner_of_segments(self, segments):
-        try:
-            return self._owner_of(self._core, "$MEM." + ".".join(segments), space=None)
-        except Exception:
-            return None
 
     def _condition_matches(self, listener: dict, event: dict) -> bool:
         condition = listener.get("condition")

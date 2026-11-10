@@ -334,7 +334,6 @@ def _set_current(core, name: str, package_version: str, effects: list) -> None:
         "kind": "memory_set",
         "ref": f"$MEM.{PACKAGES_ROOT}.{name}.current",
         "value": package_version,
-        "owner_cid": None,
         "space": None,
     })
 

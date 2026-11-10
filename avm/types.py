@@ -85,7 +85,7 @@ def batch_from_dict(data) -> 'UserMessageBatch':
 class StrNode(str):
     """字符串叶子 + 控制数据（ctrl）。
 
-    字符串只有控制数据，没有描述数据（描述属于容器）：`ctrl` 可存 `owner` 等
+    字符串只有控制数据，没有描述数据（描述属于容器）：`ctrl` 可存 `type` 等
     Core/内核态需要的结构化信息；`meta` 对字符串不适用。
     作为 str 的子类，比较、JSON 序列化、`isinstance(x, str)` 都保持原语义。
     """

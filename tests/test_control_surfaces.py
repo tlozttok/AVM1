@@ -204,7 +204,7 @@ class TestRootsControl:
         text = _write(core, root, "$MEM.conversations.1.roots", '{"lib": "$MEM.lib"}')
         assert text.startswith("Success set"), text
         # 与另一个对话的根目标前缀可比：拒绝
-        core.mem.make("$MEM", "shared", "dict", owner_cid=0)
+        core.mem.make("$MEM", "shared", "dict")
         core.set_conversation_roots(other.cid, {"lib": ["lib"], "work": ["shared", "sub"]})
         text = _write(core, root, "$MEM.conversations.1.roots", '{"w": "$MEM.shared.sub.x"}')
         assert text.startswith("Illegal:"), text

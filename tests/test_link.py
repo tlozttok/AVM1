@@ -13,14 +13,14 @@ from avm.memory_device import LinkDevice, BUILTIN_DEVICE_CLASSES
 from avm.types import MetaDict, MetaList, LinkNode
 
 
-def _seed(mem, ref, value, owner_cid=None):
+def _seed(mem, ref, value):
     """测试夹具：先 make 建链再写（memory_write 不再建节点）。"""
     try:
-        return mem.set(ref, value, owner_cid=owner_cid)
+        return mem.set(ref, value)
     except MemoryKeyNotFoundError:
         parent, _, key = ref.rpartition(".")
-        mem.make(parent, key, "str", owner_cid=owner_cid)
-        return mem.set(ref, value, owner_cid=owner_cid)
+        mem.make(parent, key, "str")
+        return mem.set(ref, value)
 
 
 def _python_node(code):
@@ -60,10 +60,10 @@ class TestBasicTransparency:
         # 读子路径
         assert core.unwrap("$MEM.alias.a.b", for_llm=False) == "orig"
         # 写子路径
-        _seed(core.mem, "$MEM.alias.a.c", "new", owner_cid=0)
+        _seed(core.mem, "$MEM.alias.a.c", "new")
         assert core.mem["deep"]["a"]["c"] == "new"
         # 精确别名写（目标为 dict 时是写 meta，沿用既有语义）
-        _seed(core.mem, "$MEM.alias", "whole", owner_cid=0)
+        _seed(core.mem, "$MEM.alias", "whole")
         assert core.mem["deep"].get_metadata() == "whole"
 
     def test_non_mem_alias(self):
@@ -74,32 +74,37 @@ class TestBasicTransparency:
 
 
 class TestMakeAndEdit:
-    def test_memory_make_via_alias_writes_owner(self):
+    def test_memory_make_via_alias_creates_plain_nodes(self):
         core = Core()
         root = _new_root(core)
         core.mem["deep"] = {}
         _mount(core, "alias", "$MEM.deep")
 
         MemoryReadInstruction  # noqa: F401
-        core.mem.make("$MEM.alias", "child", "dict", owner_cid=0)
+        core.mem.make("$MEM.alias", "child", "dict")
         assert isinstance(core.mem["deep"]["child"], MetaDict)
-        assert core.mem["deep"]["child"].get_ctrl()["owner"] == "0"
-        core.mem.make("$MEM.alias", "s", "str", owner_cid=0)
+        assert core.mem["deep"]["child"].get_ctrl() is None
+        core.mem.make("$MEM.alias", "s", "str")
         assert core.mem["deep"]["s"] == ""
 
     def test_edit_metadata_via_alias(self):
         core = Core()
         root = _new_root(core)
-        core.mem.make("$MEM", "deep", "dict", owner_cid=0)
+        core.mem.make("$MEM", "deep", "dict")
         _mount(core, "alias", "$MEM.deep")
 
         EditMetadataInstruction("em", root.cid, {"ref": "$MEM.alias", "type": "set", "key": "type", "value": "para"}).execute(core, root)
         assert core.mem["deep"].get_ctrl()["type"] == "para"
 
+        # owner 成为普通 ctrl 键：set/del 都允许（不再由 Core 维护）
         root.user_batch.clear()
         EditMetadataInstruction("em2", root.cid, {"ref": "$MEM.alias", "type": "set", "key": "owner", "value": "9"}).execute(core, root)
-        assert "不允许通过 edit_metadata 修改" in root.user_batch.tool_responses[-1].content
-        assert core.mem["deep"].get_ctrl()["owner"] == "0"
+        assert "已写入" in root.user_batch.tool_responses[-1].content
+        assert core.mem["deep"].get_ctrl()["owner"] == "9"
+        root.user_batch.clear()
+        EditMetadataInstruction("em3", root.cid, {"ref": "$MEM.alias", "type": "del", "key": "owner"}).execute(core, root)
+        assert "已删除" in root.user_batch.tool_responses[-1].content
+        assert "owner" not in core.mem["deep"].get_ctrl()
 
 
 class TestChainAndCycle:
@@ -225,26 +230,24 @@ class TestPersistence:
 
 
 class TestEventTransparency:
-    def test_alias_register_by_real_owner_and_after_memory(self):
+    def test_alias_register_no_owner_check_and_after_memory(self):
         core = Core()
         root = _new_root(core)
         core.mem["p"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         core.mem["s"] = MetaDict(data={"content": "sys"}, ctrl={"type": "settingup"})
         sink = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         core._dormant_cids.append(sink.cid)
-        core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
+        core.mem.make("$MEM", "box", "dict")
+        _seed(core.mem, "$MEM.box.msg", "v")
         _mount(core, "alias", "$MEM.box.msg")
 
         core.mem["h"] = _python_node(
             "def handle(event):\n    return {}"
         )
-        # 真实 owner(0) 可通过别名注册
+        # Core 不再按节点 owner 授权 memory 监听（注册授权交给软件层 Guard）
         lid = core.events.register(0, "memory_read", "$MEM.alias", "$MEM.h", phase="before")
         assert lid == 1
-        # 非 owner 通过别名注册被拒
-        with pytest.raises(ValueError):
-            core.events.register(1, "memory_read", "$MEM.alias", "$MEM.h", phase="before")
+        assert core.events.register(1, "memory_read", "$MEM.alias", "$MEM.h", phase="before") == 2
 
         # before 事件 target 是别名
         MemoryReadInstruction("tc", 0, {"ref": "$MEM.alias"}).execute(core, root)
@@ -263,8 +266,8 @@ class TestEventTransparency:
         core.mem["s"] = MetaDict(data={"content": "sys"}, ctrl={"type": "settingup"})
         sink = _build_conversation(core, "$MEM.s", "$MEM.p", parent=root, is_sub=False)
         core._dormant_cids.append(sink.cid)
-        core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        _seed(core.mem, "$MEM.box.msg", "v", owner_cid=0)
+        core.mem.make("$MEM", "box", "dict")
+        _seed(core.mem, "$MEM.box.msg", "v")
         _mount(core, "alias", "$MEM.box.msg")
         core.mem["h"] = _python_node(
             "def handle(event):\n    return {'notify': [{'cid': 1, 'content': json.dumps(event['payload'], ensure_ascii=False)}]}"

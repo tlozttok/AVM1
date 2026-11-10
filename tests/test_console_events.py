@@ -122,13 +122,30 @@ class TestUpdate:
         core.events.update(listener_id, enabled=False)
         assert core.events.listeners[0]["owner_cid"] == 1
 
-    def test_update_rechecks_target_permission(self):
-        """改 target 要过与注册同一套权限：无主路径不接受。"""
+    def test_update_does_not_check_memory_owner(self):
+        """改 target 不再按节点 owner 授权（监听策略交给软件层 Guard）。"""
         core = make_core()
         listener_id = add_listener(core)
         core.mem["free"] = "no owner"
-        with pytest.raises(ValueError, match="无主路径"):
-            core.events.update(listener_id, target="$MEM.free")
+        record = core.events.update(listener_id, target="$MEM.free")
+        assert record["target"] == "$MEM.free"
+
+    def test_update_still_rechecks_device_authorization(self):
+        """设备目标仍由设备 authorize_listener 决定，update 与注册同一套设备授权。"""
+        from avm.memory_device import MemoryDevice
+
+        class DenyDevice(MemoryDevice):
+            def pretend_as_type(self):
+                return "str"
+
+            def to_llm_string(self):
+                return "deny"
+
+        core = make_core()
+        core.mem.mount("input", DenyDevice())
+        listener_id = add_listener(core)
+        with pytest.raises(ValueError, match="未授权"):
+            core.events.update(listener_id, target="$MEM.input.next")
 
     def test_update_accepts_before_phase_for_lifecycle_event(self):
         """批次二：生命周期事件也有 before；target 按生命周期规则改成 cid:1。"""

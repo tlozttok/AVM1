@@ -110,7 +110,7 @@ class TestRuntimeRootRegistry:
     def test_validation_against_live_conversation_roots(self):
         core, root = _core()
         user = _user_conv(core, root)
-        core.mem.make("$MEM", "ws", "dict", owner_cid=0)
+        core.mem.make("$MEM", "ws", "dict")
         core.set_conversation_roots(user.cid, {"work": ["ws"]})
         text = _write(core, root, "$MEM.roots", '{"w": "$MEM.ws.sub"}')
         assert text.startswith("Illegal:"), text
@@ -159,7 +159,7 @@ class TestCapsSelfDescription:
             "mode": "user", "groups": ["worker"],
             "roots": [], "tools": ["memory_read"],
         })
-        core.mem.make("$MEM", "ws", "dict", owner_cid=0)
+        core.mem.make("$MEM", "ws", "dict")
         core.set_conversation_roots(user.cid, {"work": ["ws"]})
         data = json.loads(_read(core, user, "$caps"))
         assert data["cid"] == user.cid

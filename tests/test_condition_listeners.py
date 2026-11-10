@@ -56,8 +56,8 @@ def _user_conv(core, root, caps):
 class TestKernelCondition:
     def test_exact_and_phase(self):
         core, root = _core()
-        core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.make("$MEM.box", "x", "str", owner_cid=0)
+        core.mem.make("$MEM", "box", "dict")
+        core.mem.make("$MEM.box", "x", "str")
         seen = []
         core.events.add_observer(seen.append)
         h = _handler({"events": ["memory_read"], "phase": ["after"],
@@ -72,8 +72,8 @@ class TestKernelCondition:
 
     def test_subtree_and_source_filter(self):
         core, root = _core()
-        core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.make("$MEM.box", "x", "str", owner_cid=0)
+        core.mem.make("$MEM", "box", "dict")
+        core.mem.make("$MEM.box", "x", "str")
         seen = []
         core.events.add_observer(seen.append)
         h = _handler({"events": ["memory_write"], "phase": ["before"],
@@ -93,8 +93,8 @@ class TestUserPresets:
             "tools": list(ALL_TOOL_NAMES),
         })
         # 工作目录由软件建、根由控制面动态授予：handler 放在用户可见的目录里
-        core.mem.make("$MEM", "workdirs", "dict", owner_cid=0)
-        core.mem.make("$MEM.workdirs", f"w{user.cid}", "dict", owner_cid=0)
+        core.mem.make("$MEM", "workdirs", "dict")
+        core.mem.make("$MEM.workdirs", f"w{user.cid}", "dict")
         core.set_conversation_roots(user.cid, {"work": ["workdirs", f"w{user.cid}"]})
         work = core.mem.resolve_path(["MEM", "workdirs", f"w{user.cid}"], for_llm=False)
         work["h"] = _handler(condition)
@@ -111,19 +111,23 @@ class TestUserPresets:
         user = self._user(core, root, {"preset": "own_work.memory"})
         text = self._listen(core, user)
         assert text.startswith(("Illegal:", "Error:")), text
-        assert "已移除" in text and "own_nodes.memory" in text
+        assert "已移除" in text
         assert core.events.listeners == []
 
-    def test_user_preset_registers_and_matches_own_nodes(self):
+    def test_own_nodes_preset_removed(self):
         core, root = _core()
         user = self._user(core, root, {"preset": "own_nodes.memory"})
+        text = self._listen(core, user)
+        assert text.startswith(("Illegal:", "Error:")), text
+        assert "已移除" in text and "owned" not in text
+        assert core.events.listeners == []
+
+    def test_user_preset_self_lifecycle_registers(self):
+        core, root = _core()
+        user = self._user(core, root, {"preset": "self.lifecycle"})
         assert self._listen(core, user).startswith("listener_id=")
-        seen = []
-        core.events.add_observer(seen.append)
-        _call(core, user, "memory_make", {"ref": "$work", "key": "x", "mem_type": "str"})
-        _call(core, user, "memory_read", {"ref": "$work.x"})
-        reads = [e for e in seen if e["event_type"] == "memory_read"]
-        assert {e["phase"] for e in reads} == {"before", "after"}
+        record = core.events.listeners[-1]
+        assert record["condition"]["target"] == {"kind": "self_lifecycle", "cid": user.cid}
 
     def test_user_custom_condition_rejected(self):
         core, root = _core()

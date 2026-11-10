@@ -42,7 +42,7 @@ class BoxDevice(MemoryDevice):
     def __setitem__(self, key, value):
         self._data[key] = value
 
-    def set_value(self, value, owner_cid=None):
+    def set_value(self, value):
         self._data = dict(value)
 
 

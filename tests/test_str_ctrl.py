@@ -1,6 +1,6 @@
 """字符串叶子的控制数据（StrNode）：只有 ctrl，没有描述数据。
 
-批次二前置：str 需要携带控制数据（owner、后续的 ACL 等），但不带描述数据。
+批次二前置：str 需要携带控制数据（后续的 ACL 等），但不带描述数据。
 """
 
 import copy
@@ -49,33 +49,35 @@ class TestStrNode:
 
 
 class TestMemoryStrCtrl:
-    def test_make_str_records_owner(self):
+    def test_new_str_node_has_no_ctrl(self):
+        """新建节点不带 owner：所有权 cid 已移出 MEM。"""
         mem = Memory()
-        assert mem.make("$MEM", "s", "str", owner_cid=5) == "$MEM.s"
+        assert mem.make("$MEM", "s", "str") == "$MEM.s"
         node = mem.unwrap(["$", "MEM", "s"], for_llm=False)
         assert isinstance(node, StrNode)
-        assert node.get_ctrl()["owner"] == "5"
+        assert node.get_ctrl() is None
 
-    def test_write_preserves_ctrl(self):
+    def test_write_preserves_existing_ctrl(self):
         mem = Memory()
-        mem.make("$MEM", "s", "str", owner_cid=5)
+        mem.make("$MEM", "s", "str")
+        mem.unwrap(["$", "MEM", "s"], for_llm=False).set_ctrl({"type": "note"})
         mem.set("$MEM.s", "new")
         node = mem.unwrap(["$", "MEM", "s"], for_llm=False)
         assert node == "new"
-        assert node.get_ctrl()["owner"] == "5"
+        assert node.get_ctrl() == {"type": "note"}
 
-    def test_append_records_owner(self):
+    def test_append_creates_plain_node(self):
         mem = Memory()
-        mem.make("$MEM", "L", "list", owner_cid=5)
-        assert mem.set("$MEM.L.-1", "leaf", owner_cid=9) == "$MEM.L.0"
+        mem.make("$MEM", "L", "list")
+        assert mem.set("$MEM.L.-1", "leaf") == "$MEM.L.0"
         node = mem.resolve_path(["MEM", "L", "0"], for_llm=False)
-        assert node.get_ctrl()["owner"] == "9"
+        assert node.get_ctrl() is None
 
     def test_edit_metadata_on_str(self):
         core = Core()
         conv = core.start("sys", "user")
         core._active_cid = conv.cid
-        core.mem.make("$MEM", "s", "str", owner_cid=conv.cid)
+        core.mem.make("$MEM", "s", "str")
         conv.user_batch.tool_responses.clear()
         core._process_return_calls([{
             "cmd_type": "edit_metadata", "call_id": "c1",
@@ -93,14 +95,14 @@ class TestMemoryStrCtrl:
 
     def test_save_load_roundtrip_keeps_str_ctrl(self, tmp_path):
         mem = Memory()
-        mem.make("$MEM", "s", "str", owner_cid=5)
-        mem.make("$MEM", "d", "dict", owner_cid=6)
+        mem.make("$MEM", "s", "str")
+        mem.make("$MEM", "d", "dict")
         path = tmp_path / "mem.json"
         mem.save(str(path))
         loaded = Memory.load(str(path))
         node = loaded.resolve_path(["MEM", "s"], for_llm=False)
         assert isinstance(node, StrNode)
-        assert node.get_ctrl()["owner"] == "5"
+        assert node.get_ctrl() is None
 
 
 class TestStrInImage:
@@ -141,9 +143,9 @@ class TestStrInImage:
         assert "描述" in str(ei.value) and "meta" in str(ei.value)
 
 
-class TestStrOwnerFixesWorkspaceListener:
-    def test_user_owned_str_can_be_listened(self):
-        """动态授予的工作目录由软件建成；用户对话自己建的 str 带自己的 owner。"""
+class TestRemovedOwnNodesPreset:
+    def test_user_memory_listener_preset_removed(self):
+        """own_nodes.memory 依赖已删除的节点所有权：用户态注册报明确错误。"""
         core = Core()
         core.mem["model_params"] = MetaDict(data={"model": "test"}, ctrl={"type": "para"})
         parent = core.start("sys", "parent", para_ref="$MEM.model_params")
@@ -161,16 +163,15 @@ class TestStrOwnerFixesWorkspaceListener:
         # 工作目录由软件建、根动态授予（内核不再分配工作空间）
         core.mem["ws"] = MetaDict(data={})
         core.set_conversation_roots(child.cid, {"work": ["ws"]})
-        assert child.caps.tools == ALL_TOOL_NAMES or child.caps.mode == "user"
-        # 用户对话在自己的工作目录建 str，owner 应是它自己
+        # 用户对话自己建的 str 不带 owner（所有权 cid 已移出 MEM）
         child.user_batch.tool_responses.clear()
         core._process_return_calls([{
             "cmd_type": "memory_make", "call_id": "c2",
             "args": {"ref": "$work", "key": "s", "mem_type": "str"},
         }], child)
         node = core.mem.resolve_path(["MEM"] + list(child.caps.roots["work"]) + ["s"], for_llm=False)
-        assert node.get_ctrl()["owner"] == str(child.cid)
-        # 监听自己的 str 不再被 owner 检查挡住（handler 也在工作空间里）
+        assert node.get_ctrl() is None
+        # 旧 preset 依赖 owner：注册报明确错误，不留下监听器
         child.user_batch.tool_responses.clear()
         core._process_return_calls([{
             "cmd_type": "memory_make", "call_id": "c3",
@@ -186,4 +187,5 @@ class TestStrOwnerFixesWorkspaceListener:
             "args": {"action": "listen", "handler_ref": "$work.h"},
         }], child)
         text = child.user_batch.tool_responses[-1].content
-        assert "listener_id=" in text
+        assert "已移除" in text and "own_nodes.memory" in text
+        assert core.events.listeners == []

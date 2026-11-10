@@ -68,7 +68,7 @@ def _user_conv(core, root):
     text = root.user_batch.tool_responses[-1].content
     assert text.startswith("Success created: cid="), text
     child = core.get_conversation(int(text.split("=")[-1]))
-    core.mem.make("$MEM", "ws", "dict", owner_cid=0)
+    core.mem.make("$MEM", "ws", "dict")
     core.set_conversation_roots(child.cid, {"work": ["ws"]})
     return child
 
@@ -82,7 +82,7 @@ def _observe(core):
 class TestB2TargetInfoContext:
     def test_make_before_has_parent_and_prefix(self):
         core, root = _core()
-        core.mem.make("$MEM", "box", "dict", owner_cid=0)
+        core.mem.make("$MEM", "box", "dict")
         seen = _observe(core)
         core.mem["h"] = _handler()
         core.events.register(0, "memory_make", "$MEM.box.new", "$MEM.h", phase="before",
@@ -99,7 +99,7 @@ class TestB2TargetInfoContext:
 
     def test_append_before_has_list_parent(self):
         core, root = _core()
-        core.mem.make("$MEM", "lst", "list", owner_cid=0)
+        core.mem.make("$MEM", "lst", "list")
         seen = _observe(core)
         core.mem["h"] = _handler()
         core.events.register(0, "memory_write", "$MEM.lst.-1", "$MEM.h", phase="before",
@@ -113,8 +113,8 @@ class TestB2TargetInfoContext:
 
     def test_delete_link_target_info_is_link_node(self):
         core, root = _core()
-        core.mem.make("$MEM", "box", "dict", owner_cid=0)
-        core.mem.make("$MEM.box", "msg", "str", owner_cid=0)
+        core.mem.make("$MEM", "box", "dict")
+        core.mem.make("$MEM.box", "msg", "str")
         core.mem._data["alias"] = LinkNode(target="$MEM.box.msg")
         core.mem._data["alias"].set_ctrl({"owner": "0"})
         seen = _observe(core)

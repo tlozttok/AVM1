@@ -175,10 +175,10 @@ class TestRestrictedConversation:
         core.mem["ws"] = MetaDict(data={})
         core.mem["handler"] = MD(
             data={"content": "def handle(event):\n    return {}\n",
-                  "condition": StrNode(json.dumps({"preset": "own_nodes.memory"}))},
+                  "condition": StrNode(json.dumps({"preset": "self.lifecycle"}))},
             ctrl={"type": "handler"},
         )
-        # ws 无主；d 由受限对话创建并带 owner，监听 d.x 时 owner 走 d
+        # handler_ref 经根表别名 $h 解析；监听条件用用户态 preset
         _restrict(conv, {"work": ("ws",), "h": ("handler",)})
         _call(core, conv, "memory_make", {"ref": "$work", "key": "d", "mem_type": "dict"})
         _call(core, conv, "memory_make", {"ref": "$work.d", "key": "x", "mem_type": "str"})

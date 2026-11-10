@@ -70,8 +70,8 @@ def _notify_json_handler(expr: str) -> str:
 
 
 def _seed_box(core):
-    core.mem.make("$MEM", "box", "dict", owner_cid=0)
-    core.mem.make("$MEM.box", "msg", "str", owner_cid=0)
+    core.mem.make("$MEM", "box", "dict")
+    core.mem.make("$MEM.box", "msg", "str")
     core.mem.set("$MEM.box.msg", "v")
 
 
@@ -226,7 +226,7 @@ class TestListenerRegistrationPermissions:
     def _user_conv(self, core):
         core.mem["ws"] = MetaDict(data={"x": "", "h": MetaDict(
             data={"content": "def handle(event):\n    return {}\n",
-                  "condition": StrNode(json.dumps({"preset": "own_nodes.memory"}))},
+                  "condition": StrNode(json.dumps({"preset": "self.lifecycle"}))},
             ctrl={"type": "handler"})},
             ctrl={"owner": "1"})
         conv = core._conv_by_cid[1] if 1 in core._conv_by_cid else core.start("u", "u", para_ref="$MEM.p")
@@ -259,7 +259,7 @@ class TestListenerRegistrationPermissions:
         }).execute(core, conv)
         assert "命名条件子集" in conv.user_batch.tool_responses[-1].content
 
-    def test_normal_conversation_can_listen_own_node(self):
+    def test_normal_conversation_can_register_with_preset(self):
         core, root = _core()
         conv = self._user_conv(core)
         ListenEventInstruction("c4", conv.cid, {
@@ -328,7 +328,7 @@ class TestKernelSupervisionAcrossSpaces:
         child = core.get_conversation(int(root.user_batch.tool_responses[-1].content.split("=")[-1]))
         assert child.caps.mode == "user"
         # 工作目录由软件建、根由控制面动态授予（内核不再分配工作空间）
-        core.mem.make("$MEM", "ws", "dict", owner_cid=0)
+        core.mem.make("$MEM", "ws", "dict")
         core.set_conversation_roots(child.cid, {"work": ["ws"]})
         real = ("MEM",) + tuple(child.caps.roots["work"]) + ("x",)
         real_ref = "$" + ".".join(real)

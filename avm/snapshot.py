@@ -244,6 +244,8 @@ def _rebuild_conversations(core, doc: dict) -> None:
 
 
 def _rebuild_listeners(core, doc: dict) -> None:
+    from .events import drop_removed_condition_listener
+
     listeners = doc.get("listeners") or []
     if not isinstance(listeners, list):
         raise SnapshotError("快照 listeners 段必须是数组")
@@ -255,6 +257,9 @@ def _rebuild_listeners(core, doc: dict) -> None:
             listener = listener_from_snapshot(data)
         except (TypeError, ValueError) as e:
             raise SnapshotError(f"快照里的监听器记录不合法：{e}") from e
+        # 旧快照里依赖节点所有权 cid 的条件形态已删除：丢弃该监听器并告警，不中断启动。
+        if drop_removed_condition_listener(listener, "重启快照"):
+            continue
         core.events.listeners.append(listener)
         listener_id = listener.get("listener_id")
         if isinstance(listener_id, int) and listener_id >= core.events._next_listener_id:

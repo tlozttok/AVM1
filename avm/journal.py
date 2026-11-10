@@ -355,16 +355,18 @@ def apply_scheduler(core, scheduler, source: str = "日志") -> None:
 # ----------------------------------------------------------------------
 
 def _effect_memory_set(core, effect) -> None:
+    # 旧日志效果可能带 owner_cid 字段：按未知字段忽略（节点所有权已移出 MEM）。
     core.mem.set(
         effect["ref"], effect["value"],
-        owner_cid=effect.get("owner_cid"), space=_space_from_roots(effect.get("space")),
+        space=_space_from_roots(effect.get("space")),
     )
 
 
 def _effect_memory_make(core, effect) -> None:
+    # 旧日志效果可能带 owner_cid 字段：按未知字段忽略。
     core.mem.make(
         effect["ref"], effect["key"], effect["mem_type"],
-        owner_cid=effect.get("owner_cid"), space=_space_from_roots(effect.get("space")),
+        space=_space_from_roots(effect.get("space")),
     )
 
 
@@ -540,12 +542,15 @@ def _effect_delivery(core, effect) -> None:
 
 
 def _effect_listener_register(core, effect) -> None:
-    from .events import listener_from_snapshot
+    from .events import drop_removed_condition_listener, listener_from_snapshot
 
     data = effect.get("listener")
     if not isinstance(data, dict):
         raise VMMemoryError("listener_register 缺少 listener 载荷")
     listener = listener_from_snapshot(data)
+    # 旧日志里依赖节点所有权 cid 的条件形态已删除：重放时丢弃该监听器，不中断启动。
+    if drop_removed_condition_listener(listener, "日志重放"):
+        return
     core.events.listeners.append(listener)
     listener_id = listener.get("listener_id")
     if isinstance(listener_id, int) and listener_id >= core.events._next_listener_id:
@@ -553,15 +558,26 @@ def _effect_listener_register(core, effect) -> None:
 
 
 def _effect_listener_modify(core, effect) -> None:
-    from .events import listener_from_snapshot
+    from .events import drop_removed_condition_listener, listener_from_snapshot
 
     listener_id = effect.get("listener_id")
+    replacement = listener_from_snapshot(effect["listener"])
+    if drop_removed_condition_listener(replacement, "日志重放"):
+        # 旧条件形态的 modify：丢弃被改写的监听器本身；记录缺失也不报错（可能已随
+        # listener_register 一起被丢弃），重放继续。
+        core.events.listeners = [
+            listener for listener in core.events.listeners
+            if listener.get("listener_id") != listener_id
+        ]
+        return
     for index, listener in enumerate(core.events.listeners):
         if listener.get("listener_id") == listener_id:
-            replacement = listener_from_snapshot(effect["listener"])
             core.events.listeners[index] = replacement
             return
-    raise VMMemoryError(f"listener_modify 的目标监听器 {listener_id} 不存在")
+    print(
+        f"[AVM] 日志重放：listener_modify 的目标监听器 {listener_id} 不存在，跳过",
+        file=sys.stderr,
+    )
 
 
 def _effect_listener_cancel(core, effect) -> None:

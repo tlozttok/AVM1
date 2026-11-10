@@ -41,14 +41,14 @@ class EchoDevice(MemoryDevice):
                  "run": lambda args: {"echo": args}}]
 
 
-def _seed(mem, ref, value, owner_cid=None):
+def _seed(mem, ref, value):
     """测试夹具：先 make 建链再写（memory_write 不再建节点）。"""
     try:
-        return mem.set(ref, value, owner_cid=owner_cid)
+        return mem.set(ref, value)
     except MemoryKeyNotFoundError:
         parent, _, key = ref.rpartition(".")
-        mem.make(parent, key, "str", owner_cid=owner_cid)
-        return mem.set(ref, value, owner_cid=owner_cid)
+        mem.make(parent, key, "str")
+        return mem.set(ref, value)
 
 
 def request(base, method, path, body=None):

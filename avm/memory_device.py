@@ -160,11 +160,11 @@ class LinkDevice(MemoryDevice):
             print(f"[Link] {alias}: {type(e).__name__}: {e}", file=sys.stderr)
             raise VMMemoryError(f"链接目标不可达：{alias}") from None
 
-    def set_value(self, value: Any, owner_cid: Optional[int] = None) -> None:
+    def set_value(self, value: Any) -> None:
         from .exceptions import VMMemoryError
         if self._core is None:
             raise VMMemoryError("LinkDevice 未接入 Core")
-        self._core.mem.set(self.target_ref, value, owner_cid=owner_cid)
+        self._core.mem.set(self.target_ref, value)
 
     def authorize_listener(self, event_type: str, remainder: list, owner_cid: int) -> bool:
         from .exceptions import MemoryCircularReferenceError
@@ -178,10 +178,9 @@ class LinkDevice(MemoryDevice):
         except Exception:
             return False
         if follow[0] == "memory":
-            _, segments = follow
-            ref = "$MEM" if not segments else "$MEM." + ".".join(segments)
-            owner = self._core.events._owner_of(self._core, ref)
-            return owner is not None and owner == owner_cid
+            # 链接到内存树的监听授权交给软件层 Guard：Core 不再做节点所有权判定，
+            # 设备也不替 Core 猜策略；普通对话与内核态一视同仁。
+            return True
         _, mount, dev_remainder = follow
         device = self._core.mem._devices[mount]
         return device.authorize_listener(event_type, dev_remainder, owner_cid)

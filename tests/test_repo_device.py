@@ -278,11 +278,11 @@ class TestReadOnly:
         core = _core(device)
         assert device.pretend_as_type() == "str"
         with pytest.raises(MemoryTypeError):
-            core.mem.set("$MEM.AVMRepo", "value", owner_cid=0)
+            core.mem.set("$MEM.AVMRepo", "value")
         with pytest.raises(MemoryTypeError):
-            core.mem.set("$MEM.AVMRepo.x", "value", owner_cid=0)
+            core.mem.set("$MEM.AVMRepo.x", "value")
         with pytest.raises(MemoryTypeError):
-            core.mem.set('$MEM.AVMRepo.read."big.txt".0', "value", owner_cid=0)
+            core.mem.set('$MEM.AVMRepo.read."big.txt".0', "value")
 
     def test_memory_write_instruction_returns_error(self, device):
         core = _core(device)

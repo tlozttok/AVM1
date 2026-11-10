@@ -89,18 +89,6 @@ def _wrap_value(value: Any, depth: int = 0) -> Any:
     return value
 
 
-def _with_owner(node: Any, owner_cid: Optional[int]) -> Any:
-    """若节点是 MetaDict/MetaList 且提供了 owner_cid，则复制现有 ctrl 并写入 owner。
-
-    返回传入节点，方便链式调用。str 叶子没有 ctrl，不写。
-    """
-    if owner_cid is not None and isinstance(node, (MetaDict, MetaList, StrNode)):
-        ctrl = dict(node.get_ctrl() or {})
-        ctrl["owner"] = str(owner_cid)
-        node.set_ctrl(ctrl)
-    return node
-
-
 
 class Memory:
     """
@@ -509,12 +497,11 @@ class Memory:
         else:
             return value
 
-    def set_by_path(self, path: list, value: Any, owner_cid: Optional[int] = None,
+    def set_by_path(self, path: list, value: Any,
                     display: Optional[list] = None) -> Optional[str]:
         """
         根据路径设置值
         :param path: 真实路径列表（`MEM` 之后），如 ['key', 'subkey']
-        :param owner_cid: 新创建的 MetaDict/MetaList 节点的所有者 cid（可选）。
         :param display: 报错与追加地址用的请求段序列（含根名）；缺省按 `$MEM` 拼。
         特殊规则：如果 path 终点的现有值是 MetaList/MetaDict，
         则写入被解释为修改其元数据，而不是替换整个对象。
@@ -537,7 +524,7 @@ class Memory:
                 return None
             if isinstance(parent, (list, MetaList)):
                 self._check_append_same_type(parent, "str")
-                parent.append(_with_owner(_wrap_value(value), owner_cid))
+                parent.append(_wrap_value(value))
                 return _show(list(display[:-1]) + [str(len(parent) - 1)])
             if isinstance(parent, (dict, MetaDict)):
                 raise IllegalOperationError("字典里不能用 -1（-1 只表示列表追加位置）")
@@ -565,7 +552,7 @@ class Memory:
         if self.is_device_path(path):
             device = self.get_device(path)
             if getattr(device, "is_link", False):
-                device.set_value(value, owner_cid=owner_cid)
+                device.set_value(value)
             elif hasattr(device, 'set_value'):
                 device.set_value(value)
             else:
@@ -580,7 +567,7 @@ class Memory:
                 if getattr(device, "is_link", False):
                     # 链接子路径写：委托到真实目标路径（含环检测）
                     real_segments = device._real_mem_segments(path[i:])
-                    self.set_by_path(real_segments, value, owner_cid=owner_cid)
+                    self.set_by_path(real_segments, value)
                     return
                 current = device
                 for key in path[i:-1]:
@@ -605,7 +592,7 @@ class Memory:
                 f"键 {path[-1]!r} 不存在：{_show(display)}"
                 "——memory_write 不建节点，先用 memory_make 创建"
             )
-        self._assign(node, path[-1], _with_owner(_wrap_value(value), owner_cid), display, len(path) - 1)
+        self._assign(node, path[-1], _wrap_value(value), display, len(path) - 1)
 
     @staticmethod
     def _child(node: Any, key: Any, display: list, index: int):
@@ -637,8 +624,7 @@ class Memory:
                 existing.set_metadata(value)
                 return
             if isinstance(existing, str):
-                # 写字符串叶子：只改内容。owner 属于节点创建（make/append），写入不夺权：
-                # 已有 StrNode 保留其 ctrl，普通 str 保持无 ctrl（由祖先容器提供 owner）。
+                # 写字符串叶子：只改内容，不动节点的 ctrl（写入不夺权）。
                 keep = existing.get_ctrl() if isinstance(existing, StrNode) else None
                 node[key] = StrNode(str(value), ctrl=keep)
                 return
@@ -759,18 +745,17 @@ class Memory:
             del container[idx]  # 列表元素删除后，后续元素下标前移
         return deleted_type, ref
 
-    def set(self, ref: str, value: Any, owner_cid: Optional[int] = None,
+    def set(self, ref: str, value: Any,
             space: Optional[AddressSpace] = None) -> Optional[str]:
         """
         根据引用设置值
         :param ref: 引用字符串，如 '$MEM.key'、'$work.key' 或 '$data.key.subkey'
         :param value: 要设置的值
-        :param owner_cid: 新创建容器节点的所有者 cid（可选）
         :param space: 地址上下文（根表）；None = 只允许 $MEM 根
         :return: 追加到列表时的地址（请求别名形态，如 '$data.list.3'）；普通写入返回 None
         """
         real, display = self._expand_write_ref(ref, space)
-        return self.set_by_path(real, value, owner_cid=owner_cid, display=display)
+        return self.set_by_path(real, value, display=display)
 
     # ------------------------------------------------------------------
     # 调试原语：屏蔽与还原（宿主侧，不经指令、不产生事件）
@@ -821,7 +806,7 @@ class Memory:
         return key
 
     def detach(self, ref: str) -> Any:
-        """调试用：按路径摘除节点并原样返回（meta / ctrl / owner 一并保留）。
+        """调试用：按路径摘除节点并原样返回（meta / ctrl 一并保留）。
 
         与指令无关，不产生事件：屏蔽期间对话只会看到键不存在，注册在该路径上的
         监听器不会被触发。还原用 attach。设备路径拒绝——先 unmount 设备。
@@ -998,7 +983,7 @@ class Memory:
                 return ("device", prefix, real[i:])
         return ("memory", real)
 
-    def make(self, ref: str, key: str, mem_type: str, owner_cid: Optional[int] = None,
+    def make(self, ref: str, key: str, mem_type: str,
              space: Optional[AddressSpace] = None) -> str:
         """在指定路径创建新地址，返回地址字符串（请求别名形态，追加时带真实下标）。
 
@@ -1050,7 +1035,7 @@ class Memory:
             request_rest = list(parts[1:])
             offset = len(real_segments) - len(request_rest)
             node, address_parts = self._walk_make_path(
-                real_segments, list(display), offset, ref, owner_cid
+                real_segments, list(display), offset, ref
             )
 
         if isinstance(node, (dict, MetaDict)):
@@ -1060,7 +1045,7 @@ class Memory:
                 raise VMMemoryError(
                     f"地址已存在：{_show(address_parts + [key])}——memory_make 只创建新地址，不覆盖"
                 )
-            node[key] = self._new_node(mem_type, owner_cid)
+            node[key] = self._new_node(mem_type)
             return _show(address_parts + [key])
         if isinstance(node, (list, MetaList)):
             if key != "-1":
@@ -1069,7 +1054,7 @@ class Memory:
                 )
             # 仅新列表可随意指定类型；列表已有值时必须与已有元素同类型
             self._check_append_same_type(node, mem_type)
-            node.append(self._new_node(mem_type, owner_cid))
+            node.append(self._new_node(mem_type))
             return _show(address_parts + [str(len(node) - 1)])
         if isinstance(node, str):
             raise VMMemoryError(f"不能在字符串类型的路径下创建新键：{ref}")
@@ -1113,16 +1098,15 @@ class Memory:
             )
 
     @staticmethod
-    def _new_node(mem_type: str, owner_cid: Optional[int] = None):
-        """按 mem_type 造一个新节点（str 叶子不带 ctrl，容器写 owner）。"""
+    def _new_node(mem_type: str):
+        """按 mem_type 造一个新节点（新节点不带 ctrl）。"""
         if mem_type == 'str':
-            return _with_owner(StrNode(""), owner_cid)
+            return StrNode("")
         if mem_type == 'dict':
-            return _with_owner(MetaDict(data={}), owner_cid)
-        return _with_owner(MetaList(data=[]), owner_cid)
+            return MetaDict(data={})
+        return MetaList(data=[])
 
-    def _walk_make_path(self, segments: list, display: list, offset: int, ref: str,
-                        owner_cid: Optional[int] = None) -> tuple:
+    def _walk_make_path(self, segments: list, display: list, offset: int, ref: str) -> tuple:
         """沿 make 的真实路径下钻并建出缺失段，返回 (终端容器, 地址显示段)。
 
         先找最深可解析前缀（走既有 resolve_path，链接透明），再在普通 dict/list 上补建：
@@ -1155,7 +1139,7 @@ class Memory:
                 if seg in node:
                     node = node[seg]
                     continue
-                created = self._new_node('list' if next_seg == "-1" else 'dict', owner_cid)
+                created = self._new_node('list' if next_seg == "-1" else 'dict')
                 node[seg] = created
                 node = created
                 continue
@@ -1165,7 +1149,7 @@ class Memory:
                         f"列表位置的路径段只能是 -1（追加），得到 {seg!r}：{ref}"
                     )
                 self._check_append_same_type(node, "dict")
-                created = self._new_node('dict', owner_cid)
+                created = self._new_node('dict')
                 node.append(created)
                 di = display_index(j)
                 if di is not None:

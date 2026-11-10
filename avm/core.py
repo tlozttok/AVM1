@@ -56,7 +56,7 @@ def _note_memory_write(core: 'Core', conv: Conversation, ref: str, content: str)
         core.note_effect("device_write", ref=ref, mount=split[1])
         return
     core.note_effect(
-        "memory_set", ref=ref, value=content, owner_cid=conv.cid,
+        "memory_set", ref=ref, value=content,
         space=_effect_space(conv),
     )
 
@@ -79,6 +79,35 @@ def _canonical_ref(core: 'Core', target, space=None, follow_final: bool = True):
     follow_final=False 用于删除链接：最终段不跟随，canonical 指向链接节点本身。
     """
     return core.canonical_ref(target, space=space, follow_final=follow_final)
+
+
+def _condition_before_target(condition: dict) -> tuple:
+    """listen_event before 事件的目标：condition 目标的 canonical ref。
+
+    无 target（全局条件）时用 "*"；返回 (target 别名, canonical target_ref)。
+    """
+    target = (condition or {}).get("target") or {}
+    kind = target.get("kind")
+    ref = None
+    if kind in ("exact", "subtree"):
+        ref = (target.get("refs") or {}).get("normal")
+    elif kind in ("cid_owner", "self_lifecycle"):
+        cid = target.get("cid")
+        if isinstance(cid, int):
+            ref = ("cid", cid)
+    if not ref:
+        return "*", ("*",)
+    ref = tuple(ref)
+    tag = ref[0]
+    if tag == "memory":
+        return "$MEM" + ("." + ".".join(ref[1]) if ref[1] else ""), ref
+    if tag == "device":
+        return "$MEM." + ref[1] + ("." + ".".join(ref[2]) if ref[2] else ""), ref
+    if tag == "cid":
+        return f"cid:{ref[1]}", ref
+    if tag == "listener":
+        return f"listener:{ref[1]}", ref
+    return "*", ("*",)
 
 
 def _dispatch_before_event(core: 'Core', conv: Conversation, event_type: str, target: str,
@@ -402,7 +431,7 @@ class MemoryWriteInstruction(Instruction):
             return
         content = event["payload"]["content"]
         try:
-            address = core.mem.set(self.ref, content, owner_cid=conv.cid, space=conv.caps.space())
+            address = core.mem.set(self.ref, content, space=conv.caps.space())
         except _INSTRUCTION_ERRORS as e:
             _respond_error(conv, self.call_id, e)
             return
@@ -471,7 +500,7 @@ class MemoryMakeInstruction(Instruction):
             conv.user_batch.add_tool_response(event["response"], self.call_id)
             return
         try:
-            address = core.mem.make(self.ref, self.key, self.mem_type, owner_cid=conv.cid,
+            address = core.mem.make(self.ref, self.key, self.mem_type,
                                      space=conv.caps.space())
         except _INSTRUCTION_ERRORS as e:
             _respond_error(conv, self.call_id, e)
@@ -479,7 +508,7 @@ class MemoryMakeInstruction(Instruction):
         if core._journaling():
             core.note_effect(
                 "memory_make", ref=self.ref, key=self.key, mem_type=self.mem_type,
-                owner_cid=conv.cid, space=_effect_space(conv),
+                space=_effect_space(conv),
             )
         # 真实地址：链上新建的段与 -1 追加段都带真实下标，调用者据此可寻址
         if self.key == "-1":
@@ -634,11 +663,6 @@ class EditMetadataInstruction(Instruction):
                     "Illegal: edit_metadata type=set 时 value 必需（可以是空字符串）", self.call_id
                 )
                 return
-            if key == "owner":
-                conv.user_batch.add_tool_response(
-                    "Illegal: owner 由 Core 维护，不允许通过 edit_metadata 修改", self.call_id
-                )
-                return
             ctrl[key] = value
             node.set_ctrl(ctrl)
             if core._journaling():
@@ -684,11 +708,6 @@ class EditMetadataInstruction(Instruction):
             if not key:
                 conv.user_batch.add_tool_response(
                     "Illegal: edit_metadata type=del 时 key 必需", self.call_id
-                )
-                return
-            if key == "owner":
-                conv.user_batch.add_tool_response(
-                    "Illegal: owner 由 Core 维护，不允许通过 edit_metadata 修改", self.call_id
                 )
                 return
             if key not in ctrl:
@@ -1052,25 +1071,35 @@ class ListenEventInstruction(Instruction):
                 self.call_id,
             )
             return
-        # before 事件：监听注册/修改/取消本身也受事件层权限检查
+        # before 事件：监听注册/修改/取消本身也受事件层检查与软件 Guard 裁决。
+        # action=listen 先解析 handler 的 condition，before 载荷带解析后的条件；
+        # 注册在 before 通过后进行，不再重复解析。
         listener_id = getattr(self, "listener_id", None)
+        parsed_condition = None
         if action == "listen":
-            b_target = getattr(self, "target", None)
-            if not isinstance(b_target, str):
-                b_target = ""
+            handler_ref = getattr(self, "handler_ref", None)
+            if handler_ref is None:
+                conv.user_batch.add_tool_response(
+                    "Illegal: action=listen 时必须提供 handler_ref", self.call_id
+                )
+                return
+            try:
+                parsed_condition = core.events.parse_condition(
+                    conv.cid, handler_ref, space=conv.caps.space(),
+                    kernel_mode=(conv.caps.mode == "kernel"),
+                )
+            except _INSTRUCTION_ERRORS as e:
+                _respond_error(conv, self.call_id, e)
+                return
+            b_target, b_ref = _condition_before_target(parsed_condition)
             b_payload = {
                 "action": action,
                 "event_type": getattr(self, "event_type", None),
-                "target": b_target,
-                "handler_ref": getattr(self, "handler_ref", None),
-                "phase": getattr(self, "phase", None),
+                "condition": parsed_condition,
+                "handler_ref": handler_ref,
                 "priority": getattr(self, "priority", None),
                 "tier": getattr(self, "tier", None),
             }
-            if b_target == "*":
-                b_ref = ("*",)
-            else:
-                b_ref = _canonical_ref(core, b_target, conv.caps.space())
         else:
             b_target = f"listener:{listener_id}"
             b_payload = {"action": action, "listener_id": listener_id,
@@ -1083,21 +1112,13 @@ class ListenEventInstruction(Instruction):
             return
         try:
             if action == "listen":
-                handler_ref = getattr(self, "handler_ref", None)
-                if handler_ref is None:
-                    raise IllegalOperationError("action=listen 时必须提供 handler_ref")
-                node = core.unwrap(handler_ref, for_llm=False, space=conv.caps.space())
-                has_condition = isinstance(node, MetaDict) and node.get("condition") is not None
-                if not has_condition:
-                    raise IllegalOperationError(
-                        "handler 节点没有 condition 数据；监听条件必须在 handler 节点声明"
-                    )
                 priority = getattr(self, "priority", 0)
                 tier = getattr(self, "tier", None) or "normal"
                 listener_id = core.events.register_condition(
                     conv.cid, handler_ref, space=conv.caps.space(),
                     tier=tier, priority=0 if priority is None else priority,
                     kernel_mode=(conv.caps.mode == "kernel"),
+                    condition=parsed_condition,
                 )
                 response = f"listener_id={listener_id} 已注册"
                 after_payload = {"listener_id": listener_id, "action": "listen", "actor_cid": conv.cid}
