@@ -44,7 +44,8 @@ def snapshot(core) -> dict:
 
     安全点约束：只在没有半截回合的位置调用（宿主退出路径、测试）。快照的 seq 取
     `_journal_seq`——已提交的日志位置，不是日志文件长度：文件里可能存在尚未重放
-    的尾部记录，它们不属于当前状态。
+    的尾部记录，它们不属于当前状态。`generation` 记录快照所处的日志代际：
+    resume 续代际，reboot/reset 归档旧日志后开新代际。
     """
     scheduler = scheduler_to_snapshot(core)
     return {
@@ -52,6 +53,7 @@ def snapshot(core) -> dict:
         "version": SNAPSHOT_VERSION,
         "when": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "seq": int(getattr(core, "_journal_seq", 0) or 0),
+        "generation": int(getattr(core, "journal_generation", 1) or 1),
         "image": os.path.join(core.image_dir or "", core.image_name or "") or None,
         "host_flags": dict(core.host_flags or {}),
         "para_ref": core.para_ref,
@@ -136,11 +138,40 @@ def restore(core, doc: dict) -> None:
     _rebuild_conversations(core, doc)
     _rebuild_listeners(core, doc)
     _restore_security_and_pointer(core, doc)
+    core.journal_generation = _generation_of(doc, core)
     apply_scheduler(core, doc.get("scheduler"), source="重启快照")
     core._journal_seq = int(doc.get("seq", 0) or 0)
     core._last_snapshot_seq = core._journal_seq
     core._refresh_journal_batch()
     core._check_invariants()
+
+
+def restore_world(core, doc: dict) -> None:
+    """reboot 的世界段恢复：内存/设备来源表/安全配置/para/next_cid，不碰对话态。
+
+    对话、监听器、调度全部丢弃（init 稍后重跑）；日志尾部里的世界类效果由
+    `avm.boot` 在这之后重放。`_next_cid` 取快照记录，保证重启后 cid 继续增长。
+    """
+    doc = _validate_doc(doc)
+    _rebuild_memory_and_devices(core, doc)
+    _restore_security_and_pointer(core, doc)
+    core.journal_generation = _generation_of(doc, core)
+    core._journal_seq = int(doc.get("seq", 0) or 0)
+    core._last_snapshot_seq = core._journal_seq
+
+
+def _generation_of(doc: dict, core) -> int:
+    """快照的代际；旧快照缺字段时按当前代际兼容并提示。"""
+    raw = doc.get("generation")
+    if isinstance(raw, int) and raw >= 1:
+        return raw
+    current = int(getattr(core, "journal_generation", 1) or 1)
+    if int(doc.get("seq", 0) or 0) > 0:
+        print(
+            f"[AVM] 旧快照没有 generation 字段：按当前代际 {current} 继续",
+            file=sys.stderr,
+        )
+    return current
 
 
 def _validate_doc(doc: dict) -> dict:

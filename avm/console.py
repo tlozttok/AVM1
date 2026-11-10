@@ -863,18 +863,39 @@ class Console:
                 "target": entry["target"], "text": entry["text"]}
 
     def request_shutdown(self) -> dict:
-        """请求关机：停在下一个安全点，由宿主写回并退出。
+        """提交 OS 关机请求：写 `$MEM.sys.power.request = "shutdown"`。
 
-        这里只置标志；真正的写快照与进程退出在 main() 的 core.run() 返回路径上，
-        避免半截回合被拍进快照。新输入从这一刻起被拦住。
+        经保留对话/输入路径提交——一条普通世界写入，进日志、可重放。VM 不执行关机
+        语义：由 OS 软件收尾后写 `$MEM.sys.power.state = "off"`，宿主在安全点看到
+        off 才写快照/persist 并退出。OS 缺席或卡住时进程保持运行，操作员可在
+        force_stop_delay 之后走 `/api/system/force-stop` 强制退出（不写快照）。
+        新输入从这一刻起被拦住。
         """
         with self._client_lock:
+            if self.lifecycle != "running":
+                raise ConsoleConflict(f"面板处于 {self.lifecycle} 状态，不再接收关机请求")
             self.lifecycle = "stopping"
             self.stopping_since = time.time()
-        request_stop = getattr(self.core, "request_stop", None)
-        if callable(request_stop):
-            request_stop()
-        return {"status": "stopping", "force_stop_after": self.force_stop_delay}
+        warning = None
+        try:
+            self.core.unwrap("$MEM.sys.power.request", for_llm=False)
+        except VMMemoryError:
+            warning = (
+                "$MEM.sys.power.request 不存在：镜像没有 OS 关机入口，这次请求会以"
+                "工具错误留在面板对话里；等待 force_stop_after 秒后可强制退出"
+            )
+        self._enqueue_actions([
+            {"tool": "memory_write",
+             "arguments": {"ref": "$MEM.sys.power.request", "content": "shutdown"}},
+            {"end": True},  # 结束面板回合，让这次请求提交进日志
+        ], interrupt_payload=None)  # 关机请求不是"暂停"：不给面板投假正文
+        return {
+            "status": "stopping",
+            "request": "shutdown",
+            "entry": "$MEM.sys.power.request",
+            "force_stop_after": self.force_stop_delay,
+            "warning": warning,
+        }
 
     def force_stop(self) -> dict:
         """强制退出：不写快照。只有注入了回调的真实宿主才真的结束进程。
@@ -1334,8 +1355,9 @@ def main(argv=None) -> int:
                         help="关闭单客户端准入（默认一次只允许一个面板客户端）")
     parser.add_argument("--checkpoint-in", metavar="PATH",
                         help="调试用：启动时加载单对话检查点（跳过 init）")
-    from .boot import add_core_dump_args
+    from .boot import add_core_dump_args, add_mode_arg
     add_core_dump_args(parser)
+    add_mode_arg(parser)
     args = parser.parse_args(argv)
 
     if not args.image:
@@ -1347,7 +1369,8 @@ def main(argv=None) -> int:
     from .image import ImageError
 
     try:
-        core = boot(args.image, checkpoint_in=args.checkpoint_in,
+        core = boot(args.image, mode=None if args.mode == "auto" else args.mode,
+                    checkpoint_in=args.checkpoint_in,
                     host_flags={"console": True})
     except (ImageError, VMMemoryError, OSError, ValueError) as e:
         print(f"[console] 镜像错误: {e}", file=sys.stderr)
@@ -1409,8 +1432,8 @@ def main(argv=None) -> int:
     finally:
         console.running = False
         console.lifecycle = "stopped"
-        # 关机流程缺的那一环：正常退出（含 /api/system/shutdown 走到的安全点）
-        # 写重启快照；异常死亡不拍，半截回合不能当恢复输入。
+        # 正常退出（含 OS 写 power.state=off 后的安全点返回、运行者停止）写重启快照；
+        # 异常死亡与强制退出不拍，半截回合/未收尾的世界不能当恢复输入。
         if clean_exit:
             write_snapshot(core)
         persist_to = getattr(core, "persist_to", None)

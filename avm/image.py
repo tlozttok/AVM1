@@ -31,6 +31,9 @@ from .types import MetaDict, MetaList, LinkNode, StrNode
 
 IMAGE_VERSION = 1
 KINDS = ("str", "dict", "list", "device", "link")
+# 镜像 meta.guest_programs 允许的角色：内核按这个固定顺序在冷启动时创建对话。
+# 宿主用中断唤醒这些对话（向量名 = 角色名），不代替它们直接 send_instruction。
+GUEST_ROLES = ("boot", "idle", "shutdown")
 
 
 class ImageError(ValueError):
@@ -463,6 +466,199 @@ def _start_init(core: Core, init: dict):
     conv.name = name
 
 
+def _parse_guest_programs(raw) -> dict:
+    """解析镜像 meta.guest_programs（角色 → 程序节点引用）；形状错误面向镜像作者。
+
+    角色名限定 `boot`/`idle`/`shutdown`（宿主的中断向量名就是角色名）；
+    引用必须是以 `$` 开头的内存引用，指向 ctrl.type 为 python/settingup 的程序节点。
+    节点内容与 para 在真正创建对话时才校验（此时内存树/恢复世界已经就位）。
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ImageError(
+            f"meta.guest_programs 必须是对象（角色 → 程序节点引用），得到 {type(raw).__name__}"
+        )
+    unknown = sorted(set(raw) - set(GUEST_ROLES))
+    if unknown:
+        raise ImageError(
+            f"meta.guest_programs 含未知角色 {unknown}（允许：{list(GUEST_ROLES)}）"
+        )
+    decl = {}
+    for role in GUEST_ROLES:
+        ref = raw.get(role)
+        if ref is None:
+            continue
+        if not isinstance(ref, str) or not ref.startswith("$"):
+            raise ImageError(
+                f"meta.guest_programs.{role} 必须是 $ 开头的内存引用，得到 {ref!r}"
+            )
+        decl[role] = ref
+    return decl
+
+
+def _guest_entry(role: str, node_type: str) -> str:
+    """guest 角色的入口正文：中断 payload 投进对话时程序据此开始本轮。
+
+    - python 程序：按约定定义与角色同名的生成器函数，入口是 `yield from <角色>()`
+      （与镜像 init 段写 user="yield from boot()" 是同一写法）；
+    - settingup（LLM）程序：角色名就是通知正文，由提示词解释该做什么。
+    """
+    if node_type == "python":
+        return f"yield from {role}()"
+    return role
+
+
+def _guest_para_ref(core: Core, ref: str, node: MetaDict, node_type: str, role: str) -> str:
+    """guest 程序的 para 引用：程序节点的 para_ref → 镜像顶层 para_ref（仅 LLM 程序）。
+
+    python 程序必须显式给 para_ref（顶层 para 按约定是 LLM para，拿它建 Python
+    对话只会在模型命名空间校验上撞墙）；与 init 的解析规则保持一致。
+    """
+    value = node.get("para_ref")
+    if value is not None:
+        if not isinstance(value, str) or not value.startswith("$"):
+            raise ImageError(
+                f"guest 程序 {ref}（角色 {role}）的 para_ref 必须是 $ 开头的内存引用"
+            )
+        return value
+    if node_type == "python":
+        raise ImageError(
+            f"guest 程序 {ref}（角色 {role}）是 python 程序时必须在程序节点写 para_ref"
+            "（para 的 model 必须是 PLM 注册名）"
+        )
+    return core.para_ref
+
+
+def _guest_node(core: Core, ref: str, role: str):
+    """解析并按程序节点校验 guest 引用，返回 (node, node_type)。"""
+    try:
+        node = core.unwrap(ref, for_llm=False)
+    except VMMemoryError as e:
+        raise ImageError(f"meta.guest_programs.{role} 指向的节点不存在：{ref}: {e}")
+    node_type = (node.get_ctrl() or {}).get("type") if isinstance(node, MetaDict) else None
+    if node_type not in ("settingup", "python"):
+        raise ImageError(
+            f"meta.guest_programs.{role} = {ref} 必须是程序节点"
+            "（ctrl.type='settingup' 或 'python' 的 dict 节点）"
+        )
+    if not isinstance(node.get("content"), str):
+        raise ImageError(f"guest 程序节点 {ref} 必须有字符串 content 字段")
+    return node, node_type
+
+
+def start_guest_programs(core: Core, decl: Optional[dict] = None) -> dict:
+    """冷启动：按 meta.guest_programs 为每个角色创建内核态对话并注册中断向量。
+
+    - 按 GUEST_ROLES 的固定顺序创建（cid 按创建顺序分配）；
+    - `boot` 立刻进就绪队列并预置入口正文（上电后运行一次）；
+      `idle`/`shutdown` 进休眠队列，只由宿主中断唤醒；
+    - 对话 attrs["guest_role"] 记录角色，resume 靠它找回（镜像层权限策略不写内存树）。
+    返回角色 → {"cid", "entry", "kind"}，同时写入 `core.guest_roles`。
+    """
+    roles = dict(decl if decl is not None else getattr(core, "guest_programs_decl", {}) or {})
+    created = {}
+    for role in GUEST_ROLES:
+        ref = roles.get(role)
+        if ref is None:
+            continue
+        node, node_type = _guest_node(core, ref, role)
+        para_ref = _guest_para_ref(core, ref, node, node_type, role)
+        try:
+            conv = _build_conversation(
+                core, ref, para_ref, parent=None, is_sub=False, is_init=True,
+            )
+        except (VMMemoryError, IllegalOperationError) as e:
+            raise ImageError(f"guest 程序 {ref}（角色 {role}）创建失败：{e}")
+        conv.name = f"guest-{role}"
+        conv.is_root = True
+        conv.attrs["guest_role"] = role
+        entry = _guest_entry(role, node_type)
+        if role == "boot":
+            conv.append_user_message(entry)
+            core._ready_cids.append(conv.cid)
+        else:
+            core._dormant_cids.append(conv.cid)
+        core.interrupts.register(role, conv.cid)
+        created[role] = {"cid": conv.cid, "entry": entry, "kind": node_type}
+    core.guest_roles = created
+    return created
+
+
+def restore_guest_roles(core: Core, decl: Optional[dict] = None) -> dict:
+    """resume：按 attrs["guest_role"] 找回快照里的 guest 对话并注册中断向量。
+
+    缺失声明过的角色时拒绝启动（不做补建）：补建会分配新 cid，与已提交日志里的
+    旧 cid 错位，后续重放必然对不上。快照里有、但镜像已不再声明的角色只告警，
+    对话按普通对话保留（不再注册向量）。
+    """
+    roles = dict(decl if decl is not None else getattr(core, "guest_programs_decl", {}) or {})
+    found = {}
+    for conv in core._conv_by_cid.values():
+        role = (conv.attrs or {}).get("guest_role")
+        if not isinstance(role, str) or not role:
+            continue
+        if role not in GUEST_ROLES:
+            raise ImageError(
+                f"快照里对话 cid={conv.cid} 的 attrs['guest_role']={role!r} "
+                f"不是已声明的角色（允许：{list(GUEST_ROLES)}）"
+            )
+        if role in found:
+            raise ImageError(
+                f"快照里 guest 角色 {role!r} 对应多个对话"
+                f"（cid={found[role].cid} 与 cid={conv.cid}），拒绝启动"
+            )
+        found[role] = conv
+    created = {}
+    for role in GUEST_ROLES:
+        ref = roles.get(role)
+        conv = found.get(role)
+        if ref is None:
+            if conv is not None:
+                print(
+                    f"[AVM] 镜像不再声明 guest 角色 {role!r}：快照里的对话 cid={conv.cid} "
+                    "按普通对话保留，不注册中断向量",
+                    file=sys.stderr,
+                )
+            continue
+        if conv is None:
+            raise ImageError(
+                f"resume 需要 guest 程序对话 {role!r}，但快照里没有 attrs['guest_role']="
+                f"{role!r} 的对话；不允许在 resume 时补建（新 cid 会让后续日志错位）："
+                "请用 boot(mode='reboot') 或 boot(mode='reset') 重建（会重跑 init 与 guest 程序）"
+            )
+        _node, node_type = _guest_node(core, ref, role)
+        if conv.is_python != (node_type == "python"):
+            raise ImageError(
+                f"guest 角色 {role!r} 的快照对话 cid={conv.cid} 程序类型与镜像声明不一致："
+                f"对话 is_python={conv.is_python}，声明节点是 {node_type}"
+            )
+        entry = _guest_entry(role, node_type)
+        core.interrupts.register(role, conv.cid)
+        created[role] = {"cid": conv.cid, "entry": entry, "kind": node_type}
+    core.guest_roles = created
+    return created
+
+
+def start_cold(core: Core) -> dict:
+    """冷启动（load_image(restore=True) 之后）：补跑 init，再按声明创建 guest 程序。
+
+    reboot/reset 用：世界先由快照/原始镜像就位，再让 init 对话与 guest 程序对话
+    出现在新世界里（cid 从 Core._next_cid 起按创建顺序分配）。
+    """
+    init = getattr(core, "_image_init", None)
+    if init is not None:
+        if not isinstance(init, dict):
+            raise ImageError("init 段必须是对象")
+        _start_init(core, init)
+    else:
+        print(
+            "[AVM] 警告：镜像没有 init 段（或为空），冷启动不会有 init 对话",
+            file=sys.stderr,
+        )
+    return start_guest_programs(core)
+
+
 def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
                host_flags: Optional[dict] = None, restore: bool = False) -> Core:
     """把系统镜像加载进一个空核心并完成全部装载配置（不运行）。
@@ -471,8 +667,9 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
     （avm/boot.py 的 start_core；宿主通常直接用加载区的 boot() 走完三段）。
 
     checkpoint_in：调试用——启动时加载单对话检查点（跳过 init，恢复为就绪对话）。
-    restore：重启恢复——跳过 init（对话与内存稍后由重启快照/日志恢复）。镜像其余段
-    （设备、安全配置、para）照常装载，因为恢复路径也要按当前镜像/设备文件重建。
+    restore：重启恢复的内部细节——跳过 init（对话与内存稍后由重启快照/日志恢复），
+    并把 init 段与 guest 程序声明暂存在 Core 上，供冷启动模式稍后补跑（`start_cold`）。
+    镜像其余段（设备、安全配置、para）照常装载，因为恢复路径也要按当前镜像/设备文件重建。
     host_flags：启动标志——本次运行由哪个宿主托管（如 {"console": True}）。宿主事实，
     不属于镜像内容，不进 $MEM。在挂载设备之前写入 Core，设备可在 attach_core 里读；
     核心启动后不再变化。不传则空，设备行为与从前一致。
@@ -547,10 +744,16 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
     _parse_security(core, image)
 
     init = image.get("init")
+    # guest 程序声明是镜像事实：装载期校验形状，冷启动在 init 之后创建对话，
+    # 恢复路径先暂存，resume 按 attrs 找回（见 avm.boot 的三种启动模式）。
+    guest_decl = _parse_guest_programs(meta.get("guest_programs"))
+    core.guest_programs_decl = guest_decl
+    core.strict_scheduler = bool(guest_decl)
     if restore:
         if checkpoint_in:
             raise ImageError("restore 与 checkpoint_in 不能同时使用（重启恢复与单对话恢复是两条路径）")
-        # 重启恢复：对话与内存由快照/日志接管，这里不启动 init
+        # 恢复路径：对话与内存由快照/日志接管；init 段暂存给冷启动模式补跑。
+        core._image_init = init
     elif checkpoint_in:
         # 调试用：后续启动加载已保存的对话，而不是重新从 init 开始
         if not isinstance(checkpoint_in, str) or not checkpoint_in:
@@ -569,6 +772,9 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
             "[AVM] 警告：镜像没有 init 段（或为空），不会有对话启动，run() 将立即返回",
             file=sys.stderr,
         )
+    if not restore and guest_decl:
+        # 冷启动：init 之后按固定顺序创建 guest 程序对话并注册中断向量。
+        start_guest_programs(core)
 
     journal_to = image.get("journal_to")
     if journal_to is not None:
@@ -609,15 +815,20 @@ def main(argv=None) -> int:
     parser.add_argument("image", help="系统镜像 JSON 文件路径")
     parser.add_argument("--checkpoint-in", metavar="PATH",
                         help="调试用：启动时加载单对话检查点（跳过 init，恢复为就绪对话）")
-    from .boot import add_core_dump_args, add_restore_arg
+    from .boot import add_core_dump_args, add_mode_arg, add_restore_arg
     add_core_dump_args(parser)
     add_restore_arg(parser)
+    add_mode_arg(parser)
     args = parser.parse_args(argv)
     # 局部导入：boot 依赖本模块的 load_image，模块级导入会成环
     from .boot import boot, dump_on_death, write_snapshot
+    from .journal import JournalError
     try:
-        core = boot(args.image, checkpoint_in=args.checkpoint_in, restore=args.restore)
-    except (ImageError, VMMemoryError, OSError, json.JSONDecodeError) as e:
+        core = boot(
+            args.image, mode=None if args.mode == "auto" else args.mode,
+            checkpoint_in=args.checkpoint_in, restore=args.restore,
+        )
+    except (ImageError, JournalError, VMMemoryError, OSError, json.JSONDecodeError) as e:
         print(f"[AVM] 镜像错误: {e}", file=sys.stderr)
         return 1
     if args.no_core_dump:

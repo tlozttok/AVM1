@@ -17,7 +17,10 @@ import json
 import os
 import sys
 
-from avm.boot import add_core_dump_args, add_restore_arg, boot, dump_on_death, write_snapshot
+from avm.boot import (
+    add_core_dump_args, add_mode_arg, add_restore_arg, boot, dump_on_death,
+    write_snapshot,
+)
 from avm.exceptions import VMMemoryError, RunnerStop
 from avm.image import ImageError
 from avm.monitor import Monitor
@@ -70,12 +73,14 @@ def main(argv=None) -> int:
                         help="无 image 参数时的配置文件（默认 debug.json）")
     add_core_dump_args(parser)
     add_restore_arg(parser)
+    add_mode_arg(parser)
     args = parser.parse_args(argv)
 
     frames = args.frames
     transcript = args.transcript
     checkpoint_in = args.checkpoint_in
     restore = args.restore
+    mode = None if args.mode == "auto" else args.mode
     image = args.image
     config_dir = os.getcwd()
     if image is None:
@@ -95,6 +100,8 @@ def main(argv=None) -> int:
         transcript = transcript or cfg.get("transcript")
         checkpoint_in = checkpoint_in or cfg.get("checkpoint_in")
         restore = restore or cfg.get("restore")
+        # debug.json 里的 auto 与命令行同义（都不传 mode，保持旧行为）
+        mode = mode or (None if cfg.get("mode") == "auto" else cfg.get("mode"))
     if transcript and not os.path.isabs(transcript):
         transcript = os.path.join(config_dir, transcript)
     if checkpoint_in and not os.path.isabs(checkpoint_in):
@@ -103,7 +110,7 @@ def main(argv=None) -> int:
         restore = os.path.join(config_dir, restore)
 
     try:
-        core = boot(image, checkpoint_in=checkpoint_in, restore=restore)
+        core = boot(image, mode=mode, checkpoint_in=checkpoint_in, restore=restore)
     except (ImageError, VMMemoryError, OSError, ValueError) as e:
         print(f"[AVM] 镜像错误: {e}", file=sys.stderr)
         return 1

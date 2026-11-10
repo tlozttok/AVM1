@@ -31,7 +31,12 @@
 旧格式（带 `history` / `call` / `batch` / `scheduler` / `effects` 字段、没有 `v`）
 不再读取；遇到时 `apply` 直接报错并提示归档。
 
-设备的写审计（计划"待定夺"第 3 项的默认选择）以 `device_write` 效果出现，重放时跳过。
+设备写审计（计划"待定夺"第 3 项的默认选择）以 `device_write` 效果出现，重放时跳过。
+
+**代际**：每条记录带 `generation`（本次启动所处的日志代际，见 `Core.journal_generation`）。
+`resume` 续代际；`reboot`/`reset` 由宿主调 `archive_file` 把旧日志归档为
+`<base>.<generation>.journal`，再从 seq 0 开始新代际。旧日志/旧快照缺该字段时按
+"当前代际"兼容，不报错。
 
 Journal 是纯追加的 JSONL：临时想丢弃日志尾部用 `truncate(seq)`（v1 不自动压缩）。
 """
@@ -133,6 +138,16 @@ class Journal:
                     break
                 yield record
 
+    def generation(self) -> Optional[int]:
+        """日志所属的代际 id（首条记录的 `generation` 字段）。
+
+        空日志、旧日志（没有该字段）返回 None：调用方按"当前代际"兼容处理。
+        """
+        for record in self.iter_records(0):
+            generation = record.get("generation")
+            return generation if isinstance(generation, int) else None
+        return None
+
     def read(self, after_seq: int = 0) -> List[dict]:
         """读回 seq > after_seq 的记录（小规模/测试用；重放走 iter_records）。"""
         return list(self.iter_records(after_seq))
@@ -155,6 +170,40 @@ class Journal:
             os.fsync(f.fileno())
         os.replace(tmp, self.path)
         self._last_seq = records[-1]["seq"] if records else 0
+
+
+# ----------------------------------------------------------------------
+# 代际切换（reboot / reset 归档旧日志）
+# ----------------------------------------------------------------------
+
+def archive_file(path: Optional[str], generation: int):
+    """把文件改名归档为 `<base>.<generation><ext>`；返回 (归档路径, 实际代际)。
+
+    文件不存在时返回 (None, generation)——调用方据此判断"没有旧代际可归档"。
+    目标重名（同一个代际被归档两次）时递增代际直到找到空位，避免覆盖旧档案；
+    返回值里的代际是实际使用的那个，新代际应当取它 + 1。
+    """
+    if not isinstance(generation, int) or generation < 1:
+        generation = 1
+    if not path or not os.path.isfile(path):
+        return None, generation
+    try:
+        if os.path.getsize(path) == 0:
+            # 空文件没有记录可归档：直接删掉，不算一个旧代际（首次 reset 不虚增代际）。
+            os.remove(path)
+            return None, generation
+    except OSError:
+        pass
+    base, ext = os.path.splitext(path)
+    while True:
+        target = f"{base}.{generation}{ext}"
+        if not os.path.exists(target):
+            break
+        generation += 1
+    directory = os.path.dirname(os.path.abspath(target))
+    os.makedirs(directory, exist_ok=True)
+    os.replace(path, target)
+    return target, generation
 
 
 # ----------------------------------------------------------------------
@@ -644,3 +693,64 @@ _EFFECTS = {
     "device_mount": _effect_device_mount,
     "device_unmount": _effect_device_unmount,
 }
+
+# 世界类效果 vs 对话态效果：reboot 只用世界类效果重建世界（对话/监听器/调度全部丢弃）。
+# 分类是显式白名单：新增效果必须在这里归类，下面的一致性断言会拦住漏项。
+WORLD_EFFECTS = frozenset({
+    "memory_set", "memory_make", "memory_delete", "memory_attach",
+    "memory_detach", "edit_metadata", "device_mount", "device_unmount",
+})
+CONVERSATION_EFFECTS = frozenset({
+    "device_write",           # 设备写审计：只记录，重放不访问设备
+    "conversation_create", "conversation_roots", "conversation_close",
+    "conversation_delete", "delivery",
+    "listener_register", "listener_modify", "listener_cancel",
+    "listener_cancel_all",
+})
+if set(_EFFECTS) != (WORLD_EFFECTS | CONVERSATION_EFFECTS):  # pragma: no cover - 开发期自检
+    raise RuntimeError(
+        "效果分类表与 _EFFECTS 不一致："
+        f"{sorted(set(_EFFECTS) ^ (WORLD_EFFECTS | CONVERSATION_EFFECTS))}"
+    )
+
+
+def is_world_effect(kind: str) -> bool:
+    """效果种类是否属于世界类（reboot 的世界来源过滤用）。"""
+    return kind in WORLD_EFFECTS
+
+
+def world_effects_of(record: dict) -> List[dict]:
+    """取一条回合记录里的世界类效果（保持记录内顺序）。"""
+    changes = record.get("changes")
+    if not isinstance(changes, list):
+        return []
+    out = []
+    for change in changes:
+        if not isinstance(change, dict) or change.get("kind") != "effect":
+            continue
+        effect = change.get("effect")
+        if isinstance(effect, dict) and is_world_effect(effect.get("kind")):
+            out.append(effect)
+    return out
+
+
+def apply_world_record(core, record: dict) -> int:
+    """reboot 重放：只应用一条记录里的世界类效果，返回应用条数。
+
+    消息、待发批次、调度增量与对话态效果全部跳过（对话/监听器/调度已丢弃）。
+    与 `apply` 一样不调模型、不派发事件、不访问设备；形状非法抛 JournalError。
+    """
+    if not isinstance(record, dict):
+        raise JournalError("日志记录必须是对象")
+    seq = record.get("seq")
+    if record.get("v") != JOURNAL_RECORD_VERSION:
+        raise JournalError(f"日志 seq={seq}: {_OLD_FORMAT_HINT}")
+    effects = world_effects_of(record)
+    was_replaying = core._replaying
+    core._replaying = True
+    try:
+        for effect in effects:
+            _apply_effect(core, effect, seq)
+    finally:
+        core._replaying = was_replaying
+    return len(effects)

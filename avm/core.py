@@ -1702,6 +1702,8 @@ class Core:
         self.journal_path: Optional[str] = None   # 镜像 journal_to（load_image 解析后写入）
         self.snapshot_path: Optional[str] = None  # 镜像 snapshot_to（load_image 解析后写入）
         self._journal_seq: int = 0                # 已提交/已重放到的日志位置
+        # 日志代际：resume 续当前代际；reboot/reset 由宿主归档旧日志并开新代际（seq 归零）。
+        self.journal_generation: int = 1
         self._journal_batch: Dict[int, dict] = {}  # cid → 上次提交的待发批次（增量记录用）
         self._scheduler_committed: Optional[dict] = None  # 上次提交后的调度状态（增量基线）
         self.snapshot_every: Optional[int] = None  # 每 N 个已提交回合写一次定时快照；None 关闭
@@ -1709,6 +1711,16 @@ class Core:
         self._turn_effects: List[dict] = []       # 本轮指令产生的语义效果（回合结束提交）
         self._replaying: bool = False             # 重放期间禁止再记录
         self._recording: bool = False             # 只在回合执行体内记录
+        # 调度严格模式：镜像声明了 meta.guest_programs 时打开。打开后"活跃为空、
+        # 就绪为空且无待派发中断"不再视为跑完，而是向 idle 角色挂中断；处理程序
+        # 不走开空闲就 KernelPanic（空闲 = 严重错误）。没有声明的旧镜像保持旧语义：
+        # run() 在队列空了时正常返回。
+        self.strict_scheduler: bool = False
+        self.guest_roles: Dict[str, dict] = {}      # 角色 → {"cid", "entry", "kind"}（宿主中断向量来源）
+        self.guest_programs_decl: Dict[str, str] = {}  # 镜像 meta.guest_programs（角色 → 程序节点引用）
+        self._image_init = None                     # load_image(restore=True) 暂存的 init 段（冷启动补跑）
+        self._power_state_seen = None               # 断电判定的边沿基线（见 power_off_requested）
+        self._power_request_seen = None             # 关机请求的边沿基线（见 shutdown_requested）
         # 恢复出来的对话（快照/日志）：Python 执行器首次创建时要预热一次
         self._warmup_needed: set = set()
         # 设备来源表：挂载地址 → 设备 spec（文件/类/参数/标识符；内建设备 builtin）。
@@ -2075,6 +2087,7 @@ class Core:
         self._scheduler_committed = self._scheduler_state()
         record = {
             "v": 2,
+            "generation": int(self.journal_generation),
             "cid": cid,
             "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "changes": changes,
@@ -3005,19 +3018,114 @@ class Core:
 
         只置标志、不动当前回合——半截回合不能拍快照。若对话正阻塞在设备读里，
         这一轮到不了安全点；那是宿主侧的阻塞态问题，不在这里处理。
+        正常断电（OS 写 `$MEM.sys.power.state == "off"`）不走这里：宿主在安全点
+        看到 off 后直接退出（见 `power_off_requested`）。本入口留给强制退出路径。
         """
         self._stop_requested = True
+
+    def read_power_state(self):
+        """读 OS 约定的断电节点 `$MEM.sys.power.state`；不存在/不是字符串返回 None。"""
+        try:
+            value = self.unwrap("$MEM.sys.power.state", for_llm=False)
+        except VMMemoryError:
+            return None
+        return value if isinstance(value, str) else None
+
+    def power_off_requested(self) -> bool:
+        """安全点断电判定（边沿触发）：非 off → off 的一次跳变才算一次断电。
+
+        快照与日志重放会把上一次正常关机写下的 off 一起恢复回来；把启动时的存量
+        off 当成新请求会让 VM 一上电就退出。宿主只响应本次上电之后 OS 新写入的 off。
+        VM 不写 clean、不改 `$MEM.sys.boot.*`（脏关闭判定属于 OS 计划的数据面）。
+        """
+        state = self.read_power_state()
+        previous = self._power_state_seen
+        self._power_state_seen = state
+        return state == "off" and previous != "off"
+
+    def _check_journal_seq(self) -> None:
+        """安全点断言：日志末 seq 不得大于内存已提交 seq。
+
+        正常提交时两者相等（append 返回的 seq 立刻写进 `_journal_seq`）；恢复路径
+        必须先把快照 seq 之后的日志尾部重放完（boot 负责）。大于说明日志里有未重放
+        的记录，继续跑会把内存当成比日志新——拒绝继续。
+        """
+        if self.journal is None:
+            return
+        last = self.journal.last_seq()
+        if last > self._journal_seq:
+            raise JournalError(
+                f"安全点 seq 断言失败：日志末 seq={last} 大于内存已提交 seq="
+                f"{self._journal_seq}；先把日志重放完再运行"
+            )
+
+    def _idle_now(self) -> bool:
+        """安全点空闲判定：活跃为空、就绪为空、无待派发中断。
+
+        活跃对话（包括正阻塞在输入设备读上的面板对话）不算空闲——它的回合还没到
+        安全点。空闲在严格调度模式下是严重错误（guest 活体错误），见 `run`。
+        """
+        return (
+            self._active_cid is None
+            and not self._ready_cids
+            and self.interrupts.pending_count == 0
+        )
+
+    def read_power_request(self):
+        """读 OS 约定的关机请求节点 `$MEM.sys.power.request`；不存在/非字符串返回 None。"""
+        try:
+            value = self.unwrap("$MEM.sys.power.request", for_llm=False)
+        except VMMemoryError:
+            return None
+        return value if isinstance(value, str) else None
+
+    def shutdown_requested(self) -> bool:
+        """安全点判定（边沿触发）：OS 新写入了 `$MEM.sys.power.request == "shutdown"`。
+
+        存量值不算：resume 会把上一次关机时写下的 "shutdown" 一起恢复回来，
+        重新唤醒监督程序等于重复关机。启动基线在 run() 入口记录。
+        """
+        value = self.read_power_request()
+        previous = self._power_request_seen
+        self._power_request_seen = value
+        return value == "shutdown" and previous != "shutdown"
+
+    def _wake_guest(self, role: str) -> bool:
+        """用中断把执行权交给声明的 guest 角色（宿主不代替它们发指令）。
+
+        返回 False 表示镜像没有声明该角色：请求留在世界节点上（OS 缺席时优雅关机
+        停在挂起，宿主保持运行，由操作员决定是否强制退出）。
+        """
+        info = self.guest_roles.get(role)
+        if info is None:
+            return False
+        self.interrupts.raise_(role, payload=info.get("entry"))
+        self.interrupts.dispatch()
+        return True
+
+    def _panic_idle(self, message: str):
+        """空闲 = 严重错误：记监测帧后抛 KernelPanic（宿主记录并退出）。"""
+        error = KernelPanic(message)
+        self.monitor.record(self, error=error)
+        raise error
 
     def run(self):
         self._pick_next_active()
 
         self.monitor.record_baseline(self)
+        # 启动时的存量断电/关机请求不是新请求：边沿基线从安全点第一次观察开始。
+        self._power_state_seen = self.read_power_state()
+        self._power_request_seen = self.read_power_request()
+        idle_retry = False
+        idle_cid = None
 
-        while self._active_cid is not None:
+        while True:
             # 安全点：上一轮推理（含该轮产生的全部指令）已执行完，是状态完整、可恢复
             # 的边界——预算中断用的是同一个边界。中断在这里夺取执行权。
             # 中断表为空时这一行没有副作用。
             self.interrupts.dispatch()
+            # 日志与内存的提交位置必须追平（恢复路径由 boot 保证）。
+            self._check_journal_seq()
             try:
                 self._check_invariants()
             except KernelPanic as e:
@@ -3026,6 +3134,44 @@ class Core:
             if self._stop_requested:
                 # 停在安全点：上一轮已完整提交，宿主可以拍快照后干净退出。
                 return
+            if self.power_off_requested():
+                # 正常断电边界：OS 在回合里写下 off；宿主在安全点看到后写快照/persist
+                # 并退出（宿主退出路径负责，不经 request_stop）。
+                return
+            if self.shutdown_requested():
+                # OS 软件提交了关机请求（$MEM.sys.power.request="shutdown"）：宿主用中断
+                # 给声明的 shutdown 监督程序一次执行机会。没有声明就停在挂起，不自行断电。
+                self._wake_guest("shutdown")
+            if self._active_cid is None and self._ready_cids:
+                self._pick_next_active()
+            if self._idle_now():
+                if not self.strict_scheduler:
+                    # 旧镜像（没有声明 guest 程序）：队列空了就是"跑完了"，保持旧语义。
+                    return
+                if idle_retry:
+                    self._panic_idle(
+                        "系统空闲：guest idle 处理程序本轮没有让系统离开空闲"
+                        "（活跃为空、就绪为空、无待派发中断）"
+                    )
+                idle = self.guest_roles.get("idle")
+                if idle is None:
+                    self._panic_idle(
+                        "系统空闲，但镜像没有声明 idle guest 程序"
+                        "（meta.guest_programs.idle）：空闲是 guest 活体错误"
+                    )
+                idle_cid = idle.get("cid")
+                self.interrupts.raise_("idle", payload=idle.get("entry"))
+                self.interrupts.dispatch()
+                if self._active_cid is None and not self._ready_cids:
+                    self._panic_idle(
+                        "idle 中断已派发，但没有任何对话可运行（向量目标缺失或被关闭）"
+                    )
+                idle_retry = True
+            elif self._active_cid is None and not self._ready_cids:
+                continue  # 并发挂起的中断：回到循环顶部派发
+            elif self._active_cid is not None and self._active_cid != idle_cid:
+                # 空闲之后有别的对话拿到执行权：系统确实离开了空闲。
+                idle_retry = False
             self.advance_conversation()
 
     def _canonical_ref_without_final(self, target, space=None):
