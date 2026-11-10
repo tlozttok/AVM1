@@ -1,7 +1,5 @@
 # AVM 系统镜像规范（System Image Specification）
 
-**版本**: 1
-**日期**: 2026-08-01
 **一句话**: 一个 JSON 文件 + 若干设备 Python 文件 = 一个标准 AVM 系统镜像。
 
 启动方式：
@@ -16,15 +14,15 @@ python -m avm.image <image.json>
 
 | 键 | 必填 | 说明 |
 |---|---|---|
-| `meta` | 否 | 元信息：`version` 必须为 1；`instruction_budget` 可覆盖每轮指令预算（正整数，默认 50）；`snapshot_every` 为正整数时每 N 个已提交回合写一次定时快照（缺省不写） |
+| `meta` | 否 | 元信息：`version` 必须为 1；`instruction_budget` 可覆盖每轮指令预算（正整数，默认 50）；`snapshot_every` 为正整数时每 N 个已提交回合写一次定时快照（缺省不写）；`guest_programs` 声明 guest 角色程序（见 init 与启动流程） |
 | `mem` | 是 | 内存树（对象，顶层键 → 显式节点） |
 | `para_ref` | 否 | para 节点路径，默认 `$MEM.model_params` |
 | `devices` | 否 | 设备挂载列表 |
-| `security` | 否 | 权限段：根注册表 `roots` 与工作空间区域 `workspace_region`（见下文） |
+| `security` | 否 | 权限段：只含根注册表 `roots`（见下文） |
 | `init` | 否 | 启动对话配置（缺省时不启动任何对话） |
 | `persist_to` | 否 | 运行结束后内存写回路径（相对镜像文件所在目录） |
-| `journal_to` | 否 | 回合级效果日志路径（JSONL；相对镜像文件所在目录）。声明后每个提交回合追加一条，是持久化的依据；启动时非空日志会被重放 |
-| `snapshot_to` | 否 | 重启快照路径（相对镜像文件所在目录）。正常退出（`run()` 返回或运行者选择退出）时写一份；启动时若存在且可读会先恢复，缺失或损坏时自动回退到日志重放——它是缓存，不是必需 |
+| `journal_to` | 否 | 回合级效果日志路径（JSONL；相对镜像文件所在目录）。声明后每个提交回合追加一条，是持久化的依据；启动时按启动模式重放（`resume` 续代际，`reboot`/`reset` 归档旧日志并开新代际） |
+| `snapshot_to` | 否 | 重启快照路径（相对镜像文件所在目录）。正常退出（`run()` 返回或运行者选择退出）时写一份；启动时按启动模式读取或归档。`resume`/`reboot` 没有可读快照时拒绝启动，不静默退回冷启动 |
 
 ## mem 节点格式
 
@@ -44,20 +42,20 @@ python -m avm.image <image.json>
 - `kind=device` 可出现在**任意层级**，作为可读性标记；该节点从 mem 根到自身的点号路径（如 `game.map.rooms`）必须在 `devices` 段的 `path` 里出现，否则加载报错。反向不要求：`devices` 段可以有 mem 里没有标记的挂载项，照样挂载。device 节点不写入数据树，实际挂载由 `devices` 段完成（挂载会在该路径物化一个链接节点，见[运行时](runtime.md)的挂载与链接节点一节）。
 - `kind=link` 声明链接节点：`target` 以 `$` 开头是内存树地址（`$MEM.a.b`），否则是设备唯一标识符（`devices` 段条目的 `id`，缺省取 `path`）。寻址遇到链接即进入目标，读/写/`memory_make`/`edit_metadata` 都作用于目标；链接只由内核侧声明，运行期没有创建/删除链接的指令。
 - `ctrl.type` 目前定义的取值：`para`（模型调用参数）、`settingup`（LLM 提示词程序）、`python`（Python 程序）、`handler`（事件处理器；处理器节点不再用 `python` 类型）。
-- `kind="str"` 的节点只有控制数据：可带 `ctrl`（如预置 `"owner"`），**不能带 `meta`**（镜像装载报 `ImageError`）。字符串节点在运行时是 `StrNode`（str 子类），`memory_make`/列表追加创建时由 Core 写入 `ctrl.owner`。
-- `ctrl.owner` 是 Core 维护的所有者标记（字符串 cid）。`memory_make` / `memory_write` 创建容器节点时会自动写入；镜像作者也可在 `ctrl` 中显式预置 `"owner": "0"` 来声明所有权。无主节点在事件模型 v1 中不可注册 before 内存监听。
+- `kind="str"` 的节点只有控制数据：可带 `ctrl`，**不能带 `meta`**（镜像装载报 `ImageError`）。字符串节点在运行时是 `StrNode`（str 子类）。
+- Core 不写节点所有权：`memory_make` / `memory_write` 不写 `ctrl`，`edit_metadata` 可自由编辑 `ctrl` 的任意键。`ctrl.owner` 不是保留键；旧镜像里出现的 `"owner": "0"` 只是普通控制数据。
 
 ```json
 {
   "kind": "dict",
-  "ctrl": { "type": "settingup", "owner": "0" },
+  "ctrl": { "type": "settingup" },
   "value": { "content": { "kind": "str", "value": "..." } }
 }
 ```
 
 **程序节点（settingup / python）**：`create_cmd` / `create_sub` 的 `system_ref` 必须指向这类节点（运行时校验；指向 str 节点、无类型 dict 节点或其他类型会报错，不创建对话）。`settingup` 节点的 `value` 含 `name`（对话身份）与 `content`（提示词文本）；`python` 节点的 `value` 含 `content`（Python 代码）。两者均可带可选的 `signature`（预期输入/输出描述）与 `para_ref`（该程序使用的模型参数节点，`init` 指向它时按这个字段取 para；`create_cmd` / `create_sub` 的 para 由指令参数给出）。`content` 必须是字符串（缺失或类型不符会在创建对话时被拒）；`name` 可选，缺省时创建出的对话身份回退为「父身份#cid」，根入口没有名字时身份 = cid。
 
-**程序能力声明 `value.caps`**：程序节点用数据节点 `value.caps` 声明由它创建的对话的能力（详见 [runtime.md](runtime.md#对话能力与权限批次一)）；`ctrl` 只描述类型与数据组织，`ctrl.caps` 不再支持：
+**程序能力声明 `value.caps`**：程序节点用数据节点 `value.caps` 声明由它创建的对话的能力（详见 [runtime.md](runtime.md#对话能力与权限)）；`ctrl` 只描述类型与数据组织，`ctrl.caps` 不再支持：
 
 ```json
 {"kind": "dict", "ctrl": {"type": "settingup"},
@@ -65,11 +63,10 @@ python -m avm.image <image.json>
            "caps": {"kind": "dict", "value": {
              "mode": {"kind": "str", "value": "user"},
              "roots": {"kind": "list", "value": [{"kind": "str", "value": "lib"}]},
-             "tools": {"kind": "list", "value": [{"kind": "str", "value": "memory_read"}]},
-             "workspace": {"kind": "str", "value": "work"}}}}}
+             "tools": {"kind": "list", "value": [{"kind": "str", "value": "memory_read"}]}}}}}
 ```
 
-缺省字段继承父对话；`roots` 是 `security.roots` 注册表里的名字列表；`tools` 必须是父工具集的子集；`workspace` 是用户态对话工作空间根名（缺省 `work`）。没有 `caps` 的程序继承父能力（旧镜像行为不变）。程序节点的 `caps` 在创建对话时校验，非法时不创建对话。
+缺省字段继承父对话；`roots` 是 `security.roots` 注册表里的名字列表；`tools` 必须是父工具集的子集；`workspace` 已移除（声明即报错）——内核不分配工作目录，目录由软件建、根由 `$MEM.conversations.<cid>.roots` 动态加。没有 `caps` 的程序继承父能力（旧镜像行为不变）。程序节点的 `caps` 在创建对话时校验，非法时不创建对话。
 
 运行期可用 `edit_metadata` 指令给节点补 ctrl（例如给运行时创建的 dict 节点设置 `type='settingup'` / `'python'`），配合 `memory_make` / `memory_write` 组合出可被 `create_cmd` 使用的程序节点——程序节点不一定只在镜像中预置。
 
@@ -97,6 +94,7 @@ python -m avm.image <image.json>
 | `builtin` | 否 | `true` 时使用内建设备注册表 `BUILTIN_DEVICE_CLASSES`，不允许提供 `file` |
 | `args` | 否 | 传给构造函数的对象，默认 `{}` |
 | `id` | 否 | 设备唯一标识符，缺省取 `path`；链接节点的 `target` 不以 `$` 开头时按它解析 |
+| `sha256` | 否 | 设备文件内容哈希；给出时装载前核对，不一致拒绝装载（镜像作者可用来钉住设备代码） |
 
 - 外层设备插件：`builtin` 缺省或 `false`，必须提供 `file` + `class`，`class` 必须继承 `avm.memory_device.MemoryDevice`。
 - 内建设备：`builtin: true`，`class` 取内建注册表（当前包含 `LinkDevice`，保留兼容、不用于新设计），参数走 `args`。
@@ -107,7 +105,7 @@ python -m avm.image <image.json>
 - `to_llm_string() -> str`：LLM 读取该设备时看到的表示（必实现）。
 - `resolve_path(path: list)`：子路径访问（可选覆盖，默认抛错）。
 - `set_value(value)`：写入（可选）。
-- `authorize_listener(event_type, remainder, owner_cid) -> bool`：是否允许监听该设备内路径（保留兼容的 `LinkDevice` 会委托给真实目标）。
+- `authorize_listener(event_type, remainder, owner_cid) -> bool`：是否允许监听该设备内路径（保留兼容的 `LinkDevice` 会委托给真实目标）。该钩子在宿主侧注册/更新路径上调用；`listen_event` 的新式条件路径不做目标授权（见 [docs/capabilities.md](capabilities.md) 的讨论区）。
 - `after_event(event_type, remainder, result) -> Optional[dict]`：操作成功后返回纯 payload 事实事件。
 - **子路径按名称访问**：设备自己定义命名子键（如 `next`、`out`、`append`、`latest`）；数字下标只用于列表式设备的内容读取（非负）。设备没有"`-1` 是最后一条/追加位置"的语义（`-1` 只属于内存列表的追加位置），设备写入只走命名接口。
 
@@ -151,22 +149,19 @@ python -m avm.image <image.json>
 }
 ```
 
-## security（权限：根注册表与工作空间区域）
+## security（权限：根注册表）
 
-可选对象；缺省时根注册表为空、工作空间区域取 `$MEM.workspaces`：
+可选对象；缺省时根注册表为空：
 
 ```json
 "security": {
-  "roots": { "lib": "$MEM.lib", "repo": "$MEM.AVMRepo" },
-  "workspace_region": "$MEM.workspaces"
+  "roots": { "lib": "$MEM.lib", "repo": "$MEM.AVMRepo" }
 }
 ```
 
-- `roots`：可授予根的注册表，名字 → `$MEM` 引用。装载时校验：名字规则（与程序 `caps.roots` 一致：非空、不含点号、不带 `$`、不占用 `MEM`/`conv`/`batch`）、目标非空、不同目标**两两前缀无关**、不与工作空间区域重叠。用户态对话的 `caps.roots` 只能引用这里的名字。
-- `workspace_region`：工作空间区域（`$MEM` 引用，不能是根本身）。装载器校验区域指向 dict（缺则建空 dict），并拒绝区域子树里的链接节点与设备挂载——工作空间不可逃逸。
-- 只有内核态对话能通过 `create_cmd` + 程序 `caps.mode=user` 触发工作空间分配；分配出的 `w<n>` 子树带 `ctrl.owner`（创建者 cid），并作为 `caps.workspace` 指定名字绑进子对话根表。
-- 本段在设备挂载之后安装，因此区域里的设备挂载能被拒绝；`roots` 目标只校验语法与前缀，目标缺失在访问时报"引用根无效"。
-- 本批没有运行期修改 `security` 的入口（对话设备控制面在后续批次）。
+- `roots`：可授予根的注册表，名字 → `$MEM` 引用。装载时校验：名字规则（与程序 `caps.roots` 一致：非空、不含点号、不带 `$`、不占用 `MEM`/`conv`/`batch`/`caps`）、目标非空、不同目标**两两前缀无关**、不落在内核控制面设备路径。用户态对话的 `caps.roots` 只能引用这里的名字。
+- `workspace_region` 已移除：出现即报 `ImageError`。内核不分配工作目录；目录由软件用 `memory_make` 建，根由控制面 `$MEM.conversations.<cid>.roots` 动态授予/撤销（整体替换非 core 根表，Core 自述根 `caps` 保留）。
+- 本段在设备挂载之后安装；`roots` 目标只校验语法与前缀，目标缺失在访问时报"引用根无效"。运行期根注册表可经 `$MEM.roots` 整体替换或按根名单条写入。
 
 ## init（启动对话）
 
@@ -176,6 +171,8 @@ python -m avm.image <image.json>
 - `user` / `user_ref`：二选一。`user` 是字面量；`user_ref` 是 `$` 开头的内存引用，必须指向 str 节点（启动用户消息）。PLM 入口的首条用户消息就是这条（`plm.function` 的 JSON 输入、`plm.command` 的整行命令都从这里来）。
 
 init 强制内核态：程序 `ctrl.caps.mode` 声明 `user` 时装载报 `ImageError`（没有内核态就无法管理权限）。只启动 0 号对话；**不预置其他对话**（其他对话由对话运行期自己 `create_cmd` / `create_sub` 创建）。PLM 入口的典型用法：0 号程序先做确定性的准备工作（读设备、组装提示词、写内存），再 `create_cmd` 出真正跑推理的 LLM 对话并 `send_instruction` 启动它，自己 `close_conversation`。
+
+**guest 程序**：顶层 `meta.guest_programs` 可选，把角色名 `boot` / `idle` / `shutdown` 映射到程序节点引用（`$` 开头，指向 `settingup` 或 `python` 节点）。冷启动在 init 之后按固定顺序为每个角色创建内核态对话，写 `attrs["guest_role"]` 并注册同名中断向量；`resume` 按该 attrs 找回对话，不重建。Python 角色程序要定义与角色同名的生成器（入口 `yield from <role>()`），并给程序节点写 `para_ref`。声明了任意 guest 角色的镜像启用严格调度：空闲（活跃/就绪都空、无待派发中断）时没有 idle 角色、或 idle 处理程序没让系统离开空闲，都是 `KernelPanic`；idle 程序写 `$MEM.sys.idle.state = "waiting"` 时内核停在安全点等待宿主中断。
 
 ## 启动流程
 
@@ -187,16 +184,16 @@ init 强制内核态：程序 `ctrl.caps.mode` 声明 `user` 时装载报 `Image
 2. 装载镜像 `plms` 段（自定义 PLM），安装启动自带的模型目录 `$MEM.model_catalog`（镜像或检查点里已有的字段不覆盖，只补缺失）；
 3. 按 `para_ref` 校验 para 节点（`ctrl.type == "para"`）并配置 Core；
 4. 加载设备插件文件（校验继承关系与挂载路径唯一）并挂载；
-5. 解析并安装 `security` 段（根注册表、工作空间区域；错误抛 `ImageError`）；
-6. 启动 init 对话（cid 0，`name`；LLM 入口或 PLM 入口）。`init` 缺失或为空时给一行 stderr 诊断，不启动任何对话。
+5. 解析并安装 `security` 段（根注册表；错误抛 `ImageError`），并校验 `meta.guest_programs` 的形状；
+6. 启动 init 对话（cid 0，`name`；LLM 入口或 PLM 入口），再按 `guest_programs` 创建 guest 对话。`init` 缺失或为空时给一行 stderr 诊断，不启动任何对话（guest 程序仍会创建）。
 
-恢复路径（`boot(image, restore=snapshot)` 或 `load_image(..., restore=True)`）**跳过第 6 步**：对话、内存、调度、监听器与设备表稍后由快照恢复，再按 `journal_to` 重放快照之后的日志尾部。`boot` 不显式传快照时，镜像声明了 `snapshot_to` 且文件可读会自动使用它；快照缺失或损坏只警告，退回"镜像 + 整段日志"重放（进程崩溃、快照落后或损坏时的路径）。
+启动模式决定第 6 步与日志怎么处理：`resume` 跳过 init/guest 创建，由快照恢复对话、内存、调度、监听器与设备表，再重放快照之后的日志尾部；`reboot` 只从快照恢复世界段（内存/安全配置/para/设备来源表）并重放日志尾部的世界类效果，然后重跑 init 与 guest 创建；`reset` 用原始镜像重跑 init，并把旧日志/旧快照归档后开新代际。`resume`/`reboot` 没有可读快照时拒绝启动并提示 `reset`；不传 mode 时保持旧行为（快照可读就用，否则镜像 + 日志重放）。语义见 [runtime.md 的「启动模式与 guest 程序」](runtime.md#启动模式与-guest-程序)。
 
 **启动核心**依次做：拉一次上游 `GET /models` 填模型目录（失败只警告，不拦启动）；装 API 失败的运行者策略（终端三选项：更新环境 / 继续 / 退出）。
 
 之后 `core.run()`；若声明 `persist_to`，在 `finally` 中写回内存（异常也写）；若声明 `snapshot_to`，在安全点退出时写重启快照（中断与未捕获异常不写，避免把半截回合拍进缓存）。
 
-恢复与快照的语义见 [runtime.md 的「持久运行」](runtime.md#持久运行重启恢复--回合日志--程序包)。宿主入口：`python -m avm.image <image.json> --restore <snapshot>` 与 `python main.py <image.json> --restore <snapshot>`。
+恢复与快照的语义见 [runtime.md 的「持久运行」](runtime.md#持久运行重启恢复--回合日志--程序包)。宿主入口：`python -m avm.image <image.json> --mode resume|reboot|reset` / `--restore <snapshot>`（等价于显式快照的 `resume`），`python main.py <image.json>` 同样支持，控制台入口 `python -m avm.console` 也接受这两个参数。
 
 错误不吞：格式错误输出到 stderr，CLI 退出码 1。
 

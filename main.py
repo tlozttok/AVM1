@@ -7,6 +7,8 @@
     python main.py <image.json> --transcript api.txt  # API 调用全文落盘
     python main.py <image.json> --checkpoint-in cp.json  # 启动时加载单对话检查点（跳过 init，调试用）
     python main.py <image.json> --restore snap.json      # 从重启快照恢复（随后按 journal_to 重放日志尾部）
+    python main.py <image.json> --mode resume|reboot|reset|auto  # 启动模式（缺省 auto）
+    python main.py <image.json> --core-dump out.json     # 内核崩溃时写 core dump
 
 文件内配置调试（VSCode 里固定运行 python main.py，参数改 debug.json 即可）:
     python main.py                          # 从 debug.json 读取 image/frames/transcript/checkpoint_in/restore

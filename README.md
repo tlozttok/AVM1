@@ -59,11 +59,11 @@ python main.py <image.json>      # 加载并运行系统镜像
 
 Windows 上如果控制台是英文 locale（cp1252），入口脚本打印的中文进度行会报 `UnicodeEncodeError`；设 `PYTHONIOENCODING=utf-8` 即可。
 
-示例镜像见 `images/demo.json`、`images/calc_driver.json`；权限体系示例见 `images/security_demo.json`（内核态 init + 用户态工作对话 + 私有工作空间）与 `images/permission_acl_demo.json`（全 PLM 的镜像层 ACL 演示：允许/默认拒绝/写保护）；读本仓库自测的镜像见 `images/repo_tester.json`（对话经只读设备 `$MEM.AVMRepo` 读仓库跟踪文件，用法由设备自述给出），打包版见 `images/repo_tester_packed.json`（0 号是 `plm.python` 打包器，启动时按 `$MEM.file_list` 给出的清单读文档、把系统提示词组装好再建并启动测试对话，测试者不必再读这些文档；程序与清单在 `images/repo_tester_packed/`）。系统镜像的组成与要点见 [docs/runtime.md](docs/runtime.md) 的「系统镜像」一节。
+示例镜像见 `images/demo.json`、`images/calc_driver.json`；权限体系示例见 `images/security_demo.json`（内核态 init + 用户态授予根对话）与 `images/permission_acl_demo.json`（全 PLM 的镜像层 ACL 演示：允许/默认拒绝/写保护）；读本仓库自测的镜像见 `images/repo_tester.json`（对话经只读设备 `$MEM.AVMRepo` 读仓库跟踪文件，用法由设备自述给出），打包版见 `images/repo_tester_packed.json`（0 号是 `plm.python` 打包器，启动时按 `$MEM.file_list` 给出的清单读文档、把系统提示词组装好再建并启动测试对话，测试者不必再读这些文档；程序与清单在 `images/repo_tester_packed/`）。系统镜像的组成与要点见 [docs/runtime.md](docs/runtime.md) 的「系统镜像」一节。
 
 ## 状态
 
-- 用例数约 960，全部走 MockLMU；CI 覆盖 ubuntu / windows × Python 3.12 / 3.13 四个组合。
+- 用例数约 1180，全部走 MockLMU；CI 覆盖 ubuntu / windows × Python 3.12 / 3.13 四个组合。
 - 尚未发布 release。接口仍在变动，镜像格式以 `docs/system-image.md` 为准。
 - 许可证 AGPL-3.0：个人使用、修改、分发都可以；把它嵌进对外提供的服务需要同样开源。
 
@@ -75,5 +75,5 @@ Windows 上如果控制台是英文 locale（cp1252），入口脚本打印的�
 - [docs/philosophy.md](docs/philosophy.md) — 设计哲学
 - [docs/system-image.md](docs/system-image.md) — 系统镜像格式规范
 - [docs/examples/python_as_conversation.md](docs/examples/python_as_conversation.md) — 示例：Python 程序如何无损表示为"对话 + 工具调用"
-- [docs/capabilities.md](docs/capabilities.md) — 能力模型与权限机制：根表/工作空间/工具面/事件策略/ACL 示例
+- [docs/capabilities.md](docs/capabilities.md) — 能力模型与权限机制：根表与动态授予根/工具面/事件策略/Guard/ACL 示例
 - [docs/porting-contract.md](docs/porting-contract.md) — 移植契约：把外部编排方案写成 AVM 程序包的交付约定

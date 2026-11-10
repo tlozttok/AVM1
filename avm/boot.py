@@ -515,7 +515,7 @@ def _next_cid_from(doc: dict) -> int:
 
 def _restored_counts(core: Core) -> dict:
     """快照恢复后重建了什么：数量只做展示，取不到就给 0，不影响启动。"""
-    listeners = getattr(core.events, "_listeners", None)
+    listeners = getattr(core.events, "listeners", None)
     try:
         listener_count = len(listeners) if listeners is not None else 0
     except TypeError:

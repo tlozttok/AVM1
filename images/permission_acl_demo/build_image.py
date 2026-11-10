@@ -185,7 +185,6 @@ def build_image():
                         "acl.read": json.dumps({"deny": [{"group": "worker"}]}),
                     }),
                 },
-                ctrl={"owner": "0"},
                 meta="ACL 示例库：greeting 允许 worker 组读，secret 拒绝 worker 组读，greeting 禁止写",
             ),
             "programs": node_dict({

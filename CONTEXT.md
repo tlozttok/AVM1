@@ -44,12 +44,12 @@ LLM API 参数文件。type = `"para"`。存储模型名、temperature 等 API �
 **Conversation**:
 对话序列化文件。type = `"conversation"`。存储持久化的对话记录。
 
-**内核态 (Kernel mode)**（批次一已实现）:
-持有真实 `$MEM` 根的一类对话，默认拥有全部工具，负责内存分区管理、Settingup 注册、workspace 分配等系统管理任务。不是 Core 的 Python 代码；模式只是能力上界的一部分，管理权限由镜像层的策略决定。
+**内核态 (Kernel mode)**:
+持有真实 `$MEM` 根、默认拥有全部工具的一类对话，负责内存分区管理、Settingup 注册、根授予等系统管理任务（具体做哪些由镜像层的策略决定）。不是 Core 的 Python 代码；模式只是能力上界的一部分。
 _Avoid_: Core、Python 代码
 
-**用户态 (User mode)**（批次一已实现）:
-只有自己的根表（私有工作空间 `$work` 与内核授予的根）和收窄工具集的一类对话。只能通过指令访问内存，看不到 `$MEM`、设备路径简写与 `$conv`/`$batch` 伪根；工作空间见 **工作空间**。
+**用户态 (User mode)**:
+只有自己的根表（软件授予的根，另带只读 `caps` 自述根）和收窄工具集的一类对话。只能通过指令访问内存，看不到 `$MEM`、设备路径简写与 `$conv`/`$batch` 伪根。内核不分配工作目录：目录由软件用 `memory_make` 建，根由控制面动态授予（见 **授予根**）。
 
 **Core**:
 AVM 的指令分发层和调度器。不参与管理决策——只执行指令、调度对话、提供内存和设备总线。相当于操作系统的 CPU + 调度器，但不包含内核逻辑。
@@ -74,13 +74,13 @@ AVM 的指令分发层和调度器。不参与管理决策——只执行指令�
 ### 内存与数据
 
 **内存 (Memory)**:
-全局共享的键值树。四种节点：MetaDict、MetaList、字符串（`StrNode`，str 子类）、链接节点（LinkNode）。内核态对话管理根目录 `$MEM`，用户态对话经自己的根表被映射到 workspace 子树。根是对话能力的名字，不是内存树节点。
+全局共享的键值树。四种节点：MetaDict、MetaList、字符串（`StrNode`，str 子类）、链接节点（LinkNode）。内核态对话管理根目录 `$MEM`，用户态对话经自己的根表被映射到自己被授予的子树。根是对话能力的名字，不是内存树节点。
 
 **MetaDict / MetaList**:
-带元数据的复合类型。元数据统称描述与控制数据两部分：描述（`str`，代码/镜像字段名 `meta`/`metadata`）：给 LLM 快速扫描的文件摘要/描述；控制数据（`dict[str,str]`，字段名 `ctrl`）：给 Core/内核态的结构化控制信息（如 `type`、`signature`、`owner`）。`owner` 由 Core 在 `memory_make` 创建容器节点时记录（`memory_write` 不建节点，不写 owner），值为创建者 cid 的字符串；`edit_metadata` 不允许修改/删除 `owner`。字符串叶子只有控制数据、没有描述数据：`StrNode` 带 `ctrl`（可存 `owner` 等），不接受 `meta`。LLM 读取时默认只看到描述和键列表；深入索引后才返回子节点。`memory_write` 对容器改的是描述，`edit_metadata` 改的是控制数据。
+带元数据的复合类型。元数据统称描述与控制数据两部分：描述（`str`，代码/镜像字段名 `meta`/`metadata`）：给 LLM 快速扫描的文件摘要/描述；控制数据（`dict[str,str]`，字段名 `ctrl`）：给 Core/内核态的结构化控制信息（如 `type`、`signature`）。Core 不写节点所有权：`memory_make` 只创建、`memory_write` 只改值或描述，`edit_metadata` 可自由编辑 `ctrl`。字符串叶子只有控制数据、没有描述数据：`StrNode` 带 `ctrl`，不接受 `meta`。LLM 读取时默认只看到描述和键列表；深入索引后才返回子节点。`memory_write` 对容器改的是描述，`edit_metadata` 改的是控制数据。
 
 **字符串 (str / StrNode)**:
-叶子节点，直接返回内容。只有**控制数据**（`ctrl`，如 `owner`），没有**描述数据**（`meta`）；需要描述时用 MetaDict 包装。作为 str 子类，比较、JSON 序列化与 `isinstance(x, str)` 保持原语义。
+叶子节点，直接返回内容。只有**控制数据**（`ctrl`，如 `type`），没有**描述数据**（`meta`）；需要描述时用 MetaDict 包装。作为 str 子类，比较、JSON 序列化与 `isinstance(x, str)` 保持原语义。
 _Avoid_: 普通字符串
 
 **链接 (Link)**:
@@ -99,10 +99,10 @@ _Avoid_: 解引用、符号、指针
 等待被调度的对话队列。被唤醒的对话进入就绪队列末尾；`create_sub` 亚对话前插、立即执行（唯一例外）。
 
 **事件 (Event)**:
-每个工具调用对应一个瞬时事件，`listen_event` 可注册监听。事件按发布者分工：Core 发布 before 请求事件（source 含 `initiator_cid`），Memory/设备/Core 发布 after 事实事件（payload 含 `actor_cid`）。10 条指令都有 before 请求事件，10 条在成功后各产生一条 after 事实事件。监听器是普通 Python 代码（`ctrl.type="handler"` 节点的 `content`），每次事件在全新受限命名空间执行、无状态；`listen_event` 可指定 `phase=before/after/all`。事件匹配与所有权判定用 canonical 目标（跟随链接与别名的真实地址），处理器看到的目标仍是请求别名。载荷分 normal/kernel 两级：normal 给来源对话快照与目标的类型/描述/ctrl/祖先链，kernel 级（只有内核态对话可注册）追加目标完整数据与来源对话上下文。监听器按 `priority` 降序、同优先级按注册顺序执行，首个 `allow`/`replace` 短路（`allow` 放行原指令、只有 kernel 级可返回；normal 级返回 `allow` 按处理器错误处理）。处理器可返回 `notify` 由 Core 内部投递并唤醒目标，但禁止自我投递。before 处理器失败会以 `handler_error` 事件结果返回，原指令不执行、已收集 notify 仍投递。事件条件（ECA 的 C）、事件持久化/重放、事件总线、定时器等仍在设计/后续计划中。
+每个工具调用对应一个瞬时事件，`listen_event` 可注册监听。事件按发布者分工：Core 发布 before 请求事件（source 含 `initiator_cid`），Memory/设备/Core 发布 after 事实事件（payload 含 `actor_cid`）。10 条指令都有 before 请求事件，10 条在成功后各产生一条 after 事实事件。监听器是 `ctrl.type="handler"` 节点：`content` 是处理器代码，`condition` 数据叶子声明条件（事件/相位/目标/来源），每次事件在全新受限命名空间执行、无状态。用户态对话只能用命名条件子集（`inbox` / `self.lifecycle`），内核态可以写完整条件。监听注册的内存目标授权不在内核：Core 不做节点所有者判定，由软件层的 Guard 监听器在 `listen_event` 的 before 事件上按解析后的条件裁决（没有装 Guard 时注册不受限）。事件匹配与所有权判定用 canonical 目标（跟随链接与别名的真实地址），处理器看到的目标仍是请求别名。载荷分 normal/kernel 两级：normal 给来源对话快照与目标的类型/描述/ctrl/祖先链，kernel 级（只有内核态对话可注册）追加目标完整数据与来源对话上下文。监听器按 `priority` 降序、同优先级按注册顺序执行，首个 `allow`/`replace` 短路（`allow` 放行原指令、只有 kernel 级可返回；normal 级返回 `allow` 按处理器错误处理）。处理器可返回 `notify` 由 Core 内部投递并唤醒目标，但禁止自我投递。before 处理器失败会以 `handler_error` 事件结果返回，原指令不执行、已收集 notify 仍投递。事件条件（ECA 的 C）、事件持久化/重放、事件总线、定时器等仍在设计/后续计划中。
 
 **中断 (Interrupt)**:
-外部发起的控制权转移请求。与事件分工不同：**事件通知"发生了什么"，中断夺取"下一个执行谁"**。外部线程可挂起中断；Core 在安全点（一轮推理含该轮产生的全部指令执行完之后，与预算中断用的是同一边界）派发：把执行权交给向量指向的对话，被打断的活跃对话插回就绪队列**队首**，让出后先跑。没有注册向量、目标不存在或已关闭 → 丢弃（原因记 stderr）；目标已是活跃对话 → 不动作；同类型已有未派发的挂起中断时去重。v1 只有这一层：优先级、屏蔽位，以及它与其他中断源（预算中断、事件 notify）的关系都未实现。
+外部发起的控制权转移请求。与事件分工不同：**事件通知"发生了什么"，中断夺取"下一个执行谁"**。外部线程可挂起中断；Core 在安全点（一轮推理含该轮产生的全部指令执行完之后，与预算中断用的是同一边界）派发：把执行权交给向量指向的对话，被打断的活跃对话插回就绪队列**队首**，让出后先跑；派发时把中断 payload 作为正文投进目标输入批次。没有注册向量、目标不存在或已关闭 → 丢弃（原因记 stderr）；同类型已有未派发的挂起中断时去重。当前向量名：面板的 `operator`、guest 角色 `boot` / `idle` / `shutdown`（内核空闲时唤醒 idle、resume 时唤醒 boot、宿主看到关机请求后唤醒 shutdown）。优先级、屏蔽位，以及它与其他中断源（预算中断、事件 notify）的关系仍未实现。
 _Avoid_: 事件、信号
 
 **名字 (Name)**:
@@ -114,9 +114,9 @@ _Avoid_: 事件、信号
 挂载到内存路径上的伪节点，模拟文件读写但实际接入外部交互。已实现的是 `$inputs`（用户输入）与 `$outputs`（用户输出）；同一形态还可接入时钟、随机数、休眠（`$time` / `$random` / `$sleep`，未实现）。与 Linux `/proc`、`/dev` 的伪文件对齐。
 _Avoid_: Device、设备、挂载点
 
-**工作空间 (Workspace)**（批次一已实现；回收未实现）:
-用户态对话专属的内存子树，落在镜像声明的工作空间区域（`security.workspace_region`，缺省 `$MEM.workspaces`），创建用户态对话时由 Core 分配，绑定为对话根表里的 `work`（或程序 `caps.workspace` 指定的名字）。工作空间目标与其他可授予根目标两两前缀无关，因此父方向没有根能覆盖它、子方向没有根能从内部切出——这是"私有工作空间"的结构保证。区域内禁止链接与设备挂载。对话关闭时绑定消失，子树保留（回收另立计划）。
-_Avoid_: workdir、工作目录
+**授予根 (Granted root)**:
+用户态对话根表里由软件授予的根。目录不由内核分配：软件用 `memory_make` 建子树，再把「根名 → `$MEM` 路径」全量写进 `$MEM.conversations.<cid>.roots`（控制面，整体替换非 core 根表）。写入记 `conversation_roots` 日志效果、随日志重放；省略某个根就是撤销。根目标必须与其他存活根、根注册表两两前缀无关，且不落在内核控制面设备路径；Core 自述根 `caps` 不可覆盖。
+_Avoid_: 工作空间、workdir
 
 **用户 (User)**:
 AVM 的使用者，通过虚拟文件或指令操作 AVM。不是任何 LLM 对话的聊天对象。AVM 中的对话优先处理内存中设定的目的，用户输入只是外部信息源之一。
@@ -127,14 +127,14 @@ _Avoid_: 聊天对象、对话伙伴
 _Avoid_: 模型注册表、白名单
 
 **生命周期三段**:
-内核启动的显式三步：**创建空核心**（`Core()`）→ **加载镜像**（`load_image(core, path)`，要求核心还没有对话）→ **启动核心**（`start_core(core)`：刷新模型目录、装 API 失败的运行者策略）。`avm/boot.py` 是加载区，三段都收在那里，宿主通常只调 `boot(image_path)`。
+内核启动的显式三步：**创建空核心**（`Core()`）→ **加载镜像**（`load_image(core, path)`，要求核心还没有对话）→ **启动核心**（`start_core(core)`：刷新模型目录、装 API 失败的运行者策略）。`avm/boot.py` 是加载区，三段都收在那里，宿主通常只调 `boot(image_path)`。`boot(mode=resume|reboot|reset)` 选择世界从快照/快照世界段/原始镜像来；声明了 `meta.guest_programs` 的镜像在冷启动 init 之后创建 guest 角色对话（`boot` / `idle` / `shutdown`）并注册同名中断向量。
 _Avoid_: 引导、初始化
 
 **根 (Root)**:
-引用第一段的名字，如 `MEM`、`work`、`lib`。根不是内存树节点；每个对话有一张**根表**（根名 → `$MEM` 之后的真实段序列），解析引用时第一段按该表匹配，未命中的根得到统一错误。内核态根表含 `MEM`；用户态根表是 `work` 加授予根。镜像 `security.roots` 声明可授予的**根注册表**。
+引用第一段的名字，如 `MEM`、`lib`、`repo`。根不是内存树节点；每个对话有一张**根表**（根名 → `$MEM` 之后的真实段序列），解析引用时第一段按该表匹配，未命中的根得到统一错误。内核态根表含 `MEM`；用户态根表由软件授予（见 **授予根**），另有只读 `caps` 自述根。镜像 `security.roots` 声明可授予的**根注册表**；运行期根注册表可经 `$MEM.roots` 修改。
 
 **对话能力 (Capability)**:
-每个对话的模式、组、根表与工具集的合称（`avm/capabilities.py` 的 `Capability`）。创建子对话时按程序节点的 `value.caps` 数据计算：模式不可提权、子工具集 ⊆ 父工具集、同域子对话沿用父根表；内核态父对话可按程序声明给用户态子对话授予根注册表里的根并分配工作空间。宿主侧（`Core.start`、检查点恢复、操作员对话）默认内核态全能力。
+每个对话的模式、组、根表与工具集的合称（`avm/capabilities.py` 的 `Capability`）。创建子对话时按程序节点的 `value.caps` 数据计算：模式不可提权、子工具集 ⊆ 父工具集、同域子对话沿用父根表；内核态父对话可按根注册表给用户态子对话授予根。目录由软件建设；创建之后的新根走控制面动态授予。宿主侧（`Core.start`、检查点恢复、操作员对话）默认内核态全能力。
 
 **工具集 (Tool set)**:
 对话可调用的指令名集合。决定模型看到的工具 schema、PLM 注入的工具函数与 Core 实际接受的指令三处；宿主控制台的工具表始终是全量。旧对话（无 caps）默认全部 10 条。
@@ -142,10 +142,10 @@ _Avoid_: 引导、初始化
 ### 安全
 
 **Capability 模型**（机制层已实现；节点级内存访问权限仍在设计；完整说明见 [docs/capabilities.md](docs/capabilities.md)）:
-AVM 的安全基础。对话不知道内存地址就无法访问——不存在遍历根目录的操作。对话持有一份**对话能力（caps）**：模式（内核态/用户态）、组、根表与工具集。用户态对话看不到 `$MEM`，只知道自己的 workspace 根与显式授予的根。链接是"特定节点引用"的实现方式：内核态把真实地址或设备挂载为链接，对话只能通过链接访问目标内容，看不到真实路径。
+AVM 的安全基础。对话不知道内存地址就无法访问——不存在遍历根目录的操作。对话持有一份**对话能力（caps）**：模式（内核态/用户态）、组、根表与工具集。用户态对话看不到 `$MEM`，只知道自己的根表（软件授予的根与只读 `caps` 自述根）。链接是"特定节点引用"的实现方式：内核态把真实地址或设备挂载为链接，对话只能通过链接访问目标内容，看不到真实路径。
 
-**控制面 (Control surface)**（批次三已实现）:
-`$MEM.conversations` 与 `$MEM.listeners` 的可写字段面。读返回 Core 运行时实时状态；写特定字段（对话的 groups/roots/meta、监听器的 priority/enabled）直接改 Core 对象，不在内存树生成节点，也不进 `persist_to`。设备只做结构校验（字段白名单、类型、根名/目标前缀无关、保留区），授权交给镜像层事件监听器：写入是普通 `memory_write`，`before` 事件可被 `allow`/`replace`。观测面（scheduler/memory/monitor）保持只读。
+**控制面 (Control surface)**:
+`$MEM.conversations` 与 `$MEM.listeners` 的可写字段面。读返回 Core 运行时实时状态；写特定字段（对话的 groups/roots/meta、监听器的 priority/enabled）直接改 Core 对象，不在内存树生成节点，也不进 `persist_to`。`<cid>.roots` 的写入是整体替换非 core 根表（Core 的 `caps` 自述根保留、不可覆盖），记 `conversation_roots` 日志效果；只有用户态对话能被改写。设备只做结构校验（字段白名单、类型、根名/目标前缀无关、保留区），授权交给镜像层事件监听器：写入是普通 `memory_write`，`before` 事件可被 `allow`/`replace`。观测面（scheduler/memory/monitor）保持只读。
 
 **文件安全性**（设计中，未实现）:
 对话可以为其拥有的文件设定访问密码，阻止其他对话访问。可注册回调：当其他对话尝试访问受保护文件时，所有者获得通知。

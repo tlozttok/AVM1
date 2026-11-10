@@ -22,8 +22,7 @@
              "mode": {"kind": "str", "value": "user"},
              "groups": {"kind": "list", "value": [{"kind": "str", "value": "worker"}]},
              "roots": {"kind": "list", "value": [{"kind": "str", "value": "lib"}]},
-             "tools": {"kind": "list", "value": [{"kind": "str", "value": "memory_read"}]},
-             "workspace": {"kind": "str", "value": "work"}}}}}
+             "tools": {"kind": "list", "value": [{"kind": "str", "value": "memory_read"}]}}}}}
 ```
 
 `ctrl.caps` 不再支持；能力属于数据，`ctrl` 只描述节点类型与数据组织。
@@ -31,12 +30,12 @@
 - `mode` 缺省继承父对话。内核态父对话可以创建内核态或用户态子对话；用户态父对话只能创建用户态子对话，亚对话不能跨模式。
 - `roots` 是镜像 `security.roots` 注册表里的名字列表，只由内核态父对话授予；用户态对话拿到的是根名到真实子树/设备的绑定，自己看不到真实路径。
 - `tools` 缺省继承父工具集；显式声明时只能是父工具集的子集。模型看到的工具表、PLM 注入的函数与 Core 实际接受三处一致。
-- `workspace` 是用户态子对话的工作空间根名（缺省 `work`）。工作空间由 Core 在 `security.workspace_region` 里分配，与其他可授予根前缀无关，是私有区域；区域内禁止链接与设备挂载。
+- `workspace` 已移除：内核不分配工作目录。程序创建出用户态对话后，由软件用 `memory_make` 建目录，再把「根名 → `$MEM` 路径」全量写进 `$MEM.conversations.<cid>.roots` 授予根（整体替换，省略即撤销；Core 的 `caps` 自述根不可覆盖）。
 - 没有 `caps` 的程序继承父能力（旧镜像行为不变）。
 
-写用户态程序时：提示词只使用 `$work` 与授予根名（例如 `$lib`），不要写 `$MEM`；工具集按需要声明得尽量小；需要长期个体时由内核态对话创建（用户态是否能用 `create_cmd` 取决于工具集）。写内核态程序时：它持有 `$MEM` 与默认全部工具，负责建立权限层、分配工作空间、注册程序。
+写用户态程序时：提示词只使用软件授予的根名（例如 `$lib`），不要写 `$MEM`；工具集按需要声明得尽量小；需要长期个体时由内核态对话创建（用户态是否能用 `create_cmd` 取决于工具集）。写内核态程序时：它持有 `$MEM` 与默认全部工具，负责建立权限层、建目录并授予根、注册程序。
 
-本批只有创建时的能力声明；运行期改根、改组、改工具集（对话设备控制面）与事件监听器的权限策略（载荷分级、处理器分级、priority/allow）在后续批次。
+能力在创建时声明；创建之后，组与根可经控制面 `$MEM.conversations.<cid>.groups` / `.roots` 运行期改写（`.mode` / `.tools` 仍只读），监听器的 priority/启停可经 `$MEM.listeners.<id>` 改写。
 
 ## 一个对话做一件小事
 
@@ -62,9 +61,9 @@
 
 ## 用 listen_event 表达等待
 
-- 监听器是 `ctrl.type="handler"` 节点中的 `content`，每次事件在全新受限沙箱中执行，定义 `handle(event)` 返回 dict。
-- 内存 before 事件需要路径 owner 才能注册；`send_instruction` 只能监听发往自己的消息；after 事件可通配监听。
-- 处理器可返回 `action="replace"` 拦截 before 事件，或改写允许的 payload 字段；返回 `notify` 可让 Core 向指定对话投递消息并唤醒它。
+- 监听器是 `ctrl.type="handler"` 节点：`content` 是处理器代码，`condition` 数据叶子声明条件（events/phase/target/source）；每次事件在全新受限沙箱中执行，定义 `handle(event)` 返回 dict。
+- 用户态对话只能用命名条件子集（`inbox` / `self.lifecycle`），内核态可以写完整条件。内存监听注册不做所有者判定：策略由软件层的 Guard 监听器裁决（它监听 `listen_event` 的 before 事件，读解析后的条件）。
+- 处理器可返回 `action="replace"` 拦截 before 事件，或改写允许的 payload 字段；返回 `notify` 可让 Core 向指定对话投递消息并唤醒它。`priority` 只有内核态能设大于 0；`tier=kernel` 只有内核态可注册。
 - `notify` 不允许投递给当前对话（禁止自我投递）。
 - 注意：before 事件只表示「放行/改写」，不保证结果发生——后续处理器可能失败，因此 before 事件不是操作已完成的承诺。
 
@@ -80,7 +79,7 @@ Python 程序对同样的输入序列只有同样的输出；非最后一条消�
 
 ## 持久运行与跨轮状态
 
-镜像可以声明 `journal_to`（回合日志）与 `snapshot_to`（重启快照）：每个提交回合记一条状态增量，正常退出时写快照；快照只是加速缓存的落点，缺失或损坏时从日志重建。重启用 `--restore <snapshot>`，或直接启动——`boot` 会自动读取镜像声明的快照。机制细节见 [docs/runtime.md 的「持久运行」](runtime.md#持久运行重启恢复--回合日志--程序包)。
+镜像可以声明 `journal_to`（回合日志）与 `snapshot_to`（重启快照）：每个提交回合记一条状态增量，正常退出时写快照；快照只是加速缓存。重启用 `--mode resume|reboot|reset`（`resume` = 快照 + 日志尾部，`reboot` = 快照世界段 + 世界类效果重放，`reset` = 原始镜像），或直接启动——不传 mode 时 `boot` 自动使用可读快照。机制细节见 [docs/runtime.md 的「启动模式与 guest 程序」](runtime.md#启动模式与-guest-程序)与[「持久运行」](runtime.md#持久运行重启恢复--回合日志--程序包)。
 
 对写程序的人来说只有一条硬约定：**Python 程序的跨轮状态必须落在 `$MEM`**。PLM 的命名空间不序列化——恢复后执行器重建，Core 重放 system 消息（setup 代码），但历史里的 user/tool 消息不会被重新执行（副作用不能重复发生）。把状态存在命名空间变量里，恢复后就丢了。
 
