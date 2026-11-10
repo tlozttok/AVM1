@@ -6,17 +6,20 @@
 {"meta": {"format": "avm.package", "version": 1,
           "name": "demo", "package_version": "1.0.0", "description": "..."},
  "mem": { ... 与镜像 mem 段同格式 ... },
- "devices": [{ "path": "io", "file": "io.py", "class": "EchoDevice", "args": {} }]}
+ "devices": [{ "path": "io", "file": "io.py", "class": "EchoDevice", "args": {},
+                "sha256": "<可选：设备文件内容哈希>"}]}
 ```
 
 安装落点：`$MEM.packages.<name>.<package_version>` 是包内存子树的根节点；
-`$MEM.package_records.<name>.<package_version>` 是安装记录（来源路径、sha256、
-安装时间、设备清单）。`$MEM.packages.<name>.current` 指向最近安装的版本字符串
+`$MEM.package_records.<name>.<package_version>` 是安装记录（来源路径、包文件 sha256、
+安装时间、设备清单）。设备清单每项带设备文件 sha256；loader 安装时还带
+approved_sha256 / approved_at / approved_via（整包批准：approved_sha256 是包文件哈希）。
+`$MEM.packages.<name>.current` 指向最近安装的版本字符串
 （升级 = 装新版本后指针改指新版本，一条 `memory_write`，原子）。
 
 设备条目的 `path` 是**相对包子树的挂载路径**（如 `io` → `$MEM.packages.<name>.<version>.io`）：
 这样卸载 detach 整棵子树时挂载点链接一并回收，不会留下悬空链接。设备文件 `file`
-相对包文件所在目录解析。
+相对包文件所在目录解析；设备条目可选的 `sha256` 会在安装时与文件实际哈希核对。
 
 安装顺序：校验 → 挂设备 → 建子树 → 写记录 → 更新 current。任一步失败回滚已挂设备
 与已建节点；回滚的操作不进日志——只有成功的安装才把效果提交给回合日志。卸载只做
@@ -134,14 +137,41 @@ def list_installed(core) -> list:
 # 安装
 # ----------------------------------------------------------------------
 
-def install(core, path: str, *, base_dir: Optional[str] = None) -> dict:
+def install(core, path: str, *, base_dir: Optional[str] = None,
+            approved_sha256: Optional[str] = None,
+            approved_at: Optional[str] = None,
+            approved_via: Optional[str] = None) -> dict:
     """安装程序包（挂设备 → 建子树 → 写记录 → 更新 current），返回安装记录。
+
+    `approved_sha256` 是 loader 转来的程序包文件批准哈希；给了就必须与包文件
+    实际 sha256 相等。设备文件的内容哈希在装载时重算并写进设备 spec / 安装记录；
+    spec 里的 approved_sha256 是这次整包批准的程序包哈希，恢复/重放只用 spec 的
+    sha256 核对设备文件。`approved_at` / `approved_via` 只写记录，不参与校验。
 
     失败回滚已发生的设备挂载与内存节点，异常抛 VMMemoryError（对话得到 Error）。
     只有成功安装才把状态变化提交给回合日志（见 `_commit_effects`）。
     """
-    from .image import ImageError, _parse_node, mount_device_entry
+    from .image import (
+        ImageError, _device_entry_fields, _parse_node, _sha256_file,
+        mount_device_entry,
+    )
 
+    package_sha256 = None
+    if os.path.isfile(path):
+        try:
+            package_sha256 = _sha256_file(os.path.abspath(path))
+        except OSError as e:
+            raise VMMemoryError(f"读取程序包失败：{path}: {e}") from e
+    if approved_sha256 is not None:
+        if not isinstance(approved_sha256, str) or not approved_sha256.strip():
+            raise VMMemoryError("程序包批准哈希必须是非空字符串")
+        if package_sha256 is None:
+            raise VMMemoryError(f"程序包不存在：{path}")
+        if approved_sha256.strip().lower() != package_sha256:
+            raise VMMemoryError(
+                f"程序包哈希与批准哈希不一致（{path}）："
+                f"期望 {approved_sha256}，实际 {package_sha256}；拒绝安装"
+            )
     package = read_package(path)
     meta = package["meta"]
     name = meta["name"]
@@ -182,6 +212,32 @@ def install(core, path: str, *, base_dir: Optional[str] = None) -> dict:
             raise VMMemoryError(
                 f"程序包设备 {rel} 没有在 mem 段标记 kind=device"
             )
+        # 包安装同时核对每台设备的文件哈希：装载前先算一次，交给挂载入口再算，
+        # 两边不一致说明文件在安装过程中被换掉，拒绝安装（窗口收敛到一次安装内）。
+        try:
+            fields = _device_entry_fields(dict(dev, path=mount), base)
+        except ImageError as e:
+            raise VMMemoryError(f"程序包设备装载失败：{e}") from e
+        if fields["file_path"] is not None:
+            try:
+                actual = _sha256_file(fields["file_path"])
+            except OSError as e:
+                raise VMMemoryError(
+                    f"程序包设备 {mount} 的文件不可读：{fields['file_path']}: {e}"
+                ) from e
+            expected = dev.get("sha256")
+            if expected is not None:
+                if not isinstance(expected, str) or not expected:
+                    raise VMMemoryError(
+                        f"程序包设备 {mount} 的 sha256 必须是非空字符串"
+                    )
+                if expected.strip().lower() != actual:
+                    raise VMMemoryError(
+                        f"程序包设备 {mount} 的文件哈希不一致（{fields['file_path']}）："
+                        f"期望 {expected}，实际 {actual}；拒绝安装"
+                    )
+            # 把这次安装看到的内容哈希交给挂载入口核对并记录（包内设备也进来源表）。
+            dev = dict(dev, sha256=actual)
         device_mounts[mount] = dict(dev, path=mount)
 
     effects = []
@@ -223,15 +279,35 @@ def install(core, path: str, *, base_dir: Optional[str] = None) -> dict:
 
         # 3) 挂设备（此时版本节点已在树里，挂载点链接物化在包子树内）
         for mount, dev in device_mounts.items():
+            mount_dev = dict(dev)
+            if approved_at is not None:
+                mount_dev["approved_at"] = approved_at
+            if approved_via is not None:
+                mount_dev["approved_via"] = approved_via
             try:
-                spec = mount_device_entry(core, dev, base)
+                spec = mount_device_entry(core, mount_dev, base)
             except ImageError as e:
                 raise VMMemoryError(f"程序包设备装载失败：{e}") from e
+            # 整包批准：approved_sha256 是程序包文件的哈希（批准整包 = 批准其中的设备）；
+            # 设备文件自己的内容哈希在 spec["sha256"]。恢复/重放只用 sha256 核对。
+            if approved_sha256 is not None:
+                spec["approved_sha256"] = approved_sha256
+            if approved_at is not None:
+                spec["approved_at"] = approved_at
+            if approved_via is not None:
+                spec["approved_via"] = approved_via
+            if (approved_sha256 is not None or approved_at is not None
+                    or approved_via is not None):
+                core.device_specs[mount] = spec
             mounted.append(mount)
             effects.append({"kind": "device_mount", "mount": mount, "spec": spec})
 
         # 4) 写安装记录
-        record = _install_record(path, devices=effects, package_version=package_version)
+        record = _install_record(
+            path, devices=effects, package_version=package_version,
+            package_sha256=package_sha256, approved_sha256=approved_sha256,
+            approved_at=approved_at, approved_via=approved_via,
+        )
         record_node = _record_node(record)
         records_root, created_records = _ensure_root(core, RECORDS_ROOT, _RECORDS_META)
         created.append(([RECORDS_ROOT], created_records))
@@ -260,10 +336,15 @@ def install(core, path: str, *, base_dir: Optional[str] = None) -> dict:
     return record
 
 
-def _install_record(path: str, *, devices: list, package_version: str) -> dict:
+def _install_record(path: str, *, devices: list, package_version: str,
+                    package_sha256: Optional[str] = None,
+                    approved_sha256: Optional[str] = None,
+                    approved_at: Optional[str] = None,
+                    approved_via: Optional[str] = None) -> dict:
     source = os.path.abspath(path)
-    with open(source, "rb") as f:
-        digest = hashlib.sha256(f.read()).hexdigest()
+    if package_sha256 is None:
+        with open(source, "rb") as f:
+            package_sha256 = hashlib.sha256(f.read()).hexdigest()
     device_entries = []
     for effect in devices:
         if effect.get("kind") != "device_mount":
@@ -276,22 +357,38 @@ def _install_record(path: str, *, devices: list, package_version: str) -> dict:
             entry["path"] = StrNode(str(spec["path"]))
         if spec.get("id"):
             entry["id"] = StrNode(str(spec["id"]))
+        # 包内每个设备的文件内容哈希：重启恢复按它核对，不再信任"装载时看到的文件"。
+        entry["sha256"] = StrNode(str(spec.get("sha256") or ""))
+        for key in ("approved_sha256", "approved_at", "approved_via"):
+            value = spec.get(key)
+            if value:
+                entry[key] = StrNode(str(value))
         if spec.get("args"):
             entry["args"] = StrNode(json.dumps(spec["args"], ensure_ascii=False))
         device_entries.append(entry)
-    return {
+    record = {
         "source": source,
-        "sha256": digest,
+        "sha256": package_sha256,
         "installed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "package_version": package_version,
         "devices": device_entries,
     }
+    # 整包批准：approved_sha256 绑定的是程序包文件；设备文件的哈希在各自条目里。
+    if approved_sha256 is not None:
+        record["approved_sha256"] = approved_sha256
+    if approved_at is not None:
+        record["approved_at"] = approved_at
+    if approved_via is not None:
+        record["approved_via"] = approved_via
+    return record
 
 
 def _record_node(record: dict) -> MetaDict:
     node = MetaDict(data={}, metadata="程序包安装记录")
-    for key in ("source", "sha256", "installed_at", "package_version"):
-        node[key] = StrNode(str(record.get(key, "")))
+    for key in ("source", "sha256", "installed_at", "package_version",
+                "approved_sha256", "approved_at", "approved_via"):
+        if key in record:
+            node[key] = StrNode(str(record.get(key, "")))
     devices = MetaList(data=[], metadata="本包挂载的设备")
     for entry in record.get("devices") or []:
         devices.append(entry)

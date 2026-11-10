@@ -8,7 +8,7 @@ python images/base/build_image.py          # 生成 base.json
 python -m avm.console images/base/base.json
 ```
 
-装载密码（loader 用）：`base-operator`。面板是唯一入口；审批计划落地后会去掉密码，改成批准哈希。
+装载设备/程序包不再使用密码：命令必须带操作员审批得到的 `approved_sha256`（文件内容哈希）。
 
 ## 镜像里有什么
 
@@ -58,7 +58,7 @@ python -m avm.console images/base/base.json
 JSON 命令：
 
 ```json
-{"action": "load_device", "password": "base-operator",
+{"action": "load_device", "approved_sha256": "<设备文件 sha256>",
  "path": "echo", "file": "devices/echo.py", "class": "EchoDevice", "args": {}}
 ```
 
@@ -66,15 +66,15 @@ JSON 命令：
 `$MEM.echo`，对话用 `memory_read` / `memory_write` 读写它。装载是纯内存操作、进回合日志，
 重启后按来源表重新加载；设备文件必须留在原路径。
 
-> 审批计划（`plan-device-approval-2026-11-08.md`）会把这条变成"选文件 → 大弹窗 → 允许"，
-> 并用文件哈希绑定批准。
+> 操作面板的「装载设备（审批）」先只读检查文件哈希，再由操作员在全屏弹窗里允许；
+> 批准值随 `memory_write $MEM.loader` 命令进内核，装载时重新核对。
 
 ## 还没接上的部分
 
 - 输入消费者：`$MEM.sys.inbox` 现在只有落点，没有 handler；消费者由作者手动搭建。
 - boot-check：脏关闭的恢复程序由作者在系统内写（启动生命周期计划提供标记约定）。
 - 启动模式（复苏/重启/重置）与日志代际：见 `plan-boot-lifecycle-2026-11-08.md`。
-- 设备审批：见 `plan-device-approval-2026-11-08.md`。
+- 设备审批的强制力是人的仪式：内核不检查发起者（任何能写 `$MEM.loader` 的对话知道哈希即可装载）。
 - 输入路径的正式化（宿主对话从隐藏 cid -1 换成普通 cid）：见 `plan-panel-input-path-2026-11-08.md`。
 
 ## 测试

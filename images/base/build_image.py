@@ -5,19 +5,15 @@ base 只放六样：持久化三件套、装载设备 + 只读仓库设备、可
 见 README.md。
 
 设备文件按相对路径引用（`../packages/loader.py`、`../devices/*`），因此镜像可以
-直接放在仓库里运行；装载密码是 `base-operator`（面板宿主是唯一入口，审批计划会
-把它换成批准哈希）。
+直接放在仓库里运行；装载设备/程序包必须带面板审批得到的 `approved_sha256`。
 """
 
-import hashlib
 import json
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOOT_SOURCE = os.path.join(HERE, "programs", "boot.py")
 TARGET = os.path.join(HERE, "base.json")
-
-LOADER_PASSWORD = "base-operator"
 
 
 def _str(value, meta=None):
@@ -129,11 +125,7 @@ def build():
                 "path": "loader",
                 "file": "../packages/loader.py",
                 "class": "LoaderDevice",
-                "args": {
-                    "password_sha256": hashlib.sha256(
-                        LOADER_PASSWORD.encode("utf-8")
-                    ).hexdigest()
-                },
+                "args": {},
             },
             {
                 "path": "AVMRepo",
@@ -170,7 +162,6 @@ def build():
         json.dump(image, f, ensure_ascii=False, indent=2)
         f.write("\n")
     print(f"wrote {TARGET}")
-    print(f"loader 密码: {LOADER_PASSWORD}")
 
 
 if __name__ == "__main__":

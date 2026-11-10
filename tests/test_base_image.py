@@ -8,6 +8,7 @@
 5. 无阻塞：base 的程序里没有 `$MEM.inputs.next` 阻塞读。
 """
 
+import hashlib
 import json
 import os
 
@@ -16,7 +17,6 @@ from avm.image import load_image
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_IMAGE = os.path.join(REPO, "images", "base", "base.json")
-LOADER_PASSWORD = "base-operator"
 
 
 class NoLMU:
@@ -147,9 +147,11 @@ def test_loader_mounts_device_and_replay_keeps_it(tmp_path):
     core.attach_journal(core.journal_path)
     core.run()
 
+    with open(device_source, "rb") as f:
+        approved = hashlib.sha256(f.read()).hexdigest()
     command = json.dumps({
         "action": "load_device",
-        "password": LOADER_PASSWORD,
+        "approved_sha256": approved,
         "path": "echo",
         "file": str(device_source),
         "class": "EchoDevice",

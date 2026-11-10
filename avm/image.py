@@ -150,11 +150,20 @@ def _load_plms(core: Core, image_path: str, plms: list):
         core.plms[model] = cls
 
 
-def resolve_device_entry(dev: dict, base: Optional[str], subject: str = "设备"):
-    """解析一条 devices 条目（镜像 devices 段或程序包 devices 段）→ (cls, args, id, spec)。
+def _sha256_file(path: str) -> str:
+    """流式计算文件内容哈希（设备文件可能不小，不整块读进内存）。"""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    纯解析 + 加载设备模块，不挂载。spec 是设备来源表条目（快照/日志重放用）：
-    绝对路径 + 类名 + 构造参数 + 标识符 + 是否内建。
+
+def _device_entry_fields(dev: dict, base: Optional[str], subject: str = "设备"):
+    """解析设备条目的形状并解析文件路径，不 import、不读文件。
+
+    返回字段字典：path/subject/class/args/builtin/file_path/device_id。
+    镜像 devices 段、程序包 devices 段、日志重放与 loader 热装共用。
     """
     if not isinstance(dev, dict):
         raise ImageError(f"{subject}条目必须是对象，得到 {type(dev).__name__}")
@@ -175,7 +184,6 @@ def resolve_device_entry(dev: dict, base: Optional[str], subject: str = "设备"
             )
         if dev.get("file") is not None:
             raise ImageError(f"{subject}: builtin=true 不允许提供 file")
-        cls = BUILTIN_DEVICE_CLASSES[class_name]
     else:
         if not isinstance(dev.get("file"), str) or not isinstance(class_name, str):
             raise ImageError(f"{subject}: 必须包含 file 和 class")
@@ -183,18 +191,86 @@ def resolve_device_entry(dev: dict, base: Optional[str], subject: str = "设备"
         file_path = file_rel if os.path.isabs(file_rel) else os.path.join(base or os.getcwd(), file_rel)
         if not os.path.isfile(file_path):
             raise ImageError(f"{subject}: 设备文件不存在 {file_path}")
+    return {
+        "path": path,
+        "subject": subject,
+        "class": class_name,
+        "args": args,
+        "builtin": builtin,
+        "file_path": file_path,
+        "device_id": dev.get("id"),
+    }
+
+
+def _verify_device_sha256(fields: dict, dev: dict) -> Optional[str]:
+    """装载前核对设备文件哈希；返回实际哈希（内建返回 None）。
+
+    这是哈希校验的唯一落点（设备审批计划的 B 段），四条装载路径都经过
+    `mount_device_entry`。规则：
+
+    - 带 `approved_sha256`（loader 热装请求）时，文件哈希必须与批准值相等；
+    - 不带批准值但 spec 里有 `sha256`（快照恢复 / 日志重放 / 镜像重载）时，
+      必须与记录值相等；
+    - 两者都没有（镜像首次冷装载）时，计算并记录实际哈希。
+
+    不相等抛 ImageError（面向运行者），调用方不会 import、不会挂载。
+    """
+    file_path = fields["file_path"]
+    if file_path is None:
+        return None
+    actual = _sha256_file(file_path)
+    subject = fields["subject"]
+    for label, key in (("批准哈希", "approved_sha256"), ("记录哈希", "sha256")):
+        expected = dev.get(key)
+        if expected is None:
+            continue
+        if not isinstance(expected, str) or not expected:
+            raise ImageError(f"{subject}: {label}必须是非空字符串，得到 {expected!r}")
+        if expected.strip().lower() != actual:
+            raise ImageError(
+                f"{subject}: 文件哈希与{label}不一致（{file_path}）："
+                f"期望 {expected}，实际 {actual}；拒绝装载"
+            )
+    return actual
+
+
+def resolve_device_entry(dev: dict, base: Optional[str], subject: str = "设备",
+                         *, file_sha256: Optional[str] = None):
+    """解析一条 devices 条目（镜像 devices 段或程序包 devices 段）→ (cls, args, id, spec)。
+
+    纯解析 + 加载设备模块，不挂载。spec 是设备来源表条目（快照/日志重放用）：
+    绝对路径 + 类名 + 构造参数 + 标识符 + 是否内建；文件型设备带内容哈希 sha256。
+    """
+    fields = _device_entry_fields(dev, base, subject)
+    subject = fields["subject"]
+    path = fields["path"]
+    class_name = fields["class"]
+    args = fields["args"]
+    file_path = fields["file_path"]
+    if fields["builtin"]:
+        cls = BUILTIN_DEVICE_CLASSES[class_name]
+    else:
         module = _load_device_module(file_path, path)
         cls = getattr(module, class_name, None)
         if not isinstance(cls, type) or not issubclass(cls, MemoryDevice):
             raise ImageError(f"{subject}: {class_name} 必须是继承 MemoryDevice 的类")
+        if file_sha256 is None:
+            file_sha256 = _sha256_file(file_path)
     spec = {
         "path": file_path,
         "file": dev.get("file"),
         "class": class_name,
         "args": args,
         "id": dev.get("id"),
-        "builtin": builtin,
+        "builtin": fields["builtin"],
     }
+    if file_path is not None:
+        spec["sha256"] = file_sha256
+    # 审批记录只在 loader 装载时随请求带上；镜像冷装载与旧 journal 都没有。
+    for key in ("approved_sha256", "approved_at", "approved_via"):
+        value = dev.get(key)
+        if value is not None:
+            spec[key] = value
     return cls, args, dev.get("id"), spec
 
 
@@ -212,14 +288,20 @@ def instantiate_device(cls, args: dict, device_id, subject: str = "设备"):
 
 
 def mount_device_entry(core: Core, dev: dict, base: Optional[str] = None) -> dict:
-    """装载一台设备：解析 → 实例化 → 挂载 → 登记设备来源表。返回 spec。
+    """装载一台设备：校验文件哈希 → 解析 → 实例化 → 挂载 → 登记设备来源表。
 
+    哈希校验只在这里发生（设备审批计划的唯一落点）：文件型设备在 import 之前
+    重算 sha256，与请求的 approved_sha256 或 spec 的 sha256 比对；不相等拒绝装载。
     挂载是纯内存操作（Memory.mount 只改设备表与挂载点链接节点，不发事件），
     所以在指令执行中途调用是安全的；程序包装载、日志重放与镜像装载共用这一条路径。
     """
-    cls, args, device_id, spec = resolve_device_entry(dev, base)
-    path = dev["path"]
-    device = instantiate_device(cls, args, device_id, subject=f"设备 {path}")
+    fields = _device_entry_fields(dev, base)
+    actual_sha256 = _verify_device_sha256(fields, dev)
+    cls, args, device_id, spec = resolve_device_entry(
+        dev, base, file_sha256=actual_sha256,
+    )
+    path = fields["path"]
+    device = instantiate_device(cls, args, device_id, subject=fields["subject"])
     core.mem.mount(path, device)
     device.mount_path = path
     # 调试用：把 Core 引用交给设备（检查点 /save 等调试命令需要访问运行时状态）

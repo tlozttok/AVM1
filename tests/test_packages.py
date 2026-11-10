@@ -61,19 +61,57 @@ def write_package(tmp_path, *, name="demo", version="1_0_0", mem=None, devices=N
     return str(path)
 
 
+def package_sha256(path):
+    import hashlib
+
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
 class TestInstall:
     def test_install_creates_subtree_record_and_pointer(self, tmp_path):
         write_device_file(tmp_path)
         path = write_package(tmp_path)
         core = Core()
         record = packages.install(core, path)
-
         assert record["sha256"]
         assert core.unwrap("$MEM.packages.demo.1_0_0.data.msg", for_llm=False) == "hi"
         assert core.unwrap("$MEM.packages.demo.current", for_llm=False) == "1_0_0"
         installed = packages.list_installed(core)
         assert [item["name"] for item in installed] == ["demo"]
         assert installed[0]["source"] == os.path.abspath(path)
+
+    def test_wrong_approval_hash_fails_before_any_effect(self, tmp_path):
+        write_device_file(tmp_path)
+        path = write_package(tmp_path)
+        core = Core()
+        before = dict(core.mem._devices)
+        with pytest.raises(VMMemoryError, match="程序包哈希"):
+            packages.install(core, path, approved_sha256="0" * 64)
+        assert core.mem._devices == before
+        assert packages.list_installed(core) == []
+        assert "packages" not in core.mem._data
+        assert "package_records" not in core.mem._data
+
+    def test_install_records_device_hashes_and_approval(self, tmp_path):
+        write_device_file(tmp_path)
+        path = write_package(tmp_path)
+        digest = package_sha256(path)
+        core = Core()
+        packages.install(
+            core, path, approved_sha256=digest,
+            approved_at="2026-11-11T00:00:00+0800", approved_via="panel-1",
+        )
+        record = core.unwrap("$MEM.package_records.demo.1_0_0", for_llm=False)
+        assert record["sha256"] == digest
+        assert record["approved_sha256"] == digest
+        assert record["approved_at"] == "2026-11-11T00:00:00+0800"
+        assert record["approved_via"] == "panel-1"
+        (entry,) = list(record["devices"])
+        assert entry["sha256"] == package_sha256(str(tmp_path / "echo.py"))
+        assert core.device_specs["packages.demo.1_0_0.io"]["sha256"] == entry["sha256"]
+        assert core.device_specs["packages.demo.1_0_0.io"]["approved_sha256"] == digest
+        assert core.device_specs["packages.demo.1_0_0.io"]["approved_via"] == "panel-1"
 
     def test_install_twice_is_rejected(self, tmp_path):
         write_device_file(tmp_path)

@@ -5,7 +5,7 @@
     python images/packages/build_image.py
 
 演示内容（计划 B4）：
-- `loader` 设备（密码 demo-operator）挂在 `$MEM.loader`，装载命令一次写入；
+- `loader` 设备挂在 `$MEM.loader`，装载命令一次写入（设备/程序包用批准哈希）；
 - 内核态安全监听器 `$MEM.handlers.loader_guard`：只放行操作员对话（保留 cid `-1`）
   写 `$MEM.loader`，其余对话的写入被 replace；
 - 示例程序包 `example.pkg.json`：装到 `$MEM.packages.demo.1_0_0`，含一个
@@ -16,21 +16,17 @@
     python -m avm.console images/packages/packages_demo.json
 然后在操作员面板里依次让操作员发出：
     1. memory_write $MEM.loader '{"action": "install_package",
-         "password": "demo-operator", "path": "example.pkg.json"}'
+         "path": "example.pkg.json", "approved_sha256": "<包文件 sha256>"}'
     2. create_cmd $MEM.packages.demo.1_0_0.programs.pack $MEM.packages.demo.1_0_0.params
     3. send_instruction <cid> "yield from pack()"
 """
 
-import hashlib
 import json
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 IMAGE_PATH = os.path.join(HERE, "packages_demo.json")
 PACKAGE_PATH = os.path.join(HERE, "example.pkg.json")
-
-PASSWORD = "demo-operator"
-PASSWORD_SHA = hashlib.sha256(PASSWORD.encode("utf-8")).hexdigest()
 
 GUARD_CODE = """\
 def handle(event):
@@ -141,7 +137,7 @@ def build_image():
             "path": "loader",
             "file": "loader.py",
             "class": "LoaderDevice",
-            "args": {"password_sha256": PASSWORD_SHA},
+            "args": {},
         }],
         "init": {
             "name": "guard",

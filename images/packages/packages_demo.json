@@ -94,9 +94,7 @@
       "path": "loader",
       "file": "loader.py",
       "class": "LoaderDevice",
-      "args": {
-        "password_sha256": "9437e87fae95c03d3778f2575bb18ce30e647e51d86a8c37963364e1fc4f374e"
-      }
+      "args": {}
     }
   ],
   "init": {

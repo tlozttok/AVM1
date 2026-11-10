@@ -211,6 +211,25 @@ export interface DevicesResponse {
   action_log: ActionLogEntry[]
 }
 
+/** `POST /api/device/inspect`：装载设备前的只读检查（审批弹窗的数据源）。 */
+export interface DeviceInspection {
+  path: string
+  size: number
+  sha256: string
+  class: string | null
+  mount: string | null
+  args: Record<string, unknown> | null
+  /** 同一文件已在来源表里的条目；首次装载为 null。 */
+  existing: {
+    mount: string
+    class?: string | null
+    args?: Record<string, unknown> | null
+    sha256?: string | null
+    approved_at?: string | null
+    approved_via?: string | null
+  } | null
+}
+
 export interface Listener {
   listener_id: number
   event_type: string

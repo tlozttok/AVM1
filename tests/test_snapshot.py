@@ -5,6 +5,7 @@
 入口；全部不调真实 API。
 """
 
+import hashlib
 import json
 import os
 
@@ -223,6 +224,58 @@ class TestDevices:
         assert restored.device_specs["echo"]["class"] == "EchoDevice"
         assert restored.mem._devices["echo"].get_value() == "初始"
         assert_same_state(mine, restored)
+
+    @staticmethod
+    def _sha256(path):
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    def test_device_spec_records_sha256_and_snapshot_keeps_it(self, tmp_path):
+        image = self._device_image(tmp_path)
+        mine = _run(image, TWO_TURNS)
+        digest = self._sha256(tmp_path / "echo.py")
+        assert mine.device_specs["echo"]["sha256"] == digest
+        snap = str(tmp_path / "snap.json")
+        mine.snapshot_to(snap)
+        with open(snap, encoding="utf-8") as f:
+            doc = json.load(f)
+        assert doc["device_specs"]["echo"]["sha256"] == digest
+
+    def test_restore_rejects_changed_device_file(self, tmp_path):
+        image = self._device_image(tmp_path)
+        mine = _run(image, TWO_TURNS)
+        snap = str(tmp_path / "snap.json")
+        mine.snapshot_to(snap)
+        (tmp_path / "echo.py").write_text(
+            "from avm.memory_device import MemoryDevice\n"
+            "class EchoDevice(MemoryDevice):\n"
+            "    def __init__(self, value=''):\n"
+            "        self._value = value\n"
+            "    def pretend_as_type(self):\n"
+            "        return 'str'\n"
+            "    def to_llm_string(self):\n"
+            "        return '换掉了'\n",
+            encoding="utf-8",
+        )
+        restored = load_core(image)
+        with pytest.raises(SnapshotError, match="哈希") as excinfo:
+            restored.restore_from(snap)
+        assert "echo" in str(excinfo.value)
+        assert "echo.py" in str(excinfo.value)
+        assert "期望" in str(excinfo.value) and "实际" in str(excinfo.value)
+
+    def test_restore_rejects_old_spec_without_sha256(self, tmp_path):
+        image = self._device_image(tmp_path)
+        mine = _run(image, TWO_TURNS)
+        snap = str(tmp_path / "snap.json")
+        mine.snapshot_to(snap)
+        with open(snap, encoding="utf-8") as f:
+            doc = json.load(f)
+        doc["device_specs"]["echo"].pop("sha256")
+        write_atomic(snap, doc)
+        restored = load_core(image)
+        with pytest.raises(SnapshotError, match="重新审批"):
+            restored.restore_from(snap)
 
     def test_restore_clears_runtime_mounted_devices(self, tmp_path):
         """快照后热挂的设备不在快照里：恢复时以 device_specs 为准把它摘掉。"""

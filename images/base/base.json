@@ -140,9 +140,7 @@
       "path": "loader",
       "file": "../packages/loader.py",
       "class": "LoaderDevice",
-      "args": {
-        "password_sha256": "2ccd6aa93ef11c1bf3fccbe372c0d8a4b041c2fd4f7b17e71237ae2ffbcd0892"
-      }
+      "args": {}
     },
     {
       "path": "AVMRepo",

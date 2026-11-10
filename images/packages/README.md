@@ -14,15 +14,15 @@ python -m avm.console images/packages/packages_demo.json
 |---|---|
 | `loader.py` | `LoaderDevice`：把"装包 / 卸包 / 热装设备"变成对 `$MEM.loader` 的一次 `memory_write` |
 | `example.pkg.json` | 示例程序包：`$MEM.packages.demo.1_0_0`，含一个 `plm.python` 程序（`yield from` 工具调用：读 `$MEM.example.input`，把结果写 `$MEM.example.output`） |
-| `build_image.py` | 生成上面两个 JSON（loader 的密码 sha256 写进镜像 `devices.args`） |
+| `build_image.py` | 生成上面两个 JSON（loader 无密码；装载/安装命令必须带审批哈希） |
 | `packages_demo.json` | 内核态安全监听器只放行操作员对话（保留 cid `-1`）写 `$MEM.loader`，其他对话的写入被拦截 |
 
-演示密码：`demo-operator`（明文只在操作员手里；镜像里只有它的 sha256）。
+装载与安装要带操作员审批得到的 `approved_sha256`：设备文件或程序包文件的 sha256。
 
 操作员在控制台里依次发出（都是 `memory_write`/`create_cmd`/`send_instruction`，面板可以手选）：
 
 1. `memory_write $MEM.loader`
-   `{"action": "install_package", "password": "demo-operator", "path": "example.pkg.json"}`
+   `{"action": "install_package", "path": "example.pkg.json", "approved_sha256": "<包文件 sha256>"}`
 2. `create_cmd $MEM.packages.demo.1_0_0.programs.pack $MEM.packages.demo.1_0_0.params`
 3. `send_instruction <上一步的 cid> "yield from pack()"`
 4. 用 `memory_read $MEM.example.output` 看结果

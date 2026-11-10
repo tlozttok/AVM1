@@ -601,15 +601,23 @@ def _effect_device_mount(core, effect) -> None:
 
     mount = effect.get("mount")
     spec = effect.get("spec") or {}
-    mount_device_entry(core, {
+    dev = {
         "path": mount,
         "file": spec.get("path"),
         "class": spec.get("class"),
         "args": spec.get("args") or {},
         "id": spec.get("id"),
-    }, base=None)
-    # 来源表以日志记录为准（重放时重新解析的路径可能与记录形态不同）
-    core.device_specs[mount] = dict(spec)
+    }
+    if spec.get("sha256"):
+        # 重放按日志记录的内容哈希重建；旧日志没有该字段时由挂载入口计算并补记。
+        dev["sha256"] = spec["sha256"]
+    new_spec = mount_device_entry(core, dev, base=None)
+    # 来源表以日志记录为准（重放时重新解析的路径可能与记录形态不同）；
+    # 旧日志的 spec 没有 sha256，用本次重算值补上，避免下次快照变成"旧快照"。
+    recorded = dict(spec)
+    if not recorded.get("builtin") and not recorded.get("sha256"):
+        recorded["sha256"] = new_spec.get("sha256")
+    core.device_specs[mount] = recorded
 
 
 def _effect_device_unmount(core, effect) -> None:

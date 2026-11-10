@@ -4,6 +4,7 @@ from avm.exceptions import MemoryKeyNotFoundError
 起真实服务、本地请求每个端点，断言状态码与关键字段。前端的契约变了这里会先红。
 """
 
+import hashlib
 import http.client
 import json
 import threading
@@ -178,6 +179,130 @@ class TestReadEndpoints:
     def test_options_preflight(self, env):
         code, body = request(env[2], "OPTIONS", "/api/state")
         assert code == 204
+
+
+DEVICE_SOURCE = (
+    "from avm.memory_device import MemoryDevice\n"
+    "class EchoDevice(MemoryDevice):\n"
+    "    def __init__(self, value=''):\n"
+    "        self._value = value\n"
+    "    def pretend_as_type(self):\n"
+    "        return 'str'\n"
+    "    def to_llm_string(self):\n"
+    "        return self._value\n"
+)
+
+
+class TestDeviceInspect:
+    """POST /api/device/inspect：审批弹窗的只读数据源。"""
+
+    def _device_file(self, tmp_path, name="dev.py"):
+        path = tmp_path / name
+        path.write_text(DEVICE_SOURCE, encoding="utf-8")
+        return path
+
+    def test_inspect_returns_hash_class_and_echoed_fields(self, env, tmp_path):
+        core, console, base, _ = env
+        core.image_dir = str(tmp_path)
+        device_file = self._device_file(tmp_path)
+        digest = hashlib.sha256(DEVICE_SOURCE.encode("utf-8")).hexdigest()
+        code, body = request(base, "POST", "/api/device/inspect", {
+            "path": str(device_file), "mount": "extra",
+            "class": "EchoDevice", "args": {"value": "预览"},
+        })
+        assert code == 200, body
+        assert body["path"] == str(device_file.resolve())
+        assert body["size"] == len(DEVICE_SOURCE.encode("utf-8"))
+        assert body["sha256"] == digest
+        assert body["class"] == "EchoDevice"
+        assert body["mount"] == "extra"
+        assert body["args"] == {"value": "预览"}
+        assert body["existing"] is None
+
+    def test_inspect_reports_existing_mount_and_hash(self, env, tmp_path):
+        core, console, base, _ = env
+        core.image_dir = str(tmp_path)
+        device_file = self._device_file(tmp_path)
+        digest = hashlib.sha256(DEVICE_SOURCE.encode("utf-8")).hexdigest()
+        core.device_specs["echo"] = {
+            "path": str(device_file), "class": "EchoDevice",
+            "args": {"value": "已挂"}, "builtin": False, "sha256": digest,
+            "approved_at": "2026-11-11T00:00:00+0800", "approved_via": "panel-1",
+        }
+        code, body = request(base, "POST", "/api/device/inspect", {
+            "path": str(device_file),
+        })
+        assert code == 200, body
+        assert body["mount"] == "echo"
+        assert body["class"] == "EchoDevice"
+        assert body["existing"]["mount"] == "echo"
+        assert body["existing"]["sha256"] == digest
+        assert body["existing"]["approved_via"] == "panel-1"
+
+    def test_inspect_allows_installed_package_directory(self, env, tmp_path):
+        core, console, base, _ = env
+        image_dir = tmp_path / "image"
+        image_dir.mkdir()
+        core.image_dir = str(image_dir)
+        package_dir = tmp_path / "pkg"
+        package_dir.mkdir()
+        device_file = self._device_file(package_dir, "pkg_dev.py")
+        record = MetaDict(data={})
+        record["source"] = str(package_dir / "demo.pkg.json")
+        versions = MetaDict(data={})
+        versions["1_0_0"] = record
+        records = MetaDict(data={})
+        records["demo"] = versions
+        core.mem._data["package_records"] = records
+
+        code, body = request(base, "POST", "/api/device/inspect", {
+            "path": str(device_file),
+        })
+        assert code == 200, body
+        assert body["path"] == str(device_file.resolve())
+        assert body["class"] == "EchoDevice"
+
+    def test_inspect_rejects_path_outside_image_directory(self, env, tmp_path):
+        core, console, base, _ = env
+        image_dir = tmp_path / "image"
+        image_dir.mkdir()
+        core.image_dir = str(image_dir)
+        outside = self._device_file(tmp_path, "outside.py")
+        code, body = request(base, "POST", "/api/device/inspect", {
+            "path": str(outside),
+        })
+        assert code == 400
+        assert "镜像目录或程序包目录" in body["error"]
+
+    def test_inspect_rejects_arbitrary_absolute_path(self, env, tmp_path):
+        core, console, base, _ = env
+        image_dir = tmp_path / "image"
+        image_dir.mkdir()
+        core.image_dir = str(image_dir)
+        code, body = request(base, "POST", "/api/device/inspect", {
+            "path": "/etc/passwd",
+        })
+        assert code == 400
+        assert "镜像目录或程序包目录" in body["error"]
+
+    def test_inspect_rejects_class_not_in_file(self, env, tmp_path):
+        core, console, base, _ = env
+        core.image_dir = str(tmp_path)
+        device_file = self._device_file(tmp_path)
+        code, body = request(base, "POST", "/api/device/inspect", {
+            "path": str(device_file), "class": "NopeDevice",
+        })
+        assert code == 400
+        assert "NopeDevice" in body["error"]
+
+    def test_inspect_requires_image_directory(self, env, tmp_path):
+        core, console, base, _ = env
+        core.image_dir = None
+        code, body = request(base, "POST", "/api/device/inspect", {
+            "path": str(self._device_file(tmp_path)),
+        })
+        assert code == 400
+        assert "拒绝检查任意路径" in body["error"]
 
 
 class TestWriteEndpoints:

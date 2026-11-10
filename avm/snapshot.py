@@ -187,13 +187,27 @@ def _rebuild_memory_and_devices(core, doc: dict) -> None:
                 f"设备 {mount} 的文件不存在：{file_path!r}——快照依赖设备文件留在原路径，"
                 "恢复前请把设备文件放回"
             )
-        mount_device_entry(core, {
-            "path": mount,
-            "file": file_path,
-            "class": spec.get("class"),
-            "args": spec.get("args") or {},
-            "id": spec.get("id"),
-        }, base=None)
+        recorded_sha256 = spec.get("sha256")
+        if not isinstance(recorded_sha256, str) or not recorded_sha256:
+            # 旧快照的文件型设备没有内容哈希。首次加载后补记等于信任当前文件，
+            # 审批计划作者定：拒绝恢复并提示重新审批（开发期接受破坏旧快照）。
+            raise SnapshotError(
+                f"设备 {mount} 的快照记录缺少 sha256（旧快照）："
+                "拒绝恢复，请重新审批并装载该设备后再保存快照"
+            )
+        try:
+            mount_device_entry(core, {
+                "path": mount,
+                "file": file_path,
+                "class": spec.get("class"),
+                "args": spec.get("args") or {},
+                "id": spec.get("id"),
+                # 恢复只带记录哈希；快照里的 approved_sha256 是历史审批事实，
+                # 不参与本次核对（否则像包安装那样它可能是程序包哈希而非设备哈希）。
+                "sha256": recorded_sha256,
+            }, base=None)
+        except ValueError as e:  # ImageError：报错里已有设备名、路径与期望/实际哈希
+            raise SnapshotError(f"设备 {mount} 恢复失败：{e}") from e
         # 来源表以快照记录为准（挂载路径可能被规范化，比较/重启要求逐字段一致）
         core.device_specs[mount] = dict(spec)
     # 设备挂载点重新物化（mount 已建链接；这里兜底快照树里没带的挂载点）

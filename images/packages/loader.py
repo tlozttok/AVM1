@@ -3,28 +3,33 @@
 把它挂到 `$MEM.loader` 之类的路径上，操作员对话用 `memory_write` 写入一段 JSON：
 
 ```json
-{"action": "install_package", "password": "...", "path": "example.pkg.json"}
-{"action": "uninstall_package", "password": "...", "name": "demo", "package_version": "1.0.0"}
-{"action": "load_device", "password": "...", "path": "extra", "file": "echo.py",
- "class": "EchoDevice", "args": {}}
+{"action": "install_package", "path": "example.pkg.json",
+ "approved_sha256": "<程序包文件 sha256>"}
+{"action": "uninstall_package", "name": "demo", "package_version": "1.0.0"}
+{"action": "load_device", "path": "extra", "file": "echo.py",
+ "class": "EchoDevice", "args": {},
+ "approved_sha256": "<设备文件 sha256>"}
 ```
+
+装载与安装必须带 `approved_sha256`（操作员在面板审批弹窗里看到的文件哈希）；
+loader 把它透传给挂载/安装入口，由内核的 `mount_device_entry` 在 import 前重算
+文件哈希并核对。密码不再是凭证：审批是人的仪式，批准的是"哪段代码"。
 
 三条约束（计划 B3）：
 
 1. **不实现 `emit_device_event` / `after_event`**：设备不发事件。装载是纯内存操作
    （Memory.mount 只改设备表与挂载点链接节点），不触发事件管道。
-2. **错误信息不回显写入原文**：只给原因类别（密码不匹配 / 命令不是合法 JSON /
-   程序包安装失败……）；写入原文可能含密码。
+2. **错误信息不回显写入原文**：只给原因类别（批准哈希缺失/不匹配、命令不是合法
+   JSON、程序包安装失败……）。
 3. **成功返回 None**：结果靠观察设备表与 `$MEM.packages` / `$MEM.package_records`
    得到，不从返回通道塞回执。
 
-密码：构造参数 `password_sha256` 是操作员密码的 sha256（密码只在镜像 `devices.args`
-或宿主环境，不进 `$MEM`）。未配置密码时拒绝一切写入——安全缺省。
+卸载不加载代码，不要求审批；但旧命令里的 `password` 字段一律拒绝。
 """
 
-import hashlib
 import json
 import os
+import time
 
 from avm.exceptions import IllegalOperationError, VMMemoryError
 from avm.memory_device import MemoryDevice
@@ -32,15 +37,30 @@ from avm.memory_device import MemoryDevice
 _ACTIONS = ("install_package", "uninstall_package", "load_device")
 
 
-def _sha256(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def _approval(payload: dict) -> tuple:
+    """取审批三元组；approved_sha256 是装载/安装的唯一必需字段。
+
+    approved_at / approved_via 是宿主/面板写下的审批事实，缺省时由 loader 补
+    （直接写 JSON 的调用没有面板会话；时间取写入时刻）。
+    """
+    approved = payload.get("approved_sha256")
+    if not isinstance(approved, str) or not approved.strip():
+        raise VMMemoryError(
+            "装载命令必须带 approved_sha256（设备/程序包审批哈希）"
+        )
+    approved_at = payload.get("approved_at")
+    if not isinstance(approved_at, str) or not approved_at.strip():
+        approved_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    approved_via = payload.get("approved_via")
+    if not isinstance(approved_via, str) or not approved_via.strip():
+        approved_via = "loader"
+    return approved.strip().lower(), approved_at, approved_via
 
 
 class LoaderDevice(MemoryDevice):
     """把"安装程序包 / 卸载程序包 / 装载设备"变成对挂载路径的一次 memory_write。"""
 
-    def __init__(self, password_sha256: str = "", base_dir: str = ""):
-        self._password_sha = str(password_sha256 or "").strip().lower()
+    def __init__(self, base_dir: str = ""):
         self._base_dir = str(base_dir or "")
         self._core = None
 
@@ -71,25 +91,21 @@ class LoaderDevice(MemoryDevice):
             raise IllegalOperationError("装载命令不是合法 JSON") from None
         if not isinstance(payload, dict):
             raise IllegalOperationError("装载命令必须是 JSON 对象")
+        if "password" in payload:
+            raise IllegalOperationError(
+                "装载命令不再接受 password：请改用 approved_sha256 走设备审批"
+            )
         action = payload.get("action")
         if action not in _ACTIONS:
             raise IllegalOperationError(f"装载命令 action 不支持：{action!r}")
-        self._check_password(payload)
         if action == "install_package":
-            self._install(payload)
+            approved, approved_at, approved_via = _approval(payload)
+            self._install(payload, approved, approved_at, approved_via)
         elif action == "uninstall_package":
             self._uninstall(payload)
         else:
-            self._load_device(payload)
-
-    def _check_password(self, payload: dict) -> None:
-        if not self._password_sha:
-            raise VMMemoryError("装载设备没有配置密码，拒绝写入")
-        password = payload.get("password")
-        if not isinstance(password, str) or not password:
-            raise VMMemoryError("密码不匹配")
-        if _sha256(password) != self._password_sha:
-            raise VMMemoryError("密码不匹配")
+            approved, approved_at, approved_via = _approval(payload)
+            self._load_device(payload, approved, approved_at, approved_via)
 
     def _base(self) -> str:
         if self._base_dir:
@@ -101,13 +117,16 @@ class LoaderDevice(MemoryDevice):
         return path if os.path.isabs(path) else os.path.normpath(
             os.path.join(self._base(), path))
 
-    def _install(self, payload: dict) -> None:
+    def _install(self, payload: dict, approved: str, approved_at: str,
+                 approved_via: str) -> None:
         from avm.packages import install
 
         path = payload.get("path")
         if not isinstance(path, str) or not path:
             raise IllegalOperationError("install_package 需要非空 path")
-        install(self._core, self._resolve(path), base_dir=self._base())
+        install(self._core, self._resolve(path), base_dir=self._base(),
+                approved_sha256=approved, approved_at=approved_at,
+                approved_via=approved_via)
 
     def _uninstall(self, payload: dict) -> None:
         from avm.packages import uninstall
@@ -120,7 +139,8 @@ class LoaderDevice(MemoryDevice):
             raise IllegalOperationError("uninstall_package 需要非空 package_version")
         uninstall(self._core, name, package_version)
 
-    def _load_device(self, payload: dict) -> None:
+    def _load_device(self, payload: dict, approved: str, approved_at: str,
+                     approved_via: str) -> None:
         from avm.image import ImageError, mount_device_entry
 
         mount = payload.get("path")
@@ -141,6 +161,9 @@ class LoaderDevice(MemoryDevice):
             "class": class_name,
             "args": args,
             "id": payload.get("id"),
+            "approved_sha256": approved,
+            "approved_at": approved_at,
+            "approved_via": approved_via,
         }
         try:
             spec = mount_device_entry(self._core, dev, base=None)
