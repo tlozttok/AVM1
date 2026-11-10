@@ -76,7 +76,9 @@ html,
 
 .col-right {
   display: grid;
-  grid-template-rows: minmax(0, auto) minmax(0, 1fr);
+  /* 两个面板都有上限、都在自己内部滚动：动作面板内容会随调试区块增长，
+     用 auto 行会把事件流挤成 0 高（点不到日志行）。 */
+  grid-template-rows: minmax(0, 3fr) minmax(0, 2fr);
   gap: 1px;
   background: var(--line);
 }
@@ -96,6 +98,11 @@ html,
   padding: 10px 12px;
   overflow: auto;
   flex: 1;
+}
+
+/* 动作面板内容比事件流长：在自己的格子里滚动，不挤掉事件流。 */
+.action-panel {
+  overflow-y: auto;
 }
 
 .pane-title {

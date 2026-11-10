@@ -306,6 +306,7 @@ class TestConsoleEndpoints:
         code, record, _ = _request(
             base, "POST", "/api/io/input", {"target": "7", "text": "给 7 的输入"})
         assert code == 200
+        assert record["debug"] is True, "io/input 是调试通道，响应要标注"
         assert record["seq"] == 1
         assert record["target"] == "7"
         assert core.io_bus.drain_input()[0]["text"] == "给 7 的输入"

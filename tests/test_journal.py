@@ -378,6 +378,7 @@ class TestReservedConversationRecord:
         assert restored.mem["dst"] == "hi"
         conv = restored.get_conversation(PANEL_CID)
         assert conv is not None and restored.is_hidden_cid(PANEL_CID)
+        assert conv.attrs.get("hidden") == "1", "补建出来的保留对话要带宿主隐藏标记"
 
     def test_reserved_conversation_survives_snapshot_and_journal_tail(self, tmp_path):
         import json as _json
@@ -414,6 +415,7 @@ class TestReservedConversationRecord:
         assert restored.mem["dst"] == "in-tail"
         conv = restored.get_conversation(PANEL_CID)
         assert conv is not None and restored.is_hidden_cid(PANEL_CID)
+        assert conv.attrs.get("hidden") == "1", "补建出来的保留对话要带宿主隐藏标记"
 
 
 FOUR_TURNS = [

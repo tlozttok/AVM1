@@ -1730,9 +1730,16 @@ class Core:
         # 启动自带的内存节点：模型目录（静态部分；LLM 清单由宿主 refresh_model_catalog 填）
         self.install_model_catalog()
 
-    @staticmethod
-    def is_hidden_cid(cid) -> bool:
-        """保留对话 cid：对普通对话隐藏、不可寻址（显示/寻址策略，不影响恢复）。"""
+    def is_hidden_cid(self, cid) -> bool:
+        """对话是否对普通对话隐藏、不可寻址（显示/寻址策略，不影响恢复）。
+
+        判定读对话自己的 `attrs["hidden"]`（宿主在保留对话创建时写 "1"）；
+        `cid == PANEL_CID` 作为兼容判定保留：旧快照/旧日志里恢复出来的保留对话
+        没有 attrs，不能因为缺标记就变成可见。
+        """
+        conv = self._conv_by_cid.get(cid)
+        if conv is not None and (conv.attrs or {}).get("hidden") == "1":
+            return True
         return cid == PANEL_CID
 
     # ------------------------------------------------------------------
@@ -2518,6 +2525,9 @@ class Core:
             is_sub=False,
             parent=None,
             is_root=False,
+            # 宿主标记：控制台持有的保留对话对普通对话隐藏。判定只读 attrs
+            # （旧快照没有 attrs 时由 is_hidden_cid 的 cid 兼容分支兜底）。
+            attrs={"host": "console", "hidden": "1"},
         )
         self._register(conv, cid=PANEL_CID)
         conv.para_ref = para_ref or self.para_ref

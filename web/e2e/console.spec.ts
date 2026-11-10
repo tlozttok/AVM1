@@ -279,11 +279,22 @@ test('操作面板：顶栏、输出流、定向输入与调试抽屉', async ({
   await expect(out.getByTestId('output-notify').first()).toBeVisible()
   await expect(out.getByTestId('output-connected')).toContainText('SSE 已连接')
 
-  // 定向输入只走 /api/io/input，不经面板对话、不发起工具调用
+  // 正式输入走 /api/input：宿主把条目追加到 $MEM.sys.inbox（保留对话执行，可重放）
   await page.getByTestId('input-target').selectOption('0')
   await page.getByTestId('input-text').fill('给 cid 0 的一句话')
   await page.getByTestId('input-send').click()
-  await expect(page.getByTestId('input-result')).toContainText('cid 0')
+  await expect(page.getByTestId('input-result')).toContainText('已接收')
+  // 提交完成的动作经现有事件流出现（面板对话执行 memory_write）
+  await expect(
+    page.getByTestId('event-log').getByTestId('log-entry-tool_call')
+      .filter({ hasText: 'memory_write' }).first(),
+  ).toBeVisible()
+
+  // 调试抽屉保留 /api/io/input，并标注它不重放（默认收起，点开再用）
+  await page.getByTestId('debug-io-toggle').click()
+  await page.getByTestId('debug-io-text').fill('调试通道的一句话')
+  await page.getByTestId('debug-io-send').click()
+  await expect(page.getByTestId('debug-io-result')).toContainText('不重放')
 
   // 关机入口：确认流程出现后取消，不真的关掉共用的 mock 服务。
   // 强制退出不是常驻按钮：只有请求关机并等满后端给的收尾时间才出现。

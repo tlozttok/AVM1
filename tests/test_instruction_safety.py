@@ -573,6 +573,25 @@ class TestPanelConversationHidden:
         assert f"cid={panel.cid} " not in convs
         assert "-1" not in sched, "调度队列里的面板 cid 也要过滤"
 
+    def test_panel_carries_host_markers(self):
+        """保留对话创建时写宿主标记；隐藏判定读 attrs，cid 兼容作为兜底。"""
+        core, conv, panel = self._core_with_panel()
+        assert panel.attrs == {"host": "console", "hidden": "1"}
+        assert not core.is_hidden_cid(conv.cid)
+
+        panel.attrs = {}  # 旧快照/旧路径没有 attrs
+        assert core.is_hidden_cid(panel.cid), "没有 attrs 时按 cid == PANEL_CID 兜底"
+        assert f"cid={panel.cid} " not in core.unwrap("$MEM.conversations")
+
+    def test_hidden_attr_can_hide_an_ordinary_conversation(self):
+        """判定读的是对话自己的 attrs，不是 cid 特判。"""
+        core, conv, _panel = self._core_with_panel()
+        conv.attrs = {"host": "console", "hidden": "1"}
+        assert core.is_hidden_cid(conv.cid)
+        assert f"cid={conv.cid} " not in core.unwrap("$MEM.conversations")
+        with pytest.raises(VMMemoryError):
+            core.unwrap(f"$conv.{conv.cid}")
+
     def test_not_addressable_by_instructions(self):
         core, conv, panel = self._core_with_panel()
         _call(core, conv, "send_instruction", {"cid": panel.cid, "content": "hi"})

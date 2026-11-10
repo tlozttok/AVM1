@@ -124,6 +124,68 @@ def test_inbox_write_is_journaled_and_replayable(tmp_path):
     assert inbox and json.loads(inbox[0])["id"] == "m1"
 
 
+def _run_panel_input(core, channel, panel, text):
+    """让保留对话把一条 inbox 追加动作跑完（写 + 结束本轮）。"""
+    channel.submit_actions([
+        {
+            "tool": "memory_write",
+            "arguments": {
+                "ref": "$MEM.sys.inbox.-1",
+                "content": json.dumps(
+                    {"id": text, "target": None, "text": text, "status": "new"},
+                    ensure_ascii=False,
+                ),
+            },
+        },
+        {"end": True},
+    ])
+    # 模拟中断派发激活保留对话：先移出休眠队列，否则 Core 把它当成"本轮自己让出"
+    if panel.cid in core._dormant_cids:
+        core._dormant_cids.remove(panel.cid)
+    core._active_cid = panel.cid
+    for _ in range(10):
+        if core._active_cid != panel.cid:
+            return
+        core.advance_conversation()
+    raise AssertionError("保留对话没有让出执行权")
+
+
+def test_inbox_survives_snapshot_and_journal_tail(tmp_path):
+    """正式输入可重放：快照 + 日志尾部恢复后 inbox 内容一致，保留对话仍隐藏。"""
+    from avm.console import OperatorChannel
+    from avm.core import PANEL_CID
+    from avm.snapshot import snapshot
+
+    image = prepared_image(tmp_path)
+    core = load_image(Core(), image)
+    core.lmu = NoLMU()
+    core.attach_journal(core.journal_path)
+    core.run()  # boot
+
+    channel = OperatorChannel()
+    panel = core.start_operator_conversation(channel, para_ref="$MEM.para.python")
+    _run_panel_input(core, channel, panel, "first")
+
+    snap_path = tmp_path / "snap.json"
+    snap_path.write_text(
+        json.dumps(snapshot(core), ensure_ascii=False), encoding="utf-8")
+    _run_panel_input(core, channel, panel, "second")
+
+    restored = load_image(Core(), image, restore=True)
+    restored.lmu = NoLMU()
+    restored.attach_journal(restored.journal_path)
+    restored.restore_from(str(snap_path))
+    assert restored.replay_journal() >= 1
+
+    inbox = list(restored.unwrap("$MEM.sys.inbox", for_llm=False))
+    assert [json.loads(item)["text"] for item in inbox] == ["first", "second"]
+    conv = restored.get_conversation(PANEL_CID)
+    assert conv is not None
+    assert conv.attrs.get("host") == "console" and conv.attrs.get("hidden") == "1"
+    assert restored.is_hidden_cid(PANEL_CID)
+    assert f"cid={PANEL_CID} " not in restored.unwrap("$MEM.conversations")
+
+
 def test_loader_mounts_device_and_replay_keeps_it(tmp_path):
     from avm.console import OperatorChannel
 
