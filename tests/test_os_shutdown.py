@@ -87,12 +87,15 @@ def _add_stubborn_apps(image, interval="2"):
 def prepared_image(tmp_path, *, mutate=None):
     with open(BASE_IMAGE, encoding="utf-8") as f:
         image = json.load(f)
+    base_dir = os.path.dirname(BASE_IMAGE)
     for dev in image.get("devices") or []:
         file_path = dev.get("file")
         if isinstance(file_path, str) and not os.path.isabs(file_path):
-            dev["file"] = os.path.normpath(
-                os.path.join(os.path.dirname(BASE_IMAGE), file_path)
-            )
+            dev["file"] = os.path.normpath(os.path.join(base_dir, file_path))
+    for plm in image.get("plms") or []:
+        file_path = plm.get("file")
+        if isinstance(file_path, str) and not os.path.isabs(file_path):
+            plm["file"] = os.path.normpath(os.path.join(base_dir, file_path))
     if mutate is not None:
         mutate(image)
     path = tmp_path / "base.json"

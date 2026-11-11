@@ -18,6 +18,7 @@ python -m avm.image <image.json>
 | `mem` | 是 | 内存树（对象，顶层键 → 显式节点） |
 | `para_ref` | 否 | para 节点路径，默认 `$MEM.model_params` |
 | `devices` | 否 | 设备挂载列表 |
+| `plms` | 否 | 镜像声明的自定义 PLM 列表（`{model, file, class}`，见下文） |
 | `security` | 否 | 权限段：只含根注册表 `roots`（见下文） |
 | `init` | 否 | 启动对话配置（缺省时不启动任何对话） |
 | `persist_to` | 否 | 运行结束后内存写回路径（相对镜像文件所在目录） |
@@ -148,6 +149,17 @@ python -m avm.image <image.json>
   ]
 }
 ```
+
+## plms（镜像声明的自定义 PLM）
+
+可选数组，形状与 `devices` 对称：每个条目 `{model, file, class}`。
+
+- `model` 是 PLM 注册名（如 `plm.builder`），不能与内建注册表重名；
+- `file` 是实现文件，相对镜像目录；`class` 必须是 `avm.python_server.PLMServer` 的子类；
+- 装载发生在模型目录安装之前，因此模型目录会列出它；`create_cmd` / `create_sub` 的程序节点用 `para.model` 选择它；
+- 镜像声明的 PLM 只在当前核内可见，不随程序包分发（移植契约的硬约束）。
+
+base 镜像用这个机制提供构造器 `plm.builder`：把创建 settingup/python 程序节点、handler、para 等多步指令打包成一条 JSON 规格，详见 [images/base/README.md](../images/base/README.md) 的「构造器 PLM」一节。
 
 ## security（权限：根注册表）
 

@@ -1,10 +1,12 @@
 """生成 base 镜像：`python images/base/build_image.py`。
 
-base 只放六样：持久化三件套、装载设备 + 只读仓库设备、OS 程序节点
+base 只放七样：持久化三件套、装载设备 + 只读仓库设备、OS 程序节点
 （boot/shutdown 两个 guest 角色程序 + clock_a/clock_b 服务程序）、可编辑的常驻
-服务清单、空分区骨架、标准 IO 设备。空闲由宿主 console 的面板对话承担（内核把
-`idle` 中断向量指向面板），镜像不再声明 idle 角色、不预置 inbox/面板服务；关机由
-宿主挂 `shutdown` 中断唤醒 supervisor。其余基础由作者在系统内手动搭建，见 README.md。
+服务清单、空分区骨架、标准 IO 设备、构造器 PLM（`plm.builder`，镜像的 plms 段
+声明 + 一个 Python 程序节点 + 一个 para 档，作者可直接 create_cmd 出来用）。
+空闲由宿主 console 的面板对话承担（内核把 `idle` 中断向量指向面板），镜像不再
+声明 idle 角色、不预置 inbox/面板服务；关机由宿主挂 `shutdown` 中断唤醒
+supervisor。其余基础由作者在系统内手动搭建，见 README.md。
 
 设备文件按相对路径引用（`../packages/loader.py`、`../devices/*`），因此镜像可以
 直接放在仓库里运行；装载设备/程序包必须带面板审批得到的 `approved_sha256`。
@@ -26,6 +28,12 @@ OS_PROGRAMS = (
     ("supervisor", "supervisor.py", None),
     ("clock_a", "clock_a.py", "clock_a"),
     ("clock_b", "clock_b.py", "clock_b"),
+)
+
+# 构造器 PLM 的程序节点。system 消息（这段说明）会被 PLM 忽略，不要求是 JSON。
+BUILDER_PROGRAM = (
+    "构造器：system 消息不生效；用户消息是 JSON 规格"
+    "（mode/ops/calls，见 images/base/README.md 的「构造器 PLM」一节）。"
 )
 
 
@@ -58,10 +66,10 @@ def _para(model):
     )
 
 
-def _program_python(source, meta, name=None):
+def _program_python(source, meta, name=None, para_ref="$MEM.para.python"):
     value = {
         "content": _str(source),
-        "para_ref": _str("$MEM.para.python"),
+        "para_ref": _str(para_ref),
     }
     if name is not None:
         value["name"] = _str(name)
@@ -81,6 +89,12 @@ def build():
             "OS 程序节点（可编辑）",
             name=name,
         )
+    programs["builder"] = _program_python(
+        BUILDER_PROGRAM,
+        "构造器 PLM（plm.builder）的入口程序；用户消息是 JSON 构造规格",
+        name="builder",
+        para_ref="$MEM.para.builder",
+    )
 
     image = {
         "meta": {
@@ -88,7 +102,8 @@ def build():
             "version": 1,
             "description": (
                 "母板镜像：持久化三件套 + 装载设备 + OS 程序（boot/shutdown 角色与 "
-                "clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架。"
+                "clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架 + "
+                "构造器 PLM（plm.builder）。"
                 "空闲由宿主面板对话承担；不带业务；其余基础由作者在系统内手动搭建。"
             ),
             "instruction_budget": 100,
@@ -104,6 +119,7 @@ def build():
                 {
                     "python": _para("plm.python"),
                     "command": _para("plm.command"),
+                    "builder": _para("plm.builder"),
                 },
                 meta="模型档位；新的 para 由作者在系统内添加",
             ),
@@ -186,6 +202,13 @@ def build():
                 "file": "../devices/io.py",
                 "class": "OutputsListDevice",
                 "args": {},
+            },
+        ],
+        "plms": [
+            {
+                "model": "plm.builder",
+                "file": "plms/builder.py",
+                "class": "NodeBuilderPLM",
             },
         ],
         "init": {

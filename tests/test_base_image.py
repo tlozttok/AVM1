@@ -38,15 +38,18 @@ class NoLMU:
 
 
 def prepared_image(tmp_path, *, mutate=None):
-    """复制 base 镜像到 tmp，把设备文件改成绝对路径；可再改 mem。"""
+    """复制 base 镜像到 tmp，把设备/PLM 文件改成绝对路径；可再改 mem。"""
     with open(BASE_IMAGE, encoding="utf-8") as f:
         image = json.load(f)
+    base_dir = os.path.dirname(BASE_IMAGE)
     for dev in image.get("devices") or []:
         file_path = dev.get("file")
         if isinstance(file_path, str) and not os.path.isabs(file_path):
-            dev["file"] = os.path.normpath(
-                os.path.join(os.path.dirname(BASE_IMAGE), file_path)
-            )
+            dev["file"] = os.path.normpath(os.path.join(base_dir, file_path))
+    for plm in image.get("plms") or []:
+        file_path = plm.get("file")
+        if isinstance(file_path, str) and not os.path.isabs(file_path):
+            plm["file"] = os.path.normpath(os.path.join(base_dir, file_path))
     if mutate is not None:
         mutate(image)
     path = tmp_path / "base.json"
@@ -317,7 +320,7 @@ def test_base_programs_have_no_blocking_input_read():
     with open(BASE_IMAGE, encoding="utf-8") as f:
         image = json.load(f)
     programs = image["mem"]["sys"]["value"]["programs"]["value"]
-    assert set(programs) == {"boot", "supervisor", "clock_a", "clock_b"}
+    assert set(programs) == {"boot", "supervisor", "clock_a", "clock_b", "builder"}
     for name, node in programs.items():
         content = node["value"]["content"]["value"]
         assert "$MEM.inputs.next" not in content, f"程序 {name} 含阻塞读"

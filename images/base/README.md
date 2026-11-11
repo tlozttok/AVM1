@@ -19,21 +19,96 @@ python -m avm.console images/base/base.json
 | `$MEM.sys.boot.state` / `.prior` / `.id` / `.report` | 启动标记（`running` / `clean`）、上次状态、上电序号、最近一次恢复报告 |
 | `$MEM.sys.boot.manifest` | 常驻服务清单（JSON 字符串，初始 `[]`）；boot 程序按它创建缺失对话 |
 | `$MEM.sys.registry` | 名字 → cid；boot 程序重写（只记 manifest 服务；OS 服务的 cid 不落持久 MEM） |
-| `$MEM.sys.programs.*` | OS 程序节点（`boot` / `supervisor` / `clock_a` / `clock_b`），可在系统内改写 |
+| `$MEM.sys.programs.*` | OS 程序节点（`boot` / `supervisor` / `clock_a` / `clock_b`）与构造器入口（`builder`），可在系统内改写 |
 | `$MEM.sys.outbox` | 持久输出（作者约定怎么用） |
 | `$MEM.sys.clock` | 设备事件钟：`tick` / `target` / `interval` / `timeouts` / `state` |
 | `$MEM.sys.handbook` | 分区与自举约定 |
-| `$MEM.para.python` / `.command` | 两个内建 PLM 的参数档 |
+| `$MEM.para.python` / `.command` / `.builder` | 内建 PLM 的参数档（构造器用 `.builder`） |
 | `$MEM.packages` / `package_records` | 由装载设备管理 |
 | `$MEM.workshop` / `$MEM.home` | 试验区 / 个人数据区（空） |
 | `$MEM.loader` | 装载设备（程序包、设备） |
 | `$MEM.AVMRepo` | 仓库只读设备（查文档用） |
 | `$MEM.inputs` / `$MEM.outputs` | 标准 IO 设备；操作面板宿主会替换成总线设备 |
 
-程序节点里 `ctrl.type="python"`、`value.content` 是程序源、`value.para_ref` 指向
+OS 程序节点里 `ctrl.type="python"`、`value.content` 是程序源、`value.para_ref` 指向
 `$MEM.para.python`；服务节点的 `value.name`（`clock_a` / `clock_b`）会成为对话身份。
-顶层声明 `journal_to` / `snapshot_to` / `persist_to`，落点在
+构造器入口同样是一个 `ctrl.type="python"` 节点，它的 `value.para_ref` 指向
+`$MEM.para.builder`。顶层声明 `journal_to` / `snapshot_to` / `persist_to`，落点在
 `images/base/out/`；`meta.snapshot_every=200`。
+
+## 构造器 PLM（plm.builder）
+
+镜像顶层 `plms` 段声明了自定义 PLM `plm.builder`（实现：`plms/builder.py` 的
+`NodeBuilderPLM`，继承 `avm.python_server.PLMServer`）。它把「创建一个合法内存节点」
+的多步指令（探测、`memory_make`、`memory_write`、`edit_metadata`）打包成一条 JSON
+请求：作者只描述节点规格，不用手拼每一步工具调用。
+
+入口已预置：`$MEM.para.builder` 是它的 para 档，`$MEM.sys.programs.builder` 是
+`ctrl.type="python"` 的入口程序。用法是在内核态对话里创建它、再投递一条 JSON：
+
+```python
+cid = yield from create_cmd("$MEM.sys.programs.builder", "$MEM.para.builder")
+yield from send_instruction(cid, json.dumps(spec, ensure_ascii=False))
+```
+
+规格（`system` 消息不生效；用户消息必须是 JSON 对象）：
+
+```json
+{
+  "mode": "create",
+  "ops": [
+    {"type": "settingup", "path": "$MEM.programs.hello", "name": "hello",
+     "content": "...", "signature": "...", "meta": "一句描述"},
+    {"type": "python", "path": "$MEM.programs.py", "name": "py", "content": "..."},
+    {"type": "handler", "path": "$MEM.handlers.h", "name": "h",
+     "content": "def handle(event): ...",
+     "condition": {"events": ["memory_write"], "phase": ["before"]}},
+    {"type": "para", "path": "$MEM.para.fast",
+     "fields": {"model": "plm.python", "temperature": "0.2"}}
+  ],
+  "calls": [{"tool": "memory_read", "arguments": {"ref": "$MEM.x"}}]
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `mode` | `create`（缺省）或 `update` |
+| `ops[].type` | `settingup` / `python` / `handler` / `para` |
+| `ops[].path` | `$` 开头、至少写到根下第一层的目标地址（如 `$MEM.programs.hello`） |
+| `ops[].name` / `content` / `signature` | 程序节点子字段；`content` 必填，其余可选 |
+| `ops[].condition` | handler 必填；JSON 字符串，给对象/数组时自动 `json.dumps` |
+| `ops[].fields` | para 必填；每个键值写成 str 子节点（数值/布尔按 JSON 字面量转字符串） |
+| `ops[].meta` | 可选；写成节点描述（dict 节点用 `memory_write` 写 metadata） |
+| `calls` | 可选；任意打包指令，按给出顺序原样执行 |
+
+语义：
+
+- **create**：目标节点不存在时建 dict、写字段、用 `edit_metadata` 设 `ctrl.type`、
+  最后写描述；缺失的祖先自动用 `memory_make(..., "dict")` 建出。目标已存在时
+  记一条错误并跳过（不覆盖）。字段存在时直接写，缺失时先 `memory_make(..., "str")`。
+- **update**：目标必须已存在，否则记错误并跳过；字段存在用 `memory_write` 覆盖，
+  缺失用 `memory_make` + `memory_write`；`ctrl.type` 用 `edit_metadata` 设；
+  `meta` 覆盖原描述。
+- **calls**：`tool` 必须是 10 条指令之一（`memory_*` / `edit_metadata` /
+  `create_*` / `send_instruction` / `close_conversation` / `listen_event`），
+  `arguments` 必须是对象；结果原样记进摘要的 `calls`。
+- **验证**：每个 op 的 `path` 都发一次 `edit_metadata(type="get")`，解析 ctrl JSON
+  并检查 `type`，结果写进摘要的 `verified`。
+
+返回的正文是 JSON 字符串：
+
+```json
+{"ok": true, "mode": "create",
+ "built": ["$MEM.programs.hello"], "updated": [], "skipped": [], "errors": [],
+ "calls": [{"tool": "memory_read", "arguments": {"ref": "$MEM.x"}, "result": "..."}],
+ "verified": {"$MEM.programs.hello": {"expected": "settingup", "actual": "settingup", "ok": true}}}
+```
+
+`ok` 为真要求没有 `errors`（含重复/缺失目标与失败的直通指令）且全部 `verified`
+通过。规格本身非法（不是 JSON、缺必填字段、未知 `type` 等）时不产生任何工具调用，
+对话直接收到 `错误: BuilderPLM: ...`。摘要就是该对话最后一条 assistant 消息；
+要让结果进内存，可在 `calls` 里写节点，或改用 `create_sub`（把规格先写进一个
+str 节点作为 `user_ref`，亚对话完成时自动把摘要写回父对话）。
 
 ## OS 程序与自举
 

@@ -2,7 +2,7 @@
   "meta": {
     "name": "base",
     "version": 1,
-    "description": "母板镜像：持久化三件套 + 装载设备 + OS 程序（boot/shutdown 角色与 clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架。空闲由宿主面板对话承担；不带业务；其余基础由作者在系统内手动搭建。",
+    "description": "母板镜像：持久化三件套 + 装载设备 + OS 程序（boot/shutdown 角色与 clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架 + 构造器 PLM（plm.builder）。空闲由宿主面板对话承担；不带业务；其余基础由作者在系统内手动搭建。",
     "instruction_budget": 100,
     "snapshot_every": 200,
     "guest_programs": {
@@ -34,6 +34,19 @@
             "model": {
               "kind": "str",
               "value": "plm.command"
+            }
+          },
+          "meta": "模型调用参数",
+          "ctrl": {
+            "type": "para"
+          }
+        },
+        "builder": {
+          "kind": "dict",
+          "value": {
+            "model": {
+              "kind": "str",
+              "value": "plm.builder"
             }
           },
           "meta": "模型调用参数",
@@ -166,6 +179,27 @@
               "ctrl": {
                 "type": "python"
               }
+            },
+            "builder": {
+              "kind": "dict",
+              "value": {
+                "content": {
+                  "kind": "str",
+                  "value": "构造器：system 消息不生效；用户消息是 JSON 规格（mode/ops/calls，见 images/base/README.md 的「构造器 PLM」一节）。"
+                },
+                "para_ref": {
+                  "kind": "str",
+                  "value": "$MEM.para.builder"
+                },
+                "name": {
+                  "kind": "str",
+                  "value": "builder"
+                }
+              },
+              "meta": "构造器 PLM（plm.builder）的入口程序；用户消息是 JSON 构造规格",
+              "ctrl": {
+                "type": "python"
+              }
             }
           },
           "meta": "系统程序节点（OS 程序 + 作者程序）"
@@ -265,6 +299,13 @@
       "file": "../devices/io.py",
       "class": "OutputsListDevice",
       "args": {}
+    }
+  ],
+  "plms": [
+    {
+      "model": "plm.builder",
+      "file": "plms/builder.py",
+      "class": "NodeBuilderPLM"
     }
   ],
   "init": {

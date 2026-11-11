@@ -11,6 +11,8 @@
 
 对话由 `system_ref` 指向的程序节点（或入口对话的字面量）和一条用户消息启动。`create_cmd` / `create_sub` 的 `system_ref` 必须指向 `ctrl.type="settingup"` 或 `"python"` 的程序节点，指向 str 节点或无类型节点会报错。程序文本在内存中，对话可以读取、检查、修改其他节点——AVM 的元编程基础在这里。
 
+手工用 `memory_make` + `memory_write` + `edit_metadata` 逐个拼出合法节点容易漏字段或写错 `ctrl.type`。base 镜像预置了构造器 PLM `plm.builder`（入口 `$MEM.sys.programs.builder`，para `$MEM.para.builder`）：把一组节点规格包成一条 JSON 交给它，它按「探测 → 构造/更新 → 直通指令 → 验证」发完工具调用并返回 JSON 摘要；`settingup` / `python` / `handler` / `para` 四类节点的字段形状、`create` 与 `update` 语义、`calls` 直通与摘要格式见 [images/base/README.md](../images/base/README.md) 的「构造器 PLM（plm.builder）」一节。
+
 ## 声明对话能力（内核态 / 用户态）
 
 程序节点用数据 `value.caps`（一个 dict 数据节点）声明由它创建的对话的能力：
