@@ -552,7 +552,7 @@ Guard 是软件层（镜像/OS 程序）注册的一个普通内核态监听器�
 
 `load_image(core, image_path, checkpoint_in=None, host_flags=None)` 的 `host_flags` 是宿主在加载时传入的启动标志：不是镜像内容，镜像 JSON 里没有对应的键，标志也不进 `$MEM`。它在挂载设备之前写入 Core，设备可在 `attach_core` 里读一次；核心启动后不再变化。不传则空，设备行为与从前一致。必须是对象、键必须是非空字符串，否则抛 `ImageError`。
 
-当前唯一的标志是 `console`：控制台以 `{"console": True}` 加载镜像，输入设备据此从宿主 IO 总线取行、不再读终端（面板的调试抽屉喂这条通道；主输入框走 `$MEM.sys.inbox`）。
+当前唯一的标志是 `console`：控制台以 `{"console": True}` 加载镜像，输入设备据此从宿主 IO 总线取行、不再读终端（面板的调试抽屉与当前输入框都喂这条通道；正式 UI/IO 通道按操作面板计划改造为可扩展 IO，尚未实现）。
 
 ### 启动模式与 guest 程序
 
@@ -573,13 +573,13 @@ Guard 是软件层（镜像/OS 程序）注册的一个普通内核态监听器�
 
 - 冷启动在 init 之后按固定顺序 `boot` → `idle` → `shutdown` 创建内核态对话，写 `attrs["guest_role"]`（resume 靠它找回），注册同名中断向量；`resume` 不重建对话，只按 `attrs` 重新注册向量。声明的角色在快照里找不到、或角色重复时报错——不允许在 resume 时补建（新 cid 会让后续日志错位），只能 `reboot` / `reset`。
 - 入口：Python 程序定义与角色同名的生成器，payload 是 `yield from <role>()`；`settingup` 程序的 payload 是角色名加数据行。`boot` 角色在 resume 时由宿主用中断唤醒，payload 带 `last_exit`。
-- 声明了 `guest_programs` 的镜像启用**严格调度**：活跃为空、就绪为空、无待派发中断即「空闲」。空闲是 guest 活体错误——没有 `idle` 角色、或 idle 处理程序跑完仍没让系统离开空闲，都抛 `KernelPanic`。idle 处理程序写 `$MEM.sys.idle.state = "waiting"` 声明「在等待」时，内核停在安全点轮询宿主中断/新就绪对话，不 panic、不重复挂 idle 中断。
+- 声明了 `guest_programs` 的镜像启用**严格调度**：活跃为空、就绪为空、无待派发中断即「空闲」。空闲是 guest 活体错误，Core 向 `idle` 中断向量派发：console 宿主把该向量注册为面板对话（面板在操作员通道上阻塞等待，系统即处于空闲态）；镜像也可声明 `idle` guest 作为无面板宿主的 fallback。派发后仍无法离开空闲（无向量/处理程序没让系统离开）都抛 `KernelPanic`。没有 idle 向量的旧镜像保持旧语义（队列空即 `run()` 返回）。
 - 没有声明 `guest_programs` 的旧镜像保持旧语义：队列空了就是跑完了，`run()` 返回。
 
 **OS 电源与关机约定**（数据面在 `$MEM.sys`，程序实现见 [images/base/README.md](../images/base/README.md)）：
 
-- `$MEM.sys.power.request == "shutdown"` 的**边沿**（相对 `run()` 启动时的存量值）触发宿主用中断唤醒 `shutdown` guest；没有声明该角色时请求停在挂起，VM 不自行断电。
-- `$MEM.sys.power.state` 变为 `"off"` 的**边沿**是正常断电边界：`run()` 在安全点返回，宿主写快照与 `persist_to` 后退出。VM 不写 `clean`、不改 `$MEM.sys.boot.*`——脏关闭判定属于 OS 数据面。
+- 操作员的关机请求经 `shutdown` **中断**通知镜像声明的处理程序（宿主挂中断，payload 是角色入口正文）；没有声明该角色时请求停在挂起、VM 不自行断电。OS 软件负责收尾：停服务、写 `clean`，最后写 `$MEM.sys.power.state = "off"`。
+- `$MEM.sys.power.state` 变为 `"off"` 的**边沿**是正常断电边界：`run()` 在安全点返回，宿主写快照与 `persist_to` 后退出。`power.state` 是 VM 唯一读取的 OS 节点（断电寄存器）；VM 不写 `clean`、不改 `$MEM.sys.boot.*`——脏关闭判定属于 OS 数据面。
 
 ## 持久运行（重启恢复 / 回合日志 / 程序包）
 
@@ -645,7 +645,7 @@ Guard 是软件层（镜像/OS 程序）注册的一个普通内核态监听器�
 ### 边界
 
 - 不做日志自动压缩；代际归档由 `reboot`/`reset` 在启动时完成，同一代际的尾部长度仍由定时快照 + 手动 `truncate(seq)` 控制。不做并发与调度状态机改动。
-- 宿主侧外部输入分两条：`POST /api/input` 写 `$MEM.sys.inbox`，是普通内存写入、进日志、可重放；`POST /api/io/input` 发布到宿主侧 IO 总线，不进日志、不产生事件、不重放。宿主直接改批次/监听器同样不在日志里。
+- 宿主侧外部输入目前只有调试通道 `POST /api/io/input`：发布到宿主侧 IO 总线，不进日志、不产生事件、不重放。正式输入/输出按操作面板计划改成可扩展 IO 底层（宿主 IO 总线 + `$MEM` 里的设备前端），尚未实现。宿主直接改批次/监听器同样不在日志里。
 
 ## 调试与观测
 
@@ -687,7 +687,7 @@ Guard 是软件层（镜像/OS 程序）注册的一个普通内核态监听器�
 
 `python -m avm.console <image.json>`（等价入口 `scripts/run_console.py`，后者先清洗本进程的 `NO_PROXY` / `no_proxy`）起一个 HTTP 服务：默认 `127.0.0.1:8700`（`--port` / `--host` / `--checkpoint-in` / `--mode` / `--restore` 可改），只绑回环。面板凭证是启动时生成的一次性 token（打印到 stderr 并写入镜像目录 `out/console.token`，登录本身即凭证）：`/api/*` 做同源检查（跨源 403）与 token 校验（缺失/错误 401），`--allow-multiple-clients` 关闭单客户端准入（默认第二个客户端 409，`/api/session/*` 例外）。非 `/api/` 的 GET 都按面板产物处理：`web/dist` 构建过就是面板，没构建时 `/` 给构建提示页。镜像以 `host_flags={"console": True}` 加载。
 
-**输入有两条通道，不要混用**：`POST /api/input` 是正式输入，由保留对话把条目追加到 `$MEM.sys.inbox`（普通内存写入，进日志、可重放）；`POST /api/io/input` 是调试通道，只发布到宿主侧 IO 总线、唤醒正在等 `$MEM.inputs.next` 的读，不进日志、不产生事件、响应带 `debug: true`。面板的主输入框走正式输入，`$MEM.inputs` 只在调试抽屉里喂。
+**当前输入通道**：只有 `POST /api/io/input` 调试通道——发布到宿主侧 IO 总线、唤醒正在等 `$MEM.inputs.next` 的读，不进日志、不产生事件、响应带 `debug: true`。正式输入/输出要按操作面板计划改成可扩展 IO 设备（宿主 IO 总线 + `$MEM` 设备前端 + 可寻址输入/结构化输出/手动打断），该改造尚未实现，输入路径保持冻结。
 
 **启动与构建**：
 
@@ -703,9 +703,9 @@ cd web && npm run dev                    # 开发期：Vite 代理 /api 到 AVM_
 
 - **操作员对话（保留 cid -1）**：cid 是作者规定的保留值，不参与正常分配；控制台在 `boot` 返回后、`core.run()` 之前把 `plm.operator` 通道绑到它，没有就创建。对话随快照与日志正常恢复：日志里出现它的回合而它还不存在时（只靠日志恢复），重放先补建它，回合按普通记录应用；快照里它与普通对话一起保存和恢复。**隐藏标记在对话 attrs**（`host: "console"`、`hidden: "1"`），不是内存树节点：对普通对话隐藏——`$MEM.conversations` / `$MEM.scheduler` / `$MEM.caps` 列表与监测帧过滤，`send_instruction` / `close_conversation` 与 `$conv.<cid>` / `$batch.<cid>` 一律按「不存在」处理；旧快照/旧日志没有 attrs 时按保留 cid 兜底。隐藏只是显示与寻址策略，不影响恢复，宿主控制台自己仍能看到它（`/api/state` 与 `/api/conversations/-1`）。初始进休眠队列、不进就绪队列——只有中断能激活。它活跃就等于全局暂停（其他对话都不推进）。`POST /api/interrupt` 挂起 `operator` 中断（在下一个安全点生效；`core.run()` 已返回时不再生效），`POST /api/resume` 让它结束本轮、让出执行权。`POST /api/action` 提交一条动作，未暂停时先自动中断；未知工具名有意允许（响应里有 `known_tool` 与提示）。
 - **读取端点**：`GET /api/state`（运行状态、调度、对话（不过滤 cid -1）、中断、屏蔽账本、生命周期、恢复报告、IO 总线状态）、`/api/tools`（十条指令表）、`/api/conversations/<cid>`、`/api/memory`（可带 `ref`，整树无分页）、`/api/memory/diff?from=&to=`、`/api/listeners`、`/api/devices`、`/api/events`（SSE：面板输出与调度变化的有序流，按 `seq` 增量读）、`/api/io/stream?after=`（SSE：宿主 IO 输出流）。
-- **介入端点**：`POST /api/action`（面板对话执行一条工具调用）、`POST /api/input`（正式输入 → `$MEM.sys.inbox`，202 返回 `entry_id`；`lifecycle != running` 时 409）、`POST /api/io/input`（调试输入 → 宿主 IO 总线，200 返回 `debug: true`）、`POST /api/system/shutdown`（提交 OS 关机请求，见下）、`POST /api/system/force-stop`（操作员强制退出，见下）、`POST /api/device/inspect`（只读检查设备文件：路径/大小/sha256/类名/挂载/args/现有来源表条目，不 import、不挂载、不写内存）、`POST /api/device-action`（调设备自己声明的调试动作，如给 `$inputs` 投喂一行）、`/api/memory/snapshot`、`PATCH /api/listeners/<id>`（就地启停监听器、改 priority/tier）、`POST|DELETE /api/mask/memory`、`/api/mask/device`（临时摘下一个内存节点或卸载一台设备，`DELETE` 还原；调试原语不产生事件）、`POST /api/session/acquire|release`（单客户端席位）。
-- **关机与强制退出**：`POST /api/system/shutdown` 不执行关机语义，只把 `$MEM.sys.power.request = "shutdown"` 作为普通世界写入提交（经保留对话、进日志），然后等 OS 软件收尾；正常断电是 OS 写 `$MEM.sys.power.state = "off"`、宿主在安全点看到后写快照并退出。OS 缺席或收不尾时进程保持运行；请求关机 `force_stop_after` 秒后可用 `POST /api/system/force-stop` 强制退出——**不写快照、不写 clean**，响应 `{"status": "force-stopped", "snapshot_written": false}`。
-- **界面当前接的**：三栏界面（对话列表 / 内存索引与对话·内存·设备详情 / 暂停与动作·事件流）；对话列表与详情带 caps 摘要（mode/groups/根名/工具集）、暂停与继续、十条指令的结构化动作表单（下拉 +「其它（手输）」+ 原始 JSON 兜底）、事件流、主输入框（正式输入，显示「已接收 + entry id」）与调试抽屉（`$inputs` 喂一行，标注不重放）、设备审批面板（先用 `/api/device/inspect` 取哈希，再带 `approved_sha256` 提交装载）。内存索引照树画：链接节点一行，没有子节点可展开；挂载点那行标出设备类型（`device InputsListDevice`），点它打开设备视图，描述与动作来自 `GET /api/devices`。监听器编辑、屏蔽还原、快照与 diff 视图、设备动作全量都已有后端端点、界面未接。
+- **介入端点**：`POST /api/action`（面板对话执行一条工具调用）、`POST /api/io/input`（调试输入 → 宿主 IO 总线，200 返回 `debug: true`）、`POST /api/system/shutdown`（挂 shutdown 中断通知 OS，见下）、`POST /api/system/force-stop`（操作员强制退出，见下）、`POST /api/device/inspect`（只读检查设备文件：路径/大小/sha256/类名/挂载/args/现有来源表条目，不 import、不挂载、不写内存）、`POST /api/device-action`（调设备自己声明的调试动作，如给 `$inputs` 投喂一行）、`/api/memory/snapshot`、`PATCH /api/listeners/<id>`（就地启停监听器、改 priority/tier）、`POST|DELETE /api/mask/memory`、`/api/mask/device`（临时摘下一个内存节点或卸载一台设备，`DELETE` 还原；调试原语不产生事件）、`POST /api/session/acquire|release`（单客户端席位）。
+- **关机与强制退出**：`POST /api/system/shutdown` 不执行关机语义，只挂 `shutdown` 中断通知镜像声明的处理程序（中断是 VM 通知软件的通道）；OS 软件收尾后写 `$MEM.sys.power.state = "off"`，宿主在安全点看到该边沿后写快照并退出。没有声明 shutdown 处理程序时请求停在挂起（warning），VM 不自行断电；请求关机 `force_stop_after` 秒后可用 `POST /api/system/force-stop` 强制退出——**不写快照、不写 clean**，响应 `{"status": "force-stopped", "snapshot_written": false}`。
+- **界面当前接的**：三栏界面（对话列表 / 内存索引与对话·内存·设备详情 / 暂停与动作·事件流）；对话列表与详情带 caps 摘要（mode/groups/根名/工具集）、暂停与继续、十条指令的结构化动作表单（下拉 +「其它（手输）」+ 原始 JSON 兜底）、事件流、主输入框与调试抽屉（当前都走调试 IO 总线；正式可扩展 IO 待实现，标注不重放）、设备审批面板（先用 `/api/device/inspect` 取哈希，再带 `approved_sha256` 提交装载）。内存索引照树画：链接节点一行，没有子节点可展开；挂载点那行标出设备类型（`device InputsListDevice`），点它打开设备视图，描述与动作来自 `GET /api/devices`。监听器编辑、屏蔽还原、快照与 diff 视图、设备动作全量都已有后端端点、界面未接。
 - **边界**：面板对话的消息随每次动作增长，且不能存检查点（v1 检查点不支持 Python 对话）；面板输出是容量 4000 条的有界环形缓冲，丢弃数记在状态里；`GET /api/devices` 的动作账本只留最近 50 条；阻塞读的路径末段是已知会阻塞的命名子键（当前只有 `next`，如 `$MEM.inputs.next`）时面板先标出、点击才发请求（8 秒超时）。
 
 ### 思维链内容

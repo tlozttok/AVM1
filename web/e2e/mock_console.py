@@ -78,9 +78,6 @@ def build(port: int, host: str, tick: float) -> None:
     core.mem["note"] = MetaDict(data={"v": "hi"}, metadata="一条笔记", ctrl={"owner": "0"})
     # 脚本执行器写这里：$MEM.note 的元数据留给 e2e 断言，别被 tick 覆盖
     core.mem["state"] = MetaDict(data={"tick": ""}, metadata="脚本执行器的计数", ctrl={"owner": "0"})
-    # 正式输入落点：面板输入走 /api/input 时保留对话往这里追加条目（可重放）。
-    core.mem["sys"] = MetaDict(
-        data={"inbox": MetaList(data=[])}, metadata="系统分区（e2e：正式输入落点）")
     # 内存树链接节点（非挂载）：左栏要画成一行 link，读它进入 $MEM.note
     core.mem._data["alias"] = LinkNode(target="$MEM.note", metadata="指向 note 的链接")
 

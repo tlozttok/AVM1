@@ -33,7 +33,7 @@ Debug settings live in `debug.json` (`image` / `frames` / `transcript` / `checkp
 
 ### Debug Panel
 
-The debug panel is a separate project under `web/` (Vite + React): it observes a running Core and intervenes through the panel conversation. That conversation is an **operator conversation** — its executor is held by the panel rather than a model, and submitted instructions enter the Core verbatim; pausing goes through the interrupt vector to that conversation (`POST /api/interrupt`), resuming uses `POST /api/resume`. Panel input has two channels: the main composer (`POST /api/input`) is written by the operator conversation into `$MEM.sys.inbox` and is journaled, while the debug drawer (`POST /api/io/input`) only feeds the host-side IO bus (the input device no longer reads the terminal).
+The debug panel is a separate project under `web/` (Vite + React): it observes a running Core and intervenes through the panel conversation. That conversation is an **operator conversation** — its executor is held by the panel rather than a model, and submitted instructions enter the Core verbatim; pausing goes through the interrupt vector to that conversation (`POST /api/interrupt`), resuming uses `POST /api/resume`. Panel input currently uses the debug channel (`POST /api/io/input`) which only feeds the host-side IO bus (the input device no longer reads the terminal); the formal input/output path is being redesigned as an extensible IO device layer (host IO bus + `$MEM` device frontends, see the operation-panel plan) and is not implemented yet.
 
 ```bash
 python scripts/run_console.py images/demo.json   # start the backend; / is the panel once built, otherwise a build hint

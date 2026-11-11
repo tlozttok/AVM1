@@ -172,7 +172,7 @@ python -m avm.image <image.json>
 
 init 强制内核态：程序 `ctrl.caps.mode` 声明 `user` 时装载报 `ImageError`（没有内核态就无法管理权限）。只启动 0 号对话；**不预置其他对话**（其他对话由对话运行期自己 `create_cmd` / `create_sub` 创建）。PLM 入口的典型用法：0 号程序先做确定性的准备工作（读设备、组装提示词、写内存），再 `create_cmd` 出真正跑推理的 LLM 对话并 `send_instruction` 启动它，自己 `close_conversation`。
 
-**guest 程序**：顶层 `meta.guest_programs` 可选，把角色名 `boot` / `idle` / `shutdown` 映射到程序节点引用（`$` 开头，指向 `settingup` 或 `python` 节点）。冷启动在 init 之后按固定顺序为每个角色创建内核态对话，写 `attrs["guest_role"]` 并注册同名中断向量；`resume` 按该 attrs 找回对话，不重建。Python 角色程序要定义与角色同名的生成器（入口 `yield from <role>()`），并给程序节点写 `para_ref`。声明了任意 guest 角色的镜像启用严格调度：空闲（活跃/就绪都空、无待派发中断）时没有 idle 角色、或 idle 处理程序没让系统离开空闲，都是 `KernelPanic`；idle 程序写 `$MEM.sys.idle.state = "waiting"` 时内核停在安全点等待宿主中断。
+**guest 程序**：顶层 `meta.guest_programs` 可选，把角色名 `boot` / `idle` / `shutdown` 映射到程序节点引用（`$` 开头，指向 `settingup` 或 `python` 节点）。冷启动在 init 之后按固定顺序为每个角色创建内核态对话，写 `attrs["guest_role"]` 并注册同名中断向量；`resume` 按该 attrs 找回对话，不重建。Python 角色程序要定义与角色同名的生成器（入口 `yield from <role>()`），并给程序节点写 `para_ref`。声明了任意 guest 角色的镜像启用严格调度：空闲（活跃/就绪都空、无待派发中断）时 Core 向 `idle` 中断向量派发——console 宿主会把该向量注册为面板对话（面板阻塞等待即空闲态），镜像也可声明 `idle` guest 作为无面板宿主的 fallback；派发后仍无法离开空闲即 `KernelPanic`。没有 idle 向量的旧镜像保持「队列空即 `run()` 返回」的旧语义。
 
 ## 启动流程
 
