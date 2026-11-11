@@ -214,13 +214,28 @@ def test_cold_boot_creates_os_programs_and_waits_idle(tmp_path):
 # 2. 输入：idle 唤醒 panel_shell，inbox 消费，outbox/outputs 输出
 # ----------------------------------------------------------------------
 
+def submit_os_input(console, text, target=None):
+    """测试夹具：模拟 OS 软件往 `$MEM.sys.inbox` 追加一条 new 条目。
+
+    正式输入路径属于 UI 设备（待作者定义），测试不借宿主输入端点；这里直接
+    通过调试动作通道让保留对话写 inbox，验证 panel_shell 的消费逻辑。
+    """
+    entry = json.dumps(
+        {"id": "test-input", "target": target, "text": text, "status": "new"},
+        ensure_ascii=False,
+    )
+    console.submit_action("memory_write",
+                          {"ref": "$MEM.sys.inbox.-1", "content": entry})
+    console.resume()
+
+
 def test_input_wakes_panel_shell_and_consumes_inbox(tmp_path):
     core = load_core(prepared_image(tmp_path))
     console = Console(core, mount_io_devices=True)
     thread, errors = start_run(core)
     try:
         wait_idle_waiting(core)
-        console.submit_input("喂给系统的第一句")
+        submit_os_input(console, "喂给系统的第一句")
         wait_for(
             lambda: any("喂给系统的第一句" in e["text"]
                         for e in core.io_bus.drain_io()),
@@ -233,7 +248,7 @@ def test_input_wakes_panel_shell_and_consumes_inbox(tmp_path):
         assert thread.is_alive() and not errors
         # 处理完再次空闲：idle 自己把状态写回 waiting，下一次输入可以再次唤醒
         wait_idle_waiting(core)
-        console.submit_input("第二句")
+        submit_os_input(console, "第二句")
         wait_for(
             lambda: any("第二句" in e["text"] for e in core.io_bus.drain_io()),
             message="第二次空闲后 panel_shell 没有被再次唤醒",
@@ -413,7 +428,7 @@ def test_resume_after_dirty_shutdown_reports_forced(tmp_path):
         wait_idle_waiting(core)
         assert write_snapshot(core), "先拍一个基准快照"
         # 快照之后继续写日志（消费一条输入），然后不写快照直接停
-        console.submit_input("脏关闭前的动作")
+        submit_os_input(console, "脏关闭前的动作")
         wait_for(
             lambda: any("脏关闭前的动作" in e["text"]
                         for e in core.io_bus.drain_io()),

@@ -1,7 +1,6 @@
 import { useState } from 'react'
 import { apiSend, describeError } from '../api/client'
-import type { ConversationBrief, InputAccepted } from '../api/types'
-import { buildInputBody, describeAccepted } from '../lib/inputPath'
+import type { ConversationBrief } from '../api/types'
 
 interface Props {
   conversations: ConversationBrief[]
@@ -10,12 +9,9 @@ interface Props {
 }
 
 /**
- * 操作面板的主区右半：正式输入。
- *
- * 走 `POST /api/input`：宿主把输入作为一条 JSON 字符串条目追加到
- * `$MEM.sys.inbox`（保留对话执行），随日志重放；202 表示已接收，不等待
- * 回合完成。目标为空表示无目标输入（入口对话可取）。
- * 调试通道 `/api/io/input` 在下方调试抽屉，不重放。
+ * 操作面板的主区右半：定向输入。
+ * 只走 `POST /api/io/input`，不经面板对话、不发起任意工具调用；
+ * 目标为空表示无目标输入（入口对话可取）。
  */
 export default function InputComposer({ conversations, activeCid, onSent }: Props) {
   const [target, setTarget] = useState('')
@@ -25,14 +21,17 @@ export default function InputComposer({ conversations, activeCid, onSent }: Prop
   const [busy, setBusy] = useState(false)
 
   const send = async () => {
-    const body = buildInputBody(text, target)
-    if (body === null || busy) return
+    if (!text.trim() || busy) return
     setBusy(true)
     setError(null)
     setResult(null)
     try {
-      const accepted = await apiSend<InputAccepted>('/api/input', 'POST', body)
-      setResult(describeAccepted(accepted))
+      const record = await apiSend<{ seq: number; target: string | null }>(
+        '/api/io/input',
+        'POST',
+        { target: target || null, text },
+      )
+      setResult(`已发出 #${record.seq}${record.target ? ` → cid ${record.target}` : ' → 入口'}`)
       setText('')
       onSent()
     } catch (err) {
@@ -46,7 +45,7 @@ export default function InputComposer({ conversations, activeCid, onSent }: Prop
     <section className="pane input-composer" data-testid="input-composer">
       <div className="pane-title">
         输入
-        <span className="muted small">正式输入：写 $MEM.sys.inbox，随日志重放</span>
+        <span className="muted small">发给选中的对话；留空给入口</span>
       </div>
       <div className="pane-body composer-body">
         <label className="field">

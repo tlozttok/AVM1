@@ -218,7 +218,7 @@ export default function App() {
       <header className="app-head">
         <span className="title">AVM 操作面板</span>
         <span className="muted small">
-          输出走宿主侧 IO 总线；正式输入写 $MEM.sys.inbox（可重放），调试通道在下方抽屉
+          输出与输入走宿主侧 IO 总线；调试能力在下方抽屉
         </span>
         {stateError ? <span className="hint error inline">状态轮询失败：{stateError}</span> : null}
         {deviceError ? <span className="hint error inline">设备清单失败：{deviceError}</span> : null}

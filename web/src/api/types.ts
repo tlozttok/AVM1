@@ -289,26 +289,6 @@ export interface PauseResponse {
   already_active: boolean
 }
 
-/**
- * `POST /api/input` 的 202 回执：宿主已把条目排进保留对话的回合，
- * `entry_id` 是该条目写进 `$MEM.sys.inbox` 时的 id。回合提交后进日志。
- */
-export interface InputAccepted {
-  accepted: boolean
-  entry_id: string
-}
-
-/**
- * `POST /api/io/input` 的回执：宿主侧 IO 总线的调试通道。
- * `debug: true` 表示它不进日志、不产生事件、不重放。
- */
-export interface IoInputResponse {
-  debug: true
-  seq: number
-  target: string | null
-  text: string
-}
-
 /** SSE 帧：schedule 帧没有 entry，其余六种都带递增的 entry.seq。 */
 export interface SseEntry {
   seq: number

@@ -8,12 +8,9 @@
   产生事件、发起者是面板对话。控制台不另开写内存的路径；
 - **设备调试动作是例外**：直接调用设备自己声明的 `run`，不入核心、不产生事件。
 
-输入有两条通道，不要混用：
-
-- `POST /api/input`：正式输入。宿主把 `{id,target,text,status}` 作为 JSON 字符串
-  追加到 `$MEM.sys.inbox`（保留对话执行 `memory_write`），随日志重放；
-- `POST /api/io/input`：调试通道。只发布到宿主侧 IO 总线，不进日志、不产生事件，
-  响应带 `debug: true`，不重放。
+输入通道：`POST /api/io/input` 只发布到宿主侧 IO 总线，是调试通道；不进日志、
+不产生事件、不重放。正式输入由 UI 设备承担（UI 是设备，格式待作者定义），
+控制台不提供绕开设备的写世界输入端点。
 
 面板对话是 AVM 里的一条宿主对话：保留魔数 cid（-1），对普通对话不可见、不可寻址
 （conversations/scheduler 列表过滤，send/close 报不存在），由中断向量表激活、
@@ -305,9 +302,6 @@ class Console:
         self._memory_mask: Dict[str, Any] = {}     # ref → 摘下来的节点
         self._device_mask: Dict[str, Any] = {}     # 挂载键 → 设备实例
         self._action_log: List[dict] = []          # 设备调试动作的调用记录
-        # 正式输入条目 id 的会话内自增（HTTP 线程并发提交时保持唯一）
-        self._input_lock = threading.Lock()
-        self._input_counter = 0
         self._snapshots: List[Dict[str, Any]] = [_walk(core.unwrap("$MEM", for_llm=False))]
         core.events.add_observer(self._on_event)
 
@@ -419,18 +413,16 @@ class Console:
 
     def _on_event(self, event: dict) -> None:
         self.channel.publish("event", _jsonable(event))
-        # 正式输入落进 inbox 后唤醒 OS 空闲处理程序。放在事件观察者里而不是只放在
-        # `/api/input` 的提交瞬间：写入由保留对话在稍后的回合执行，提交瞬间挂中断
-        # 可能让 idle 先跑、看不到输入，把状态写回 waiting 后就没有人再消费。
+        # OS 软件往 inbox 写新条目后唤醒空闲处理程序：写事件即可作为唤醒源，
+        # 不需要宿主在写入前另挂一次可能落空的中断。
         self._wake_idle_on_inbox_write(event)
 
     def _wake_idle_on_inbox_write(self, event: dict) -> None:
-        """inbox 写了新输入 → 给声明的 idle 角色挂一次中断。
+        """inbox 出现新条目 → 给声明的 idle 角色挂一次中断。
 
         只对 memory_write after 事件生效；target 是写入地址（追加仍是 `...inbox.-1`）。
-        内容能解析成对象时只对 `status == "new"` 唤醒：panel_shell 把条目标记
-        done 的写不会再叫醒 idle。没有 idle 角色的旧镜像保持原行为（不会出现
-        无向量中断的告警）。
+        内容能解析成对象时只对 `status == "new"` 唤醒：消费方把条目标记 done 的写
+        不会再叫醒 idle。没有 idle 角色的旧镜像保持原行为（不会出现无向量中断的告警）。
         """
         if self.core.guest_roles.get("idle") is None:
             return
@@ -796,62 +788,6 @@ class Console:
         self.channel.submit_actions(actions)
         return paused
 
-    def submit_input(self, text, target=None) -> dict:
-        """正式输入：把一条条目追加到 `$MEM.sys.inbox`，由保留对话执行并进日志。
-
-        - 输入原样进 inbox，不解析命令、不替换模板；条目的 id 由宿主生成；
-        - 提交 `memory_write` 后再提交 `end`，让这一回合结束、被日志提交；
-          HTTP 只等动作入队，不等回合跑完（完成事件走 `/api/events`）；
-        - `$MEM.sys.inbox` 不存在或不是 list 时直接报错，不静默丢弃输入。
-        """
-        if self.lifecycle != "running":
-            raise ConsoleConflict(f"面板处于 {self.lifecycle} 状态，不再接收新输入")
-        if not isinstance(text, str) or not text:
-            raise ValueError("text 必须是非空字符串")
-        if target is not None and not isinstance(target, str):
-            raise ValueError("target 必须是字符串或省略")
-        target = target or None
-        self._require_inbox()
-        entry = {
-            "id": self._next_input_id(),
-            "target": target,
-            "text": text,
-            "status": "new",
-        }
-        payload = json.dumps(entry, ensure_ascii=False)
-        self._enqueue_actions([
-            {"tool": "memory_write",
-             "arguments": {"ref": "$MEM.sys.inbox.-1", "content": payload}},
-            {"end": True},  # 结束本轮：Core 在回合结束提交日志
-        ], interrupt_payload=None)  # 输入不是"暂停"：不给面板投假正文
-        if self.core.guest_roles.get("idle") is not None:
-            # OS 空闲处理程序由 idle 中断唤醒；真正的唤醒点还在 inbox 写入的
-            # after 事件里（_wake_idle_on_inbox_write），这里保留提交后的第一次通知。
-            self.core.interrupts.raise_("idle", payload=self._idle_entry())
-        return {"accepted": True, "entry_id": entry["id"]}
-
-    def _require_inbox(self) -> None:
-        """正式输入的落点必须是一个已存在的 list；缺了就说清楚怎么补。"""
-        try:
-            node = self.core.unwrap("$MEM.sys.inbox", for_llm=False)
-        except VMMemoryError as e:
-            raise ValueError(
-                "$MEM.sys.inbox 不存在：正式输入要求 base 镜像先创建空 list"
-                "（参考 images/base/base.json 的 sys.inbox）"
-            ) from e
-        if not isinstance(node, MetaList):
-            raise ValueError(
-                f"$MEM.sys.inbox 不是 list（是 {type(node).__name__}）："
-                "正式输入只能追加到 list"
-            )
-
-    def _next_input_id(self) -> str:
-        """会话内输入条目标识：时间戳前缀 + 自增序号，面板可直接展示。"""
-        with self._input_lock:
-            self._input_counter += 1
-            counter = self._input_counter
-        return f"in-{int(time.time() * 1000)}-{counter}"
-
     def resume(self) -> dict:
         """让面板结束本轮交互，把执行权让回就绪队列。"""
         self.channel.submit_action({"end": True})
@@ -894,8 +830,8 @@ class Console:
         """调试输入：发布到宿主侧 IO 总线，唤醒可能正等在读上的 IO 设备。
 
         target 为 None / 空 / '*' 表示无目标输入（入口对话可取）。
-        输入只进宿主侧总线，不经面板对话、不产生事件、不进日志，因此不重放；
-        正式输入走 `submit_input`（`POST /api/input`，写 `$MEM.sys.inbox`）。
+        输入只进宿主侧总线，不经面板对话、不产生事件、不进日志，因此不重放。
+        正式输入由 UI 设备承担；本端点只是调试通道。
         """
         if self.lifecycle != "running":
             raise ConsoleConflict(f"面板处于 {self.lifecycle} 状态，不再接收新输入")
@@ -1028,8 +964,7 @@ _INDEX_HTML = """<!doctype html>
 <li><code>GET /api/devices</code> · <code>POST /api/device-action</code> · <code>POST /api/device/inspect</code></li>
 <li><code>GET /api/events</code> · <code>GET /api/io/stream?after=&lt;seq&gt;</code>（SSE）</li>
 <li><code>POST /api/interrupt</code> · <code>POST /api/resume</code> · <code>POST /api/action</code></li>
-<li><code>POST /api/input</code>（正式输入：写 <code>$MEM.sys.inbox</code>，可重放）</li>
-<li><code>POST /api/io/input</code>（调试输入：只进宿主 IO 总线，不重放）</li>
+<li><code>POST /api/io/input</code>（调试输入：只进宿主 IO 总线，不进日志、不重放）</li>
 <li><code>POST /api/session/acquire</code> · <code>POST /api/session/release</code></li>
 <li><code>POST /api/system/shutdown</code> · <code>POST /api/system/force-stop</code></li>
 <li><code>POST|DELETE /api/mask/memory</code> · <code>POST|DELETE /api/mask/device</code></li>
@@ -1249,9 +1184,6 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
                 self._send_json(200, console.mask_memory(body.get("ref")))
             elif path == "/api/mask/device":
                 self._send_json(200, console.mask_device(body.get("mount")))
-            elif path == "/api/input":
-                self._send_json(202, console.submit_input(
-                    body.get("text"), body.get("target")))
             elif path == "/api/io/input":
                 self._send_json(200, console.io_input(
                     body.get("target"), body.get("text")))

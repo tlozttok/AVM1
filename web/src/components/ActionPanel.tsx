@@ -7,7 +7,6 @@ import { pairAction, startTrace, type ActionTrace, type SubmittedAction } from '
 import type { TrayValue } from '../lib/valueTray'
 import ActionCard from './ActionCard'
 import ActionForm from './ActionForm'
-import DebugIoInput from './DebugIoInput'
 import DeviceApprovalPanel from './DeviceApprovalPanel'
 import InputFeed from './InputFeed'
 import ValueTray from './ValueTray'
@@ -165,7 +164,6 @@ export default function ActionPanel({
         onSubmitted={onSubmitted}
       />
       <InputFeed devices={devices} onDevicesChanged={onDevicesChanged} />
-      <DebugIoInput />
       <DeviceApprovalPanel onRefresh={onRefresh} />
     </div>
   )

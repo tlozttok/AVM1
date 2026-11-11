@@ -17,7 +17,7 @@ import pytest
 from avm.console import Console, serve
 from avm.core import Core, _build_tools
 from avm.memory_device import InputsListDevice, MemoryDevice
-from avm.types import MetaDict, MetaList
+from avm.types import MetaDict
 
 
 class MockLMU:
@@ -50,11 +50,6 @@ def _seed(mem, ref, value):
         parent, _, key = ref.rpartition(".")
         mem.make(parent, key, "str")
         return mem.set(ref, value)
-
-
-def _seed_inbox(core, value=None):
-    """测试夹具：base 里由镜像创建的 `$MEM.sys.inbox` 空 list。"""
-    core.mem["sys"] = MetaDict(data={"inbox": MetaList(data=list(value or []))})
 
 
 def _advance_panel(core, console):
@@ -476,77 +471,7 @@ class TestWriteEndpoints:
         assert code == 400
 
 
-class TestFormalInput:
-    """`POST /api/input`：正式输入写 `$MEM.sys.inbox`，由保留对话执行进日志。"""
-
-    def test_missing_inbox_is_an_error(self, env):
-        code, body = request(env[2], "POST", "/api/input", {"text": "你好"})
-        assert code == 400
-        assert "$MEM.sys.inbox" in body["error"]
-        assert "list" in body["error"]
-
-    def test_inbox_must_be_a_list(self, env):
-        core = env[0]
-        core.mem["sys"] = MetaDict(data={"inbox": "不是列表"})
-        code, body = request(env[2], "POST", "/api/input", {"text": "你好"})
-        assert code == 400
-        assert "$MEM.sys.inbox" in body["error"] and "StrNode" in body["error"]
-
-    def test_empty_text_is_rejected(self, env):
-        _seed_inbox(env[0])
-        code, body = request(env[2], "POST", "/api/input", {"text": ""})
-        assert code == 400
-
-    def test_input_is_accepted_then_committed_as_str_json(self, env, tmp_path):
-        core, console, base, _ = env
-        _seed_inbox(core)
-        core.attach_journal(str(tmp_path / "journal.jsonl"))
-
-        code, body = request(base, "POST", "/api/input", {"text": "喂给系统的第一句"})
-        assert code == 202
-        assert body["accepted"] is True
-        entry_id = body["entry_id"]
-        # HTTP 不阻塞：动作已入队（memory_write + end），回合还没跑、日志还没写
-        assert console.channel.status()["pending_actions"] == 2
-        assert core.journal.read() == []
-        assert list(core.unwrap("$MEM.sys.inbox", for_llm=False)) == []
-
-        _advance_panel(core, console)
-
-        inbox = list(core.unwrap("$MEM.sys.inbox", for_llm=False))
-        assert len(inbox) == 1
-        assert isinstance(inbox[0], str), "inbox 元素必须是 str（JSON 文本），不是 dict"
-        entry = json.loads(inbox[0])
-        assert entry == {
-            "id": entry_id,
-            "target": None,
-            "text": "喂给系统的第一句",
-            "status": "new",
-        }
-        # 回合提交后进日志：记录属于保留对话，效果是向 inbox 追加。
-        # 一次输入在 Core.run 里跨两条记录（工具调用一步、结束一步），都按回合提交。
-        records = core.journal.read()
-        assert records and all(r["cid"] == console.panel.cid for r in records)
-        effects = [c["effect"] for r in records for c in r["changes"]
-                   if c["kind"] == "effect"]
-        assert any(e["kind"] == "memory_set" and e["ref"] == "$MEM.sys.inbox.-1"
-                   and json.loads(e["value"])["id"] == entry_id for e in effects)
-        # 提交完成的动作/事件经现有控制台事件流出现
-        kinds = [entry_["kind"] for entry_ in console.channel.drain()]
-        assert "tool_call" in kinds and "tool_result" in kinds
-
-    def test_target_is_kept_in_the_entry(self, env):
-        core, console, base, _ = env
-        _seed_inbox(core)
-
-        code, body = request(base, "POST", "/api/input", {"text": "给 echo", "target": "echo"})
-        assert code == 202
-        _advance_panel(core, console)
-
-        entry = json.loads(list(core.unwrap("$MEM.sys.inbox", for_llm=False))[0])
-        assert entry["target"] == "echo"
-        assert entry["id"] == body["entry_id"]
-
+class TestDebugIoInput:
     def test_io_input_is_a_debug_channel_and_does_not_journal(self, env, tmp_path):
         core, _, base, _ = env
         core.attach_journal(str(tmp_path / "journal.jsonl"))
@@ -558,7 +483,6 @@ class TestFormalInput:
         # 调试通道不进日志、不写 inbox（测试环境本来就没有 sys.inbox）
         assert core.journal.read() == []
         assert "sys" not in core.mem._data
-        assert [e["text"] for e in core.io_bus.drain_input()] == ["调试输入"]
 
 
 class TestInterventionFlow:

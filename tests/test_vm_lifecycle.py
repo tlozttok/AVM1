@@ -722,9 +722,6 @@ class TestConsoleShutdownRequest:
         assert any(effect["kind"] == "memory_set"
                    and effect["ref"] == "$MEM.sys.power.request"
                    and effect["value"] == "shutdown" for effect in effects)
-        # 关机中不再接收正式输入
-        with pytest.raises(ConsoleConflict):
-            console.submit_input("迟到的输入")
         # 再次提交关机请求被拒
         with pytest.raises(ConsoleConflict):
             console.request_shutdown()
