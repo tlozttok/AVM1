@@ -61,9 +61,15 @@ pip install openai python-dotenv pytest httpx
 echo "OPENAI_API_KEY=sk-..." > .env
 
 python -m pytest                 # 全部测试（MockLMU，不调真实 API，不需要 key）
-python main.py                   # 启动入口（读 debug.json 指定的镜像）
-python main.py <image.json>      # 加载并运行系统镜像
+
+# 运行母板镜像：用操作面板宿主（长期运行镜像需要面板承接空闲/关机）
+cd web && npm install && npm run build   # 首次构建面板；改前端后重新构建
+cd ..
+python scripts/run_console.py images/base/base.json
+# 浏览器打开 http://127.0.0.1:8700，凭证打印在终端并写入 images/base/out/console.token
 ```
+
+`main.py` 是终端宿主：适合没有 `meta.guest_programs` 的调试镜像（`python main.py <image.json>`）。母板镜像声明了 guest 程序但没有 idle 处理程序，终端宿主也不注册 idle 中断向量，空闲时会按"guest 活体错误"触发 `KernelPanic`——这是设计行为，不是可直接运行的入口。启动模式用 `--mode auto|resume|reboot|reset`（默认 `auto`：有可读快照则 resume，否则 reset）。
 
 Windows 上如果控制台是英文 locale（cp1252），入口脚本打印的中文进度行会报 `UnicodeEncodeError`；设 `PYTHONIOENCODING=utf-8` 即可。
 
