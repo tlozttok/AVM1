@@ -70,7 +70,7 @@ class TestMainGuard:
     def test_refuses_to_start_when_httpx_still_cannot_be_built(self, script, monkeypatch, capsys):
         monkeypatch.setattr(script, "clean_environment", lambda environ=None: [])
         monkeypatch.setattr(script, "client_buildable", lambda: "InvalidURL: Invalid port: ':1]'")
-        assert script.main(["images/demo.json"]) == 1
+        assert script.main(["images/base/base.json"]) == 1
         err = capsys.readouterr().err
         assert "建不了 httpx 客户端" in err
         assert "NO_PROXY" in err
@@ -87,8 +87,8 @@ class TestMainGuard:
             return 0
 
         monkeypatch.setattr(console, "main", fake_main)
-        assert script.main(["images/demo.json", "--port", "8701"]) == 0
-        assert seen["argv"] == ["images/demo.json", "--port", "8701"]
+        assert script.main(["images/base/base.json", "--port", "8701"]) == 0
+        assert seen["argv"] == ["images/base/base.json", "--port", "8701"]
 
     def test_script_is_runnable_from_anywhere(self, script):
         """脚本要能把仓库根塞进 sys.path，否则从别的目录跑就 import 不到 avm。"""

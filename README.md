@@ -12,39 +12,47 @@ AVM 不是 Agent 框架。它不预设编排模式，不提供业务提示词，
 
 ## 一个系统镜像长什么样
 
-`images/demo.json` 全文 43 行。下面是它的骨架（省略了提示词正文）：
+仓库里的母板镜像是 [images/base/base.json](images/base/base.json)（说明见 [images/base/README.md](images/base/README.md)）。下面只是它的骨架（省略了大量节点与程序正文）：
 
 ```json
 {
-  "meta": { "name": "demo", "version": 1,
-            "description": "最小交互演示：读输入 → 处理 → 写输出，循环" },
+  "meta": { "name": "base", "version": 1,
+            "description": "母板镜像：持久化三件套 + 装载设备 + OS 程序 + 空分区骨架",
+            "instruction_budget": 100, "snapshot_every": 200,
+            "guest_programs": { "boot": "$MEM.sys.programs.boot",
+                                "shutdown": "$MEM.sys.programs.supervisor" } },
   "mem": {
-    "system": {
-      "kind": "dict", "ctrl": { "type": "settingup" },
+    "sys": {
+      "kind": "dict",
       "value": {
-        "name": { "kind": "str", "value": "init" },
-        "content": { "kind": "str", "value": "你是 AVM 中运行的 init 对话……" }
+        "power": { "kind": "dict", "value": {
+          "state": { "kind": "str", "value": "on" } } },
+        "programs": { "kind": "dict", "value": {
+          "boot": { "kind": "dict", "ctrl": { "type": "python" },
+                    "value": { "content": { "kind": "str", "value": "def boot(): ..." } } } } }
       }
     },
-    "user": { "kind": "str", "value": "开始" },
-    "model_params": { "kind": "dict", "ctrl": { "type": "para" },
-                      "value": { "model": { "kind": "str", "value": "deepseek-flash" } } },
+    "loader": { "kind": "device" },
     "inputs": { "kind": "device" },
     "outputs": { "kind": "device" }
   },
-  "para_ref": "$MEM.model_params",
+  "para_ref": "$MEM.para.python",
   "devices": [
-    { "path": "inputs",  "file": "devices/io.py", "class": "InputsListDevice",  "args": {} },
-    { "path": "outputs", "file": "devices/io.py", "class": "OutputsListDevice", "args": {} }
+    { "path": "loader",  "file": "../packages/loader.py", "class": "LoaderDevice",      "args": {} },
+    { "path": "inputs",  "file": "../devices/io.py",      "class": "InputsListDevice",  "args": {} },
+    { "path": "outputs", "file": "../devices/io.py",      "class": "OutputsListDevice", "args": {} }
   ],
-  "init": { "name": "init", "system_ref": "$MEM.system", "user_ref": "$MEM.user" },
-  "persist_to": "out/mem.json"
+  "init": { "name": "init", "system_ref": "$MEM.sys.programs.boot",
+            "user": "yield from init()", "para_ref": "$MEM.para.python" },
+  "journal_to": "out/base.journal",
+  "snapshot_to": "out/base.snapshot.json",
+  "persist_to": "out/base_mem.json"
 }
 ```
 
 三样东西在一个文件里：内存树（`mem`）、设备挂载（`devices`）、启动哪个对话（`init`）。
 
-值得注意的是 **程序的位置**：那段提示词不是主机代码里的常量，而是内存树上的一个 `str` 节点（`mem.system.value.content`）。运行期改写它，就是改写程序本身——这是"程序即数据"在格式上的落点，也是 AVM 与"框架 + 配置文件"的分界。
+值得注意的是 **程序的位置**：boot 程序的源码不是主机代码里的常量，而是内存树上的一个 `str` 节点（`mem.sys.programs.boot.value.content`）。运行期改写它，就是改写程序本身——这是"程序即数据"在格式上的落点，也是 AVM 与"框架 + 配置文件"的分界。
 
 ## 快速开始
 
@@ -59,11 +67,11 @@ python main.py <image.json>      # 加载并运行系统镜像
 
 Windows 上如果控制台是英文 locale（cp1252），入口脚本打印的中文进度行会报 `UnicodeEncodeError`；设 `PYTHONIOENCODING=utf-8` 即可。
 
-示例镜像见 `images/demo.json`、`images/calc_driver.json`；权限体系示例见 `images/security_demo.json`（内核态 init + 用户态授予根对话）与 `images/permission_acl_demo.json`（全 PLM 的镜像层 ACL 演示：允许/默认拒绝/写保护）；读本仓库自测的镜像见 `images/repo_tester.json`（对话经只读设备 `$MEM.AVMRepo` 读仓库跟踪文件，用法由设备自述给出），打包版见 `images/repo_tester_packed.json`（0 号是 `plm.python` 打包器，启动时按 `$MEM.file_list` 给出的清单读文档、把系统提示词组装好再建并启动测试对话，测试者不必再读这些文档；程序与清单在 `images/repo_tester_packed/`）。系统镜像的组成与要点见 [docs/runtime.md](docs/runtime.md) 的「系统镜像」一节。
+示例镜像保留两块：母板镜像 `images/base/base.json`（长期运行、持久化与 OS 程序，见 [images/base/README.md](images/base/README.md)）与程序包装载演示 `images/packages/packages_demo.json`（loader + 示例包，见 [images/packages/README.md](images/packages/README.md)）。系统镜像的组成与要点见 [docs/runtime.md](docs/runtime.md) 的「系统镜像」一节。
 
 ## 状态
 
-- 用例数约 1180，全部走 MockLMU；CI 覆盖 ubuntu / windows × Python 3.12 / 3.13 四个组合。
+- 用例数约 1141，全部走 MockLMU；CI 覆盖 ubuntu / windows × Python 3.12 / 3.13 四个组合。
 - 尚未发布 release。接口仍在变动，镜像格式以 `docs/system-image.md` 为准。
 - 许可证 AGPL-3.0：个人使用、修改、分发都可以；把它嵌进对外提供的服务需要同样开源。
 

@@ -9,7 +9,7 @@ httpx 客户端都建不起来——`OpenAI()` 在建客户端时就抛 `Invalid
 这个脚本只改**自己这份**环境变量（父进程、`.env`、系统设置都不动），然后照常进
 `python -m avm.console`：
 
-    python scripts/run_console.py images/demo.json
+    python scripts/run_console.py images/base/base.json
 
 其余参数原样传给控制台。清洗规则：丢掉形如 `[...]` 的项（同一串里不带方括号的 `::1`
 通常已经覆盖它）；清洗后先试着建一个 httpx 客户端，建不起来就在启动前把原因说清楚，

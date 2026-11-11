@@ -5,7 +5,6 @@
 
 import importlib.util
 import json
-import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -18,7 +17,45 @@ from avm.image import load_image
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEVICE_FILE = REPO_ROOT / "images" / "devices" / "avm_repo.py"
-IMAGE_FILE = REPO_ROOT / "images" / "repo_tester.json"
+IO_DEVICE = REPO_ROOT / "images" / "devices" / "io.py"
+
+
+def _minimal_image(tmp_path) -> str:
+    """在测试内构造的最小镜像：挂 RepoDevice + 两个 IO 设备，init 是普通 LLM 对话。
+
+    原出厂测试镜像已删除；这里只保留 RepoDevice 挂载、设备自述读取与
+    outputs 写入所需的节点与设备定义。
+    """
+    image = {
+        "meta": {"version": 1},
+        "mem": {
+            "system": {
+                "kind": "dict", "ctrl": {"type": "settingup"},
+                "value": {
+                    "name": {"kind": "str", "value": "repo_reader"},
+                    "content": {"kind": "str", "value": "用 $MEM.AVMRepo 读仓库"},
+                },
+            },
+            "user": {"kind": "str", "value": "开始"},
+            "model_params": {
+                "kind": "dict", "ctrl": {"type": "para"},
+                "value": {"model": {"kind": "str", "value": "deepseek-flash"}},
+            },
+            "AVMRepo": {"kind": "device"},
+            "inputs": {"kind": "device"},
+            "outputs": {"kind": "device"},
+        },
+        "para_ref": "$MEM.model_params",
+        "devices": [
+            {"path": "AVMRepo", "file": str(DEVICE_FILE), "class": "RepoDevice", "args": {}},
+            {"path": "inputs", "file": str(IO_DEVICE), "class": "InputsListDevice", "args": {}},
+            {"path": "outputs", "file": str(IO_DEVICE), "class": "OutputsListDevice", "args": {}},
+        ],
+        "init": {"name": "repo_reader", "system_ref": "$MEM.system", "user_ref": "$MEM.user"},
+    }
+    path = tmp_path / "image.json"
+    path.write_text(json.dumps(image, ensure_ascii=False), encoding="utf-8")
+    return str(path)
 
 
 def _fs_supports(build) -> bool:
@@ -299,33 +336,18 @@ class TestReadOnly:
 
 
 class TestRepoImage:
-    """出厂镜像 images/repo_tester.json：在用户指导下按 AVM 实际代码测整个系统；读文件接口从设备自述读出；镜像不规定步骤。"""
+    """内联最小镜像：RepoDevice 挂载、设备自述读取与 outputs 写入（原出厂镜像已删除）。"""
 
-    def test_image_loads_device_and_terminal(self):
-        core = load_image(Core(), str(IMAGE_FILE))
+    def test_image_loads_device_and_terminal(self, tmp_path):
+        core = load_image(Core(), _minimal_image(tmp_path))
         conv = core.get_conversation(0)
-        assert conv.name == "repo_tester" and conv.is_root
+        assert conv.name == "repo_reader" and conv.is_root
         assert {"AVMRepo", "inputs", "outputs"} <= set(core.mem._devices)
         assert "写入一律报错" in core.unwrap("$MEM.AVMRepo", for_llm=True)
         assert core.unwrap('$MEM.AVMRepo.ls."avm"', for_llm=True).startswith('ls "avm"')
 
-    def test_entry_prompt_points_at_device_without_teaching_syntax(self):
-        image = json.loads(IMAGE_FILE.read_text(encoding="utf-8"))
-        system = image["mem"]["system"]["value"]["content"]["value"]
-        user = image["mem"]["user"]["value"]
-        prompt = system + "\n" + user
-        # 身份与判据在 system 里：按实际代码测这个系统，测什么由用户指令决定
-        assert "$MEM.AVMRepo" in prompt
-        assert "实际代码" in prompt and "用户指令" in prompt
-        # 镜像不规定步骤：步骤由运行时的用户指令给出，改起来不用动镜像
-        assert "步骤" not in user and not re.search(r"\d\s*[.、]", user)
-        assert "$MEM.inputs.next" in user and "$MEM.outputs.out" in user
-        # 接口由设备自述给出：提示词里不写动作语法与分页规则
-        for token in ("ls", 'read."', 'search."', "每页", "双引号", "页码"):
-            assert token not in prompt
-
-    def test_manual_reaches_conversation_through_memory_read(self):
-        core = load_image(Core(), str(IMAGE_FILE))
+    def test_manual_reaches_conversation_through_memory_read(self, tmp_path):
+        core = load_image(Core(), _minimal_image(tmp_path))
         conv = core.get_conversation(0)
         MemoryReadInstruction("tc1", conv.cid, {"ref": "$MEM.AVMRepo"}).execute(core, conv)
         manual = conv.user_batch.tool_responses[-1].content

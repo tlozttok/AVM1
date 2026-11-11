@@ -238,7 +238,7 @@ def handle(event):
     return {"action": "replace", "response": "ACL 默认拒绝读取"}
 ```
 
-可运行示例见 [images/permission_acl_demo.json](../images/permission_acl_demo.json) 与生成脚本 [images/permission_acl_demo/build_image.py](../images/permission_acl_demo/build_image.py)：初始 Python 程序注册读/写 ACL 监听器、创建用户态工作对话、验证允许读取/禁止读取/写保护，把审计报告写进 `$MEM.report`。测试见 [tests/test_acl_demo.py](../tests/test_acl_demo.py)。
+这段处理器由镜像作者在初始程序里注册；ACL 是镜像层策略，Core 只提供 before 事件与解析后的条件（见 7.1 与 7.4）。
 
 ### 7.4 自保护清单
 

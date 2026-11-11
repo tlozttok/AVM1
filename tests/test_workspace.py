@@ -8,7 +8,6 @@
 """
 
 import json
-import os
 
 import pytest
 
@@ -18,7 +17,58 @@ from avm.image import ImageError, load_image
 from avm.memory_device import StringDevice
 from avm.types import MetaDict, MetaList, StrNode
 
-IMAGE = os.path.join(os.path.dirname(__file__), "..", "images", "security_demo.json")
+
+def _security_image(tmp_path) -> str:
+    """在测试内构造的最小 security 段镜像：内核 init + 只持有 $lib 根的用户态程序。
+
+    原示例镜像已删除；这里只保留本文件用到的节点（$lib.greeting、programs.worker
+    的 caps、para 与 init 入口），覆盖根注册表与用户态根可见性。
+    """
+    image = {
+        "meta": {"version": 1},
+        "mem": {
+            "model_params": {
+                "kind": "dict", "ctrl": {"type": "para"},
+                "value": {"model": {"kind": "str", "value": "test"}},
+            },
+            "lib": {
+                "kind": "dict",
+                "value": {"greeting": {"kind": "str", "value": "hello from lib"}},
+            },
+            "programs": {
+                "kind": "dict",
+                "value": {
+                    "kernel_init": {
+                        "kind": "dict", "ctrl": {"type": "settingup"},
+                        "value": {"content": {"kind": "str", "value": "kernel init"}},
+                    },
+                    "worker": {
+                        "kind": "dict", "ctrl": {"type": "settingup"},
+                        "value": {
+                            "content": {"kind": "str", "value": "worker"},
+                            "caps": {
+                                "kind": "dict",
+                                "value": {
+                                    "mode": {"kind": "str", "value": "user"},
+                                    "roots": {"kind": "list", "value": [
+                                        {"kind": "str", "value": "lib"},
+                                    ]},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            "init_prompt": {"kind": "str", "value": "开始"},
+        },
+        "security": {"roots": {"lib": "$MEM.lib"}},
+        "para_ref": "$MEM.model_params",
+        "init": {"name": "init", "system_ref": "$MEM.programs.kernel_init",
+                 "user_ref": "$MEM.init_prompt"},
+    }
+    path = tmp_path / "security.json"
+    path.write_text(json.dumps(image, ensure_ascii=False), encoding="utf-8")
+    return str(path)
 
 
 def _caps_node(caps):
@@ -200,9 +250,9 @@ class TestDynamicRoots:
         assert child.caps.roots["dev"] == ("box", "dev")
 
 
-class TestSecurityDemoImage:
-    def test_load_demo_and_create_user(self):
-        core = load_image(Core(), IMAGE)
+class TestSecurityImage:
+    def test_load_image_and_create_user(self, tmp_path):
+        core = load_image(Core(), _security_image(tmp_path))
         root = core.get_conversation(0)
         assert root.caps.mode == "kernel"
         assert core.root_registry == {"lib": ("lib",)}
@@ -214,8 +264,8 @@ class TestSecurityDemoImage:
         assert child.caps.roots["lib"] == ("lib",)
         assert "work" not in child.caps.roots
 
-    def test_demo_user_cannot_read_mem_or_work(self):
-        core = load_image(Core(), IMAGE)
+    def test_user_cannot_read_mem_or_work(self, tmp_path):
+        core = load_image(Core(), _security_image(tmp_path))
         root = core.get_conversation(0)
         text = _call(core, root, "create_cmd", {
             "system_ref": "$MEM.programs.worker", "para_ref": "$MEM.model_params",

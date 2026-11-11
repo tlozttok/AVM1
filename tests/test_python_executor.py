@@ -36,7 +36,7 @@ def _setup():
     return core, root
 
 
-def test_calc_driver_flow():
+def test_create_cmd_then_send_instruction_flow():
     core, root = _setup()
     core.lmu = MockLMU([
         (None, [{"call_id": "cc", "cmd_type": "create_cmd", "args": {"system_ref": "$MEM.calc_program", "para_ref": "$MEM.calc_params"}}], None),

@@ -4,8 +4,6 @@ log/*.txt
 log/*.log
 log/*.tmp
 data/*.json
-images/out/
-images/community/out/
 docs/private/
 skills-generalization/
 

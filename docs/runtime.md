@@ -681,7 +681,7 @@ Guard 是软件层（镜像/OS 程序）注册的一个普通内核态监听器�
 
 启动时加载：`python main.py <image.json> --checkpoint-in cp.json`（或 debug.json 的 `checkpoint_in` 字段）会**跳过 init**，把检查点恢复为 cid 0 的就绪对话直接续跑——这是"上次保存的对话下次启动接着用"的入口。它只用于冷启动（`reset`；`auto` 在无快照时等价 `reset`）：`resume` / `reboot` 与检查点同时给出会报错。
 
-终端输入：等待输入时显示正在等待的对话身份提示（如 `[tester（cid=0）等待输入，/save 保存检查点]`），不再是黑屏裸等；已启用 readline 行编辑（历史/方向键，中文输入法组合友好）；终端非 UTF-8 编码会警告一次——中文乱码通常源于终端编码而不是程序。
+终端输入：等待输入时显示正在等待的对话身份提示（如 `[init（cid=0）等待输入，/save 保存检查点]`），不再是黑屏裸等；已启用 readline 行编辑（历史/方向键，中文输入法组合友好）；终端非 UTF-8 编码会警告一次——中文乱码通常源于终端编码而不是程序。
 
 ### 调试面板（Console）
 
@@ -692,7 +692,7 @@ Guard 是软件层（镜像/OS 程序）注册的一个普通内核态监听器�
 **启动与构建**：
 
 ```bash
-python scripts/run_console.py images/demo.json   # 起后端；前端构建过的话 / 就是面板，没构建则给出构建提示
+python scripts/run_console.py images/base/base.json   # 起后端；前端构建过的话 / 就是面板，没构建则给出构建提示
 cd web && npm install && npm run build   # 构建面板到 web/dist（不入库）
 cd web && npm run dev                    # 开发期：Vite 代理 /api 到 AVM_CONSOLE_URL（默认 http://127.0.0.1:8700）
 ```

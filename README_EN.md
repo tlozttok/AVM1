@@ -29,14 +29,14 @@ python main.py <image.json> --frames      # print monitor frame summary after ru
 python main.py <image.json> --transcript api.txt  # write full API calls to a file
 ```
 
-Debug settings live in `debug.json` (`image` / `frames` / `transcript` / `checkpoint_in`) so the command line does not need to change (VSCode runs `python main.py` fixed; `--debug-config <file>` selects another config file). Example images: `images/demo.json`, `images/calc_driver.json`; the image that reads this repository is `images/repo_tester.json` (the conversation reads tracked files through the read-only `$MEM.AVMRepo` device, whose usage is stated by the device itself). See the "System Images" section of [docs/runtime.md](docs/runtime.md) for the composition and key points.
+Debug settings live in `debug.json` (`image` / `frames` / `transcript` / `checkpoint_in`) so the command line does not need to change (VSCode runs `python main.py` fixed; `--debug-config <file>` selects another config file). Example images: `images/base/base.json` (motherboard image; long-running persistence + OS programs) and `images/packages/packages_demo.json` (loader/package demo). See the "System Images" section of [docs/runtime.md](docs/runtime.md) for the composition and key points.
 
 ### Debug Panel
 
 The debug panel is a separate project under `web/` (Vite + React): it observes a running Core and intervenes through the panel conversation. That conversation is an **operator conversation** — its executor is held by the panel rather than a model, and submitted instructions enter the Core verbatim; pausing goes through the interrupt vector to that conversation (`POST /api/interrupt`), resuming uses `POST /api/resume`. Panel input currently uses the debug channel (`POST /api/io/input`) which only feeds the host-side IO bus (the input device no longer reads the terminal); the formal input/output path is being redesigned as an extensible IO device layer (host IO bus + `$MEM` device frontends, see the operation-panel plan) and is not implemented yet.
 
 ```bash
-python scripts/run_console.py images/demo.json   # start the backend; / is the panel once built, otherwise a build hint
+python scripts/run_console.py images/base/base.json   # start the backend; / is the panel once built, otherwise a build hint
 cd web && npm install && npm run build   # build the panel into web/dist (not committed)
 cd web && npm run dev                    # development: Vite proxies /api to AVM_CONSOLE_URL (default http://127.0.0.1:8700)
 ```
