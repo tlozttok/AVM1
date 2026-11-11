@@ -316,7 +316,9 @@ def test_base_programs_have_no_blocking_input_read():
     with open(BASE_IMAGE, encoding="utf-8") as f:
         image = json.load(f)
     programs = image["mem"]["sys"]["value"]["programs"]["value"]
-    assert set(programs) == {"boot", "supervisor", "clock_a", "clock_b", "builder"}
+    assert set(programs) == {
+        "boot", "supervisor", "clock_a", "clock_b", "builder", "shell",
+    }
     for name, node in programs.items():
         content = node["value"]["content"]["value"]
         assert "$MEM.inputs.next" not in content, f"程序 {name} 含阻塞读"

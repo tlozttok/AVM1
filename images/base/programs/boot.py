@@ -10,8 +10,8 @@
 3. 把 `$MEM.sys.power.state` 复位成 `"on"`（resume 恢复出来的 `off` 是上一次
    关机的存量值，不复位的话 supervisor 再写 off 就没有"非 off → off"的边沿）；
 4. 按 `$MEM.sys.boot.manifest` 创建缺失的常驻对话，名字 → cid 写 registry；
-5. 创建缺失的 OS 服务对话 `clock_a` / `clock_b`；服务 cid 不写持久 MEM，运行期由
-   OS 程序按名字查 `$MEM.conversations`（运行期视图）；
+5. 创建缺失的 OS 服务对话 `clock_a` / `clock_b` / `shell`；服务 cid 不写持久 MEM，
+   运行期由 OS 程序按名字查 `$MEM.conversations`（运行期视图）；
 6. 写 `$MEM.sys.boot.report`（boot id、上次状态、宿主给的 last_exit、本次新建的
    服务），并往 `$MEM.sys.outbox` 与 `$MEM.outputs` 写一条启动记录。
 
@@ -74,12 +74,12 @@ def _live_cid(cid):
     return False
 
 
-def _ensure_service(name, program_ref, created, existing):
+def _ensure_service(name, program_ref, para_ref, created, existing):
     cid = yield from _find_cid(name)
     if cid is not None:
         existing.append(name)
         return
-    response = yield from create_cmd(program_ref, "$MEM.para.python")
+    response = yield from create_cmd(program_ref, para_ref)
     if _ok(response):
         created.append(name)
     else:
@@ -105,11 +105,12 @@ def boot(last_exit="unknown"):
     # 服务对话只建一次：先按运行期视图找，找到就不再建（resume 时 cid 已在快照里）。
     os_created = []
     os_existing = []
-    for name, program_ref in (
-        ("clock_a", "$MEM.sys.programs.clock_a"),
-        ("clock_b", "$MEM.sys.programs.clock_b"),
+    for name, program_ref, para_ref in (
+        ("clock_a", "$MEM.sys.programs.clock_a", "$MEM.para.python"),
+        ("clock_b", "$MEM.sys.programs.clock_b", "$MEM.para.python"),
+        ("shell", "$MEM.sys.programs.shell", "$MEM.para.shell"),
     ):
-        yield from _ensure_service(name, program_ref, os_created, os_existing)
+        yield from _ensure_service(name, program_ref, para_ref, os_created, os_existing)
 
     raw = str((yield from memory_read("$MEM.sys.boot.manifest"))).strip()
     specs = []

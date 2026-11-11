@@ -1,10 +1,12 @@
 """生成 base 镜像：`python images/base/build_image.py`。
 
-base 只放七样：持久化三件套、装载设备 + 只读仓库设备、OS 程序节点
+base 只放八样：持久化三件套、装载设备 + 只读仓库设备、OS 程序节点
 （boot/shutdown 两个 guest 角色程序 + clock_a/clock_b 服务程序）、可编辑的常驻
 服务清单、空分区骨架、标准 IO 设备、构造器命令程序（`plm.command`：一个程序节点
 `$MEM.sys.programs.builder` + 一个 para 档 `$MEM.para.builder`，作者可直接
-create_cmd 出来用）。
+create_cmd 出来用）、统一命令入口 shell（`plm.command`：程序节点
+`$MEM.sys.programs.shell` + para 档 `$MEM.para.shell` + 注册表分区
+`$MEM.sys.shell`，boot 按名字创建常驻服务对话）。
 空闲由宿主 console 的面板对话承担（内核把 `idle` 中断向量指向面板），镜像不再
 声明 idle 角色、不预置 inbox/面板服务；关机由宿主挂 `shutdown` 中断唤醒
 supervisor。其余基础由作者在系统内手动搭建，见 README.md。
@@ -33,6 +35,9 @@ OS_PROGRAMS = (
 
 # 构造器命令程序：system 消息是 programs/builder.py 的正文，用户消息是 JSON 规格。
 BUILDER_PROGRAM_FILE = "builder.py"
+
+# 统一命令入口：system 消息是 programs/shell.py 的正文，用户消息是一行命令。
+SHELL_PROGRAM_FILE = "shell.py"
 
 
 def _str(value, meta=None):
@@ -93,6 +98,12 @@ def build():
         name="builder",
         para_ref="$MEM.para.builder",
     )
+    programs["shell"] = _program_python(
+        _read_program(SHELL_PROGRAM_FILE),
+        "统一命令入口程序（plm.command）；按 $MEM.sys.shell.commands 注册表 create_sub 分发",
+        name="shell",
+        para_ref="$MEM.para.shell",
+    )
 
     image = {
         "meta": {
@@ -101,7 +112,7 @@ def build():
             "description": (
                 "母板镜像：持久化三件套 + 装载设备 + OS 程序（boot/shutdown 角色与 "
                 "clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架 + "
-                "构造器命令程序（plm.command）。"
+                "构造器命令程序与统一命令入口 shell（均为 plm.command）。"
                 "空闲由宿主面板对话承担；不带业务；其余基础由作者在系统内手动搭建。"
             ),
             "instruction_budget": 100,
@@ -118,6 +129,7 @@ def build():
                     "python": _para("plm.python"),
                     "command": _para("plm.command"),
                     "builder": _para("plm.command"),
+                    "shell": _para("plm.command"),
                 },
                 meta="模型档位；新的 para 由作者在系统内添加",
             ),
@@ -143,6 +155,24 @@ def build():
                         meta="启动状态、名单与恢复报告（作者可编辑）",
                     ),
                     "registry": _dict({}, meta="名字 → cid；每次启动由 boot 程序重写（仅 manifest 服务）"),
+                    "shell": _dict(
+                        {
+                            "args": _str(""),
+                            "commands": _dict(
+                                {
+                                    "builder": _dict(
+                                        {
+                                            "program": _str("$MEM.sys.programs.builder"),
+                                            "para": _str("$MEM.para.builder"),
+                                        },
+                                        meta="构造器命令",
+                                    ),
+                                },
+                                meta="命令注册表：名字 → {program, para} 引用（不存 cid）",
+                            ),
+                        },
+                        meta="统一命令入口：shell 服务程序的分发表与参数暂存",
+                    ),
                     "programs": _dict(programs, meta="系统程序节点（OS 程序 + 作者程序）"),
                     "outbox": _list([], "持久输出（作者约定怎么用）"),
                     "clock": _dict(
@@ -157,7 +187,9 @@ def build():
                     ),
                     "handbook": _str(
                         "base 约定：sys.boot.manifest 是常驻服务清单（JSON 字符串）；"
-                        "sys.registry 是名字→cid；sys.clock 是设备事件钟；"
+                        "sys.registry 是 manifest 服务名字→cid；"
+                        "sys.shell 是统一命令入口（commands 注册 program/para 引用、args 暂存）；"
+                        "sys.clock 是设备事件钟；"
                         "sys.power.state 是断电寄存器（OS 写 off，VM 在安全点读取）；"
                         "空闲由宿主面板对话承担（idle 中断向量指向面板），关机由宿主挂 "
                         "shutdown 中断唤醒 supervisor；"

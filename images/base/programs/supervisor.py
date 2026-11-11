@@ -21,7 +21,7 @@ OS 软件缺席或一直收不尾时，关机停在挂起；操作员可以走�
 """
 
 _OS_NAMES = (
-    "init", "guest-boot", "guest-shutdown", "clock_a", "clock_b",
+    "init", "guest-boot", "guest-shutdown", "clock_a", "clock_b", "shell",
 )
 
 

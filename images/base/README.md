@@ -1,8 +1,8 @@
 # base 母板镜像
 
 第一块长期运行的镜像：不带业务，只带持久化、装载设备、OS 程序（引导/关机监督/
-设备事件钟）与空分区。空闲由宿主控制台的面板对话承担，镜像不再声明空闲处理程序。
-其余基础由作者在系统内手动搭建。
+设备事件钟）、统一命令入口 shell 与空分区。空闲由宿主控制台的面板对话承担，镜像
+不再声明空闲处理程序。其余基础由作者在系统内手动搭建。
 
 ```bash
 python images/base/build_image.py          # 重新生成 base.json（首次生成后 base.json 是种子）
@@ -19,11 +19,12 @@ python -m avm.console images/base/base.json
 | `$MEM.sys.boot.state` / `.prior` / `.id` / `.report` | 启动标记（`running` / `clean`）、上次状态、上电序号、最近一次恢复报告 |
 | `$MEM.sys.boot.manifest` | 常驻服务清单（JSON 字符串，初始 `[]`）；boot 程序按它创建缺失对话 |
 | `$MEM.sys.registry` | 名字 → cid；boot 程序重写（只记 manifest 服务；OS 服务的 cid 不落持久 MEM） |
-| `$MEM.sys.programs.*` | OS 程序节点（`boot` / `supervisor` / `clock_a` / `clock_b`）与构造器命令程序（`builder`），可在系统内改写 |
+| `$MEM.sys.programs.*` | OS 程序节点（`boot` / `supervisor` / `clock_a` / `clock_b`）、构造器命令程序（`builder`）与 shell 程序（`shell`），可在系统内改写 |
+| `$MEM.sys.shell` | 统一命令入口：`args`（分发暂存位，str）与 `commands`（命令注册表：名字 → `{program, para}` 引用） |
 | `$MEM.sys.outbox` | 持久输出（作者约定怎么用） |
 | `$MEM.sys.clock` | 设备事件钟：`tick` / `target` / `interval` / `timeouts` / `state` |
 | `$MEM.sys.handbook` | 分区与自举约定 |
-| `$MEM.para.python` / `.command` / `.builder` | 内建 PLM 的参数档（构造器的 `.builder` 用 `plm.command`） |
+| `$MEM.para.python` / `.command` / `.builder` / `.shell` | 内建 PLM 的参数档（`.builder` / `.shell` 用 `plm.command`） |
 | `$MEM.packages` / `package_records` | 由装载设备管理 |
 | `$MEM.workshop` / `$MEM.home` | 试验区 / 个人数据区（空） |
 | `$MEM.loader` | 装载设备（程序包、设备） |
@@ -31,9 +32,10 @@ python -m avm.console images/base/base.json
 | `$MEM.inputs` / `$MEM.outputs` | 标准 IO 设备；操作面板宿主会替换成总线设备 |
 
 OS 程序节点里 `ctrl.type="python"`、`value.content` 是程序源、`value.para_ref` 指向
-`$MEM.para.python`；服务节点的 `value.name`（`clock_a` / `clock_b`）会成为对话身份。
-构造器程序节点同样是 `ctrl.type="python"`，`value.content` 是 `plm.command` 程序正文，
-`value.para_ref` 指向 `$MEM.para.builder`（`model` 为 `plm.command`）。顶层声明
+`$MEM.para.python`；服务节点的 `value.name`（`clock_a` / `clock_b` / `shell`）会成为
+对话身份。构造器与 shell 程序节点同样是 `ctrl.type="python"`，`value.content` 是
+`plm.command` 程序正文，`value.para_ref` 分别指向 `$MEM.para.builder` /
+`$MEM.para.shell`（`model` 为 `plm.command`）。顶层声明
 `journal_to` / `snapshot_to` / `persist_to`，落点在 `images/base/out/`；
 `meta.snapshot_every=200`。
 
@@ -113,6 +115,66 @@ yield from send_instruction(cid, json.dumps(spec, ensure_ascii=False))
 消息；要让结果进内存，可在 `calls` 里写节点，或改用 `create_sub`（把规格先写进一个
 str 节点作为 `user_ref`，亚对话完成时自动把摘要写回父对话）。
 
+## shell（统一命令入口）
+
+shell 是 base 预置的第二个普通 `plm.command` 程序节点（`$MEM.sys.programs.shell`，
+para `$MEM.para.shell`），给作者一个统一命令入口：一条命令按注册表分发给对应的
+命令程序，不用为每个功能记一组 cid。它不是新 PLM 类型，程序正文同样可以在系统内
+直接读改。
+
+**怎么找到 shell 服务。** boot 冷启动/恢复时创建（或复用）名字为 `shell` 的常驻
+对话，规则与 `clock_a` / `clock_b` 相同：运行期按名字查 `$MEM.conversations`，cid
+不写进持久 MEM（`$MEM.sys.registry` 只记 manifest 服务）。
+
+```python
+listing = yield from memory_read("$MEM.conversations")
+match = re.search(r"cid=(\d+)\s+shell\b", str(listing))
+shell_cid = int(match.group(1)) if match else None
+yield from send_instruction(shell_cid, "builder {...JSON 规格...}")
+```
+
+`send_instruction` 只确认投递、不返回命令结果；命令的输出是 shell 对话自己的
+assistant 消息（例如 builder 直接返回的 JSON 摘要）。需要同步拿结果的调用方可以把
+`$MEM.sys.programs.shell` 当普通命令程序用 `create_sub` 启动（`user_ref` 指向一个
+装了整行命令的 str 节点），shell 会把子命令结果作为返回通道写回。注意
+`$MEM.sys.shell.args` 是共享暂存位：同一时刻只应有一条命令在分发。
+
+**命令格式。** `<命令名> <参数...>`：第一个空格前是命令名，其余整段原样作为参数
+（参数可以含空格）。整行只有空白时返回 `错误: shell: 空命令`。
+
+**内建命令。**
+
+| 命令 | 行为 |
+|---|---|
+| `help` | 列出 `$MEM.sys.shell.commands` 里已注册的命令名 |
+| `help <名字>` | 显示该命令注册的 `program` / `para` 引用 |
+
+**分发机制。** 从 `$MEM.sys.shell.commands.<名字>` 读 `program` 与 `para` 两个 str
+子节点；读不到（或读出来是 Error/Illegal）时返回
+`错误: shell: 未知命令 '<名字>'（用 help 查看）`。否则把剩余参数原样写入
+`$MEM.sys.shell.args`，再：
+
+```python
+result = yield from create_sub(program, "$MEM.sys.shell.args", para)
+return str(result)
+```
+
+`create_sub` 是同步的：shell 服务在亚对话返回前休眠，亚对话完成时输出自动写回，
+shell 把那条工具响应原样返回——子命令返回的 JSON 摘要、错误文本都直接成为 shell
+的输出，不再包装。程序内部异常不抛穿 Core，统一返回 `错误: shell: ...`。
+
+**加新命令。**
+
+1. 建一个 `ctrl.type="python"` 命令程序节点（正文是 `plm.command` 程序，定义
+   `handle(cmd)`）；para 的 `model` 为 `plm.command`，可以复用 `$MEM.para.shell`。
+2. 在 `$MEM.sys.shell.commands` 下建同名 dict，写 `program`、`para` 两个 str
+   子节点，指向上面两个节点。
+3. 无需重启：下一条命令即按新注册表分发。注册表只存引用、不存 cid，命令程序
+   按需现建现用。
+
+作者可以用构造器（`builder`）一次建出程序节点与注册项，也可以用 `memory_make` /
+`memory_write` 手工建，或直接改 `base.json` 再冷启动。
+
 ## OS 程序与自举
 
 `meta.guest_programs` 声明两个 guest 角色（内核创建对话并注册同名中断向量）：
@@ -131,7 +193,7 @@ str 节点作为 `user_ref`，亚对话完成时自动把摘要写回父对话�
   `boot` 角色；作者可以在系统内改写它加早期步骤。
 - **boot**：写 `running` / 递增 `boot.id` / 复位 `power.state = on`（否则 resume
   后第二次关机没有边沿）/ 按 manifest 创建缺失服务 / 创建缺失的 OS 服务对话
-  （`clock_a` / `clock_b`）/ 写 `boot.report` / 休眠。
+  （`clock_a` / `clock_b` / `shell`）/ 写 `boot.report` / 休眠。
   服务 cid 不写持久 MEM：运行期通过 `$MEM.conversations` 按名字查找。
 - **shutdown（supervisor）**：检查 `$MEM.conversations` 里是否还有非 OS 对话处于
   active / ready；有就启/保持设备事件钟、写等待/超时记录，**不写 off**；全部收尾
@@ -164,5 +226,6 @@ IO 总线，是不进日志的调试通道。base 不预置 inbox/面板输入�
 ## 测试
 
 ```bash
-python -m pytest tests/test_base_image.py tests/test_os_shutdown.py -q
+python -m pytest tests/test_base_image.py tests/test_os_shutdown.py \
+    tests/test_builder_command.py tests/test_shell_command.py -q
 ```
