@@ -4,9 +4,7 @@
 - listen_event before 事件先解析 handler 的 condition，载荷带解析后的条件；
 - 内核态 Guard 监听 listen_event before，可 replace / allow 普通注册；
 - 无 Guard 时注册不受限（默认行为）；
-- 旧快照/旧日志里依赖已删除条件形态（owned_by_owner、source.cid）的监听器
-  恢复/重放时被丢弃并告警，旧日志多余的 owner_cid 字段按未知字段忽略；
-- 旧 handler 节点使用已删形态时注册报明确错误；
+- handler 节点使用已删除条件形态（owned_by_owner、source.cid、preset）时注册报明确错误；
 - 宿主入口 EventSystem.register 不做 memory owner 授权（受信任入口）。
 """
 
@@ -16,9 +14,7 @@ import pytest
 
 from avm.capabilities import ALL_TOOL_NAMES, Capability
 from avm.core import Core, ListenEventInstruction
-from avm.events import listener_to_snapshot
-from avm.journal import Journal
-from avm.snapshot import snapshot, restore
+from avm.journal import Journal, JournalError
 from avm.exceptions import IllegalOperationError
 from avm.types import MetaDict, StrNode
 
@@ -225,106 +221,17 @@ class TestRemovedConditionForms:
 
 
 # ----------------------------------------------------------------------
-# 旧快照 / 旧日志的监听器兼容
+# 格式拒绝：旧版本输入不能回流
 # ----------------------------------------------------------------------
 
-def _legacy_listener(listener_id, kind="owned_by_owner", source=None,
-                     handler_code="def handle(event):\n    return {}\n"):
-    return {
-        "listener_id": listener_id,
-        "owner_cid": 0,
-        "event_type": "*",
-        "target": "*",
-        "target_ref": None,
-        "handler_ref": "$MEM.h",
-        "handler_code": handler_code,
-        "phase": "all",
-        "enabled": True,
-        "tier": "kernel",
-        "priority": 0,
-        "space": None,
-        "condition": {
-            "preset": None,
-            "events": ["memory_read"],
-            "phases": ["before"],
-            "target": {"kind": kind, "cid": 0},
-            "source": source,
-        },
-    }
-
-
-class TestLegacySnapshot:
-    def test_removed_condition_listeners_dropped_on_restore(self, capsys):
-        core, root = _core()
-        _memory_handler(core)
-        normal_id = core.events.register_condition(
-            0, "$MEM.h", kernel_mode=True,
-        )
-        doc = snapshot(core)
-        # 模拟旧快照：监听器记录带已删除条件形态；节点上还可能残留 ctrl.owner。
-        doc["listeners"] = [
-            listener_to_snapshot(core.events.listeners[0]),
-            _legacy_listener(2),
-            _legacy_listener(3, source={"cid": [0]}),
-        ]
-        doc["memory"]["value"]["old"] = {
-            "kind": "dict", "ctrl": {"owner": "0"}, "value": {},
-        }
-
-        restored = Core()
-        restore(restored, doc)
-
-        # 正常监听器保留，旧形态的丢弃；旧 ctrl.owner 只是普通 ctrl 数据，不影响启动。
-        assert [l["listener_id"] for l in restored.events.listeners] == [normal_id]
-        err = capsys.readouterr().err
-        assert err.count("丢弃使用已移除条件形态的监听器") == 2
-        assert restored.mem["old"].get_ctrl() == {"owner": "0"}
-
-
-class TestLegacyJournal:
-    def _journaled_core(self, tmp_path):
+class TestOldFormatRejected:
+    def test_old_journal_record_version_is_rejected(self, tmp_path):
         core, root = _core()
         path = str(tmp_path / "run.journal")
         core.attach_journal(path)
-        return core, root, path
-
-    def test_removed_condition_listeners_dropped_on_replay(self, tmp_path, capsys):
-        core, root, path = self._journaled_core(tmp_path)
-        _memory_handler(core)
-        core.events.register_condition(0, "$MEM.h", kernel_mode=True)
-        normal = listener_to_snapshot(core.events.listeners[-1])
-        # 重放会自己创建这条监听器：先把当前表清空，避免同一 listener_id 重复。
-        core.events.listeners = []
-        core.events._next_listener_id = 1
-        Journal(path).append({"v": 2, "cid": root.cid, "changes": [
-            {"kind": "effect", "effect": {"kind": "listener_register", "listener": normal}},
-            {"kind": "effect",
-             "effect": {"kind": "listener_register", "listener": _legacy_listener(2)}},
-            {"kind": "effect",
-             "effect": {"kind": "listener_register",
-                        "listener": _legacy_listener(3, source={"cid": [0]})}},
-        ]})
-
-        assert core.replay_journal() == 1
-        assert [l["listener_id"] for l in core.events.listeners] == [normal["listener_id"]]
-        err = capsys.readouterr().err
-        assert err.count("丢弃使用已移除条件形态的监听器") == 2
-
-    def test_legacy_owner_cid_effect_fields_ignored(self, tmp_path):
-        """旧日志效果里多余的 owner_cid 字段按未知字段忽略，重放不写入 MEM。"""
-        core, root, path = self._journaled_core(tmp_path)
-        Journal(path).append({"v": 2, "cid": root.cid, "changes": [
-            {"kind": "effect", "effect": {
-                "kind": "memory_make", "ref": "$MEM", "key": "d", "mem_type": "dict",
-                "owner_cid": 0, "space": None,
-            }},
-            {"kind": "effect", "effect": {
-                "kind": "memory_set", "ref": "$MEM.d", "value": "v",
-                "owner_cid": 0, "space": None,
-            }},
-        ]})
-        assert core.replay_journal() == 1
-        assert core.mem["d"].get_ctrl() is None
+        Journal(path).append({"v": 2, "generation": 1, "cid": root.cid, "changes": []})
+        with pytest.raises(JournalError, match="不支持的记录版本"):
+            core.replay_journal()
 
 
 class TestHostRegisterIsTrusted:

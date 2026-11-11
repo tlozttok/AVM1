@@ -102,14 +102,15 @@ def main(argv=None) -> int:
         transcript = transcript or cfg.get("transcript")
         checkpoint_in = checkpoint_in or cfg.get("checkpoint_in")
         restore = restore or cfg.get("restore")
-        # debug.json 里的 auto 与命令行同义（都不传 mode，保持旧行为）
-        mode = mode or (None if cfg.get("mode") == "auto" else cfg.get("mode"))
+        # debug.json 里的 mode 与命令行同义；缺省 auto。
+        mode = mode or cfg.get("mode") or "auto"
     if transcript and not os.path.isabs(transcript):
         transcript = os.path.join(config_dir, transcript)
     if checkpoint_in and not os.path.isabs(checkpoint_in):
         checkpoint_in = os.path.join(config_dir, checkpoint_in)
     if restore and not os.path.isabs(restore):
         restore = os.path.join(config_dir, restore)
+    mode = mode or "auto"
 
     try:
         core = boot(image, mode=mode, checkpoint_in=checkpoint_in, restore=restore)

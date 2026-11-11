@@ -2,7 +2,7 @@
 
 总线属于宿主，不属于 $MEM：操作面板宿主的 `IOInputDevice` / `IOOutputDevice`
 （见 avm/io_devices.py）是它的设备前端，面板断开、终端模式都不影响运行时本身。
-标准镜像设备（avm/memory_device.py）不读这条总线，终端宿主的旧行为不变。
+标准镜像设备（avm/memory_device.py）不读这条总线，终端宿主行为不变。
 
 形状与 OperatorChannel 一致：有界缓冲、seq 单调递增、丢弃计数进 status()。
 """

@@ -24,7 +24,7 @@ from .monitor import Monitor
 from .python_server import HOST_ONLY_PLMS, PLM_REGISTRY, create_plm
 from .events import EventSystem, build_event, EVENT_TYPES
 from .journal import (
-    Journal, JournalError, apply as apply_journal_record,
+    JOURNAL_RECORD_VERSION, Journal, JournalError, apply as apply_journal_record,
     conversation_create_payload, scheduler_to_snapshot,
 )
 from .info_devices import (
@@ -1702,7 +1702,7 @@ class Core:
         self.journal_path: Optional[str] = None   # 镜像 journal_to（load_image 解析后写入）
         self.snapshot_path: Optional[str] = None  # 镜像 snapshot_to（load_image 解析后写入）
         self._journal_seq: int = 0                # 已提交/已重放到的日志位置
-        # 日志代际：resume 续当前代际；reboot/reset 由宿主归档旧日志并开新代际（seq 归零）。
+        # 日志代际：resume 续当前代际；reboot/reset 由宿主归档当前日志并开新代际（seq 归零）。
         self.journal_generation: int = 1
         self._journal_batch: Dict[int, dict] = {}  # cid → 上次提交的待发批次（增量记录用）
         self._scheduler_committed: Optional[dict] = None  # 上次提交后的调度状态（增量基线）
@@ -1715,8 +1715,9 @@ class Core:
         # 就绪为空且无待派发中断"不再视为跑完：run() 向已注册的 `idle` 中断向量
         # 派发；派发后仍然是空闲（没有可运行目标、或 guest idle 处理程序没离开
         # 空闲）就 KernelPanic（空闲 = 严重错误）。宿主 console 把保留对话注册为
-        # `idle` 向量，面板阻塞等操作员就是空闲态；没有声明的旧镜像保持旧语义：
-        # run() 在队列空了时正常返回。
+        # `idle` 向量，面板阻塞等操作员就是空闲态。嵌入式宿主未接入生命周期管理
+        # （镜像没有声明 guest 程序、宿主也没注册 idle 向量）时，run() 在队列空了
+        # 时正常返回。
         self.strict_scheduler: bool = False
         self.guest_roles: Dict[str, dict] = {}      # 角色 → {"cid", "entry", "kind"}（宿主中断向量来源）
         self.guest_programs_decl: Dict[str, str] = {}  # 镜像 meta.guest_programs（角色 → 程序节点引用）
@@ -1746,14 +1747,11 @@ class Core:
     def is_hidden_cid(self, cid) -> bool:
         """对话是否对普通对话隐藏、不可寻址（显示/寻址策略，不影响恢复）。
 
-        判定读对话自己的 `attrs["hidden"]`（宿主在保留对话创建时写 "1"）；
-        `cid == PANEL_CID` 作为兼容判定保留：旧快照/旧日志里恢复出来的保留对话
-        没有 attrs，不能因为缺标记就变成可见。
+        判定只读对话自己的 `attrs["hidden"]`（宿主在保留对话创建时写 "1"）；
+        cid 是身份，不参与显示策略。
         """
         conv = self._conv_by_cid.get(cid)
-        if conv is not None and (conv.attrs or {}).get("hidden") == "1":
-            return True
-        return cid == PANEL_CID
+        return conv is not None and (conv.attrs or {}).get("hidden") == "1"
 
     # ------------------------------------------------------------------
     # 安全配置：根注册表与动态授予根（批次一 S4）
@@ -2087,7 +2085,7 @@ class Core:
             changes.append(delta)
         self._scheduler_committed = self._scheduler_state()
         record = {
-            "v": 2,
+            "v": JOURNAL_RECORD_VERSION,
             "generation": int(self.journal_generation),
             "cid": cid,
             "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -2539,8 +2537,7 @@ class Core:
             is_sub=False,
             parent=None,
             is_root=False,
-            # 宿主标记：控制台持有的保留对话对普通对话隐藏。判定只读 attrs
-            # （旧快照没有 attrs 时由 is_hidden_cid 的 cid 兼容分支兜底）。
+            # 宿主标记：控制台持有的保留对话对普通对话隐藏。判定只读 attrs。
             attrs={"host": "console", "hidden": "1"},
         )
         self._register(conv, cid=PANEL_CID)
@@ -2559,14 +2556,6 @@ class Core:
         conv.para_ref = para_ref or self.para_ref
         self._executors[conv.cid] = PLMExecutor(create_plm("plm.operator", channel=channel))
         return conv
-
-    def start_operator_conversation(
-        self,
-        channel,
-        para_ref: Optional[str] = None,
-    ) -> Conversation:
-        """兼容旧入口：绑定控制台通道；没有保留对话时建一条。"""
-        return self.bind_console_conversation(channel, para_ref)
 
     # ------------------------------------------------------------------
     # 安全点自检（六条具名不变量）
@@ -3149,8 +3138,8 @@ class Core:
                 )
                 if vector_cid is None:
                     if not self.strict_scheduler:
-                        # 旧镜像（没有声明 guest 程序，宿主也没注册 idle 向量）：
-                        # 队列空了就是"跑完了"，保持旧语义。
+                        # 嵌入式宿主未接入生命周期管理（镜像没有声明 guest 程序，
+                        # 宿主也没注册 idle 向量）：队列空了就是"跑完了"，run() 返回。
                         return
                     self._panic_idle(
                         "系统空闲，但镜像没有声明 idle guest 程序"

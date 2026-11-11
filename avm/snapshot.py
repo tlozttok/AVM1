@@ -2,7 +2,12 @@
 
 日志是持久化依据，快照是它的缓存。快照记录"某一安全点上的状态"，日志记录之后
 提交的回合；恢复顺序是：装载镜像（跳过 init）→ 恢复快照 → 按 `journal_to` 重放
-seq 之后的日志。快照缺失或损坏时退回"镜像 + 日志"重放，不阻塞启动。
+seq 之后的日志。快照缺失或损坏时没有可恢复的对话状态：启动模式必须选 `reset`
+（`auto` 在快照不可读时自动等价 `reset`）。
+
+快照格式由 `format` + `version` 显式版本化（当前 `version=2`）；`generation`
+必须存在且为正整数。旧版本快照不读取也不迁移，`SnapshotError` 提示用 `reset`
+重建世界。
 
 快照形状与内核转储（诊断用）同源但目标不同：
 
@@ -18,7 +23,6 @@ seq 之后的日志。快照缺失或损坏时退回"镜像 + 日志"重放，�
 
 import json
 import os
-import sys
 import time
 from typing import Optional
 
@@ -28,7 +32,7 @@ from .memory import Memory
 from .types import MetaDict
 
 SNAPSHOT_FORMAT = "avm.snapshot"
-SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
 
 
 class SnapshotError(ValueError):
@@ -45,7 +49,7 @@ def snapshot(core) -> dict:
     安全点约束：只在没有半截回合的位置调用（宿主退出路径、测试）。快照的 seq 取
     `_journal_seq`——已提交的日志位置，不是日志文件长度：文件里可能存在尚未重放
     的尾部记录，它们不属于当前状态。`generation` 记录快照所处的日志代际：
-    resume 续代际，reboot/reset 归档旧日志后开新代际。
+    resume 续代际，reboot/reset 归档当前代际日志后开新代际。
     """
     scheduler = scheduler_to_snapshot(core)
     return {
@@ -82,7 +86,7 @@ def snapshot(core) -> dict:
 
 
 def write_atomic(path: str, doc: dict) -> str:
-    """原子写快照：同目录临时文件 + os.replace（半截快照不会覆盖掉旧快照）。"""
+    """原子写快照：同目录临时文件 + os.replace（半截快照不会覆盖已有快照）。"""
     if not isinstance(path, str) or not path:
         raise SnapshotError("快照路径必须是非空字符串")
     directory = os.path.dirname(os.path.abspath(path))
@@ -116,7 +120,11 @@ def read_snapshot(path: str) -> dict:
         )
     version = doc.get("version")
     if version != SNAPSHOT_VERSION:
-        raise SnapshotError(f"不支持的快照版本 {version}（当前支持 {SNAPSHOT_VERSION}）：{path}")
+        raise SnapshotError(
+            f"不支持的快照版本 {version}（当前支持 {SNAPSHOT_VERSION}）：{path}"
+            "——旧版本快照不再支持，请用 reset 重建世界"
+        )
+    _validate_generation(doc, path)
     for key in ("scheduler", "memory", "conversations", "device_specs"):
         if key not in doc:
             raise SnapshotError(f"快照缺少 {key} 段：{path}")
@@ -138,7 +146,7 @@ def restore(core, doc: dict) -> None:
     _rebuild_conversations(core, doc)
     _rebuild_listeners(core, doc)
     _restore_security_and_pointer(core, doc)
-    core.journal_generation = _generation_of(doc, core)
+    core.journal_generation = _generation_of(doc)
     apply_scheduler(core, doc.get("scheduler"), source="重启快照")
     core._journal_seq = int(doc.get("seq", 0) or 0)
     core._last_snapshot_seq = core._journal_seq
@@ -155,23 +163,23 @@ def restore_world(core, doc: dict) -> None:
     doc = _validate_doc(doc)
     _rebuild_memory_and_devices(core, doc)
     _restore_security_and_pointer(core, doc)
-    core.journal_generation = _generation_of(doc, core)
+    core.journal_generation = _generation_of(doc)
     core._journal_seq = int(doc.get("seq", 0) or 0)
     core._last_snapshot_seq = core._journal_seq
 
 
-def _generation_of(doc: dict, core) -> int:
-    """快照的代际；旧快照缺字段时按当前代际兼容并提示。"""
-    raw = doc.get("generation")
-    if isinstance(raw, int) and raw >= 1:
-        return raw
-    current = int(getattr(core, "journal_generation", 1) or 1)
-    if int(doc.get("seq", 0) or 0) > 0:
-        print(
-            f"[AVM] 旧快照没有 generation 字段：按当前代际 {current} 继续",
-            file=sys.stderr,
+def _generation_of(doc: dict) -> int:
+    """快照记录的日志代际（`_validate_doc` 已校验存在且为正整数）。"""
+    return doc["generation"]
+
+
+def _validate_generation(doc: dict, where: str) -> None:
+    generation = doc.get("generation")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise SnapshotError(
+            f"快照缺少合法的 generation 字段（应为正整数）：{where}"
+            "——旧版本快照不再支持，请用 reset 重建世界"
         )
-    return current
 
 
 def _validate_doc(doc: dict) -> dict:
@@ -181,7 +189,9 @@ def _validate_doc(doc: dict) -> dict:
         raise SnapshotError(
             f"不是可恢复的重启快照（format/version 不对）："
             f"{doc.get('format')!r}/{doc.get('version')!r}"
+            "——旧版本快照不再支持，请用 reset 重建世界"
         )
+    _validate_generation(doc, "快照")
     return doc
 
 
@@ -220,10 +230,9 @@ def _rebuild_memory_and_devices(core, doc: dict) -> None:
             )
         recorded_sha256 = spec.get("sha256")
         if not isinstance(recorded_sha256, str) or not recorded_sha256:
-            # 旧快照的文件型设备没有内容哈希。首次加载后补记等于信任当前文件，
-            # 审批计划作者定：拒绝恢复并提示重新审批（开发期接受破坏旧快照）。
+            # 恢复只信任快照记录的内容哈希；缺失说明快照不完整，拒绝而不是按当前文件补记。
             raise SnapshotError(
-                f"设备 {mount} 的快照记录缺少 sha256（旧快照）："
+                f"设备 {mount} 的快照记录缺少 sha256："
                 "拒绝恢复，请重新审批并装载该设备后再保存快照"
             )
         try:
@@ -289,8 +298,6 @@ def _rebuild_conversations(core, doc: dict) -> None:
 
 
 def _rebuild_listeners(core, doc: dict) -> None:
-    from .events import drop_removed_condition_listener
-
     listeners = doc.get("listeners") or []
     if not isinstance(listeners, list):
         raise SnapshotError("快照 listeners 段必须是数组")
@@ -302,9 +309,6 @@ def _rebuild_listeners(core, doc: dict) -> None:
             listener = listener_from_snapshot(data)
         except (TypeError, ValueError) as e:
             raise SnapshotError(f"快照里的监听器记录不合法：{e}") from e
-        # 旧快照里依赖节点所有权 cid 的条件形态已删除：丢弃该监听器并告警，不中断启动。
-        if drop_removed_condition_listener(listener, "重启快照"):
-            continue
         core.events.listeners.append(listener)
         listener_id = listener.get("listener_id")
         if isinstance(listener_id, int) and listener_id >= core.events._next_listener_id:
@@ -317,7 +321,6 @@ def _restore_security_and_pointer(core, doc: dict) -> None:
     core.root_registry = {
         name: tuple(segments) for name, segments in roots.items()
     }
-    # 旧快照可能带 security.workspace_region：内核已不分配工作空间，按未知字段忽略。
     para_ref = doc.get("para_ref")
     if isinstance(para_ref, str) and para_ref:
         core.para_ref = para_ref

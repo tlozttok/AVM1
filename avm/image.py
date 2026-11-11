@@ -269,7 +269,7 @@ def resolve_device_entry(dev: dict, base: Optional[str], subject: str = "设备"
     }
     if file_path is not None:
         spec["sha256"] = file_sha256
-    # 审批记录只在 loader 装载时随请求带上；镜像冷装载与旧 journal 都没有。
+    # 审批记录只在 loader 装载时随请求带上；镜像冷装载与日志重放都不带这些字段。
     for key in ("approved_sha256", "approved_at", "approved_via"):
         value = dev.get(key)
         if value is not None:
@@ -825,7 +825,7 @@ def main(argv=None) -> int:
     from .journal import JournalError
     try:
         core = boot(
-            args.image, mode=None if args.mode == "auto" else args.mode,
+            args.image, mode=args.mode,
             checkpoint_in=args.checkpoint_in, restore=args.restore,
         )
     except (ImageError, JournalError, VMMemoryError, OSError, json.JSONDecodeError) as e:

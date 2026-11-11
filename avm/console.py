@@ -827,9 +827,10 @@ class Console:
         不自行断电，操作员可在 force_stop_delay 之后强制退出。
 
         面板对话空闲时正阻塞在自己的推理里等操作员动作，中断要等它回到安全点才能
-        派发；所以关机时如果面板持有执行权，就结束它这一轮（提交 `{"end": True}`）
-        把执行权还给 Core。这不是"经保留对话写世界"：只是让阻塞的面板让出执行权。
-        新输入从这一刻起被拦住。
+        派发；所以面板关机按钮在挂中断的同时向操作员通道提交一次 `{"end": True}`，
+        让阻塞的面板回合回到安全点（作者 2026-11-11 定）。面板没有占执行权时中断
+        在下一个安全点自然派发，不提交动作，避免在通道里留下一枚过早的 end。
+        这不是"经保留对话写世界"：只是让阻塞的面板让出执行权。新输入从这一刻起被拦住。
         """
         with self._client_lock:
             if self.lifecycle != "running":
@@ -847,7 +848,8 @@ class Console:
         else:
             self.core.interrupts.raise_("shutdown", payload=info.get("entry"))
             if self.core._active_cid == self.panel.cid:
-                # 面板阻塞在操作员通道上（系统空闲态）：结束这一轮，Core 回到安全点。
+                # 面板关机按钮同时向操作员通道提交一次：结束面板这一轮，Core 回到
+                # 安全点才能派发 shutdown 中断（作者 2026-11-11 定）。
                 self.channel.submit_action({"end": True})
         return {
             "status": "stopping",
@@ -1326,7 +1328,7 @@ def main(argv=None) -> int:
     from .image import ImageError
 
     try:
-        core = boot(args.image, mode=None if args.mode == "auto" else args.mode,
+        core = boot(args.image, mode=args.mode,
                     checkpoint_in=args.checkpoint_in,
                     host_flags={"console": True})
     except (ImageError, VMMemoryError, OSError, ValueError) as e:

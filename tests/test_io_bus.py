@@ -296,7 +296,7 @@ class TestConsoleEndpoints:
         code, state, _ = _request(base, "GET", "/api/state")
         assert code == 200
         assert state["lifecycle"] == "running"
-        assert state["recovery"]["source"] in ("cold", "snapshot", "journal")
+        assert state["recovery"]["source"] in ("cold", "snapshot")
         assert set(state["io"]) == {"input", "output"}
         assert state["client"]["single_client"] is False
         assert "force_stop_after" in state

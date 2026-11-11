@@ -231,7 +231,7 @@ def test_panel_write_is_journaled_and_replayable(tmp_path):
     boot_cold(core)
 
     channel = OperatorChannel()
-    panel = core.start_operator_conversation(channel, para_ref="$MEM.para.python")
+    panel = core.bind_console_conversation(channel, para_ref="$MEM.para.python")
     _panel_write(core, channel, panel, "panel-写入")
 
     restored = load_core(image, journal=True)
@@ -247,7 +247,7 @@ def test_panel_write_survives_snapshot_and_journal_tail(tmp_path):
     boot_cold(core)
 
     channel = OperatorChannel()
-    panel = core.start_operator_conversation(channel, para_ref="$MEM.para.python")
+    panel = core.bind_console_conversation(channel, para_ref="$MEM.para.python")
     _panel_write(core, channel, panel, "first")
 
     snap_path = tmp_path / "snap.json"
@@ -298,7 +298,7 @@ def test_loader_mounts_device_and_replay_keeps_it(tmp_path):
         "args": {"value": "初始"},
     })
     channel = OperatorChannel()
-    panel = core.start_operator_conversation(channel, para_ref="$MEM.para.python")
+    panel = core.bind_console_conversation(channel, para_ref="$MEM.para.python")
     _panel_actions(core, channel, panel, [
         {"tool": "memory_write",
          "arguments": {"ref": "$MEM.loader", "content": command}},

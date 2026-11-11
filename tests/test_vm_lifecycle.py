@@ -376,7 +376,7 @@ class TestGeneration:
         assert rebooted.journal_generation == 1 + 1
         assert [record.get("generation") for record in rebooted.journal.read()] == [2]
 
-    def test_snapshot_generation_roundtrip_and_old_snapshot_compat(self, tmp_path):
+    def test_snapshot_generation_roundtrip(self, tmp_path):
         image = write_image(tmp_path)
         core = load_core(image, THREE_TURNS)
         core.attach_journal(core.journal_path)
@@ -385,22 +385,13 @@ class TestGeneration:
         core.snapshot_to(out_path(image, "run.snapshot.json"))
         assert read_snapshot(core.snapshot_path)["generation"] == 7
 
-        # 旧快照没有 generation：按当前代际兼容，不拒绝恢复
-        with open(core.snapshot_path, encoding="utf-8") as f:
-            doc = json.load(f)
-        doc.pop("generation")
-        write_atomic(core.snapshot_path, doc)
-        restored = load_core(image)
-        restored.restore_from(core.snapshot_path)
-        assert restored.journal_generation == 1
-
-    def test_old_log_without_generation_fields_is_accepted(self, tmp_path):
+    def test_log_without_generation_is_rejected(self, tmp_path):
         image = write_image(tmp_path)
         core = load_core(image, THREE_TURNS)
         core.attach_journal(core.journal_path)
         run_turns(core, 3)
         core.snapshot_to(out_path(image, "run.snapshot.json"))
-        # 把日志里的 generation 字段剥掉（模拟旧版本写下的日志）
+        # v3 记录必须带代际：剥掉后按格式错误拒绝，不按当前代际兜底。
         path = out_path(image, "run.journal")
         with open(path, encoding="utf-8") as f:
             records = [json.loads(line) for line in f if line.strip()]
@@ -409,8 +400,8 @@ class TestGeneration:
         with open(path, "w", encoding="utf-8") as f:
             for record in records:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        resumed = boot(image, mode="resume", refresh_models=False)
-        assert resumed.journal_generation == 1
+        with pytest.raises(JournalError, match="缺少 generation"):
+            boot(image, mode="resume", refresh_models=False)
 
 
 # ----------------------------------------------------------------------
@@ -595,8 +586,8 @@ class TestIdleIsFatal:
         core._active_cid = None
         assert core._idle_now(), "没有活跃/就绪/待派发中断才是空闲"
 
-    def test_legacy_image_without_guest_programs_returns_when_idle(self, tmp_path):
-        """兼容：没有 guest 声明的旧镜像保持旧语义，队列空了 run() 正常返回。"""
+    def test_embedded_host_without_guest_programs_returns_when_idle(self, tmp_path):
+        """嵌入式宿主未接入生命周期管理：没有 guest 声明时队列空了 run() 返回。"""
         image = write_image(tmp_path)
         core = load_core(image, [("done", [])])
         assert core.strict_scheduler is False
@@ -783,6 +774,11 @@ class TestModeValidation:
         with pytest.raises(ImageError, match="未知启动模式"):
             boot(image, mode="cold", refresh_models=False)
 
+    def test_none_mode_is_rejected(self, tmp_path):
+        image = write_image(tmp_path)
+        with pytest.raises(ImageError, match="未知启动模式"):
+            boot(image, mode=None, refresh_models=False)
+
     def test_restore_argument_only_for_resume(self, tmp_path):
         image = write_image(tmp_path)
         with pytest.raises(ImageError, match="restore 参数只用于 resume"):
@@ -793,10 +789,11 @@ class TestModeValidation:
         with pytest.raises(ImageError, match="checkpoint_in"):
             boot(image, mode="resume", checkpoint_in="cp.json", refresh_models=False)
 
-    def test_old_call_without_mode_still_works(self, tmp_path):
+    def test_default_mode_auto_resets_without_snapshot(self, tmp_path):
         image = write_image(tmp_path)
         core = boot(image, refresh_models=False)
         assert core.recovery["mode"] == "auto"
+        assert core.recovery["source"] == "cold", "auto 无快照时等价 reset"
         assert sorted(core._conv_by_cid) == [0]
         assert core.journal_generation == 1
         assert core._journal_seq == 0

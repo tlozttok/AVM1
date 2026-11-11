@@ -4,7 +4,7 @@ from typing import Dict, Optional
 
 from .capabilities import Capability, caps_from_dict, caps_to_dict, default_kernel_caps
 
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 
 
 def _tool_call_to_dict(tc) -> dict:
@@ -568,9 +568,10 @@ class Conversation:
         )
         conv.para_ref = cp.get("para_ref")
         conv.is_python = bool(cp.get("is_python", False))
-        # 旧检查点没有 caps/attrs：回退内核态全能力与空元数据（宿主可信，不提升上界检查）
         caps = cp.get("caps")
-        conv.caps = caps_from_dict(caps) if caps is not None else default_kernel_caps()
+        if caps is None:
+            raise ValueError("检查点缺少 caps：旧版本检查点不再支持，请重新保存")
+        conv.caps = caps_from_dict(caps)
         conv.attrs = dict(cp.get("attrs") or {})
         return conv
 
@@ -583,7 +584,6 @@ class Conversation:
         """
         conv = cls.from_checkpoint(doc)
         conv.cid = doc.get("cid", 0)
-        # 旧快照可能带 workspace_root_name：内核已不分配工作空间，按未知字段忽略。
         batch = doc.get("batch") or {}
         conv.user_batch = batch_from_dict(batch)
         return conv

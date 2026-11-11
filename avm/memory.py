@@ -968,9 +968,9 @@ class Memory:
         返回：
         - ("memory", segments)
         - ("device", mount_key, remainder)
-        space=None 时只接受 `$MEM` 引用（旧行为）；提供 space 时接受根名。
+        space=None 时只接受 `$MEM` 引用；提供 space 时接受根名。
         段序列按最长设备挂载键匹配；`box` 不会错误匹配 `$MEM.box2`。
-        设备路径简写（`$inputs...`）不是根引用，仍按旧行为拒绝。
+        设备路径简写（`$inputs...`）不是根引用，仍拒绝。
         """
         parts = self._parse_ref(ref)
         kind, real, display = self._expand_ref_parts(parts, space)
@@ -1207,8 +1207,7 @@ class Memory:
 
     @classmethod
     def load(cls, filepath: str) -> "Memory":
-        """从 JSON 文件加载内存数据并返回 Memory 实例。
-        支持显式节点格式（kind/meta/ctrl/value）与旧 __type 格式。"""
+        """从 JSON 文件加载内存数据并返回 Memory 实例（只接受显式节点格式）。"""
         import json, os
 
         mem = cls()
@@ -1222,7 +1221,7 @@ class Memory:
 
     @classmethod
     def _deserialize_node(cls, value):
-        """解析单个显式节点；兼容旧 __type 格式。"""
+        """解析单个显式节点（只接受 {kind, meta, ctrl, value/target} 格式）。"""
         from .types import MetaList, MetaDict
 
         if isinstance(value, dict):
@@ -1248,16 +1247,10 @@ class Memory:
                         data=[cls._deserialize_node(x) for x in (v or [])],
                         metadata=meta, ctrl=ctrl,
                     )
-            if value.get("__type") == "MetaDict":  # 旧格式兼容
-                return MetaDict(
-                    data={k: cls._deserialize_node(x) for k, x in value.get("data", {}).items()},
-                    metadata=value.get("meta"),
-                )
-            if value.get("__type") == "MetaList":  # 旧格式兼容
-                return MetaList(
-                    data=[cls._deserialize_node(x) for x in value.get("data", [])],
-                    metadata=value.get("meta"),
-                )
+            raise VMMemoryError(
+                f"内存节点格式无效（缺合法 kind）：{value!r}；旧 __type 格式不再支持，"
+                "请用 reset 重建世界"
+            )
         return value
 
     @classmethod

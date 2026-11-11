@@ -81,7 +81,7 @@ export interface MaskState {
 
 /** 操作面板：本次启动的恢复摘要（`/api/state.recovery`）。 */
 export interface RecoveryState {
-  source: 'cold' | 'snapshot' | 'journal'
+  source: 'cold' | 'snapshot'
   snapshot_seq: number | null
   replayed: number
   restored: Record<string, number>

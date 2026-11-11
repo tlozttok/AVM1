@@ -103,7 +103,7 @@ class TestSnapshotRoundtrip:
 
     def test_write_atomic_creates_directory(self, tmp_path):
         target = str(tmp_path / "a" / "b" / "snap.json")
-        write_atomic(target, {"format": "avm.snapshot", "version": 1})
+        write_atomic(target, {"format": "avm.snapshot", "version": 2})
         assert os.path.isfile(target)
 
 
@@ -142,7 +142,7 @@ class TestSnapshotPlusJournalTail:
 
 
 class TestBootAutoRestore:
-    """快照是缓存：启动时自动使用、坏了退回日志、显式恢复仍然严格。"""
+    """快照是缓存：auto 可读则恢复，读不出来则等价 reset；显式恢复仍然严格。"""
 
     def test_boot_auto_restores_declared_snapshot(self, tmp_path, capsys):
         image = write_image(tmp_path)
@@ -153,7 +153,7 @@ class TestBootAutoRestore:
         assert "已从重启快照恢复" in capsys.readouterr().err
         assert_same_state(mine, restored)
 
-    def test_boot_falls_back_when_snapshot_corrupt(self, tmp_path, capsys):
+    def test_boot_auto_resets_when_snapshot_corrupt(self, tmp_path):
         image = write_image(tmp_path)
         snap = out_path(image, "run.snapshot.json")
         os.makedirs(os.path.dirname(snap), exist_ok=True)
@@ -161,15 +161,17 @@ class TestBootAutoRestore:
             f.write("{not-json")
 
         core = boot(image, refresh_models=False)
-        err = capsys.readouterr().err
-        assert "重启快照不可用" in err
+        assert core.recovery["mode"] == "auto"
+        assert core.recovery["source"] == "cold", "不可读快照按 auto 的 reset 语义冷启动"
         assert 0 in core._conv_by_cid  # init 正常启动
 
-    def test_boot_boots_fresh_when_declared_snapshot_missing(self, tmp_path):
+    def test_boot_auto_resets_when_declared_snapshot_missing(self, tmp_path):
         image = write_image(tmp_path)
         assert not os.path.exists(out_path(image, "run.snapshot.json"))
 
         core = boot(image, refresh_models=False)
+        assert core.recovery["mode"] == "auto"
+        assert core.recovery["source"] == "cold"
         assert 0 in core._conv_by_cid
 
     def test_explicit_restore_missing_stays_strict(self, tmp_path):
@@ -264,7 +266,7 @@ class TestDevices:
         assert "echo.py" in str(excinfo.value)
         assert "期望" in str(excinfo.value) and "实际" in str(excinfo.value)
 
-    def test_restore_rejects_old_spec_without_sha256(self, tmp_path):
+    def test_restore_rejects_spec_without_sha256(self, tmp_path):
         image = self._device_image(tmp_path)
         mine = _run(image, TWO_TURNS)
         snap = str(tmp_path / "snap.json")
@@ -388,22 +390,35 @@ class TestRestoredInvariants:
         restored._check_invariants()  # 不抛即通过
 
 
-class TestRemovedWorkspaceCompatibility:
-    def test_old_snapshot_workspace_fields_ignored(self, tmp_path):
-        """旧快照的 security.workspace_region 与 workspace_root_name 按未知字段忽略。"""
+class TestSnapshotFormatVersion:
+    def test_old_snapshot_version_is_rejected(self, tmp_path):
         image = write_image(tmp_path)
         mine = _run(image, TWO_TURNS)
         path = str(tmp_path / "old.json")
         mine.snapshot_to(path)
         with open(path, encoding="utf-8") as f:
             doc = json.load(f)
-        doc["security"]["workspace_region"] = ["workspaces"]
-        doc["conversations"][0]["workspace_root_name"] = "work"
+        doc["version"] = 1
         write_atomic(path, doc)
 
+        with pytest.raises(SnapshotError, match="旧版本快照不再支持") as excinfo:
+            read_snapshot(path)
+        assert "reset" in str(excinfo.value)
+        with pytest.raises(ImageError, match="reset"):
+            boot(image, mode="resume", refresh_models=False)
+
+    def test_snapshot_without_generation_is_rejected(self, tmp_path):
+        image = write_image(tmp_path)
+        mine = _run(image, TWO_TURNS)
+        path = str(tmp_path / "snap.json")
+        mine.snapshot_to(path)
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+        doc.pop("generation")
+        write_atomic(path, doc)
+
+        with pytest.raises(SnapshotError, match="generation"):
+            read_snapshot(path)
         restored = load_core(image)
-        restored.restore_from(path)
-        assert restored.mem["src"] == "v1"
-        assert not hasattr(restored, "workspace_region")
-        assert not hasattr(restored._conv_by_cid[0], "workspace_root_name")
-        assert "workspaces" not in restored.mem._data
+        with pytest.raises(SnapshotError, match="generation"):
+            restored.restore_from(path)

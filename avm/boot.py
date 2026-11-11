@@ -11,18 +11,20 @@
 之后把 Core 交给宿主自己 `run()`。宿主通常只调 `boot()`，它把三段串起来；要单独测试或
 分步使用某一段时，直接调对应的函数。
 
-**三种启动模式**（计划 `plan-vm-lifecycle-2026-11-10`）：
+**启动模式**（计划 `plan-vm-lifecycle-2026-11-10`）：
 
+- `auto`（默认）：快照可读则等价 `resume`，否则等价 `reset`。没有"镜像 + 日志重放"
+  的冷启动路径：对话态只能从快照恢复。
 - `resume`：最近重启快照 + 日志尾部重放；恢复对话/监听器/调度/`_next_cid`；不跑 init；
   续当前日志代际。没有可读快照拒绝启动（日志不能单独重建对话）。
 - `reboot`：世界 = 最近快照的世界段（内存/安全配置/para/设备来源表）+ 日志尾部里的
   世界类效果重放（对话态效果跳过）；对话/监听器/调度全部丢弃，init 重跑，`_next_cid`
-  来自快照；归档旧日志、开新代际。没有可读快照拒绝启动并提示 `reset`。
-- `reset`：原始镜像；归档旧日志（与旧快照）、开新代际。
+  来自快照；归档当前代际日志、开新代际。没有可读快照拒绝启动并提示 `reset`。
+- `reset`：原始镜像；归档当前代际日志（与快照）、开新代际。
 
-不传 `mode` 时保持旧行为（`mode="auto"` 的语义）：镜像声明了 `snapshot_to` 且快照可读
-就用它恢复，否则冷启动 + 日志重放。镜像声明了 `meta.guest_programs` 时，冷启动在 init
-之后创建 guest 程序对话并注册中断向量，resume 按 `attrs["guest_role"]` 找回。
+日志记录版本拒绝非 v3、快照版本拒绝非 v2：恢复输入来自不同格式时明确失败并提示
+`reset`，不迁移。镜像声明了 `meta.guest_programs` 时，冷启动在 init 之后创建 guest
+程序对话并注册中断向量，resume 按 `attrs["guest_role"]` 找回。
 
 装载期的错误（坏镜像、缺 para、设备加载失败）照旧抛给调用方，由宿主决定怎么报——加载区
 只负责顺序与默认值，不吞错。日志与内存提交位置不一致时抛 `JournalError`（面向运行者）。
@@ -40,7 +42,7 @@ from .journal import Journal, JournalError, apply_world_record, archive_file
 from .runner_prompt import prompt_api_error
 from .snapshot import SnapshotError, read_snapshot, restore_world
 
-BOOT_MODES = ("resume", "reboot", "reset")
+BOOT_MODES = ("auto", "resume", "reboot", "reset")
 
 
 # ----------------------------------------------------------------------
@@ -126,10 +128,10 @@ def add_restore_arg(parser) -> None:
 def add_mode_arg(parser) -> None:
     """启动模式开关（三个宿主共用）：--mode auto|resume|reboot|reset。"""
     parser.add_argument(
-        "--mode", choices=("auto",) + BOOT_MODES, default="auto",
-        help="启动模式（默认 auto=旧行为：有可读快照用它，否则冷启动）。"
+        "--mode", choices=BOOT_MODES, default="auto",
+        help="启动模式（默认 auto=快照可读则 resume，否则 reset）。"
              "resume=最近快照+日志尾部重放；reboot=快照世界+世界类效果重放并重跑 init"
-             "（需要快照）；reset=原始镜像并归档旧日志开新代际",
+             "（需要快照）；reset=原始镜像并归档当前日志/快照开新代际",
     )
 
 
@@ -174,9 +176,8 @@ def _declared_journal_path(image_path: str) -> Optional[str]:
 
 
 def _snapshot_generation(doc: dict) -> int:
-    """快照记录的日志代际；旧快照缺字段按 1（第一代）兼容。"""
-    raw = doc.get("generation")
-    return raw if isinstance(raw, int) and raw >= 1 else 1
+    """快照记录的日志代际；快照模块已校验该字段存在且为正整数。"""
+    return doc["generation"]
 
 
 def _try_read_snapshot(path: Optional[str]) -> Optional[dict]:
@@ -216,7 +217,7 @@ def _last_exit_status(snapshot_path: Optional[str],
 
 
 def _generation_hint(snapshot_path: Optional[str], journal_path: Optional[str]) -> int:
-    """reset 归档旧日志时用的代际：快照记录 → 日志首条记录 → 已有档案的最大代际 + 1。"""
+    """reset 归档当前日志时用的代际：快照记录 → 日志首条记录 → 已有档案的最大代际 + 1。"""
     doc = _try_read_snapshot(snapshot_path)
     if doc is not None:
         return _snapshot_generation(doc)
@@ -247,9 +248,9 @@ def _generation_hint(snapshot_path: Optional[str], journal_path: Optional[str]) 
 
 def _new_recovery(mode: str, last_exit: str) -> dict:
     return {
-        "mode": mode,             # resume / reboot / reset / auto（旧调用方式）
-        "source": "cold",         # cold / snapshot / journal（面板首屏兼容字段）
-        "world_source": "image",  # image / snapshot / snapshot+journal / image+journal
+        "mode": mode,             # auto / resume / reboot / reset
+        "source": "cold",         # cold / snapshot
+        "world_source": "image",  # image / snapshot / snapshot+journal
         "snapshot_seq": None,
         "generation": 1,
         "replayed": 0,
@@ -304,7 +305,7 @@ def _print_recovery(recovery: dict) -> None:
 # ----------------------------------------------------------------------
 
 def _restore_snapshot(core: Core, path: str) -> dict:
-    """恢复快照并打印一行（旧宿主测试依赖这一行）；格式错误翻成 ImageError。"""
+    """恢复快照并打印一行（宿主测试依赖这一行）；格式错误翻成 ImageError。"""
     try:
         doc = core.restore_from(path)
     except SnapshotError as e:
@@ -336,20 +337,23 @@ def _resume_journal_tail(core: Core, doc: dict) -> int:
     journal = core.attach_journal(core.journal_path)
     last = journal.last_seq()
     log_generation = journal.generation()
-    if last > 0 and log_generation is not None and log_generation != snapshot_generation:
-        raise JournalError(
-            f"resume：快照代际 {snapshot_generation} 与日志代际 {log_generation} 不一致，"
-            "拒绝重放；请用 boot(mode='reboot') 重建世界或 boot(mode='reset') 重开"
-        )
+    if last > 0:
+        if log_generation is None:
+            raise JournalError(
+                f"resume：日志 seq=1..{last} 缺少 generation（v3 记录必须带代际），"
+                "拒绝重放；请用 boot(mode='reset') 重建世界"
+            )
+        if log_generation != snapshot_generation:
+            raise JournalError(
+                f"resume：快照代际 {snapshot_generation} 与日志代际 {log_generation} 不一致，"
+                "拒绝重放；请用 boot(mode='reboot') 重建世界或 boot(mode='reset') 重开"
+            )
     if last < snapshot_seq:
         raise JournalError(
             f"resume：快照 seq={snapshot_seq} 比日志末 seq={last} 大（日志缺失/被截断），"
             "无法续当前代际；请用 boot(mode='reset')"
         )
-    # 旧日志没有 generation 字段：沿用快照记录的代际（新记录按它继续记）。
-    core.journal_generation = (
-        log_generation if isinstance(log_generation, int) else snapshot_generation
-    )
+    core.journal_generation = snapshot_generation
     applied = core.replay_journal()
     if core._journal_seq != snapshot_seq + applied:
         raise JournalError(
@@ -388,11 +392,17 @@ def _replay_world_tail(core: Core, journal_path: Optional[str], after_seq: int,
             "无法重放快照之后的世界变化；请用 boot(mode='reset')"
         )
     log_generation = journal.generation()
-    if log_generation is not None and log_generation != generation:
-        raise JournalError(
-            f"reboot：快照代际 {generation} 与日志代际 {log_generation} 不一致，"
-            "无法重放世界尾部；请用 boot(mode='reset')"
-        )
+    if last > 0:
+        if log_generation is None:
+            raise JournalError(
+                f"reboot：日志 seq=1..{last} 缺少 generation（v3 记录必须带代际），"
+                "无法重放世界尾部；请用 boot(mode='reset') 重建世界"
+            )
+        if log_generation != generation:
+            raise JournalError(
+                f"reboot：快照代际 {generation} 与日志代际 {log_generation} 不一致，"
+                "无法重放世界尾部；请用 boot(mode='reset')"
+            )
     applied = effects = 0
     expected = after_seq
     for record in journal.iter_records(after_seq):
@@ -413,10 +423,10 @@ def _replay_world_tail(core: Core, journal_path: Optional[str], after_seq: int,
 
 def _start_new_generation(core: Core, journal_path: Optional[str],
                           generation: int, *, bump_when_absent: bool) -> tuple:
-    """归档旧日志（若存在）并从 seq 0 开新代际；返回 (新代际, 归档路径)。
+    """归档当前日志（若存在）并从 seq 0 开新代际；返回 (新代际, 归档路径)。
 
-    reboot 总是进入新代际（bump_when_absent=True）；reset 在没有任何旧恢复输入时
-    留在当前代际（首次启动的原始镜像没有"旧世界"可归档）。
+    reboot 总是进入新代际（bump_when_absent=True）；reset 在没有任何已有恢复输入时
+    留在当前代际（首次启动的原始镜像没有上一代世界可归档）。
     """
     archived, archived_generation = archive_file(journal_path, generation)
     if archived is not None or bump_when_absent:
@@ -447,40 +457,22 @@ def _begin_generation(core: Core, journal_path: Optional[str], generation: int) 
     core._last_snapshot_seq = 0
 
 
-def _restore_from_journal(core: Core, label: str) -> int:
-    """旧式启动（mode=auto）的冷回退：挂日志并从已应用位置重放，返回重放条数。
-
-    只用于"快照不可用"的兼容路径：日志是持久化依据，但单独靠日志重建对话是
-    尽力而为（快照才是可靠恢复输入）。异常翻成镜像错误。
-    """
-    if not core.journal_path:
-        return 0
-    journal = core.attach_journal(core.journal_path)
-    generation = journal.generation()
-    if isinstance(generation, int) and generation >= 1:
-        core.journal_generation = generation
-    try:
-        applied = core.replay_journal()
-    except JournalError as e:
-        raise ImageError(f"日志重放失败：{e}") from e
-    if applied:
-        print(f"[AVM] {label}：重放日志 {applied} 条（seq={core._journal_seq}）", file=sys.stderr)
-    return applied
-
-
 # ----------------------------------------------------------------------
-# boot：三种模式 + 旧调用方式
+# boot：四种启动模式
 # ----------------------------------------------------------------------
 
 def _check_mode(mode) -> None:
-    if mode is None:
-        return
     if not isinstance(mode, str) or mode not in BOOT_MODES:
         raise ImageError(
             f"未知启动模式 {mode!r}；允许：{', '.join(BOOT_MODES)}"
-            "（resume=最近快照+日志尾部重放；reboot=快照世界+世界类效果重放；"
-            "reset=原始镜像）"
+            "（auto=快照可读则 resume，否则 reset；resume=最近快照+日志尾部重放；"
+            "reboot=快照世界+世界类效果重放；reset=原始镜像）"
         )
+
+
+def _resolve_auto(snapshot_path: Optional[str]) -> str:
+    """auto 的显式语义：快照可读则等价 resume，否则等价 reset。"""
+    return "resume" if _try_read_snapshot(snapshot_path) is not None else "reset"
 
 
 def _require_snapshot(path: Optional[str], mode: str) -> dict:
@@ -528,7 +520,8 @@ def _restored_counts(core: Core) -> dict:
 
 
 def _boot_resume(image_path: str, snapshot_path: str, last_exit: str,
-                 host_flags: Optional[dict], checkpoint_in: Optional[str]) -> Core:
+                 host_flags: Optional[dict], checkpoint_in: Optional[str],
+                 report_mode: str = "resume") -> Core:
     if checkpoint_in:
         raise ImageError(
             "resume 从快照恢复，不能同时用 checkpoint_in（单对话检查点属于冷启动调试路径）"
@@ -538,7 +531,7 @@ def _boot_resume(image_path: str, snapshot_path: str, last_exit: str,
     doc = _restore_snapshot(core, snapshot_path)
     applied = _resume_journal_tail(core, doc)
     restore_guest_roles(core)
-    recovery = _new_recovery("resume", last_exit)
+    recovery = _new_recovery(report_mode, last_exit)
     recovery["source"] = "snapshot"
     recovery["world_source"] = "snapshot+journal" if applied else "snapshot"
     recovery["snapshot_seq"] = int(doc.get("seq", 0) or 0)
@@ -587,19 +580,20 @@ def _boot_reboot(image_path: str, snapshot_path: str, journal_path: Optional[str
 
 def _boot_reset(image_path: str, snapshot_path: Optional[str],
                 journal_path: Optional[str], last_exit: str,
-                host_flags: Optional[dict], checkpoint_in: Optional[str]) -> Core:
+                host_flags: Optional[dict], checkpoint_in: Optional[str],
+                report_mode: str = "reset") -> Core:
     generation = _generation_hint(snapshot_path, journal_path)
     core = load_image(Core(), image_path, checkpoint_in=checkpoint_in,
                       host_flags=host_flags)
     archived_journal, archived_generation = archive_file(journal_path, generation)
-    # 旧快照是旧世界的缓存：reset 后它没有意义，归档而不是留着让下一次 reboot 误用。
+    # 快照是上一代世界的缓存：reset 后它没有意义，归档而不是留着让下一次 reboot 误用。
     archived_snapshot, _snap_generation = archive_file(snapshot_path, archived_generation)
     if archived_journal or archived_snapshot:
         new_generation = archived_generation + 1
     else:
         new_generation = generation
     _begin_generation(core, journal_path, new_generation)
-    recovery = _new_recovery("reset", last_exit)
+    recovery = _new_recovery(report_mode, last_exit)
     recovery["source"] = "cold"
     recovery["world_source"] = "image"
     recovery["restored"] = _restored_counts(core)
@@ -607,52 +601,10 @@ def _boot_reset(image_path: str, snapshot_path: Optional[str],
     return core
 
 
-def _boot_legacy(image_path: str, snapshot_path: Optional[str],
-                 last_exit: str, host_flags: Optional[dict],
-                 checkpoint_in: Optional[str]) -> Core:
-    """旧调用方式（不传 mode）：保持 plan-persistent-runtime 的行为。
-
-    快照是缓存：声明了且可读就自动恢复（等价 resume）；缺失或损坏只警告，退回
-    "镜像 + 日志重放"（等价旧行为）。新的模式语义只在显式 mode 下生效。
-    """
-    recovery = _new_recovery("auto", last_exit)
-    candidate = snapshot_path if snapshot_path and os.path.isfile(snapshot_path) else None
-    if candidate is not None:
-        try:
-            read_snapshot(candidate)
-        except (OSError, ValueError) as e:
-            recovery["warnings"].append(f"重启快照不可用（{e}），改为从镜像 + 日志重建")
-            candidate = None
-    core = load_image(Core(), image_path, checkpoint_in=checkpoint_in,
-                      host_flags=host_flags, restore=bool(candidate))
-    if candidate is not None:
-        doc = _restore_snapshot(core, candidate)
-        recovery["source"] = "snapshot"
-        recovery["snapshot_seq"] = int(doc.get("seq", 0) or 0)
-        try:
-            applied = _resume_journal_tail(core, doc)
-        except JournalError as e:
-            raise ImageError(f"日志重放失败：{e}") from e
-        recovery["replayed"] = applied
-        recovery["world_source"] = "snapshot+journal" if applied else "snapshot"
-        restore_guest_roles(core)
-        recovery["restored"] = _restored_counts(core)
-    else:
-        if core.journal_path:
-            applied = _restore_from_journal(core, "从日志恢复")
-            if applied:
-                recovery["source"] = "journal"
-                recovery["replayed"] = applied
-                recovery["world_source"] = "image+journal"
-        recovery["restored"] = _restored_counts(core)
-    _finish_recovery(core, recovery)
-    return core
-
-
 def boot(
     image_path: str,
     *,
-    mode: Optional[str] = None,
+    mode: str = "auto",
     checkpoint_in: Optional[str] = None,
     restore: Optional[str] = None,
     host_flags: Optional[dict] = None,
@@ -662,36 +614,38 @@ def boot(
 ) -> Core:
     """加载区的便捷入口：创建空核心 → 加载镜像 →（按模式恢复/重放）→ 启动核心。
 
-    mode：resume / reboot / reset；不传时保持旧行为（快照可用则恢复，否则冷启动）。
+    mode：auto（默认）/ resume / reboot / reset。auto 在快照可读时等价 resume，
+    否则等价 reset；没有"镜像 + 日志重放"的冷启动路径。
     restore：显式快照路径，等价 resume（严格——快照读不出来直接报错）。
-    checkpoint_in：调试用单对话检查点；只用于冷启动（reset / 不传 mode）。
+    checkpoint_in：调试用单对话检查点；只用于冷启动（reset）。
     """
     _check_mode(mode)
     snapshot_path = _declared_snapshot_path(image_path)
     journal_path = _declared_journal_path(image_path)
     if restore is not None:
-        if mode not in (None, "resume"):
+        if mode not in ("auto", "resume"):
             raise ImageError(
                 "restore 参数只用于 resume：reboot/reset 从镜像声明的 snapshot_to 取快照"
             )
         snapshot_path = restore
         mode = "resume"
+    report_mode = mode
+    resolved = _resolve_auto(snapshot_path) if mode == "auto" else mode
     last_exit = _last_exit_status(snapshot_path, journal_path)
-    if checkpoint_in is not None and mode in ("resume", "reboot"):
+    if checkpoint_in is not None and resolved in ("resume", "reboot"):
         raise ImageError(
-            f"{mode} 从快照恢复，不能同时用 checkpoint_in"
-            "（单对话检查点属于冷启动调试路径）"
+            f"{resolved} 从快照恢复，不能同时用 checkpoint_in"
+            "（单对话检查点属于冷启动调试路径；需要冷启动请用 mode='reset'）"
         )
-    if mode is None:
-        core = _boot_legacy(image_path, snapshot_path, last_exit, host_flags, checkpoint_in)
-    elif mode == "resume":
-        core = _boot_resume(image_path, snapshot_path, last_exit, host_flags, checkpoint_in)
-    elif mode == "reboot":
+    if resolved == "resume":
+        core = _boot_resume(image_path, snapshot_path, last_exit, host_flags,
+                            checkpoint_in, report_mode=report_mode)
+    elif resolved == "reboot":
         core = _boot_reboot(image_path, snapshot_path, journal_path, last_exit,
                             host_flags, checkpoint_in)
     else:
         core = _boot_reset(image_path, snapshot_path, journal_path, last_exit,
-                           host_flags, checkpoint_in)
+                           host_flags, checkpoint_in, report_mode=report_mode)
     return start_core(
         core,
         refresh_models=refresh_models,

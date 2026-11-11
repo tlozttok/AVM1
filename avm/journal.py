@@ -4,10 +4,10 @@
 `Core.advance_conversation` 的安全点（`monitor.record` 之后）记一条记录；异常路径
 （API 失败重试、未捕获异常）不追加，该回合视为未提交。
 
-记录是**有序变化序列**（v2），不是按字段分组的快照：
+记录是**有序变化序列**（v3），不是按字段分组的快照：
 
 ```json
-{"v": 2, "seq": 3, "cid": 0, "at": "2026-11-09T21:00:00+0800",
+{"v": 3, "generation": 1, "seq": 3, "cid": 0, "at": "2026-11-09T21:00:00+0800",
  "changes": [
    {"kind": "message", "message": {"role": "tool", "content": "...", "tool_call_id": "c1"}},
    {"kind": "message", "message": {"role": "assistant", "content": "", "tool_calls": [...]}},
@@ -29,14 +29,14 @@
   的状态差算出，保证不漏。
 
 旧格式（带 `history` / `call` / `batch` / `scheduler` / `effects` 字段、没有 `v`）
-不再读取；遇到时 `apply` 直接报错并提示归档。
+以及任何 `v != 3` 的记录都不读取：`apply` / `apply_world_record` 直接报错，提示用
+`boot(mode="reset")` 重建世界。格式不迁移。
 
 设备写审计（计划"待定夺"第 3 项的默认选择）以 `device_write` 效果出现，重放时跳过。
 
 **代际**：每条记录带 `generation`（本次启动所处的日志代际，见 `Core.journal_generation`）。
-`resume` 续代际；`reboot`/`reset` 由宿主调 `archive_file` 把旧日志归档为
-`<base>.<generation>.journal`，再从 seq 0 开始新代际。旧日志/旧快照缺该字段时按
-"当前代际"兼容，不报错。
+`resume` 续代际；`reboot`/`reset` 由宿主调 `archive_file` 把当前代际日志归档为
+`<base>.<generation>.journal`，再从 seq 0 开始新代际。记录缺少代际按格式错误拒绝。
 
 Journal 是纯追加的 JSONL：临时想丢弃日志尾部用 `truncate(seq)`（v1 不自动压缩）。
 """
@@ -139,10 +139,7 @@ class Journal:
                 yield record
 
     def generation(self) -> Optional[int]:
-        """日志所属的代际 id（首条记录的 `generation` 字段）。
-
-        空日志、旧日志（没有该字段）返回 None：调用方按"当前代际"兼容处理。
-        """
+        """日志所属的代际 id（首条记录的 `generation` 字段）；空日志返回 None。"""
         for record in self.iter_records(0):
             generation = record.get("generation")
             return generation if isinstance(generation, int) else None
@@ -173,7 +170,7 @@ class Journal:
 
 
 # ----------------------------------------------------------------------
-# 代际切换（reboot / reset 归档旧日志）
+# 代际切换（reboot / reset 归档当前代际日志）
 # ----------------------------------------------------------------------
 
 def archive_file(path: Optional[str], generation: int):
@@ -227,7 +224,6 @@ def conversation_create_payload(core, conv) -> dict:
 
     工作目录不再由内核分配：软件用 memory_make 建目录、再写
     `$MEM.conversations.<cid>.roots`（`conversation_roots` 效果）动态加根。
-    旧日志的 `conversation_create` 载荷可能仍带 `workspace` 字段，重放侧保留兼容。
     """
     doc = conv.to_snapshot()
     doc.pop("batch", None)  # 新建对话没有待发批次
@@ -251,12 +247,15 @@ def _space_from_roots(roots: Optional[dict]):
 # 重放
 # ----------------------------------------------------------------------
 
-JOURNAL_RECORD_VERSION = 2
+JOURNAL_RECORD_VERSION = 3
 
-_OLD_FORMAT_HINT = (
-    "旧格式回合日志（v!=2）：日志已改为增量变化序列，不再读取旧记录。"
-    "请归档旧日志后重开世界（或换一个镜像目录）。"
-)
+
+def _version_error(seq, version) -> str:
+    return (
+        f"日志 seq={seq}: 不支持的记录版本 {version!r}（当前 v{JOURNAL_RECORD_VERSION}）；"
+        "日志格式显式版本化，不读取也不迁移旧记录。"
+        "请用 boot(mode='reset') 重建世界。"
+    )
 
 
 def apply(core, record: dict) -> None:
@@ -266,14 +265,14 @@ def apply(core, record: dict) -> None:
     JournalError——日志与镜像/快照不一致时继续跑只会把状态带得更歪。
     幂等由 `Core.replay_journal` 的 seq 游标保证（已应用过的记录不再进入这里）。
 
-    记录形状（v2）：`{"v": 2, "seq", "cid", "at", "changes": [...]}`，逐个应用
-    changes 里的变化：消息追加、效果、待发批次、调度增量。顺序就是执行顺序。
+    记录形状（v3）：`{"v": 3, "generation", "seq", "cid", "at", "changes": [...]}`，
+    逐个应用 changes 里的变化：消息追加、效果、待发批次、调度增量。顺序就是执行顺序。
     """
     if not isinstance(record, dict):
         raise JournalError("日志记录必须是对象")
     seq = record.get("seq")
     if record.get("v") != JOURNAL_RECORD_VERSION:
-        raise JournalError(f"日志 seq={seq}: {_OLD_FORMAT_HINT}")
+        raise JournalError(_version_error(seq, record.get("v")))
     cid = record.get("cid")
     conv = core._conv_by_cid.get(cid)
     if conv is None:
@@ -404,7 +403,6 @@ def apply_scheduler(core, scheduler, source: str = "日志") -> None:
 # ----------------------------------------------------------------------
 
 def _effect_memory_set(core, effect) -> None:
-    # 旧日志效果可能带 owner_cid 字段：按未知字段忽略（节点所有权已移出 MEM）。
     core.mem.set(
         effect["ref"], effect["value"],
         space=_space_from_roots(effect.get("space")),
@@ -412,7 +410,6 @@ def _effect_memory_set(core, effect) -> None:
 
 
 def _effect_memory_make(core, effect) -> None:
-    # 旧日志效果可能带 owner_cid 字段：按未知字段忽略。
     core.mem.make(
         effect["ref"], effect["key"], effect["mem_type"],
         space=_space_from_roots(effect.get("space")),
@@ -495,9 +492,6 @@ def _effect_conversation_create(core, effect) -> None:
     if not isinstance(payload, dict):
         raise VMMemoryError("conversation_create 缺少 conversation 载荷")
     conv = Conversation.from_snapshot(payload)
-    workspace = effect.get("workspace")
-    if isinstance(workspace, dict) and workspace.get("target"):
-        _attach_workspace_node(core, workspace["target"], workspace.get("node"))
     parent_cid = payload.get("parent_cid")
     if parent_cid is not None:
         parent = core._conv_by_cid.get(parent_cid)
@@ -507,25 +501,6 @@ def _effect_conversation_create(core, effect) -> None:
     core._register(conv, cid=payload["cid"])
     # 日志里创建出来的对话在续跑时同样需要 Python 执行器预热
     core._warmup_needed.add(conv.cid)
-
-
-def _attach_workspace_node(core, target, node_image) -> None:
-    """旧日志兼容：把工作空间节点挂到真实段路径（父段不存在时补空 dict）。
-
-    内核不再分配工作空间；这段只用于重放本机制移除前写下的日志。
-    """
-    parent = core.mem._data
-    for key in list(target)[:-1]:
-        if not isinstance(parent, (dict, MetaDict)):
-            raise VMMemoryError(f"工作空间区域父段不是容器：{'/'.join(str(x) for x in target)}")
-        child = parent.get(key)
-        if child is None:
-            child = Memory.deserialize_node({"kind": "dict", "value": {}})
-            parent[key] = child
-        parent = child
-    node = Memory.deserialize_node(node_image) if node_image is not None else None
-    if isinstance(parent, (dict, MetaDict)) and node is not None:
-        parent[target[-1]] = node
 
 
 def _effect_conversation_roots(core, effect) -> None:
@@ -591,15 +566,12 @@ def _effect_delivery(core, effect) -> None:
 
 
 def _effect_listener_register(core, effect) -> None:
-    from .events import drop_removed_condition_listener, listener_from_snapshot
+    from .events import listener_from_snapshot
 
     data = effect.get("listener")
     if not isinstance(data, dict):
         raise VMMemoryError("listener_register 缺少 listener 载荷")
     listener = listener_from_snapshot(data)
-    # 旧日志里依赖节点所有权 cid 的条件形态已删除：重放时丢弃该监听器，不中断启动。
-    if drop_removed_condition_listener(listener, "日志重放"):
-        return
     core.events.listeners.append(listener)
     listener_id = listener.get("listener_id")
     if isinstance(listener_id, int) and listener_id >= core.events._next_listener_id:
@@ -607,25 +579,16 @@ def _effect_listener_register(core, effect) -> None:
 
 
 def _effect_listener_modify(core, effect) -> None:
-    from .events import drop_removed_condition_listener, listener_from_snapshot
+    from .events import listener_from_snapshot
 
     listener_id = effect.get("listener_id")
     replacement = listener_from_snapshot(effect["listener"])
-    if drop_removed_condition_listener(replacement, "日志重放"):
-        # 旧条件形态的 modify：丢弃被改写的监听器本身；记录缺失也不报错（可能已随
-        # listener_register 一起被丢弃），重放继续。
-        core.events.listeners = [
-            listener for listener in core.events.listeners
-            if listener.get("listener_id") != listener_id
-        ]
-        return
     for index, listener in enumerate(core.events.listeners):
         if listener.get("listener_id") == listener_id:
             core.events.listeners[index] = replacement
             return
-    print(
-        f"[AVM] 日志重放：listener_modify 的目标监听器 {listener_id} 不存在，跳过",
-        file=sys.stderr,
+    raise VMMemoryError(
+        f"listener_modify 的目标监听器 {listener_id} 不存在：日志与镜像/快照不匹配"
     )
 
 
@@ -649,24 +612,26 @@ def _effect_device_mount(core, effect) -> None:
     from .image import mount_device_entry
 
     mount = effect.get("mount")
-    spec = effect.get("spec") or {}
+    spec = effect.get("spec")
+    if not isinstance(spec, dict):
+        raise VMMemoryError("device_mount 缺少 spec 载荷")
+    sha256 = spec.get("sha256")
+    if not isinstance(sha256, str) or not sha256:
+        raise VMMemoryError(
+            f"device_mount {mount!r} 的记录缺少 sha256：v3 日志必须记录设备内容哈希，"
+            "重放不重新计算"
+        )
     dev = {
         "path": mount,
         "file": spec.get("path"),
         "class": spec.get("class"),
         "args": spec.get("args") or {},
         "id": spec.get("id"),
+        "sha256": sha256,
     }
-    if spec.get("sha256"):
-        # 重放按日志记录的内容哈希重建；旧日志没有该字段时由挂载入口计算并补记。
-        dev["sha256"] = spec["sha256"]
-    new_spec = mount_device_entry(core, dev, base=None)
-    # 来源表以日志记录为准（重放时重新解析的路径可能与记录形态不同）；
-    # 旧日志的 spec 没有 sha256，用本次重算值补上，避免下次快照变成"旧快照"。
-    recorded = dict(spec)
-    if not recorded.get("builtin") and not recorded.get("sha256"):
-        recorded["sha256"] = new_spec.get("sha256")
-    core.device_specs[mount] = recorded
+    mount_device_entry(core, dev, base=None)
+    # 来源表以日志记录为准（重放时重新解析的路径可能与记录形态不同）。
+    core.device_specs[mount] = dict(spec)
 
 
 def _effect_device_unmount(core, effect) -> None:
@@ -744,7 +709,7 @@ def apply_world_record(core, record: dict) -> int:
         raise JournalError("日志记录必须是对象")
     seq = record.get("seq")
     if record.get("v") != JOURNAL_RECORD_VERSION:
-        raise JournalError(f"日志 seq={seq}: {_OLD_FORMAT_HINT}")
+        raise JournalError(_version_error(seq, record.get("v")))
     effects = world_effects_of(record)
     was_replaying = core._replaying
     core._replaying = True

@@ -163,7 +163,7 @@ class TestThroughCore:
         """用真实路径激活面板：注册向量、挂起中断、派发。"""
         core = Core()
         channel = RecordingChannel(actions)
-        panel = core.start_operator_conversation(channel)
+        panel = core.bind_console_conversation(channel)
         core.interrupts.register("operator", panel.cid)
         core.interrupts.raise_("operator")
         core.interrupts.dispatch()
@@ -182,7 +182,7 @@ class TestThroughCore:
     def test_panel_does_not_preempt_on_its_own(self):
         core = Core()
         channel = RecordingChannel()
-        panel = core.start_operator_conversation(channel)
+        panel = core.bind_console_conversation(channel)
         assert panel.cid in core._dormant_cids
         assert panel.cid not in core._ready_cids
 

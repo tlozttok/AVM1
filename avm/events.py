@@ -48,9 +48,6 @@ LIFECYCLE_TYPES = {
     "listen_event",
 }
 
-# 历史常量：批次二后不再有"只有 after 的事件"，保留名字给旧代码/文档引用
-AFTER_ONLY_TYPES = set()
-
 NORMAL_TIER = "normal"
 KERNEL_TIER = "kernel"
 LISTENER_TIERS = (NORMAL_TIER, KERNEL_TIER)
@@ -121,37 +118,6 @@ def listener_from_snapshot(data: dict) -> dict:
                 key: _to_tuple_ref(ref) for key, ref in target["refs"].items()
             }
     return listener
-
-
-def listener_uses_removed_condition(listener: dict) -> bool:
-    """监听器记录是否使用了已删除的条件形态（owner 相关）。
-
-    旧快照与旧日志里可能残留：target.kind="owned_by_owner" 与 condition.source.cid。
-    两者都依赖创建者 cid，恢复/重放时丢弃监听器而不是让启动失败。
-    """
-    condition = (listener or {}).get("condition")
-    if not isinstance(condition, dict):
-        return False
-    target = condition.get("target")
-    if isinstance(target, dict) and target.get("kind") == "owned_by_owner":
-        return True
-    source = condition.get("source")
-    if isinstance(source, dict) and "cid" in source:
-        return True
-    return False
-
-
-def drop_removed_condition_listener(listener: dict, context: str) -> bool:
-    """旧条件形态的监听器：打 stderr 告警并返回 True（调用方丢弃该记录）。"""
-    if not listener_uses_removed_condition(listener):
-        return False
-    print(
-        f"[AVM] {context}: 丢弃使用已移除条件形态的监听器 "
-        f"listener_id={(listener or {}).get('listener_id')}"
-        "（owned_by_owner/source.cid 依赖已删除的节点所有权）",
-        file=sys.stderr,
-    )
-    return True
 
 
 class EventHandlerError(Exception):

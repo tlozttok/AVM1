@@ -56,7 +56,7 @@ def make_core(on_exec=None):
 def attach_panel(core):
     """建一条操作员对话并把操作员中断指向它。"""
     channel = RecordingChannel()
-    panel = core.start_operator_conversation(channel)
+    panel = core.bind_console_conversation(channel)
     core.interrupts.register("operator", panel.cid)
     return panel, channel
 
@@ -132,7 +132,7 @@ class TestPending:
     def test_dispatch_is_thread_safe(self):
         """控制台在后端线程里挂起中断；派发在 Core 线程里做。"""
         core = Core()
-        core.interrupts.register("operator", core.start_operator_conversation(
+        core.interrupts.register("operator", core.bind_console_conversation(
             RecordingChannel()).cid)
         threads = [threading.Thread(target=core.interrupts.raise_, args=("op%d" % i,))
                    for i in range(16)]

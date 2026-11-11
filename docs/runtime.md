@@ -215,7 +215,7 @@ Core 提供权限机制的构件：每个对话的能力（`caps`）、地址空
 - `groups` 缺省继承；用户态父对话只能给子对话父已有的组。
 - `roots` 是**根注册表里的名字列表**（见下），只能由内核态父对话授予；同域创建（亚对话、用户态父对话建子对话）只能沿用父根表。
 - `workspace` 已移除：程序声明它会得到「`value.caps.workspace` 已移除」错误。内核不再分配工作目录——目录由软件用 `memory_make` 建，根在创建之后写 `$MEM.conversations.<cid>.roots` 动态加（见下）。
-- 没有 `caps` 的程序：继承父能力（旧镜像行为不变）。
+- 没有 `caps` 的程序：继承父能力。
 
 ### 根注册表与动态授予根（镜像 `security` 段）
 
@@ -284,7 +284,7 @@ Python 程序与 LLM 对话对等：都是 AVM 中的一等执行单元，通过
 | `plm.machine` | 状态机：system 是状态机 DSL，user 是 JSON 事件；状态/变量跨消息保留在 PLM 实例内，可输出全部 10 条指令的 tool calls。 |
 | `plm.command` | 字符串 IO 命令行：system 定义 `handle(cmd)`，user 是命令与参数（整行字符串）；`handle` 可用 `yield from` 调用注入的工具函数，工具响应回到断点继续执行。 |
 | `plm.python` | 图灵完备兜底：Jupyter 笔记本式持久命名空间；系统/用户消息都进同一个命名空间；工具调用写成 `yield from`，挂起后从断点继续（不重放前缀）；程序结束后返回 stdout，`return` 字符串追加。 |
-| `plm.operator` | 操作员：执行器由调试面板持有而不是模型——每次"推理"等操作员提交一个动作，工具调用原样透传（未知工具名不在这里拦，留给 Core 报未知工具），或提交结束动作让本轮交互结束。只能由 `Core.start_operator_conversation` 创建（需要注入操作员通道）；镜像里声明同名程序节点会在第一次推理时报错。 |
+| `plm.operator` | 操作员：执行器由调试面板持有而不是模型——每次"推理"等操作员提交一个动作，工具调用原样透传（未知工具名不在这里拦，留给 Core 报未知工具），或提交结束动作让本轮交互结束。只能由 `Core.bind_console_conversation` 创建（需要注入操作员通道）；镜像里声明同名程序节点会在第一次推理时报错。 |
 
 Python 对话的 `model` 必须是注册表（`PLM_REGISTRY`）中的名字，否则报错，不静默回退到 LLM。
 
@@ -429,7 +429,7 @@ before 语义：操作被请求，不保证到达执行组件；可被 `allow` �
 - 监听器是 `ctrl.type="handler"` 节点：`content` 是处理器代码，`condition` 是声明式条件数据叶子。每次事件在全新受限沙箱命名空间执行（只提供 `json` 和受限 builtins），不创建对话、不保留处理器实例状态。**处理器代码与条件在注册时抄副本**：之后改内存里的节点不会自动生效，必须 `listen_event action=modify` 一次重新解析。
 - 条件 schema（handler 节点 `condition`，JSON 字符串叶）：`events`（事件类型列表）、`phase`（before/after 列表）、`target`（`exact`/`subtree` + `$` 引用，或 `cid_owner`/`self_lifecycle`）、`source`（`mode`/`groups` 过滤）。匹配用 canonical 目标。
 - 用户态对话只能用命名条件子集（preset）：`inbox`（发往自己的 `send_instruction`）、`self.lifecycle`（自己相关的创建/关闭/监听生命周期事件）；自定义条件被拒绝。内核态可以写完整条件，`subtree` 或省略 target 用于全局监听（例如禁止访问表）。
-- 已删除的条件形态：`target.kind="owned_by_owner"`、`source.cid`、preset `own_work.memory` / `own_nodes.memory`。旧 handler 节点使用它们时注册报「已移除」；旧快照/旧日志里的这类监听器在恢复/重放时丢弃并告警。
+- 已删除的条件形态：`target.kind="owned_by_owner"`、`source.cid`、preset `own_work.memory` / `own_nodes.memory`。handler 节点使用它们时注册报「已移除」（使用错误，不是兼容入口）。
 - 旧式 `listen_event` 的 `event_type`/`target`/`phase` 参数已移除；`action=modify` 可更新 handler_ref 与/或 priority，并重新解析 handler 的条件。
 - 处理器必须定义可调用 `handle(event)`，返回 dict。返回的 `action` 在 before 阶段可为 `execute`（继续）、`replace`（拒绝/改写，原指令不执行）、`allow`（接受并短路，原指令照常执行）。
 - **级别（tier）**由注册者的模式决定：内核态对话注册的监听器可声明 `tier=kernel`；普通对话一律 `normal`，不采信 handler 节点自报。kernel 级拿正常载荷 + `target_full` + `source_context`；normal 级拿不到这两个重块。
@@ -556,25 +556,25 @@ Guard 是软件层（镜像/OS 程序）注册的一个普通内核态监听器�
 
 ### 启动模式与 guest 程序
 
-`boot(image, mode="resume"|"reboot"|"reset", restore=..., checkpoint_in=...)` 与 CLI `--mode auto|resume|reboot|reset`（默认 `auto`）选择世界从哪来：
+`boot(image, mode="auto"|"resume"|"reboot"|"reset", restore=..., checkpoint_in=...)` 与 CLI `--mode auto|resume|reboot|reset`（默认 `auto`）选择世界从哪来：
 
 | 模式 | 世界来源 | 对话/监听器/调度 | 日志 |
 |---|---|---|---|
 | `resume` | 最近快照 + 日志尾部重放 | 从快照恢复，不跑 init | 续当前代际 |
-| `reboot` | 最近快照的世界段（内存/安全配置/para/设备来源表）+ 日志尾部里的世界类效果 | 全部丢弃，init 重跑，`next_cid` 来自快照 | 归档旧日志，开新代际 |
-| `reset` | 原始镜像 | init 重跑 | 归档旧日志与旧快照，开新代际（没有旧输入时留在当前代际） |
-| 不传 `mode`（CLI `--mode auto` 映射为不传） | 快照可读则等价 `resume`，否则原始镜像 + 日志重放 | 旧行为 | 不变 |
+| `reboot` | 最近快照的世界段（内存/安全配置/para/设备来源表）+ 日志尾部里的世界类效果 | 全部丢弃，init 重跑，`next_cid` 来自快照 | 归档当前代际日志，开新代际 |
+| `reset` | 原始镜像 | init 重跑 | 归档当前日志与快照，开新代际（没有旧输入时留在当前代际） |
+| `auto`（默认） | 快照可读则等价 `resume`，否则等价 `reset` | 与等价模式相同 | 与等价模式相同 |
 
-- `resume` 与 `reboot` 都**需要可读快照**：没有快照直接拒绝并提示 `reset`（日志不能单独重建对话）。`restore=<path>` 等价于显式给出快照的 `resume`；`checkpoint_in` 只用于冷启动（`reset` 或不传 mode）。
+- `resume` 与 `reboot` 都**需要可读快照**：没有快照直接拒绝并提示 `reset`（日志不能单独重建对话）。`restore=<path>` 等价于显式给出快照的 `resume`；`checkpoint_in` 只用于冷启动（`reset`）。`auto` 没有"镜像 + 日志重放"的冷启动路径。
 - `reboot` 只重放世界类效果：`memory_set` / `memory_make` / `memory_delete` / `memory_attach` / `memory_detach` / `edit_metadata` / `device_mount` / `device_unmount`；消息、批次、调度、对话创建/关闭/根授予、投递、监听器效果一律跳过。
-- **恢复报告**：`boot` 把 `recovery` 写到 `core.recovery` 并打印一行——`mode`、`source`（cold / snapshot / journal）、`world_source`（image / snapshot / snapshot+journal / image+journal）、`snapshot_seq`、`replayed`（重放记录数）、`world_effects`（世界效果数）、`generation`、`next_cid`、`guest_programs`（角色 → cid）、`interrupt_vectors`、`last_exit`（`normal` / `forced` / `unknown`）、`restored`（重建数量，仅展示）与 `warnings`。`last_exit` 只是数据：VM 不替 OS 写 `$MEM.sys.boot.*`。
+- **恢复报告**：`boot` 把 `recovery` 写到 `core.recovery` 并打印一行——`mode`、`source`（cold / snapshot）、`world_source`（image / snapshot / snapshot+journal）、`snapshot_seq`、`replayed`（重放记录数）、`world_effects`（世界效果数）、`generation`、`next_cid`、`guest_programs`（角色 → cid）、`interrupt_vectors`、`last_exit`（`normal` / `forced` / `unknown`）、`restored`（重建数量，仅展示）与 `warnings`。`last_exit` 只是数据：VM 不替 OS 写 `$MEM.sys.boot.*`。
 
 **guest 程序**（镜像 `meta.guest_programs`，可选）：把角色名映射到程序节点引用，角色限定 `boot` / `idle` / `shutdown`，宿主的中断向量名就是角色名。
 
 - 冷启动在 init 之后按固定顺序 `boot` → `idle` → `shutdown` 创建内核态对话，写 `attrs["guest_role"]`（resume 靠它找回），注册同名中断向量；`resume` 不重建对话，只按 `attrs` 重新注册向量。声明的角色在快照里找不到、或角色重复时报错——不允许在 resume 时补建（新 cid 会让后续日志错位），只能 `reboot` / `reset`。
 - 入口：Python 程序定义与角色同名的生成器，payload 是 `yield from <role>()`；`settingup` 程序的 payload 是角色名加数据行。`boot` 角色在 resume 时由宿主用中断唤醒，payload 带 `last_exit`。
-- 声明了 `guest_programs` 的镜像启用**严格调度**：活跃为空、就绪为空、无待派发中断即「空闲」。空闲是 guest 活体错误，Core 向 `idle` 中断向量派发：console 宿主把该向量注册为面板对话（面板在操作员通道上阻塞等待，系统即处于空闲态）；镜像也可声明 `idle` guest 作为无面板宿主的 fallback。派发后仍无法离开空闲（无向量/处理程序没让系统离开）都抛 `KernelPanic`。没有 idle 向量的旧镜像保持旧语义（队列空即 `run()` 返回）。
-- 没有声明 `guest_programs` 的旧镜像保持旧语义：队列空了就是跑完了，`run()` 返回。
+- 声明了 `guest_programs` 的镜像启用**严格调度**：活跃为空、就绪为空、无待派发中断即「空闲」。空闲是 guest 活体错误，Core 向 `idle` 中断向量派发：console 宿主把该向量注册为面板对话（面板在操作员通道上阻塞等待，系统即处于空闲态）；镜像也可声明 `idle` guest 作为无面板宿主的 fallback。派发后仍无法离开空闲（无向量/处理程序没让系统离开）都抛 `KernelPanic`。嵌入式宿主未接入生命周期管理（镜像没有声明 guest 程序、也没有注册 idle 中断向量）时，队列空即 `run()` 返回。
+- 没有声明 `guest_programs` 的镜像不启用严格调度：队列空了就是跑完了，`run()` 返回。
 
 **OS 电源与关机约定**（数据面在 `$MEM.sys`，程序实现见 [images/base/README.md](../images/base/README.md)）：
 
@@ -589,28 +589,28 @@ Guard 是软件层（镜像/OS 程序）注册的一个普通内核态监听器�
 
 分工来自"谁能持久化"：程序的状态由程序自己写进 `$MEM`；对话没有办法把自己的上下文写进 `$MEM`，所以内核代存它的消息历史、身份与待发批次；运行态（执行器、监听器、设备实例、调度队列）按数据重建。
 
-**硬承诺**：已提交回合对 `$MEM` 的变更（数据、程序、包与安装记录），以及各对话的消息历史、身份（cid / name / para / caps / attrs）与待发批次，重启后一致。依据是回合日志；快照只是它的缓存。
+**硬承诺**：已提交回合对 `$MEM` 的变更（数据、程序、包与安装记录），以及各对话的消息历史、身份（cid / name / para / caps / attrs）与待发批次，重启后一致。依据是回合日志与快照；快照是日志的缓存。
 
 **软承诺（重建结果，不是契约）**：监听器、调度队列、设备表按日志与快照重建；设备实例重新构造；LLM 对话沿用消息历史，Python 对话重放 system 消息（命名空间变量不恢复）。
 
 **明确不承诺**：设备内部状态与设备副作用；未提交回合的副作用（可能已经发生，日志里没有）；宿主特权操作（控制台屏蔽、直接改监听器、外部输入中未读的部分）；调度队列逐字段一致。
 
-日志只对产生它的镜像有效：换镜像视为新的世界。显式 `--restore` 严格——读不出来就报错；不传时按缓存处理：镜像声明了 `snapshot_to` 且文件可读就自动使用；快照文件缺失或读不出来时只警告，退回"镜像 + 日志"重放；快照能读但引用的设备文件缺失时明确失败（世界不完整，退回日志也重建不出那台设备）。
+日志只对产生它的镜像有效：换镜像视为新的世界。显式 `--restore` 严格——读不出来就报错；`auto` 在镜像声明了 `snapshot_to` 且文件可读时等价 `resume`，否则等价 `reset`；快照能读但引用的设备文件缺失时明确失败。
 
 ### 回合日志（journal）
 
 一轮 = 一次推理 + 该轮产生的全部指令。执行完回到 `Core.advance_conversation` 的安全点（`monitor.record` 之后）记一条记录；API 失败重试与未捕获异常不提交，该回合视为未发生。
 
-一条记录是**有序变化序列**（`v=2`，完整形状见 `avm/journal.py` 模块 docstring）：`{"v": 2, "generation", "seq", "cid", "at", "changes": [...]}`。`changes` 按执行顺序列出：
+一条记录是**有序变化序列**（`v=3`，完整形状见 `avm/journal.py` 模块 docstring）：`{"v": 3, "generation", "seq", "cid", "at", "changes": [...]}`。`changes` 按执行顺序列出：
 
 - `message`：本轮真正追加进历史的消息（上一轮指令产生的 tool 响应、投递进来的 user 内容、assistant 消息）——按实际追加记，不按生成它的效果推导：before 事件处理器可以改写 payload，指令最终写入的值才是状态；
 - `effect`：语义效果——内存写/建/删、`edit_metadata`、对话创建/关闭/删除、投递、监听器注册/修改/取消、设备装卸。重放期间不调模型、不派发事件、不访问设备；设备写只记审计条目（`device_write`），重放时跳过；
 - `batch`：待发批次；只在相对上次提交有变化时写（带 `cid`，可能落在别的对话上——投递给目标加输入）；
 - `scheduler`：调度增量（活跃对话、就绪/休眠的增删、finished、预算计数、下一个 cid），只在有变化时写。增量基线是该对话上次提交后的调度状态；装载/快照恢复后对齐，所以第一次提交包含 `run()` 之前的活跃选择。
 
-旧格式（带 `history` / `call` / `batch` / `scheduler` / `effects`、没有 `v`）不再读取：启动时直接报错并提示归档旧日志。
+记录格式显式版本化为 `v=3`。旧格式（带 `history` / `call` / `batch` / `scheduler` / `effects`、没有 `v`）与任何 `v != 3` 的记录都不读取也不迁移：启动时直接报错并提示 `reset` 重建世界。
 
-**代际**：每条记录带 `generation`（本次启动所处的日志代际）；新代际从 `seq=0` 开始。`resume` 续用当前代际；`reboot` / `reset` 由宿主把旧日志改名为 `<base>.<generation><ext>` 归档，再开新代际。旧记录缺该字段时按当前代际兼容。
+**代际**：每条记录带 `generation`（本次启动所处的日志代际）；新代际从 `seq=0` 开始。`resume` 续用当前代际；`reboot` / `reset` 由宿主把当前日志改名为 `<base>.<generation><ext>` 归档，再开新代际。记录缺少代际按格式错误拒绝。
 
 记录点：内存写入口在指令执行体里记（带调用者地址空间与事件处理后的真实值）；对话生命周期在 `_build_conversation` 的指令入口、`_close_conversation`、`_delete_conversation` 与亚对话返回/关闭时记投递；动态授予根记 `conversation_roots`；监听器在 `EventSystem.register/register_condition/modify/cancel/cancel_all_for_owner` 记。宿主侧特权操作（控制台屏蔽设备、就地编辑监听器）不记录。
 
@@ -620,15 +620,15 @@ Guard 是软件层（镜像/OS 程序）注册的一个普通内核态监听器�
 
 ### 重启快照（snapshot，缓存）
 
-`avm/snapshot.py`；形状与内核转储同源（调度、内存、安全段、对话、监听器、设备表），差别：不截断、带 `seq`（已提交的日志位置）与 `generation`（日志代际）、带 `device_specs`（设备来源表）、对话额外带 cid/parent_cid/待发批次。它是加速重启的缓存；恢复依据始终是镜像 + 日志。
+`avm/snapshot.py`；`format="avm.snapshot"`、`version=2`（显式版本化，旧版本拒绝恢复并提示 `reset`），`generation` 必须存在且为正整数。形状与内核转储同源（调度、内存、安全段、对话、监听器、设备表），差别：不截断、带 `seq`（已提交的日志位置）与 `generation`（日志代际）、带 `device_specs`（设备来源表）、对话额外带 cid/parent_cid/待发批次。它是加速重启的缓存；没有快照就没有可恢复的对话态。
 
 `Core.snapshot_to(path)` 只在安全点调用（宿主正常退出路径，以及定时快照触发）。`Core.restore_from(path)` 顺序：清空调度/对话/监听器 → 换内存树 → 按来源表重建设备并重新物化挂载点 → 按 cid 重建对话与父子引用 → 恢复监听器 → 安全配置/para_ref/下一个 cid → 跑安全点自检。对话身份与历史按硬承诺保留；设备内部状态不序列化，按 spec 重建实例。
 
-**设备哈希校验**：恢复文件型设备时用来源表记录的 `sha256` 重新核对设备文件，不一致拒绝恢复（`SnapshotError`，含设备名、路径与期望/实际哈希）；来源表缺少 `sha256` 的旧快照直接拒绝恢复并提示重新审批装载。快照里的 `approved_sha256` 只是历史审批事实，不参与本次核对（程序包的批准哈希是包文件哈希，不是设备文件哈希）。设备文件缺失同样明确失败。
+**设备哈希校验**：恢复文件型设备时用来源表记录的 `sha256` 重新核对设备文件，不一致拒绝恢复（`SnapshotError`，含设备名、路径与期望/实际哈希）；来源表缺少 `sha256` 的快照直接拒绝恢复并提示重新审批装载。快照里的 `approved_sha256` 只是历史审批事实，不参与本次核对（程序包的批准哈希是包文件哈希，不是设备文件哈希）。设备文件缺失同样明确失败。
 
 **定时快照**：镜像声明 `meta.snapshot_every` 为正整数时，每 N 个已提交回合在安全点写一次快照（写失败只警告，日志仍是依据）。恢复时从最近快照 + 尾部重放，崩溃后最多重放 N 个回合；镜像不声明时只在正常退出写快照。
 
-重启恢复的入口与语义见[启动模式与 guest 程序](#启动模式与-guest-程序)：`resume` = 快照 + 日志尾部，`reboot` = 快照世界段 + 日志尾部世界类效果，`reset` = 原始镜像；不传 `mode` 时快照可读就用它，缺失或损坏只警告并退回「镜像 + 日志」重放（进程崩溃、快照落后或损坏的路径）。
+重启恢复的入口与语义见[启动模式与 guest 程序](#启动模式与-guest-程序)：`resume` = 快照 + 日志尾部，`reboot` = 快照世界段 + 日志尾部世界类效果，`reset` = 原始镜像；`auto`（默认）在快照可读时等价 `resume`，否则等价 `reset`（进程崩溃、快照落后或损坏时没有可恢复的对话态，日志不单独重放）。
 
 ### 程序包（packages）
 
@@ -679,7 +679,7 @@ Guard 是软件层（镜像/OS 程序）注册的一个普通内核态监听器�
 
 输入设备支持操作者命令 `/save`（可带路径 `/save <path>`）：在输入前截取，保存当前活跃对话的检查点后继续等待真实输入——对话感知不到该命令。恢复在 host 侧进行（`restore_conversation`），不做 AVM 内 `/load`。
 
-启动时加载：`python main.py <image.json> --checkpoint-in cp.json`（或 debug.json 的 `checkpoint_in` 字段）会**跳过 init**，把检查点恢复为 cid 0 的就绪对话直接续跑——这是"上次保存的对话下次启动接着用"的入口。它只用于冷启动（`reset` 或不传 mode）：`resume` / `reboot` 与检查点同时给出会报错。
+启动时加载：`python main.py <image.json> --checkpoint-in cp.json`（或 debug.json 的 `checkpoint_in` 字段）会**跳过 init**，把检查点恢复为 cid 0 的就绪对话直接续跑——这是"上次保存的对话下次启动接着用"的入口。它只用于冷启动（`reset`；`auto` 在无快照时等价 `reset`）：`resume` / `reboot` 与检查点同时给出会报错。
 
 终端输入：等待输入时显示正在等待的对话身份提示（如 `[tester（cid=0）等待输入，/save 保存检查点]`），不再是黑屏裸等；已启用 readline 行编辑（历史/方向键，中文输入法组合友好）；终端非 UTF-8 编码会警告一次——中文乱码通常源于终端编码而不是程序。
 
@@ -701,10 +701,10 @@ cd web && npm run dev                    # 开发期：Vite 代理 /api 到 AVM_
 
 面板自身：`cd web && npm run test:unit` 跑纯逻辑用例，`cd web && npm run e2e` 起一个脚本化 MockLMU 的控制台并在浏览器里跑五个场景（观测、工具选择、三步交互、喂输入、产物由 console 托管）。
 
-- **操作员对话（保留 cid -1）**：cid 是作者规定的保留值，不参与正常分配；控制台在 `boot` 返回后、`core.run()` 之前把 `plm.operator` 通道绑到它，没有就创建。对话随快照与日志正常恢复：日志里出现它的回合而它还不存在时（只靠日志恢复），重放先补建它，回合按普通记录应用；快照里它与普通对话一起保存和恢复。**隐藏标记在对话 attrs**（`host: "console"`、`hidden: "1"`），不是内存树节点：对普通对话隐藏——`$MEM.conversations` / `$MEM.scheduler` / `$MEM.caps` 列表与监测帧过滤，`send_instruction` / `close_conversation` 与 `$conv.<cid>` / `$batch.<cid>` 一律按「不存在」处理；旧快照/旧日志没有 attrs 时按保留 cid 兜底。隐藏只是显示与寻址策略，不影响恢复，宿主控制台自己仍能看到它（`/api/state` 与 `/api/conversations/-1`）。初始进休眠队列、不进就绪队列——只有中断能激活。它活跃就等于全局暂停（其他对话都不推进）。`POST /api/interrupt` 挂起 `operator` 中断（在下一个安全点生效；`core.run()` 已返回时不再生效），`POST /api/resume` 让它结束本轮、让出执行权。`POST /api/action` 提交一条动作，未暂停时先自动中断；未知工具名有意允许（响应里有 `known_tool` 与提示）。
+- **操作员对话（保留 cid -1）**：cid 是作者规定的保留值，不参与正常分配；控制台在 `boot` 返回后、`core.run()` 之前把 `plm.operator` 通道绑到它，没有就创建。对话随快照与日志正常恢复：日志里出现它的回合而它还不存在时（只靠日志恢复），重放先补建它，回合按普通记录应用；快照里它与普通对话一起保存和恢复。**隐藏标记在对话 attrs**（`host: "console"`、`hidden: "1"`），不是内存树节点：对普通对话隐藏——`$MEM.conversations` / `$MEM.scheduler` / `$MEM.caps` 列表与监测帧过滤，`send_instruction` / `close_conversation` 与 `$conv.<cid>` / `$batch.<cid>` 一律按「不存在」处理；隐藏只由对话 `attrs` 决定，cid 不参与判定。隐藏只是显示与寻址策略，不影响恢复，宿主控制台自己仍能看到它（`/api/state` 与 `/api/conversations/-1`）。初始进休眠队列、不进就绪队列——只有中断能激活。它活跃就等于全局暂停（其他对话都不推进）。`POST /api/interrupt` 挂起 `operator` 中断（在下一个安全点生效；`core.run()` 已返回时不再生效），`POST /api/resume` 让它结束本轮、让出执行权。`POST /api/action` 提交一条动作，未暂停时先自动中断；未知工具名有意允许（响应里有 `known_tool` 与提示）。
 - **读取端点**：`GET /api/state`（运行状态、调度、对话（不过滤 cid -1）、中断、屏蔽账本、生命周期、恢复报告、IO 总线状态）、`/api/tools`（十条指令表）、`/api/conversations/<cid>`、`/api/memory`（可带 `ref`，整树无分页）、`/api/memory/diff?from=&to=`、`/api/listeners`、`/api/devices`、`/api/events`（SSE：面板输出与调度变化的有序流，按 `seq` 增量读）、`/api/io/stream?after=`（SSE：宿主 IO 输出流）。
 - **介入端点**：`POST /api/action`（面板对话执行一条工具调用）、`POST /api/io/input`（调试输入 → 宿主 IO 总线，200 返回 `debug: true`）、`POST /api/system/shutdown`（挂 shutdown 中断通知 OS，见下）、`POST /api/system/force-stop`（操作员强制退出，见下）、`POST /api/device/inspect`（只读检查设备文件：路径/大小/sha256/类名/挂载/args/现有来源表条目，不 import、不挂载、不写内存）、`POST /api/device-action`（调设备自己声明的调试动作，如给 `$inputs` 投喂一行）、`/api/memory/snapshot`、`PATCH /api/listeners/<id>`（就地启停监听器、改 priority/tier）、`POST|DELETE /api/mask/memory`、`/api/mask/device`（临时摘下一个内存节点或卸载一台设备，`DELETE` 还原；调试原语不产生事件）、`POST /api/session/acquire|release`（单客户端席位）。
-- **关机与强制退出**：`POST /api/system/shutdown` 不执行关机语义，只挂 `shutdown` 中断通知镜像声明的处理程序（中断是 VM 通知软件的通道）；OS 软件收尾后写 `$MEM.sys.power.state = "off"`，宿主在安全点看到该边沿后写快照并退出。没有声明 shutdown 处理程序时请求停在挂起（warning），VM 不自行断电；请求关机 `force_stop_after` 秒后可用 `POST /api/system/force-stop` 强制退出——**不写快照、不写 clean**，响应 `{"status": "force-stopped", "snapshot_written": false}`。
+- **关机与强制退出**：`POST /api/system/shutdown` 不执行关机语义，只挂 `shutdown` 中断通知镜像声明的处理程序（中断是 VM 通知软件的通道）；面板占执行权（系统空闲态）时，关机按钮同时在操作员通道提交一次 `{"end": True}`，让阻塞的面板回合回到安全点才能派发中断。OS 软件收尾后写 `$MEM.sys.power.state = "off"`，宿主在安全点看到该边沿后写快照并退出。没有声明 shutdown 处理程序时请求停在挂起（warning），VM 不自行断电；请求关机 `force_stop_after` 秒后可用 `POST /api/system/force-stop` 强制退出——**不写快照、不写 clean**，响应 `{"status": "force-stopped", "snapshot_written": false}`。
 - **界面当前接的**：三栏界面（对话列表 / 内存索引与对话·内存·设备详情 / 暂停与动作·事件流）；对话列表与详情带 caps 摘要（mode/groups/根名/工具集）、暂停与继续、十条指令的结构化动作表单（下拉 +「其它（手输）」+ 原始 JSON 兜底）、事件流、主输入框与调试抽屉（当前都走调试 IO 总线；正式可扩展 IO 待实现，标注不重放）、设备审批面板（先用 `/api/device/inspect` 取哈希，再带 `approved_sha256` 提交装载）。内存索引照树画：链接节点一行，没有子节点可展开；挂载点那行标出设备类型（`device InputsListDevice`），点它打开设备视图，描述与动作来自 `GET /api/devices`。监听器编辑、屏蔽还原、快照与 diff 视图、设备动作全量都已有后端端点、界面未接。
 - **边界**：面板对话的消息随每次动作增长，且不能存检查点（v1 检查点不支持 Python 对话）；面板输出是容量 4000 条的有界环形缓冲，丢弃数记在状态里；`GET /api/devices` 的动作账本只留最近 50 条；阻塞读的路径末段是已知会阻塞的命名子键（当前只有 `next`，如 `$MEM.inputs.next`）时面板先标出、点击才发请求（8 秒超时）。
 

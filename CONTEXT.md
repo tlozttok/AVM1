@@ -127,7 +127,7 @@ _Avoid_: 聊天对象、对话伙伴
 _Avoid_: 模型注册表、白名单
 
 **生命周期三段**:
-内核启动的显式三步：**创建空核心**（`Core()`）→ **加载镜像**（`load_image(core, path)`，要求核心还没有对话）→ **启动核心**（`start_core(core)`：刷新模型目录、装 API 失败的运行者策略）。`avm/boot.py` 是加载区，三段都收在那里，宿主通常只调 `boot(image_path)`。`boot(mode=resume|reboot|reset)` 选择世界从快照/快照世界段/原始镜像来；声明了 `meta.guest_programs` 的镜像在冷启动 init 之后创建 guest 角色对话（`boot` / `idle` / `shutdown`）并注册同名中断向量。
+内核启动的显式三步：**创建空核心**（`Core()`）→ **加载镜像**（`load_image(core, path)`，要求核心还没有对话）→ **启动核心**（`start_core(core)`：刷新模型目录、装 API 失败的运行者策略）。`avm/boot.py` 是加载区，三段都收在那里，宿主通常只调 `boot(image_path)`。`boot(mode=auto|resume|reboot|reset)`（默认 `auto`：快照可读则等价 `resume`，否则等价 `reset`）选择世界从快照/快照世界段/原始镜像来；日志记录版本 3、快照版本 2，旧版本恢复输入被明确拒绝并提示 `reset`。声明了 `meta.guest_programs` 的镜像在冷启动 init 之后创建 guest 角色对话（`boot` / `idle` / `shutdown`）并注册同名中断向量。
 _Avoid_: 引导、初始化
 
 **根 (Root)**:

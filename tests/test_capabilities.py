@@ -127,9 +127,9 @@ class TestCapsSerialization:
         assert restored.attrs == {"role": "greeter", "approved": "1"}
         assert restored.to_api_messages() == conv.to_api_messages()
 
-    def test_old_checkpoint_without_caps_defaults_to_kernel(self):
+    def test_old_checkpoint_without_caps_is_rejected(self):
         cp = {
-            "version": 1,
+            "version": 2,
             "name": "old",
             "para_ref": "$MEM.model_params",
             "is_python": False,
@@ -141,6 +141,5 @@ class TestCapsSerialization:
                 {"role": "user", "content": "u"},
             ],
         }
-        conv = Conversation.from_checkpoint(cp)
-        assert conv.caps == default_kernel_caps()
-        assert conv.attrs == {}
+        with pytest.raises(ValueError, match="caps"):
+            Conversation.from_checkpoint(cp)

@@ -21,8 +21,8 @@ python -m avm.image <image.json>
 | `security` | 否 | 权限段：只含根注册表 `roots`（见下文） |
 | `init` | 否 | 启动对话配置（缺省时不启动任何对话） |
 | `persist_to` | 否 | 运行结束后内存写回路径（相对镜像文件所在目录） |
-| `journal_to` | 否 | 回合级效果日志路径（JSONL；相对镜像文件所在目录）。声明后每个提交回合追加一条，是持久化的依据；启动时按启动模式重放（`resume` 续代际，`reboot`/`reset` 归档旧日志并开新代际） |
-| `snapshot_to` | 否 | 重启快照路径（相对镜像文件所在目录）。正常退出（`run()` 返回或运行者选择退出）时写一份；启动时按启动模式读取或归档。`resume`/`reboot` 没有可读快照时拒绝启动，不静默退回冷启动 |
+| `journal_to` | 否 | 回合级效果日志路径（JSONL；相对镜像文件所在目录）。声明后每个提交回合追加一条，是持久化的依据；启动时按启动模式重放（`resume` 续代际，`reboot`/`reset` 归档当前日志并开新代际）。记录格式显式版本化为 `v=3`，旧版本记录拒绝读取并提示 `reset` |
+| `snapshot_to` | 否 | 重启快照路径（相对镜像文件所在目录）。正常退出（`run()` 返回或运行者选择退出）时写一份；启动时按启动模式读取或归档。快照格式 `version=2`，旧版本拒绝恢复并提示 `reset`。`resume`/`reboot` 没有可读快照时拒绝启动，不静默退回冷启动 |
 
 ## mem 节点格式
 
@@ -43,7 +43,7 @@ python -m avm.image <image.json>
 - `kind=link` 声明链接节点：`target` 以 `$` 开头是内存树地址（`$MEM.a.b`），否则是设备唯一标识符（`devices` 段条目的 `id`，缺省取 `path`）。寻址遇到链接即进入目标，读/写/`memory_make`/`edit_metadata` 都作用于目标；链接只由内核侧声明，运行期没有创建/删除链接的指令。
 - `ctrl.type` 目前定义的取值：`para`（模型调用参数）、`settingup`（LLM 提示词程序）、`python`（Python 程序）、`handler`（事件处理器；处理器节点不再用 `python` 类型）。
 - `kind="str"` 的节点只有控制数据：可带 `ctrl`，**不能带 `meta`**（镜像装载报 `ImageError`）。字符串节点在运行时是 `StrNode`（str 子类）。
-- Core 不写节点所有权：`memory_make` / `memory_write` 不写 `ctrl`，`edit_metadata` 可自由编辑 `ctrl` 的任意键。`ctrl.owner` 不是保留键；旧镜像里出现的 `"owner": "0"` 只是普通控制数据。
+- Core 不写节点所有权：`memory_make` / `memory_write` 不写 `ctrl`，`edit_metadata` 可自由编辑 `ctrl` 的任意键。`ctrl.owner` 不是保留键；内存里出现的 `"owner": "0"` 只是普通控制数据。
 
 ```json
 {
@@ -66,7 +66,7 @@ python -m avm.image <image.json>
              "tools": {"kind": "list", "value": [{"kind": "str", "value": "memory_read"}]}}}}}
 ```
 
-缺省字段继承父对话；`roots` 是 `security.roots` 注册表里的名字列表；`tools` 必须是父工具集的子集；`workspace` 已移除（声明即报错）——内核不分配工作目录，目录由软件建、根由 `$MEM.conversations.<cid>.roots` 动态加。没有 `caps` 的程序继承父能力（旧镜像行为不变）。程序节点的 `caps` 在创建对话时校验，非法时不创建对话。
+缺省字段继承父对话；`roots` 是 `security.roots` 注册表里的名字列表；`tools` 必须是父工具集的子集；`workspace` 已移除（声明即报错）——内核不分配工作目录，目录由软件建、根由 `$MEM.conversations.<cid>.roots` 动态加。没有 `caps` 的程序继承父能力。程序节点的 `caps` 在创建对话时校验，非法时不创建对话。
 
 运行期可用 `edit_metadata` 指令给节点补 ctrl（例如给运行时创建的 dict 节点设置 `type='settingup'` / `'python'`），配合 `memory_make` / `memory_write` 组合出可被 `create_cmd` 使用的程序节点——程序节点不一定只在镜像中预置。
 
@@ -172,7 +172,7 @@ python -m avm.image <image.json>
 
 init 强制内核态：程序 `ctrl.caps.mode` 声明 `user` 时装载报 `ImageError`（没有内核态就无法管理权限）。只启动 0 号对话；**不预置其他对话**（其他对话由对话运行期自己 `create_cmd` / `create_sub` 创建）。PLM 入口的典型用法：0 号程序先做确定性的准备工作（读设备、组装提示词、写内存），再 `create_cmd` 出真正跑推理的 LLM 对话并 `send_instruction` 启动它，自己 `close_conversation`。
 
-**guest 程序**：顶层 `meta.guest_programs` 可选，把角色名 `boot` / `idle` / `shutdown` 映射到程序节点引用（`$` 开头，指向 `settingup` 或 `python` 节点）。冷启动在 init 之后按固定顺序为每个角色创建内核态对话，写 `attrs["guest_role"]` 并注册同名中断向量；`resume` 按该 attrs 找回对话，不重建。Python 角色程序要定义与角色同名的生成器（入口 `yield from <role>()`），并给程序节点写 `para_ref`。声明了任意 guest 角色的镜像启用严格调度：空闲（活跃/就绪都空、无待派发中断）时 Core 向 `idle` 中断向量派发——console 宿主会把该向量注册为面板对话（面板阻塞等待即空闲态），镜像也可声明 `idle` guest 作为无面板宿主的 fallback；派发后仍无法离开空闲即 `KernelPanic`。没有 idle 向量的旧镜像保持「队列空即 `run()` 返回」的旧语义。
+**guest 程序**：顶层 `meta.guest_programs` 可选，把角色名 `boot` / `idle` / `shutdown` 映射到程序节点引用（`$` 开头，指向 `settingup` 或 `python` 节点）。冷启动在 init 之后按固定顺序为每个角色创建内核态对话，写 `attrs["guest_role"]` 并注册同名中断向量；`resume` 按该 attrs 找回对话，不重建。Python 角色程序要定义与角色同名的生成器（入口 `yield from <role>()`），并给程序节点写 `para_ref`。声明了任意 guest 角色的镜像启用严格调度：空闲（活跃/就绪都空、无待派发中断）时 Core 向 `idle` 中断向量派发——console 宿主会把该向量注册为面板对话（面板阻塞等待即空闲态），镜像也可声明 `idle` guest 作为无面板宿主的 fallback；派发后仍无法离开空闲即 `KernelPanic`。嵌入式宿主未接入生命周期管理（镜像没有声明 guest 程序、也没有注册 idle 中断向量）时，队列空即 `run()` 返回。
 
 ## 启动流程
 
@@ -187,7 +187,7 @@ init 强制内核态：程序 `ctrl.caps.mode` 声明 `user` 时装载报 `Image
 5. 解析并安装 `security` 段（根注册表；错误抛 `ImageError`），并校验 `meta.guest_programs` 的形状；
 6. 启动 init 对话（cid 0，`name`；LLM 入口或 PLM 入口），再按 `guest_programs` 创建 guest 对话。`init` 缺失或为空时给一行 stderr 诊断，不启动任何对话（guest 程序仍会创建）。
 
-启动模式决定第 6 步与日志怎么处理：`resume` 跳过 init/guest 创建，由快照恢复对话、内存、调度、监听器与设备表，再重放快照之后的日志尾部；`reboot` 只从快照恢复世界段（内存/安全配置/para/设备来源表）并重放日志尾部的世界类效果，然后重跑 init 与 guest 创建；`reset` 用原始镜像重跑 init，并把旧日志/旧快照归档后开新代际。`resume`/`reboot` 没有可读快照时拒绝启动并提示 `reset`；不传 mode 时保持旧行为（快照可读就用，否则镜像 + 日志重放）。语义见 [runtime.md 的「启动模式与 guest 程序」](runtime.md#启动模式与-guest-程序)。
+启动模式决定第 6 步与日志怎么处理：`resume` 跳过 init/guest 创建，由快照恢复对话、内存、调度、监听器与设备表，再重放快照之后的日志尾部；`reboot` 只从快照恢复世界段（内存/安全配置/para/设备来源表）并重放日志尾部的世界类效果，然后重跑 init 与 guest 创建；`reset` 用原始镜像重跑 init，并把当前日志/快照归档后开新代际。`resume`/`reboot` 没有可读快照时拒绝启动并提示 `reset`；`auto`（默认）在快照可读时等价 `resume`，否则等价 `reset`，没有"镜像 + 日志重放"的冷启动路径。语义见 [runtime.md 的「启动模式与 guest 程序」](runtime.md#启动模式与-guest-程序)。
 
 **启动核心**依次做：拉一次上游 `GET /models` 填模型目录（失败只警告，不拦启动）；装 API 失败的运行者策略（终端三选项：更新环境 / 继续 / 退出）。
 

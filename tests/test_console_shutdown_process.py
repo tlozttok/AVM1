@@ -312,8 +312,10 @@ def test_hard_kill_is_reported_as_forced_shutdown(tmp_path):
         code, state = _request(port2, "/api/state", token=token2)
         assert code == 200
         assert state["recovery"]["last_exit"] == "forced", "脏关闭要报告 forced"
-        assert state["recovery"]["source"] == "journal"
-        assert state["recovery"]["replayed"] >= 1
+        # 没有快照：auto 等价 reset，日志不单独重放（对话态不能从日志重建）。
+        assert state["recovery"]["mode"] == "auto"
+        assert state["recovery"]["source"] == "cold"
+        assert state["recovery"]["replayed"] == 0
     finally:
         proc2.kill()
         proc2.wait(timeout=5)

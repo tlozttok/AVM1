@@ -82,7 +82,7 @@ class PLMServer(ABC):
                 }
 
     def _tool_allowed(self, name) -> bool:
-        """当前对话工具集是否允许该指令名（未声明 tools 时保持旧行为：允许）。"""
+        """当前对话工具集是否允许该指令名（未声明 tools 时缺省允许）。"""
         if not self._tools_declared:
             return True
         return name in self._tools
@@ -1090,7 +1090,7 @@ class OperatorPLM(PLMServer):
         if self._channel is None:
             raise ValueError(
                 "操作员对话必须由控制台创建：plm.operator 需要一个已绑定的操作员通道"
-                "（见 Core.start_operator_conversation）"
+                "（见 Core.bind_console_conversation）"
             )
         return self._channel
 

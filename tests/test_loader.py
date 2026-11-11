@@ -2,7 +2,7 @@
 
 验收（设备审批计划）：正确哈希装载成功；错误/缺失哈希 Error 且无挂载/无记录；
 程序包装载同时核对设备文件哈希并写安装记录；恢复时改文件失败；去密码；
-升级需重新审批；旧快照缺 sha256 拒绝恢复；内置设备恢复不受影响。
+升级需重新审批；快照记录缺 sha256 拒绝恢复；内置设备恢复不受影响。
 全部不调真实 API。
 """
 
@@ -550,7 +550,7 @@ class TestDemoImage:
                            "content": json.dumps(install_command_demo(), ensure_ascii=False)}},
             {"end": True},
         ])
-        panel = core.start_operator_conversation(channel)
+        panel = core.bind_console_conversation(channel)
         core._ready_cids.append(panel.cid)
         run_core(core)
         assert [item["package_version"] for item in packages.list_installed(core)] == ["1_0_0"]

@@ -10,13 +10,11 @@ interface Props {
 
 function recoveryText(state: State | null): string {
   const r = state?.recovery
-  if (!r) return '恢复信息不可用（旧后端）'
+  if (!r) return '恢复信息不可用'
   const origin =
     r.source === 'snapshot'
       ? `从快照恢复（seq ${r.snapshot_seq ?? '—'}）`
-      : r.source === 'journal'
-        ? '从日志恢复'
-        : '冷启动'
+      : '冷启动'
   return `${origin} · 重放 ${r.replayed} 条 · ${r.warnings.length} 个警告`
 }
 

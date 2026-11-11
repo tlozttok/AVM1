@@ -486,16 +486,15 @@ class TestPersistRoundtrip:
         assert loaded["cfg"].get_ctrl() == {"type": "para"}
         assert loaded["tags"].get_metadata() == "标签"
 
-    def test_load_legacy_format(self, tmp_path):
+    def test_load_legacy_format_is_rejected(self, tmp_path):
         path = tmp_path / "legacy.json"
         path.write_text(json.dumps({
             "__type": "MetaDict",
             "meta": None,
             "data": {"a": {"__type": "MetaList", "meta": "m", "data": ["x", "y"]}},
         }), encoding="utf-8")
-        loaded = Memory.load(str(path))
-        assert loaded["a"] == ["x", "y"]
-        assert loaded["a"].get_metadata() == "m"
+        with pytest.raises(Exception, match="旧 __type 格式不再支持"):
+            Memory.load(str(path))
 
 
 PLM_CODE = '''

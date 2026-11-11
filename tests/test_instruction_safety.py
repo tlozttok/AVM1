@@ -557,7 +557,7 @@ class _FakeChannel:
 class TestPanelConversationHidden:
     def _core_with_panel(self):
         core, conv = _core()
-        panel = core.start_operator_conversation(_FakeChannel())
+        panel = core.bind_console_conversation(_FakeChannel())
         return core, conv, panel
 
     def test_panel_uses_reserved_cid(self):
@@ -574,14 +574,13 @@ class TestPanelConversationHidden:
         assert "-1" not in sched, "调度队列里的面板 cid 也要过滤"
 
     def test_panel_carries_host_markers(self):
-        """保留对话创建时写宿主标记；隐藏判定读 attrs，cid 兼容作为兜底。"""
+        """保留对话创建时写宿主标记；隐藏判定只读 attrs。"""
         core, conv, panel = self._core_with_panel()
         assert panel.attrs == {"host": "console", "hidden": "1"}
         assert not core.is_hidden_cid(conv.cid)
 
-        panel.attrs = {}  # 旧快照/旧路径没有 attrs
-        assert core.is_hidden_cid(panel.cid), "没有 attrs 时按 cid == PANEL_CID 兜底"
-        assert f"cid={panel.cid} " not in core.unwrap("$MEM.conversations")
+        panel.attrs = {}
+        assert not core.is_hidden_cid(panel.cid), "隐藏只由 attrs 决定，cid 不参与"
 
     def test_hidden_attr_can_hide_an_ordinary_conversation(self):
         """判定读的是对话自己的 attrs，不是 cid 特判。"""

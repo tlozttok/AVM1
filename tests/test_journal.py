@@ -452,7 +452,7 @@ class TestRecordShape:
             "activation_instructions", "next_cid",
         }
         for record in records:
-            assert record["v"] == 2
+            assert record["v"] == 3
             for legacy in ("history", "call", "batch", "scheduler", "effects"):
                 assert legacy not in record
             assert isinstance(record["changes"], list)
@@ -467,8 +467,34 @@ class TestRecordShape:
         core = load_core(image)
         core.attach_journal(core.journal_path)
         core.journal.append({"cid": 0, "history": [], "effects": []})
-        with pytest.raises(JournalError, match="旧格式"):
+        with pytest.raises(JournalError, match="不支持的记录版本"):
             core.replay_journal()
+
+    def test_v2_record_is_rejected(self, tmp_path):
+        image = write_image(tmp_path)
+        core = load_core(image)
+        core.attach_journal(core.journal_path)
+        core.journal.append({"v": 2, "generation": 1, "cid": 0, "changes": []})
+        with pytest.raises(JournalError, match="不支持的记录版本"):
+            core.replay_journal()
+
+
+class TestDeviceMountReplay:
+    def test_mount_effect_without_sha256_is_rejected(self, tmp_path):
+        from avm.journal import apply
+
+        image = write_image(tmp_path)
+        core = load_core(image)
+        core.start("sys", "user", para_ref="$MEM.model_params")
+        record = {
+            "v": 3, "generation": 1, "seq": 1, "cid": 0,
+            "changes": [{"kind": "effect", "effect": {
+                "kind": "device_mount", "mount": "echo",
+                "spec": {"path": "echo.py", "class": "EchoDevice", "args": {}},
+            }}],
+        }
+        with pytest.raises(JournalError, match="sha256"):
+            apply(core, record)
 
 
 class TestPeriodicSnapshot:
@@ -594,32 +620,3 @@ class TestConversationRootsReplay:
         assert "work" not in replayed._conv_by_cid[1].caps.roots
         assert replayed._conv_by_cid[1].caps.roots["caps"][0] == "caps"
         assert_same_state(mine, replayed)
-
-    def test_old_log_workspace_payload_still_attached(self, tmp_path):
-        """兼容：旧日志的 conversation_create 载荷里的 workspace 节点仍会挂回内存。"""
-        from avm.journal import apply
-
-        image = write_image(tmp_path)
-        responses = [
-            ("", [{"call_id": "c1", "cmd_type": "create_cmd",
-                   "args": {"system_ref": "$MEM.programs.main",
-                            "para_ref": "$MEM.model_params"}}]),
-            ("done", []),
-        ]
-        _run(image, responses)
-        record = Journal(out_path(image, "run.journal")).read()[0]
-        create = next(
-            change["effect"] for change in record["changes"]
-            if change.get("kind") == "effect"
-            and change.get("effect", {}).get("kind") == "conversation_create"
-        )
-        create["workspace"] = {
-            "root_name": "work",
-            "target": ["workspaces", "w0"],
-            "node": {"kind": "dict", "value": {"x": {"kind": "str", "value": "v"}}},
-        }
-
-        fresh = load_core(image)
-        apply(fresh, record)
-        assert str(fresh.mem.resolve_path(
-            ["MEM", "workspaces", "w0", "x"], for_llm=False)) == "v"
