@@ -1,8 +1,9 @@
-"""base 镜像的构造器 PLM（`plm.builder`）测试。
+"""base 镜像的构造器命令程序（`plm.command`）测试。
 
-覆盖：镜像装载（core.plms / 模型目录 / 预置 para 与程序节点）、端到端构造四类节点、
-create 重复路径跳过、update 覆盖、非法规格不产生工具调用、calls 直通。
-全程 Mock（构造器是确定性 Python 对话，不调 LLM）。
+覆盖：镜像装载（没有 plm.builder、para 用 plm.command、程序节点就是一个普通
+python 程序节点）、端到端构造四类节点、create 重复路径跳过、update 覆盖、
+非法规格不产生工具调用、calls 直通、程序正文可读可改（程序即数据）。
+全程 Mock（构造器是确定性 Python 命令程序，不调 LLM）。
 """
 
 import json
@@ -18,7 +19,7 @@ BASE_IMAGE = os.path.join(REPO, "images", "base", "base.json")
 
 
 class NoLMU:
-    """构造器是 Python 对话；任何 LLM 调用都说明测试走错了路径。"""
+    """构造器是 Python 命令程序；任何 LLM 调用都说明测试走错了路径。"""
 
     def exec(self, conv, para):
         raise AssertionError("builder 测试不应调用 LLM")
@@ -94,22 +95,29 @@ CREATE_SPEC = {
 }
 
 
-def test_image_declares_builder_plm_and_preset_nodes():
+def test_image_declares_builder_command_program():
     core = load_core()
-    cls = core.plms["plm.builder"]
-    assert cls.__name__ == "NodeBuilderPLM"
+    # 构造器不再是镜像声明的自定义 PLM：没有 plms 段，也没有 plm.builder 注册。
+    assert "plm.builder" not in core.plms
     catalog = core.mem._data["model_catalog"]
-    assert "plm.builder" in [entry["name"] for entry in catalog["plm"]]
+    names = [entry["name"] for entry in catalog["plm"]]
+    assert "plm.command" in names
+    assert "plm.builder" not in names
 
     para = core.unwrap("$MEM.para.builder", for_llm=False)
     assert para.get_ctrl() == {"type": "para"}
-    assert para.get("model") == "plm.builder"
+    assert para.get("model") == "plm.command"
 
     program = core.unwrap("$MEM.sys.programs.builder", for_llm=False)
     assert program.get_ctrl() == {"type": "python"}
     content = program.get("content")
-    assert "构造器" in content and "JSON" in content
+    assert "def handle(cmd)" in content
+    assert "错误: builder" in content
+    assert "JSON" in content
     assert program.get("para_ref") == "$MEM.para.builder"
+    # 程序正文就是 system 消息：构建出的对话里能读到同一份源码。
+    conv = builder_conversation(core)
+    assert conv.messages[0].content == content
 
 
 def test_create_builds_all_node_kinds_end_to_end():
@@ -251,6 +259,7 @@ def test_update_rewrites_existing_content_and_fills_missing_field():
     {"ops": [{"type": "python", "path": "$MEM.x"}]},
     {"ops": [{"type": "handler", "path": "$MEM.x", "content": "code"}]},
     {"calls": [{"tool": "not_an_instruction", "arguments": {}}]},
+    {"calls": [{"tool": "create_cmd", "arguments": {}}]},
     {"calls": [{"tool": "memory_read", "arguments": "not-an-object"}]},
 ])
 def test_invalid_spec_returns_error_without_tool_calls(bad):
@@ -262,7 +271,7 @@ def test_invalid_spec_returns_error_without_tool_calls(bad):
 
     # 一条用户消息 + 一条错误回执，没有 assistant 工具调用，也没有工具消息。
     assert [message.role for message in conv.messages] == ["system", "user", "assistant"]
-    assert conv.messages[-1].content.startswith("错误: BuilderPLM:")
+    assert conv.messages[-1].content.startswith("错误: builder:")
     assert conv.cid in core._dormant_cids
     # 规格非法时不执行任何指令：目标路径没有被建出来。
     assert "x" not in core.unwrap("$MEM.workshop", for_llm=False)
@@ -276,31 +285,52 @@ def test_calls_passthrough_and_summary_results():
             {"tool": "memory_read", "arguments": {"ref": "$MEM.sys.power.state"}},
             {"tool": "memory_write",
              "arguments": {"ref": "$MEM.sys.outbox.-1", "content": "via-builder"}},
+            {"tool": "edit_metadata",
+             "arguments": {"ref": "$MEM.para.command", "type": "get"}},
         ],
     }
     summary, _ = send(core, conv, spec)
 
     assert summary["ok"] is True
-    assert [call["tool"] for call in summary["calls"]] == ["memory_read", "memory_write"]
-    assert summary["calls"][0]["tool"] == "memory_read"
+    assert [call["tool"] for call in summary["calls"]] == [
+        "memory_read", "memory_write", "edit_metadata",
+    ]
     assert summary["calls"][0]["arguments"] == {"ref": "$MEM.sys.power.state"}
     assert summary["calls"][0]["result"] == "on"
-    assert summary["calls"][1]["tool"] == "memory_write"
     assert summary["calls"][1]["result"].startswith("Success")
+    assert json.loads(summary["calls"][2]["result"]) == {"type": "para"}
     outbox = list(core.unwrap("$MEM.sys.outbox", for_llm=False))
     assert outbox[-1] == "via-builder"
 
 
-def test_system_message_is_ignored():
-    """程序节点的说明文字不是 JSON；system 消息必须忽略而不是报配置错误。"""
+def test_builder_can_create_a_runnable_command_program():
+    """程序即数据：构造器建出的 plm.command 程序节点可以直接创建对话并执行。"""
     core = load_core()
-    plm = core.plms["plm.builder"]()
-    history = [
-        {"role": "system", "content": core.unwrap("$MEM.sys.programs.builder.content", for_llm=False)},
-    ]
-    assert plm.handle_messages(list(history), {}) == {"content": ""}
+    conv = builder_conversation(core)
+    spec = {
+        "ops": [
+            {
+                "type": "python",
+                "path": "$MEM.workshop.echo",
+                "content": "def handle(cmd):\n    return 'echo:' + cmd\n",
+            },
+            {
+                "type": "para",
+                "path": "$MEM.para.echo",
+                "fields": {"model": "plm.command"},
+            },
+        ],
+    }
+    summary, _ = send(core, conv, spec)
+    assert summary["ok"] is True
 
-    spec = {"ops": [{"type": "para", "path": "$MEM.workshop.para", "fields": {"model": "x"}}]}
-    history.append({"role": "user", "content": json.dumps(spec, ensure_ascii=False)})
-    response = plm.handle_messages(list(history), {})
-    assert response["tool_calls"][0]["function"]["name"] == "memory_read"
+    init = core.get_conversation(0)
+    child = _build_conversation(
+        core, "$MEM.workshop.echo", "$MEM.para.echo",
+        parent=init, is_sub=False, space=init.caps.space(),
+    )
+    assert child.is_python is True
+    child.append_user_message("hi")
+    core._active_cid = child.cid
+    core.advance_conversation()
+    assert child.messages[-1].content == "echo:hi"

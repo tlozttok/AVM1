@@ -4,7 +4,7 @@ from avm.exceptions import MemoryKeyNotFoundError
 import json
 
 from avm.core import Core
-from avm.python_server import create_plm, PLM_REGISTRY, CommandPLM
+from avm.python_server import COMMAND_TOOLS, create_plm, PLM_REGISTRY, CommandPLM
 from avm.types import MetaDict
 
 
@@ -169,10 +169,12 @@ class TestCommandPLMToolCalls:
         h.append({"role": "tool", "content": "Error: 路径不存在", "tool_call_id": r["tool_calls"][0]["id"]})
         assert plm.handle_messages(list(h), tools) == {"content": "err=Error: 路径不存在"}
 
-    def test_all_five_tools_yield_expected_arguments(self):
+    def test_tools_yield_expected_arguments(self):
         cases = {
             "memory_write": ("memory_write('$MEM.a', 'v')", {"ref": "$MEM.a", "content": "v"}),
             "memory_make": ("memory_make('$MEM.a', 'k', 'str')", {"ref": "$MEM.a", "key": "k", "mem_type": "str"}),
+            "edit_metadata": ("edit_metadata('$MEM.a', 'set', key='k', value='v')",
+                              {"ref": "$MEM.a", "type": "set", "key": "k", "value": "v"}),
             "send_instruction": ("send_instruction(2, 'hi')", {"cid": 2, "content": "hi"}),
             "close_conversation": ("close_conversation(3)", {"cid": 3}),
         }
@@ -184,12 +186,44 @@ class TestCommandPLMToolCalls:
             assert tool_call["function"]["name"] == name
             assert json.loads(tool_call["function"]["arguments"]) == expected
 
+    def test_edit_metadata_get_and_del_omit_missing_fields(self):
+        cases = {
+            "get": ("edit_metadata('$MEM.a', 'get')", {"ref": "$MEM.a", "type": "get"}),
+            "del": ("edit_metadata('$MEM.a', 'del', key='k')",
+                    {"ref": "$MEM.a", "type": "del", "key": "k"}),
+        }
+        for _name, (call, expected) in cases.items():
+            plm = create_plm("plm.command")
+            setup = f"def handle(cmd):\n    return (yield from {call})\n"
+            r = plm.handle_messages(
+                _history(("system", setup), ("user", "go")), _params("edit_metadata")
+            )
+            arguments = json.loads(r["tool_calls"][0]["function"]["arguments"])
+            assert arguments == expected
+
     def test_unknown_tool_yield_rejected(self):
-        setup = "def handle(cmd):\n    return (yield ('create_cmd', {}))\n"
+        setup = "def handle(cmd):\n    return (yield ('not_a_tool', {}))\n"
         plm = create_plm("plm.command")
         r = plm.handle_messages(_history(("system", setup), ("user", "go")), {})
         assert "非法工具调用" in r["content"]
         assert r.get("tool_calls") is None
+
+    def test_all_ten_tools_are_available(self):
+        names = sorted(COMMAND_TOOLS)
+        assert names == sorted([
+            "memory_read", "memory_write", "memory_make", "memory_delete",
+            "edit_metadata", "create_cmd", "create_sub", "send_instruction",
+            "close_conversation", "listen_event",
+        ])
+        setup = (
+            "def handle(cmd):\n"
+            "    cid = yield from create_cmd('$MEM.programs.p', '$MEM.model_params')\n"
+            "    return str(cid)\n"
+        )
+        plm = create_plm("plm.command")
+        tools = _params("create_cmd")
+        r = plm.handle_messages(_history(("system", setup), ("user", "go")), tools)
+        assert r["tool_calls"][0]["function"]["name"] == "create_cmd"
 
     def test_malformed_yield_rejected(self):
         setup = "def handle(cmd):\n    return (yield 'memory_read')\n"

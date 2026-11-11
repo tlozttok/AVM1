@@ -339,7 +339,7 @@ def handle(cmd):
 
 - `handle` 返回字符串即命令输出（返回 `None` 视为空输出，其它类型报错）；stdout 丢弃；
 - `handle` 可以是生成器：注入的工具函数用 `yield from` 产生工具调用，Core 执行后把工具响应字符串送回断点继续（一条命令内可完成「读→算→写」往返）；
-- 注入的工具函数有 6 个：`memory_read(ref)`、`memory_write(ref, content)`、`memory_make(ref, key, mem_type)`、`memory_delete(ref)`、`send_instruction(cid, content)`、`close_conversation(cid)`；工具响应原样返回（包括 `Illegal: ...` / `Error: ...` 文本），由程序决定如何处理；其它指令名不可调用；
+- 注入的工具函数与指令集一致：10 条指令全部可用（`memory_read`、`memory_write`、`memory_make`、`memory_delete`、`edit_metadata`、`create_cmd`、`create_sub`、`send_instruction`、`close_conversation`、`listen_event`），并按对话 caps 过滤；工具响应原样返回（包括 `Illegal: ...` / `Error: ...` 文本），由程序决定如何处理；
 - 每条命令在全新受限命名空间中执行（程序与辅助代码重新执行），无跨命令状态——要持久化就写 `$MEM`；
 - tool calls 的 id 形如 `cmd-0`，每条命令内递增；一条命令最多挂起一个工具调用，命令未结束就投递新命令会丢弃旧生成器；
 - 错误以 `错误: CommandPLM: <类型>: <信息>` 文本返回。

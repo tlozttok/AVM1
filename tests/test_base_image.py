@@ -38,7 +38,7 @@ class NoLMU:
 
 
 def prepared_image(tmp_path, *, mutate=None):
-    """复制 base 镜像到 tmp，把设备/PLM 文件改成绝对路径；可再改 mem。"""
+    """复制 base 镜像到 tmp，把设备文件改成绝对路径；可再改 mem。"""
     with open(BASE_IMAGE, encoding="utf-8") as f:
         image = json.load(f)
     base_dir = os.path.dirname(BASE_IMAGE)
@@ -46,10 +46,6 @@ def prepared_image(tmp_path, *, mutate=None):
         file_path = dev.get("file")
         if isinstance(file_path, str) and not os.path.isabs(file_path):
             dev["file"] = os.path.normpath(os.path.join(base_dir, file_path))
-    for plm in image.get("plms") or []:
-        file_path = plm.get("file")
-        if isinstance(file_path, str) and not os.path.isabs(file_path):
-            plm["file"] = os.path.normpath(os.path.join(base_dir, file_path))
     if mutate is not None:
         mutate(image)
     path = tmp_path / "base.json"

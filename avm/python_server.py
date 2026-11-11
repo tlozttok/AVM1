@@ -892,6 +892,15 @@ def _tool_memory_delete(ref):
     return (yield ("memory_delete", {"ref": ref}))
 
 
+def _tool_edit_metadata(ref, type, key=None, value=None):
+    arguments = {"ref": ref, "type": type}
+    if key is not None:
+        arguments["key"] = key
+    if value is not None:
+        arguments["value"] = value
+    return (yield ("edit_metadata", arguments))
+
+
 def _tool_send_instruction(cid, content):
     return (yield ("send_instruction", {"cid": cid, "content": content}))
 
@@ -900,14 +909,39 @@ def _tool_close_conversation(cid):
     return (yield ("close_conversation", {"cid": cid}))
 
 
-# 注入程序的工具函数集合（命令执行子集，不开放创建对话等重指令）
+def _tool_create_cmd(system_ref, para_ref):
+    return (yield ("create_cmd", {"system_ref": system_ref, "para_ref": para_ref}))
+
+
+def _tool_create_sub(system_ref, user_ref, para_ref):
+    return (yield ("create_sub", {
+        "system_ref": system_ref, "user_ref": user_ref, "para_ref": para_ref,
+    }))
+
+
+def _tool_listen_event(action, event_type=None, target=None, handler_ref=None,
+                       listener_id=None, phase=None, priority=None, tier=None):
+    arguments = {"action": action}
+    for key, value in (("event_type", event_type), ("target", target),
+                       ("handler_ref", handler_ref), ("listener_id", listener_id),
+                       ("phase", phase), ("priority", priority), ("tier", tier)):
+        if value is not None:
+            arguments[key] = value
+    return (yield ("listen_event", arguments))
+
+
+# 注入程序的工具函数集合：与指令集一致（10 条），按对话 caps 过滤后注入。
 COMMAND_TOOLS = {
     "memory_read": _tool_memory_read,
     "memory_write": _tool_memory_write,
     "memory_make": _tool_memory_make,
     "memory_delete": _tool_memory_delete,
+    "edit_metadata": _tool_edit_metadata,
+    "create_cmd": _tool_create_cmd,
+    "create_sub": _tool_create_sub,
     "send_instruction": _tool_send_instruction,
     "close_conversation": _tool_close_conversation,
+    "listen_event": _tool_listen_event,
 }
 
 class CommandPLM(_GeneratorToolPLM):
@@ -920,8 +954,9 @@ class CommandPLM(_GeneratorToolPLM):
     - `handle` 返回字符串即命令输出（返回 None 视为空输出，其它类型报错）；
     - `handle` 也可以是生成器：注入的工具函数用 `yield from` 产生工具调用，Core 执行后
       把工具响应字符串送回生成器，程序从断点继续（一条命令内可完成「读→算→写」往返）；
-    - 注入的工具函数（对应 AVM 指令子集）：memory_read(ref) / memory_write(ref, content)
-      / memory_make(ref, key, mem_type) / send_instruction(cid, content) / close_conversation(cid)；
+    - 注入的工具函数与指令集一致（10 条，按对话 caps 过滤）：memory_read/ memory_write/
+      memory_make/ memory_delete/ edit_metadata/ create_cmd/ create_sub/
+      send_instruction/ close_conversation/ listen_event；
       工具响应原样返回（包括 `Error: ...` 文本），由程序决定如何处理；
     - 命令行沙箱：安全 builtins 白名单 + AST 检查（禁 import、禁双下划线属性、禁危险调用）；
     - stdout 捕获后丢弃（print 不进入返回值），输出就是 `handle` 的返回值；

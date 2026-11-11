@@ -2,8 +2,9 @@
 
 base 只放七样：持久化三件套、装载设备 + 只读仓库设备、OS 程序节点
 （boot/shutdown 两个 guest 角色程序 + clock_a/clock_b 服务程序）、可编辑的常驻
-服务清单、空分区骨架、标准 IO 设备、构造器 PLM（`plm.builder`，镜像的 plms 段
-声明 + 一个 Python 程序节点 + 一个 para 档，作者可直接 create_cmd 出来用）。
+服务清单、空分区骨架、标准 IO 设备、构造器命令程序（`plm.command`：一个程序节点
+`$MEM.sys.programs.builder` + 一个 para 档 `$MEM.para.builder`，作者可直接
+create_cmd 出来用）。
 空闲由宿主 console 的面板对话承担（内核把 `idle` 中断向量指向面板），镜像不再
 声明 idle 角色、不预置 inbox/面板服务；关机由宿主挂 `shutdown` 中断唤醒
 supervisor。其余基础由作者在系统内手动搭建，见 README.md。
@@ -30,11 +31,8 @@ OS_PROGRAMS = (
     ("clock_b", "clock_b.py", "clock_b"),
 )
 
-# 构造器 PLM 的程序节点。system 消息（这段说明）会被 PLM 忽略，不要求是 JSON。
-BUILDER_PROGRAM = (
-    "构造器：system 消息不生效；用户消息是 JSON 规格"
-    "（mode/ops/calls，见 images/base/README.md 的「构造器 PLM」一节）。"
-)
+# 构造器命令程序：system 消息是 programs/builder.py 的正文，用户消息是 JSON 规格。
+BUILDER_PROGRAM_FILE = "builder.py"
 
 
 def _str(value, meta=None):
@@ -90,8 +88,8 @@ def build():
             name=name,
         )
     programs["builder"] = _program_python(
-        BUILDER_PROGRAM,
-        "构造器 PLM（plm.builder）的入口程序；用户消息是 JSON 构造规格",
+        _read_program(BUILDER_PROGRAM_FILE),
+        "构造器命令程序（plm.command）；system 是程序正文，用户消息是 JSON 构造规格",
         name="builder",
         para_ref="$MEM.para.builder",
     )
@@ -103,7 +101,7 @@ def build():
             "description": (
                 "母板镜像：持久化三件套 + 装载设备 + OS 程序（boot/shutdown 角色与 "
                 "clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架 + "
-                "构造器 PLM（plm.builder）。"
+                "构造器命令程序（plm.command）。"
                 "空闲由宿主面板对话承担；不带业务；其余基础由作者在系统内手动搭建。"
             ),
             "instruction_budget": 100,
@@ -119,7 +117,7 @@ def build():
                 {
                     "python": _para("plm.python"),
                     "command": _para("plm.command"),
-                    "builder": _para("plm.builder"),
+                    "builder": _para("plm.command"),
                 },
                 meta="模型档位；新的 para 由作者在系统内添加",
             ),
@@ -202,13 +200,6 @@ def build():
                 "file": "../devices/io.py",
                 "class": "OutputsListDevice",
                 "args": {},
-            },
-        ],
-        "plms": [
-            {
-                "model": "plm.builder",
-                "file": "plms/builder.py",
-                "class": "NodeBuilderPLM",
             },
         ],
         "init": {
