@@ -138,7 +138,10 @@ class TestReadEndpoints:
         code, state = request(base, "GET", "/api/state")
         assert code == 200
         assert state["schedule"]["panel_cid"] == console.panel.cid
-        assert state["interrupts"]["vectors"] == {"operator": console.panel.cid}
+        assert state["interrupts"]["vectors"] == {
+            "operator": console.panel.cid,
+            "idle": console.panel.cid,
+        }
         assert state["panel"]["channel"]["dropped"] == 0
         assert state["mask"] == {"memory": [], "devices": []}
         assert [c["cid"] for c in state["conversations"]] == [console.panel.cid]
@@ -480,7 +483,7 @@ class TestDebugIoInput:
         assert code == 200
         assert body["debug"] is True
         assert body["seq"] == 1
-        # 调试通道不进日志、不写 inbox（测试环境本来就没有 sys.inbox）
+        # 调试通道不进日志、不产生事件（输入路径已冻结，等 UI 设备定义）
         assert core.journal.read() == []
         assert "sys" not in core.mem._data
 
@@ -491,10 +494,13 @@ class TestInterventionFlow:
         first = core.start("sys", "one")
         second = core.start("sys", "two")
         _seed(core.mem, "$MEM.from_panel", "")
+        second_ran = threading.Event()
 
         def on_exec(conv):
             if conv.cid == first.cid:
                 core.interrupts.raise_("operator")
+            elif conv.cid == second.cid:
+                second_ran.set()
 
         core.lmu.on_exec = on_exec
         thread = threading.Thread(target=core.run, daemon=True)
@@ -529,11 +535,17 @@ class TestInterventionFlow:
 
             code, body = request(base, "POST", "/api/resume")
             assert code == 200
-            thread.join(timeout=5)
-            assert not thread.is_alive()
+            # 两个对话都收尾后系统空闲：执行权再次交给面板（阻塞等操作员），
+            # Core 停在面板的推理里不返回；面板只是系统空闲态的承载者。
+            assert wait_for(
+                lambda: second_ran.is_set() and core._active_cid == console.panel.cid
+            ), "收尾后没有回到面板空闲态"
+            assert thread.is_alive(), "面板阻塞保持活跃，Core 不应返回"
         finally:
             console.channel.submit_action({"end": True})
+            core.request_stop()
             thread.join(timeout=5)
+            assert not thread.is_alive()
 
         assert core._active_cid is None
 

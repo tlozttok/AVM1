@@ -16,6 +16,11 @@
 （conversations/scheduler 列表过滤，send/close 报不存在），由中断向量表激活、
 结束交互即让出执行权。面板本身不主动抢占。
 
+空闲态由面板承担：控制台绑定面板对话后把 `idle` 中断向量注册为面板 cid，系统没有
+其它对话可跑时执行权交给面板；面板在自己的推理里阻塞等操作员动作，这正是系统的
+空闲态（Core 不轮询、不读任何 OS 约定的空闲节点）。关机则由宿主直接挂 `shutdown`
+中断通知软件（`POST /api/system/shutdown`），不再借保留对话写世界节点。
+
 用法：
     python -m avm.console <image.json> [--port 8700] [--checkpoint-in cp.json]
 
@@ -285,6 +290,10 @@ class Console:
         # 没有（例如测试直接构造 Core）时 bind 会创建一条。
         self.panel = core.bind_console_conversation(self.channel)
         core.interrupts.register("operator", self.panel.cid)
+        # 空闲态就是面板：系统没有可运行的对话时，Core 把执行权交给 `idle` 向量，
+        # 面板在自己的推理里阻塞等操作员动作。镜像声明的 guest idle 程序在
+        # console 宿主下被这个向量覆盖（面板即 OS 空闲处理程序）。
+        core.interrupts.register("idle", self.panel.cid)
 
         self.auth_token = auth_token
         self.force_stop_hook = force_stop_hook
@@ -413,41 +422,6 @@ class Console:
 
     def _on_event(self, event: dict) -> None:
         self.channel.publish("event", _jsonable(event))
-        # OS 软件往 inbox 写新条目后唤醒空闲处理程序：写事件即可作为唤醒源，
-        # 不需要宿主在写入前另挂一次可能落空的中断。
-        self._wake_idle_on_inbox_write(event)
-
-    def _wake_idle_on_inbox_write(self, event: dict) -> None:
-        """inbox 出现新条目 → 给声明的 idle 角色挂一次中断。
-
-        只对 memory_write after 事件生效；target 是写入地址（追加仍是 `...inbox.-1`）。
-        内容能解析成对象时只对 `status == "new"` 唤醒：消费方把条目标记 done 的写
-        不会再叫醒 idle。没有 idle 角色的旧镜像保持原行为（不会出现无向量中断的告警）。
-        """
-        if self.core.guest_roles.get("idle") is None:
-            return
-        if event.get("event_type") != "memory_write" or event.get("phase") != "after":
-            return
-        target = event.get("target")
-        if not isinstance(target, str):
-            return
-        if target != "$MEM.sys.inbox" and not target.startswith("$MEM.sys.inbox."):
-            return
-        content = (event.get("payload") or {}).get("content")
-        if isinstance(content, str) and content:
-            try:
-                entry = json.loads(content)
-            except ValueError:
-                entry = None
-            if isinstance(entry, dict) and entry.get("status") != "new":
-                return
-        self.core.interrupts.raise_("idle", payload=self._idle_entry())
-
-    def _idle_entry(self) -> Optional[str]:
-        """唤醒 idle 角色的入口正文；中断不给 payload 时 guest 程序不会开始本轮。"""
-        info = self.core.guest_roles.get("idle") or {}
-        entry = info.get("entry")
-        return entry if isinstance(entry, str) else None
 
     # -- 观测 ----------------------------------------------------------
 
@@ -844,12 +818,17 @@ class Console:
                 "target": entry["target"], "text": entry["text"]}
 
     def request_shutdown(self) -> dict:
-        """提交 OS 关机请求：写 `$MEM.sys.power.request = "shutdown"`。
+        """挂 `shutdown` 中断通知系统关机（中断是 VM 通知软件的通道）。
 
-        经保留对话/输入路径提交——一条普通世界写入，进日志、可重放。VM 不执行关机
-        语义：由 OS 软件收尾后写 `$MEM.sys.power.state = "off"`，宿主在安全点看到
-        off 才写快照/persist 并退出。OS 缺席或卡住时进程保持运行，操作员可在
-        force_stop_delay 之后走 `/api/system/force-stop` 强制退出（不写快照）。
+        镜像声明了 `meta.guest_programs.shutdown` 时，把该角色程序的入口正文作为
+        payload 挂中断：Core 在下一个安全点把执行权交给监督程序，由它收尾并写
+        `$MEM.sys.power.state = "off"`；宿主在安全点看到 off 才写快照/persist 并退出。
+        没有声明 shutdown 角色时中断没有接收方：只返回 warning 并保持 stopping，
+        不自行断电，操作员可在 force_stop_delay 之后强制退出。
+
+        面板对话空闲时正阻塞在自己的推理里等操作员动作，中断要等它回到安全点才能
+        派发；所以关机时如果面板持有执行权，就结束它这一轮（提交 `{"end": True}`）
+        把执行权还给 Core。这不是"经保留对话写世界"：只是让阻塞的面板让出执行权。
         新输入从这一刻起被拦住。
         """
         with self._client_lock:
@@ -857,23 +836,24 @@ class Console:
                 raise ConsoleConflict(f"面板处于 {self.lifecycle} 状态，不再接收关机请求")
             self.lifecycle = "stopping"
             self.stopping_since = time.time()
+        info = self.core.guest_roles.get("shutdown")
         warning = None
-        try:
-            self.core.unwrap("$MEM.sys.power.request", for_llm=False)
-        except VMMemoryError:
+        if info is None:
             warning = (
-                "$MEM.sys.power.request 不存在：镜像没有 OS 关机入口，这次请求会以"
-                "工具错误留在面板对话里；等待 force_stop_after 秒后可强制退出"
+                "镜像没有声明 shutdown 处理程序（meta.guest_programs.shutdown）："
+                "关机中断没有接收方，系统不会自行断电；等待 force_stop_after 秒后"
+                "可走 force-stop 强制退出"
             )
-        self._enqueue_actions([
-            {"tool": "memory_write",
-             "arguments": {"ref": "$MEM.sys.power.request", "content": "shutdown"}},
-            {"end": True},  # 结束面板回合，让这次请求提交进日志
-        ], interrupt_payload=None)  # 关机请求不是"暂停"：不给面板投假正文
+        else:
+            self.core.interrupts.raise_("shutdown", payload=info.get("entry"))
+            if self.core._active_cid == self.panel.cid:
+                # 面板阻塞在操作员通道上（系统空闲态）：结束这一轮，Core 回到安全点。
+                self.channel.submit_action({"end": True})
         return {
             "status": "stopping",
             "request": "shutdown",
-            "entry": "$MEM.sys.power.request",
+            "interrupt": "shutdown" if info is not None else None,
+            "payload": info.get("entry") if info is not None else None,
             "force_stop_after": self.force_stop_delay,
             "warning": warning,
         }
@@ -966,7 +946,7 @@ _INDEX_HTML = """<!doctype html>
 <li><code>POST /api/interrupt</code> · <code>POST /api/resume</code> · <code>POST /api/action</code></li>
 <li><code>POST /api/io/input</code>（调试输入：只进宿主 IO 总线，不进日志、不重放）</li>
 <li><code>POST /api/session/acquire</code> · <code>POST /api/session/release</code></li>
-<li><code>POST /api/system/shutdown</code> · <code>POST /api/system/force-stop</code></li>
+<li><code>POST /api/system/shutdown</code>（挂 shutdown 中断）· <code>POST /api/system/force-stop</code></li>
 <li><code>POST|DELETE /api/mask/memory</code> · <code>POST|DELETE /api/mask/device</code></li>
 </ul>
 """

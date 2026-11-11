@@ -337,11 +337,13 @@ class TestConsoleEndpoints:
         core, console, base = env
         code, body, _ = _request(base, "POST", "/api/system/shutdown", {})
         assert code == 202 and body["status"] == "stopping"
-        # 关机请求走 OS 约定（写 $MEM.sys.power.request），不再直接停内核
+        # 关机走中断：这个裸 Core 没有声明 shutdown 角色 → 只给 warning，不挂中断
         assert core._stop_requested is False
-        assert body["entry"] == "$MEM.sys.power.request"
+        assert body["interrupt"] is None
+        assert body["warning"] and "shutdown" in body["warning"]
+        assert not core.interrupts.pending_types()
+        assert console.channel.status()["pending_actions"] == 0
         assert console.lifecycle == "stopping"
-        assert console.channel.status()["pending_actions"] == 2
         # 关机后不再收新输入
         code, _, _ = _request(base, "POST", "/api/io/input", {"text": "迟到的输入"})
         assert code == 409

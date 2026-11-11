@@ -1,9 +1,10 @@
 """生成 base 镜像：`python images/base/build_image.py`。
 
 base 只放六样：持久化三件套、装载设备 + 只读仓库设备、OS 程序节点
-（boot/idle/shutdown 三个 guest 角色程序 + panel_shell/clock_a/clock_b 服务程序）、
-可编辑的常驻服务清单、空分区骨架、标准 IO 设备。其余基础由作者在系统内手动搭建，
-见 README.md。
+（boot/shutdown 两个 guest 角色程序 + clock_a/clock_b 服务程序）、可编辑的常驻
+服务清单、空分区骨架、标准 IO 设备。空闲由宿主 console 的面板对话承担（内核把
+`idle` 中断向量指向面板），镜像不再声明 idle 角色、不预置 inbox/面板服务；关机由
+宿主挂 `shutdown` 中断唤醒 supervisor。其余基础由作者在系统内手动搭建，见 README.md。
 
 设备文件按相对路径引用（`../packages/loader.py`、`../devices/*`），因此镜像可以
 直接放在仓库里运行；装载设备/程序包必须带面板审批得到的 `approved_sha256`。
@@ -22,9 +23,7 @@ TARGET = os.path.join(HERE, "base.json")
 # 程序节点：镜像内键名 → (源文件, 显示名)。guest 角色由 meta.guest_programs 引用。
 OS_PROGRAMS = (
     ("boot", "boot.py", None),
-    ("idle", "idle.py", None),
     ("supervisor", "supervisor.py", None),
-    ("panel_shell", "panel_shell.py", "panel_shell"),
     ("clock_a", "clock_a.py", "clock_a"),
     ("clock_b", "clock_b.py", "clock_b"),
 )
@@ -88,15 +87,14 @@ def build():
             "name": "base",
             "version": 1,
             "description": (
-                "母板镜像：持久化三件套 + 装载设备 + OS 程序（boot/idle/shutdown 角色与 "
-                "panel_shell/clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架。"
-                "不带业务；其余基础由作者在系统内手动搭建。"
+                "母板镜像：持久化三件套 + 装载设备 + OS 程序（boot/shutdown 角色与 "
+                "clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架。"
+                "空闲由宿主面板对话承担；不带业务；其余基础由作者在系统内手动搭建。"
             ),
             "instruction_budget": 100,
             "snapshot_every": 200,
             "guest_programs": {
                 "boot": "$MEM.sys.programs.boot",
-                "idle": "$MEM.sys.programs.idle",
                 "shutdown": "$MEM.sys.programs.supervisor",
             },
         },
@@ -113,10 +111,9 @@ def build():
                 {
                     "power": _dict(
                         {
-                            "request": _str("", "OS 关机请求：写 shutdown；由 supervisor 处理"),
                             "state": _str("on", "on / off；只有 OS 写 off，宿主才正常断电退出"),
                         },
-                        meta="OS 电源约定节点",
+                        meta="OS 电源约定节点（VM 在安全点读取的断电寄存器）",
                     ),
                     "boot": _dict(
                         {
@@ -133,12 +130,7 @@ def build():
                     ),
                     "registry": _dict({}, meta="名字 → cid；每次启动由 boot 程序重写（仅 manifest 服务）"),
                     "programs": _dict(programs, meta="系统程序节点（OS 程序 + 作者程序）"),
-                    "inbox": _list([], "面板输入的唯一落点（空；消费由 idle/panel_shell 负责）"),
                     "outbox": _list([], "持久输出（作者约定怎么用）"),
-                    "idle": _dict(
-                        {"state": _str("", "waiting = OS 声明在等待宿主中断；其它值表示不在等待")},
-                        meta="空闲处理程序与内核的等待约定",
-                    ),
                     "clock": _dict(
                         {
                             "tick": _str("0", "逻辑 tick 计数"),
@@ -151,9 +143,10 @@ def build():
                     ),
                     "handbook": _str(
                         "base 约定：sys.boot.manifest 是常驻服务清单（JSON 字符串）；"
-                        "sys.registry 是名字→cid；sys.inbox 是面板输入落点；"
-                        "sys.idle.state=waiting 表示 OS 在空闲等待，内核不判严重错误；"
-                        "sys.clock 是设备事件钟；sys.power.request/state 是关机约定；"
+                        "sys.registry 是名字→cid；sys.clock 是设备事件钟；"
+                        "sys.power.state 是断电寄存器（OS 写 off，VM 在安全点读取）；"
+                        "空闲由宿主面板对话承担（idle 中断向量指向面板），关机由宿主挂 "
+                        "shutdown 中断唤醒 supervisor；"
                         "改 sys.programs.boot 的内容就是改下一次启动运行的引导程序。",
                         "分区与自举约定；作者可编辑",
                     ),

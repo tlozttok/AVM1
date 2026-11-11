@@ -1,16 +1,17 @@
 """base 镜像的 OS 监督程序（guest `shutdown` 角色，`plm.python`）。
 
-宿主在安全点看到 `$MEM.sys.power.request == "shutdown"` 后，用 `shutdown` 中断
-把它唤醒（入口 `yield from shutdown()`）。它判断"应用是否全部收尾"：
+宿主用 `shutdown` 中断把执行权交给它（入口 `yield from shutdown()`）：中断就是 VM
+通知软件的通道，程序不读任何关机请求节点。它判断"应用是否全部收尾"：
 
 - 收尾 = 对话结束本轮、不再排工作、进入休眠。运行期视图 `$MEM.conversations`
   里状态为 active / ready 的**非 OS 对话**都算未收尾；OS 自己的对话
-  （init、guest-boot、guest-idle、guest-shutdown、panel_shell、clock_a、clock_b）
-  不是应用，不阻塞关机。
+  （init、guest-boot、guest-shutdown、clock_a、clock_b）不是应用，不阻塞关机。
+  面板对话对普通对话隐藏，不出现在这个视图里。
 - 有未收尾对话：确保设备事件钟在跑（两个互相激活的 PLM，超时通知会再唤醒本程序），
   往 outbox/outputs 写一条等待/超时记录，然后结束本轮；**不写 off**。
 - 全部收尾：停钟 → 写 `$MEM.sys.boot.state = "clean"` → 写
   `$MEM.sys.power.state = "off"` → 结束本轮。宿主看到 off 后写快照并退出。
+  `power.state` 是 VM 在安全点唯一读取的约定节点（断电寄存器）。
 
 OS 软件缺席或一直收不尾时，关机停在挂起；操作员可以走宿主的强制退出。
 超时次数、间隔由 `$MEM.sys.clock.interval` 等 OS 约定节点配置；发多少次超时都
@@ -20,8 +21,7 @@ OS 软件缺席或一直收不尾时，关机停在挂起；操作员可以走�
 """
 
 _OS_NAMES = (
-    "init", "guest-boot", "guest-idle", "guest-shutdown",
-    "panel_shell", "clock_a", "clock_b",
+    "init", "guest-boot", "guest-shutdown", "clock_a", "clock_b",
 )
 
 
@@ -74,11 +74,6 @@ def _start_clock():
 
 
 def shutdown():
-    request = yield from memory_read("$MEM.sys.power.request")
-    if str(request).strip() != "shutdown":
-        # 不是关机中断的内容：不执行断电语义。
-        return
-
     rows = yield from _conversations()
     waiting = []
     for cid, identity, state in rows:

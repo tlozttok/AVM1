@@ -7,15 +7,19 @@
 
 1. 把 `$MEM.sys.boot.state` 从旧值改成 `"running"`，并把旧值记到 `prior`；
 2. 递增 `$MEM.sys.boot.id`（每次上电/恢复一次）；
-3. 按 `$MEM.sys.boot.manifest` 创建缺失的常驻对话，名字 → cid 写 registry；
-4. 创建缺失的 OS 服务对话 `panel_shell` / `clock_a` / `clock_b`；服务 cid 不写
-   持久 MEM，运行期由 OS 程序按名字查 `$MEM.conversations`（运行期视图）；
-5. 写 `$MEM.sys.boot.report`（boot id、上次状态、宿主给的 last_exit、本次新建的服务）；
-6. 往 `$MEM.sys.outbox` 与 `$MEM.outputs` 写一条启动记录。
+3. 把 `$MEM.sys.power.state` 复位成 `"on"`（resume 恢复出来的 `off` 是上一次
+   关机的存量值，不复位的话 supervisor 再写 off 就没有"非 off → off"的边沿）；
+4. 按 `$MEM.sys.boot.manifest` 创建缺失的常驻对话，名字 → cid 写 registry；
+5. 创建缺失的 OS 服务对话 `clock_a` / `clock_b`；服务 cid 不写持久 MEM，运行期由
+   OS 程序按名字查 `$MEM.conversations`（运行期视图）；
+6. 写 `$MEM.sys.boot.report`（boot id、上次状态、宿主给的 last_exit、本次新建的
+   服务），并往 `$MEM.sys.outbox` 与 `$MEM.outputs` 写一条启动记录。
 
 resume 时宿主用中断唤醒 boot，把 last_exit 放进入口 payload（形如
 `yield from boot('normal')`）；冷启动用默认 `"unknown"`。正常关机由 supervisor
-写 `clean`，boot 只读旧值、不写 clean。
+写 `clean`，boot 只读旧值、不写 clean。空闲与关机都走中断：没有空闲对话可跑时
+面板对话被 `idle` 中断唤醒并阻塞等待操作员，关机由宿主挂 `shutdown` 中断唤醒
+supervisor，boot 不参与这两条路径。
 
 这个节点本身是内存数据：作者在系统内改写它，下一次启动就运行新内容。
 清单条目：`{"name": "...", "program": "$MEM...", "para": "$MEM..."}`，
@@ -94,16 +98,14 @@ def boot(last_exit="unknown"):
     boot_id = (yield from _int_at("$MEM.sys.boot.id", 0)) + 1
     yield from memory_write("$MEM.sys.boot.id", str(boot_id))
 
-    # 新上电：清掉上次关机留下的电源标记。否则 resume 恢复出来的 request=shutdown
-    # / state=off 会让宿主看不到"新请求 → 新断电"的边沿，第二次关机永远不生效。
-    yield from memory_write("$MEM.sys.power.request", "")
+    # 新上电：复位断电寄存器。resume 恢复出来的 state=off 是上一次关机的存量值，
+    # 不复位的话 supervisor 再写 off 就没有"非 off → off"的边沿，第二次关机不生效。
     yield from memory_write("$MEM.sys.power.state", "on")
 
     # 服务对话只建一次：先按运行期视图找，找到就不再建（resume 时 cid 已在快照里）。
     os_created = []
     os_existing = []
     for name, program_ref in (
-        ("panel_shell", "$MEM.sys.programs.panel_shell"),
         ("clock_a", "$MEM.sys.programs.clock_a"),
         ("clock_b", "$MEM.sys.programs.clock_b"),
     ):

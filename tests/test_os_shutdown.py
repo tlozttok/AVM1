@@ -1,13 +1,14 @@
-"""OS 层优雅关机与空闲等待的验收（plan-os-shutdown-2026-11-10）。
+"""OS 层空闲与关机验收（按作者 2026-11-11 的口径重写）。
 
 覆盖：
-1. base 冷启动创建 guest 程序与服务对话，空闲时 idle 写 waiting、宿主等待不 panic；
-2. 面板输入唤醒 panel_shell，inbox 被消费，outbox/outputs 出现输出；
-3. 优雅关机：supervisor 写 clean/off，宿主写快照退出；resume 后 boot 读到
-   last_exit 并写 report；
-4. 顽固对话：超时只发通知，supervisor 不自动断电，进程保持运行；
-5. 顽固对话收尾后由下一次超时重新唤醒 supervisor，正常关机；
-6. 脏关闭（日志比快照长）resume 时 boot 报告 last_exit=forced。
+1. base 冷启动创建 guest 程序与 clock 服务；空闲时执行权交给宿主面板对话
+   （面板阻塞保持活跃），Core 不轮询、不读任何 OS 空闲节点；面板可通过 HTTP
+   `/api/action` + `/api/resume` 交互；
+2. 优雅关机：`console.request_shutdown()` 挂 `shutdown` 中断唤醒 supervisor，
+   它写 clean/off，宿主在安全点退出并写快照；resume 后 boot 读到 last_exit；
+3. resume 后可以再次关机：boot 复位 `power.state`，新的 off 才有边沿；
+4. 顽固对话：超时只发通知，supervisor 不自动断电，进程保持运行；收尾后正常关机；
+5. 脏关闭（日志比快照长）resume 时 boot 报告 last_exit=forced。
 
 全程离线：base 程序都是 plm.python；LLM 执行器换成会报错的 NoLMU。
 """
@@ -16,9 +17,11 @@ import json
 import os
 import threading
 import time
+import urllib.error
+import urllib.request
 
 from avm.boot import boot, write_snapshot
-from avm.console import Console
+from avm.console import Console, serve
 from avm.core import Core
 from avm.image import load_image
 
@@ -127,17 +130,20 @@ def wait_for(predicate, timeout=15, message="条件没有满足"):
     raise AssertionError(message)
 
 
-def stop_run(core, thread, timeout=10):
+def stop_run(core, thread, console=None, timeout=10):
+    """请求停止；面板正阻塞时先结束它这一轮，让 Core 回到安全点。"""
+    if console is not None and thread.is_alive():
+        console.channel.submit_action({"end": True})
     core.request_stop()
     thread.join(timeout)
     assert not thread.is_alive(), "run() 没有在停止请求后返回"
 
 
-def wait_idle_waiting(core, timeout=15):
+def wait_panel_active(core, console, timeout=15):
     wait_for(
-        lambda: core.unwrap("$MEM.sys.idle.state", for_llm=False) == "waiting",
+        lambda: core._active_cid == console.panel.cid,
         timeout=timeout,
-        message="系统没有进入 OS 声明的空闲等待",
+        message="空闲时执行权没有交给面板对话（面板应阻塞保持活跃）",
     )
 
 
@@ -152,10 +158,8 @@ def memory_int(core, ref):
     return int(str(core.unwrap(ref, for_llm=False)).strip() or "0")
 
 
-def finish_panel(console):
-    """提交 end，并保证保留对话能醒来处理（它可能正休眠）。"""
-    console.channel.submit_action({"end": True})
-    console.core.interrupts.raise_("operator")
+def outbox(core):
+    return list(core.unwrap("$MEM.sys.outbox", for_llm=False))
 
 
 def create_app(console, core, name):
@@ -175,7 +179,7 @@ def start_stubborn_apps(core, console):
     console.submit_action(
         "send_instruction", {"cid": cid_a, "content": "yield from app_a()"}
     )
-    finish_panel(console)
+    console.resume()
     wait_for(
         lambda: cid_a in core._ready_cids or cid_b in core._ready_cids
         or core._active_cid in (cid_a, cid_b),
@@ -184,85 +188,79 @@ def start_stubborn_apps(core, console):
     return cid_a, cid_b
 
 
+def _request(base, method, path, body=None):
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(
+        base + path, data=data, method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read() or b"null")
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b"null")
+
+
 # ----------------------------------------------------------------------
-# 1. 冷启动：guest 程序、服务对话、空闲等待
+# 1. 冷启动：guest 程序、clock 服务、空闲 = 面板阻塞
 # ----------------------------------------------------------------------
 
-def test_cold_boot_creates_os_programs_and_waits_idle(tmp_path):
+def test_cold_boot_creates_os_programs_and_panel_idles(tmp_path):
     core = load_core(prepared_image(tmp_path))
+    console = Console(core, mount_io_devices=True)
     thread, errors = start_run(core)
     try:
-        wait_idle_waiting(core)
-        assert thread.is_alive(), "OS 声明的空闲等待不应让宿主 panic"
+        wait_panel_active(core, console)
+        assert thread.is_alive(), "面板阻塞保持活跃，宿主不应 panic 或退出"
         assert not errors
         assert core.guest_roles["boot"]["cid"] == 1
-        assert core.guest_roles["idle"]["cid"] == 2
-        assert core.guest_roles["shutdown"]["cid"] == 3
-        for name in ("panel_shell", "clock_a", "clock_b"):
+        assert core.guest_roles["shutdown"]["cid"] == 2
+        assert "idle" not in core.guest_roles
+        assert core.interrupts.vectors["idle"] == console.panel.cid
+        assert core.interrupts.vectors["shutdown"] == 2
+        for name in ("clock_a", "clock_b"):
             assert find_conversation(core, name) is not None, name + " 服务对话没创建"
         assert core.unwrap("$MEM.sys.boot.state", for_llm=False) == "running"
         assert core.unwrap("$MEM.sys.boot.id", for_llm=False) == "1"
         report = core.unwrap("$MEM.sys.boot.report", for_llm=False)
         assert "prior=clean" in report and "last_exit=unknown" in report
-        assert list(core.unwrap("$MEM.sys.outbox", for_llm=False))
+        assert outbox(core)
     finally:
-        stop_run(core, thread)
+        stop_run(core, thread, console)
     assert errors == []
 
 
-# ----------------------------------------------------------------------
-# 2. 输入：idle 唤醒 panel_shell，inbox 消费，outbox/outputs 输出
-# ----------------------------------------------------------------------
-
-def submit_os_input(console, text, target=None):
-    """测试夹具：模拟 OS 软件往 `$MEM.sys.inbox` 追加一条 new 条目。
-
-    正式输入路径属于 UI 设备（待作者定义），测试不借宿主输入端点；这里直接
-    通过调试动作通道让保留对话写 inbox，验证 panel_shell 的消费逻辑。
-    """
-    entry = json.dumps(
-        {"id": "test-input", "target": target, "text": text, "status": "new"},
-        ensure_ascii=False,
-    )
-    console.submit_action("memory_write",
-                          {"ref": "$MEM.sys.inbox.-1", "content": entry})
-    console.resume()
-
-
-def test_input_wakes_panel_shell_and_consumes_inbox(tmp_path):
+def test_panel_interaction_over_http_while_idle(tmp_path):
+    """空闲时面板可经 HTTP 执行动作并 resume；之后面板再次阻塞，系统不 panic。"""
     core = load_core(prepared_image(tmp_path))
     console = Console(core, mount_io_devices=True)
+    server = serve(console, port=0)
+    base = f"http://127.0.0.1:{server.server_port}"
     thread, errors = start_run(core)
     try:
-        wait_idle_waiting(core)
-        submit_os_input(console, "喂给系统的第一句")
-        wait_for(
-            lambda: any("喂给系统的第一句" in e["text"]
-                        for e in core.io_bus.drain_io()),
-            message="输出流里没有 panel_shell 的处理结果",
-        )
-        entry = json.loads(list(core.unwrap("$MEM.sys.inbox", for_llm=False))[0])
-        assert entry["status"] == "done", "inbox 条目没有被消费标记"
-        assert any("panel_shell: 喂给系统的第一句" in item
-                   for item in core.unwrap("$MEM.sys.outbox", for_llm=False))
+        wait_panel_active(core, console)
+        code, body = _request(base, "POST", "/api/action", {
+            "tool": "memory_write",
+            "arguments": {"ref": "$MEM.sys.outbox.-1", "content": "面板动作"},
+        })
+        assert code == 200 and body["known_tool"] is True
+        wait_for(lambda: "面板动作" in outbox(core),
+                 message="面板动作没有执行")
+
+        code, body = _request(base, "POST", "/api/resume", {})
+        assert code == 200 and body["submitted"] is True
+        wait_for(lambda: console.channel.status()["pending_actions"] == 0,
+                 message="面板没有消费 resume 动作")
+        wait_panel_active(core, console)
         assert thread.is_alive() and not errors
-        # 处理完再次空闲：idle 自己把状态写回 waiting，下一次输入可以再次唤醒
-        wait_idle_waiting(core)
-        submit_os_input(console, "第二句")
-        wait_for(
-            lambda: any("第二句" in e["text"] for e in core.io_bus.drain_io()),
-            message="第二次空闲后 panel_shell 没有被再次唤醒",
-        )
-        entries = [json.loads(item)
-                   for item in core.unwrap("$MEM.sys.inbox", for_llm=False)]
-        assert [entry["status"] for entry in entries] == ["done", "done"]
     finally:
-        stop_run(core, thread)
+        stop_run(core, thread, console)
+        server.shutdown()
     assert errors == []
 
 
 # ----------------------------------------------------------------------
-# 3. 优雅关机 + 正常 resume
+# 2. 优雅关机 + 正常 resume
 # ----------------------------------------------------------------------
 
 def test_graceful_shutdown_writes_clean_and_off_then_resume_reports(tmp_path):
@@ -271,23 +269,26 @@ def test_graceful_shutdown_writes_clean_and_off_then_resume_reports(tmp_path):
     console = Console(core, mount_io_devices=True)
     thread, errors = start_run(core)
     try:
-        wait_idle_waiting(core)
-        console.request_shutdown()
+        wait_panel_active(core, console)
+        response = console.request_shutdown()
+        assert response["status"] == "stopping"
+        assert response["interrupt"] == "shutdown"
+        assert response["warning"] is None
         wait_for(lambda: not thread.is_alive(), message="优雅关机后宿主没有退出")
         assert errors == []
     finally:
         if thread.is_alive():
-            stop_run(core, thread)
+            stop_run(core, thread, console)
 
     assert core.unwrap("$MEM.sys.power.state", for_llm=False) == "off"
     assert core.unwrap("$MEM.sys.boot.state", for_llm=False) == "clean"
     assert core.unwrap("$MEM.sys.clock.state", for_llm=False) == "stopped"
-    assert any("shutdown:" in item
-               for item in core.unwrap("$MEM.sys.outbox", for_llm=False))
+    assert any("shutdown:" in item for item in outbox(core))
     assert write_snapshot(core), "正常退出应写重启快照"
 
     resumed = boot(image_path, mode="resume", refresh_models=False)
     resumed.lmu = NoLMU()
+    console2 = Console(resumed, mount_io_devices=True)
     resumed_thread, resumed_errors = start_run(resumed)
     try:
         wait_for(
@@ -299,14 +300,14 @@ def test_graceful_shutdown_writes_clean_and_off_then_resume_reports(tmp_path):
         assert resumed.unwrap("$MEM.sys.boot.state", for_llm=False) == "running"
         assert resumed.recovery["last_exit"] == "normal"
         assert not resumed_errors
-        assert resumed_thread.is_alive(), "resume 后系统应在空闲等待"
+        wait_panel_active(resumed, console2)
     finally:
-        stop_run(resumed, resumed_thread)
+        stop_run(resumed, resumed_thread, console2)
     assert resumed_errors == []
 
 
 # ----------------------------------------------------------------------
-# 3b. resume 后可以再次关机：boot 清掉上次的 power.request/state 边沿
+# 2b. resume 后可以再次关机：boot 复位 power.state 才有新的 off 边沿
 # ----------------------------------------------------------------------
 
 def test_resume_can_request_shutdown_again(tmp_path):
@@ -315,13 +316,13 @@ def test_resume_can_request_shutdown_again(tmp_path):
     console = Console(core, mount_io_devices=True)
     thread, errors = start_run(core)
     try:
-        wait_idle_waiting(core)
+        wait_panel_active(core, console)
         console.request_shutdown()
         wait_for(lambda: not thread.is_alive(), message="第一次优雅关机没有退出")
         assert errors == []
     finally:
         if thread.is_alive():
-            stop_run(core, thread)
+            stop_run(core, thread, console)
 
     assert write_snapshot(core)
     # 控制台重启默认走 auto（有快照就恢复）；boot 唤醒条件必须覆盖这条路径。
@@ -329,6 +330,7 @@ def test_resume_can_request_shutdown_again(tmp_path):
     assert resumed.recovery["mode"] == "auto"
     assert resumed.recovery["source"] == "snapshot"
     resumed.lmu = NoLMU()
+    console2 = Console(resumed, mount_io_devices=True)
     resumed_thread, resumed_errors = start_run(resumed)
     try:
         wait_for(
@@ -336,11 +338,9 @@ def test_resume_can_request_shutdown_again(tmp_path):
             in str(resumed.unwrap("$MEM.sys.boot.report", for_llm=False)),
             message="resume 后 boot 没有跑完",
         )
-        # boot 必须把上次关机留下的 request=shutdown / state=off 复位，
-        # 否则宿主看不到"新的关机请求 → 新的 off"边沿。
-        assert resumed.unwrap("$MEM.sys.power.request", for_llm=False) == ""
+        # boot 必须把上次关机留下的 state=off 复位，否则新的 off 没有边沿。
         assert resumed.unwrap("$MEM.sys.power.state", for_llm=False) == "on"
-        console2 = Console(resumed, mount_io_devices=False)
+        wait_panel_active(resumed, console2)
         console2.request_shutdown()
         wait_for(lambda: not resumed_thread.is_alive(),
                  message="resume 后的第二次关机没有退出")
@@ -349,11 +349,11 @@ def test_resume_can_request_shutdown_again(tmp_path):
         assert resumed.unwrap("$MEM.sys.boot.state", for_llm=False) == "clean"
     finally:
         if resumed_thread.is_alive():
-            stop_run(resumed, resumed_thread)
+            stop_run(resumed, resumed_thread, console2)
 
 
 # ----------------------------------------------------------------------
-# 4. 顽固对话：超时通知不断电，进程保持运行
+# 3. 顽固对话：超时通知不断电，进程保持运行
 # ----------------------------------------------------------------------
 
 def test_stubborn_conversation_is_not_powered_off_after_timeout(tmp_path):
@@ -362,7 +362,7 @@ def test_stubborn_conversation_is_not_powered_off_after_timeout(tmp_path):
     console = Console(core, mount_io_devices=True)
     thread, errors = start_run(core)
     try:
-        wait_idle_waiting(core)
+        wait_panel_active(core, console)
         start_stubborn_apps(core, console)
         console.request_shutdown()
         wait_for(
@@ -372,16 +372,16 @@ def test_stubborn_conversation_is_not_powered_off_after_timeout(tmp_path):
         assert thread.is_alive(), "顽固对话未收尾时进程必须保持运行"
         assert core.unwrap("$MEM.sys.power.state", for_llm=False) != "off"
         assert core.unwrap("$MEM.sys.boot.state", for_llm=False) == "running"
-        assert any("未收尾" in item or "等待" in item
-                   for item in core.unwrap("$MEM.sys.outbox", for_llm=False))
+        assert any("未收尾" in item or "等待" in item or "超时" in item
+                   for item in outbox(core))
         assert not errors
     finally:
-        stop_run(core, thread)
+        stop_run(core, thread, console)
     assert errors == []
 
 
 # ----------------------------------------------------------------------
-# 5. 顽固对话收尾后：下一次超时唤醒 supervisor，正常关机
+# 4. 顽固对话收尾后：下一次超时唤醒 supervisor，正常关机
 # ----------------------------------------------------------------------
 
 def test_timeout_then_apps_close_leads_to_clean_shutdown(tmp_path):
@@ -390,7 +390,7 @@ def test_timeout_then_apps_close_leads_to_clean_shutdown(tmp_path):
     console = Console(core, mount_io_devices=True)
     thread, errors = start_run(core)
     try:
-        wait_idle_waiting(core)
+        wait_panel_active(core, console)
         cid_a, cid_b = start_stubborn_apps(core, console)
         console.request_shutdown()
         wait_for(
@@ -403,12 +403,12 @@ def test_timeout_then_apps_close_leads_to_clean_shutdown(tmp_path):
         # 应用收尾（内核级关闭），让下一次超时唤醒 supervisor 时全部已休眠
         console.submit_action("close_conversation", {"cid": cid_a})
         console.submit_action("close_conversation", {"cid": cid_b})
-        finish_panel(console)
+        console.resume()
         wait_for(lambda: not thread.is_alive(), message="全部收尾后没有正常关机")
         assert errors == []
     finally:
         if thread.is_alive():
-            stop_run(core, thread)
+            stop_run(core, thread, console)
 
     assert core.unwrap("$MEM.sys.power.state", for_llm=False) == "off"
     assert core.unwrap("$MEM.sys.boot.state", for_llm=False) == "clean"
@@ -416,7 +416,7 @@ def test_timeout_then_apps_close_leads_to_clean_shutdown(tmp_path):
 
 
 # ----------------------------------------------------------------------
-# 6. 脏关闭：resume 时 boot 读到 last_exit=forced
+# 5. 脏关闭：resume 时 boot 读到 last_exit=forced
 # ----------------------------------------------------------------------
 
 def test_resume_after_dirty_shutdown_reports_forced(tmp_path):
@@ -425,27 +425,27 @@ def test_resume_after_dirty_shutdown_reports_forced(tmp_path):
     console = Console(core, mount_io_devices=True)
     thread, errors = start_run(core)
     try:
-        wait_idle_waiting(core)
+        wait_panel_active(core, console)
         assert write_snapshot(core), "先拍一个基准快照"
-        # 快照之后继续写日志（消费一条输入），然后不写快照直接停
-        submit_os_input(console, "脏关闭前的动作")
-        wait_for(
-            lambda: any("脏关闭前的动作" in e["text"]
-                        for e in core.io_bus.drain_io()),
-            message="输入没有被处理，日志没有继续增长",
+        # 快照之后继续写日志（面板写一条输出），然后不写快照直接停
+        console.submit_action(
+            "memory_write",
+            arguments={"ref": "$MEM.sys.outbox.-1", "content": "脏关闭前的动作"},
         )
-        wait_idle_waiting(core)
-        stop_run(core, thread)
+        wait_for(lambda: "脏关闭前的动作" in outbox(core),
+                 message="面板动作没有被执行，日志没有继续增长")
+        stop_run(core, thread, console)
         assert errors == []
     finally:
         if thread.is_alive():
-            stop_run(core, thread)
+            stop_run(core, thread, console)
 
     journal_last = core.journal.last_seq()
     assert journal_last > core._last_snapshot_seq, "日志没有长于快照，无法模拟脏关闭"
 
     resumed = boot(image_path, mode="resume", refresh_models=False)
     resumed.lmu = NoLMU()
+    console2 = Console(resumed, mount_io_devices=True)
     resumed_thread, resumed_errors = start_run(resumed)
     try:
         wait_for(
@@ -457,4 +457,4 @@ def test_resume_after_dirty_shutdown_reports_forced(tmp_path):
         assert resumed.unwrap("$MEM.sys.boot.prior", for_llm=False) == "running"
         assert not resumed_errors
     finally:
-        stop_run(resumed, resumed_thread)
+        stop_run(resumed, resumed_thread, console2)

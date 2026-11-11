@@ -1,12 +1,14 @@
 """base 母板镜像的冒烟测试（MockLMU / 无 LLM 调用）。
 
-验收（plan-base-image-2026-11-08 与 plan-os-shutdown-2026-11-10）：
-1. 冷启动：boot 程序写 running / boot id / report，创建 OS 服务，空闲时 idle
-   处理程序写 waiting，宿主等待而不 panic；
+验收（空闲与关机按作者 2026-11-11 的口径重写）：
+1. 冷启动：boot 程序写 running / boot id / report、创建 clock 服务；空闲时执行权
+   交给宿主面板对话（cid -1，阻塞等操作员），不是 Core 自己等待，也不读任何
+   `$MEM.sys.idle.state` 之类节点；
 2. 清单：manifest 有服务时 boot 程序按清单创建对话并写 registry；
-3. 输入落点：面板（操作员对话）写 `$MEM.sys.inbox`，日志可重放；
+3. 面板写入：面板对话的普通写入进日志、可重放，快照 + 日志尾部恢复后仍在；
 4. 装载设备：经 loader 装入临时设备，日志重放后设备仍在；
-5. 无阻塞：base 的所有程序里都没有 `$MEM.inputs.next` 阻塞读。
+5. 无阻塞：base 的程序里都没有 `$MEM.inputs.next` 阻塞读；
+6. 约定清理：base 不再有 inbox / idle.state / power.request 节点。
 """
 
 import hashlib
@@ -15,8 +17,10 @@ import os
 import threading
 import time
 
-from avm.core import Core
+from avm.console import Console, OperatorChannel
+from avm.core import Core, PANEL_CID
 from avm.image import load_image
+from avm.snapshot import snapshot
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_IMAGE = os.path.join(REPO, "images", "base", "base.json")
@@ -59,7 +63,7 @@ def load_core(image_path, journal=False):
 
 
 def start_run(core):
-    """在后台线程跑 Core.run（严格调度下它会停在 OS 声明的空闲等待里）。"""
+    """在后台线程跑 Core.run（空闲时会停在面板对话的阻塞推理里）。"""
     errors = []
 
     def target():
@@ -82,14 +86,17 @@ def wait_for(predicate, timeout=10, message="条件没有满足"):
     raise AssertionError(message)
 
 
-def stop_run(core, thread, timeout=10):
+def stop_run(core, thread, console=None, timeout=10):
+    """请求停止；面板正阻塞时先结束它这一轮，让 Core 回到安全点。"""
+    if console is not None and thread.is_alive():
+        console.channel.submit_action({"end": True})
     core.request_stop()
     thread.join(timeout)
     assert not thread.is_alive(), "run() 没有在停止请求后返回"
 
 
 def boot_cold(core):
-    """手动推进冷启动：init → boot → 一次 idle，不进入 Core.run 的等待循环。
+    """手动推进冷启动：init → boot，不进入 Core.run 的调度循环。
 
     每个 `advance_conversation` 只执行程序里的一次工具调用，boot 程序有很多次
     （读状态、建服务、写报告、写 outbox），所以要一直推进到没有活跃对话为止。
@@ -101,25 +108,38 @@ def boot_cold(core):
             break
         core.advance_conversation()
     assert core._active_cid is None, "冷启动程序没有在合理回合内结束"
-    core.interrupts.raise_("idle", payload=core.guest_roles["idle"]["entry"])
-    core.interrupts.dispatch()
-    for _ in range(100):  # idle 程序也要逐次工具调用推进到结束
-        if core._active_cid is None:
-            break
+
+
+def _panel_actions(core, channel, panel, actions):
+    """让保留对话把一批动作跑完（批里要带 end，否则它会阻塞等下一个动作）。"""
+    channel.submit_actions(actions)
+    if panel.cid in core._dormant_cids:
+        core._dormant_cids.remove(panel.cid)
+    core._active_cid = panel.cid
+    for _ in range(20):
+        if core._active_cid != panel.cid:
+            return
         core.advance_conversation()
-    assert core._active_cid is None, "idle 处理程序没有结束本轮"
+    raise AssertionError("保留对话没有让出执行权")
 
 
-def test_cold_boot_writes_state_and_report():
+def _panel_write(core, channel, panel, content):
+    _panel_actions(core, channel, panel, [
+        {"tool": "memory_write",
+         "arguments": {"ref": "$MEM.sys.outbox.-1", "content": content}},
+        {"end": True},
+    ])
+
+
+def test_cold_boot_and_idle_is_panel_blocking():
     core = load_core(BASE_IMAGE)
+    console = Console(core, mount_io_devices=True)
     thread, errors = start_run(core)
     try:
-        wait_for(
-            lambda: core.unwrap("$MEM.sys.idle.state", for_llm=False) == "waiting",
-            message="冷启动没有进入 OS 声明的空闲等待",
-        )
+        wait_for(lambda: core._active_cid == console.panel.cid,
+                 message="空闲时执行权没有交给面板对话")
+        assert thread.is_alive(), "面板对话阻塞保持活跃，宿主应保持运行"
         assert not errors
-        assert thread.is_alive(), "OS 声明等待后宿主应保持运行，不 panic"
 
         assert core.unwrap("$MEM.sys.boot.state", for_llm=False) == "running"
         assert core.unwrap("$MEM.sys.boot.prior", for_llm=False) == "clean"
@@ -128,13 +148,18 @@ def test_cold_boot_writes_state_and_report():
         assert "prior=clean" in report and "boot_id=1" in report
         assert dict(core.unwrap("$MEM.sys.registry", for_llm=False)) == {}
         assert list(core.unwrap("$MEM.sys.outbox", for_llm=False))
-        assert core._active_cid is None
         assert 0 in core._dormant_cids
         assert core.guest_roles["boot"]["cid"] == 1
-        assert core.guest_roles["idle"]["cid"] == 2
-        assert core.guest_roles["shutdown"]["cid"] == 3
+        assert core.guest_roles["shutdown"]["cid"] == 2
+        assert "idle" not in core.guest_roles
+        assert core.interrupts.vectors["idle"] == console.panel.cid
+        assert core.interrupts.vectors["shutdown"] == 2
+
+        for name in ("clock_a", "clock_b"):
+            assert any(conv.name == name for conv in core._conv_by_cid.values()), \
+                name + " 服务对话没创建"
     finally:
-        stop_run(core, thread)
+        stop_run(core, thread, console)
     assert errors == []
 
 
@@ -200,84 +225,42 @@ def test_manifest_service_is_not_duplicated_on_later_boot(tmp_path):
     assert sorted(core._conv_by_cid) == before, "已有 manifest 服务不应在重启时重复创建"
 
 
-def test_inbox_write_is_journaled_and_replayable(tmp_path):
-    from avm.console import OperatorChannel
-
+def test_panel_write_is_journaled_and_replayable(tmp_path):
     image = prepared_image(tmp_path)
     core = load_core(image, journal=True)
     boot_cold(core)
 
     channel = OperatorChannel()
-    channel.submit_action({
-        "tool": "memory_write",
-        "arguments": {
-            "ref": "$MEM.sys.inbox.-1",
-            "content": json.dumps({"id": "m1", "target": "echo", "text": "hi"}),
-        },
-    })
     panel = core.start_operator_conversation(channel, para_ref="$MEM.para.python")
-    core._active_cid = panel.cid
-    core.advance_conversation()
+    _panel_write(core, channel, panel, "panel-写入")
 
     restored = load_core(image, journal=True)
     assert restored.replay_journal() >= 1
-    inbox = list(restored.unwrap("$MEM.sys.inbox", for_llm=False))
-    assert inbox and json.loads(inbox[0])["id"] == "m1"
+    outbox = list(restored.unwrap("$MEM.sys.outbox", for_llm=False))
+    assert outbox and outbox[-1] == "panel-写入"
 
 
-def _run_panel_input(core, channel, panel, text):
-    """让保留对话把一条 inbox 追加动作跑完（写 + 结束本轮）。"""
-    channel.submit_actions([
-        {
-            "tool": "memory_write",
-            "arguments": {
-                "ref": "$MEM.sys.inbox.-1",
-                "content": json.dumps(
-                    {"id": text, "target": None, "text": text, "status": "new"},
-                    ensure_ascii=False,
-                ),
-            },
-        },
-        {"end": True},
-    ])
-    # 模拟中断派发激活保留对话：先移出休眠队列，否则 Core 把它当成"本轮自己让出"
-    if panel.cid in core._dormant_cids:
-        core._dormant_cids.remove(panel.cid)
-    core._active_cid = panel.cid
-    for _ in range(10):
-        if core._active_cid != panel.cid:
-            return
-        core.advance_conversation()
-    raise AssertionError("保留对话没有让出执行权")
-
-
-def test_inbox_survives_snapshot_and_journal_tail(tmp_path):
-    """正式输入可重放：快照 + 日志尾部恢复后 inbox 内容一致，保留对话仍隐藏。"""
-    from avm.console import OperatorChannel
-    from avm.core import PANEL_CID
-    from avm.snapshot import snapshot
-
+def test_panel_write_survives_snapshot_and_journal_tail(tmp_path):
+    """面板写入可重放：快照 + 日志尾部恢复后内容一致，保留对话仍隐藏。"""
     image = prepared_image(tmp_path)
     core = load_core(image, journal=True)
     boot_cold(core)
 
     channel = OperatorChannel()
     panel = core.start_operator_conversation(channel, para_ref="$MEM.para.python")
-    _run_panel_input(core, channel, panel, "first")
+    _panel_write(core, channel, panel, "first")
 
     snap_path = tmp_path / "snap.json"
     snap_path.write_text(
         json.dumps(snapshot(core), ensure_ascii=False), encoding="utf-8")
-    _run_panel_input(core, channel, panel, "second")
+    _panel_write(core, channel, panel, "second")
 
-    restored = load_image(Core(), image, restore=True)
-    restored.lmu = NoLMU()
-    restored.attach_journal(restored.journal_path)
+    restored = load_core(image, journal=True)
     restored.restore_from(str(snap_path))
     assert restored.replay_journal() >= 1
 
-    inbox = list(restored.unwrap("$MEM.sys.inbox", for_llm=False))
-    assert [json.loads(item)["text"] for item in inbox] == ["first", "second"]
+    outbox = list(restored.unwrap("$MEM.sys.outbox", for_llm=False))
+    assert [item for item in outbox if item in ("first", "second")] == ["first", "second"]
     conv = restored.get_conversation(PANEL_CID)
     assert conv is not None
     assert conv.attrs.get("host") == "console" and conv.attrs.get("hidden") == "1"
@@ -286,8 +269,6 @@ def test_inbox_survives_snapshot_and_journal_tail(tmp_path):
 
 
 def test_loader_mounts_device_and_replay_keeps_it(tmp_path):
-    from avm.console import OperatorChannel
-
     device_source = tmp_path / "echo_dev.py"
     device_source.write_text(
         "from avm.memory_device import MemoryDevice\n"
@@ -317,13 +298,12 @@ def test_loader_mounts_device_and_replay_keeps_it(tmp_path):
         "args": {"value": "初始"},
     })
     channel = OperatorChannel()
-    channel.submit_action({
-        "tool": "memory_write",
-        "arguments": {"ref": "$MEM.loader", "content": command},
-    })
     panel = core.start_operator_conversation(channel, para_ref="$MEM.para.python")
-    core._active_cid = panel.cid
-    core.advance_conversation()
+    _panel_actions(core, channel, panel, [
+        {"tool": "memory_write",
+         "arguments": {"ref": "$MEM.loader", "content": command}},
+        {"end": True},
+    ])
     assert "echo" in core.mem._devices
 
     restored = load_image(Core(), image)
@@ -337,9 +317,21 @@ def test_base_programs_have_no_blocking_input_read():
     with open(BASE_IMAGE, encoding="utf-8") as f:
         image = json.load(f)
     programs = image["mem"]["sys"]["value"]["programs"]["value"]
-    assert set(programs) >= {
-        "boot", "idle", "supervisor", "panel_shell", "clock_a", "clock_b",
-    }
+    assert set(programs) == {"boot", "supervisor", "clock_a", "clock_b"}
     for name, node in programs.items():
         content = node["value"]["content"]["value"]
         assert "$MEM.inputs.next" not in content, f"程序 {name} 含阻塞读"
+
+
+def test_base_image_drops_old_os_conventions():
+    with open(BASE_IMAGE, encoding="utf-8") as f:
+        image = json.load(f)
+    sys_mem = image["mem"]["sys"]["value"]
+    assert "inbox" not in sys_mem, "输入路径已冻结：base 不预置 inbox"
+    assert "idle" not in sys_mem, "空闲由宿主面板承担：base 不预置 idle 约定节点"
+    assert "request" not in sys_mem["power"]["value"], "关机走中断：不再有 power.request"
+    assert "state" in sys_mem["power"]["value"]
+    assert image["meta"]["guest_programs"] == {
+        "boot": "$MEM.sys.programs.boot",
+        "shutdown": "$MEM.sys.programs.supervisor",
+    }

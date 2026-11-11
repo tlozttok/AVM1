@@ -7,6 +7,8 @@ seq 断言、镜像声明 guest 程序与中断向量、空闲=严重错误、�
 
 import json
 import os
+import threading
+import time
 
 import pytest
 
@@ -106,20 +108,40 @@ def _guest_image(tmp_path, *, roles=("boot", "idle", "shutdown"), idle_code=None
     return image
 
 
-def _advance_panel(core, console):
-    """让保留对话把通道里排队的动作跑完（与 Core.run 的连续推进一致）。"""
-    if console.panel.cid in core._dormant_cids:
-        core._dormant_cids.remove(console.panel.cid)
-    core._active_cid = console.panel.cid
-    for _ in range(20):
-        if core._active_cid != console.panel.cid:
+def _run_in_thread(core):
+    errors = []
+
+    def target():
+        try:
+            core.run()
+        except BaseException as e:  # noqa: BLE001 - 把内核异常带回主线程
+            errors.append(e)
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return thread, errors
+
+
+def _wait_for(predicate, timeout=10, message="条件没有满足"):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
             return
-        core.advance_conversation()
-    raise AssertionError("保留对话没有让出执行权")
+        time.sleep(0.01)
+    raise AssertionError(message)
+
+
+def _stop_run(core, thread, console=None, timeout=10):
+    """请求停止；面板正阻塞时先结束它这一轮，让 Core 回到安全点。"""
+    if console is not None and thread.is_alive():
+        console.channel.submit_action({"end": True})
+    core.request_stop()
+    thread.join(timeout)
+    assert not thread.is_alive(), "run() 没有在停止请求后返回"
 
 
 def _power_mem():
-    """最小镜像 + OS 约定的断电节点（$MEM.sys.power.request/state）。"""
+    """最小镜像 + VM 读取的断电寄存器（$MEM.sys.power.state）。"""
     return {
         "model_params": {
             "kind": "dict", "ctrl": {"type": "para"},
@@ -131,7 +153,6 @@ def _power_mem():
         }}},
         "src": {"kind": "str", "value": "hello"},
         "sys": {"kind": "dict", "value": {"power": {"kind": "dict", "value": {
-            "request": {"kind": "str", "value": ""},
             "state": {"kind": "str", "value": "on"},
         }}}},
     }
@@ -583,66 +604,56 @@ class TestIdleIsFatal:
         assert core._active_cid is None
 
 
-class TestShutdownSupervisorWake:
-    """OS 提交关机请求后，宿主用中断唤醒声明的 shutdown 监督程序（不自行断电）。"""
+class TestShutdownInterrupt:
+    """关机走中断：宿主挂 `shutdown`，Core 在安全点把执行权交给声明的角色。"""
 
-    def _mem_with_power(self, init_code):
-        mem = _guest_mem(idle_code="def idle():\n    pass\n")
-        mem["programs"]["value"]["init"] = _py_program(init_code)
-        mem["sys"] = {"kind": "dict", "value": {"power": {"kind": "dict", "value": {
-            "request": {"kind": "str", "value": ""},
-            "state": {"kind": "str", "value": "on"},
-        }}}}
-        return mem
-
-    def test_power_request_change_wakes_shutdown_role(self, tmp_path):
-        init_code = (
-            "def init():\n"
-            "    yield from memory_write('$MEM.sys.power.request', 'shutdown')\n"
-        )
-        image = write_image(
-            tmp_path, mem=self._mem_with_power(init_code),
-            init={"name": "init", "system_ref": "$MEM.programs.init",
-                  "user": "yield from init()", "para_ref": "$MEM.para.python"},
-        )
-        with open(image, encoding="utf-8") as f:
-            doc = json.load(f)
-        doc["meta"]["guest_programs"] = {"shutdown": "$MEM.programs.shutdown"}
-        with open(image, "w", encoding="utf-8") as f:
-            json.dump(doc, f, ensure_ascii=False)
+    def test_shutdown_interrupt_wakes_shutdown_role(self, tmp_path):
+        image = _guest_image(tmp_path, roles=("boot", "shutdown"))
         core = boot(image, mode="reset", refresh_models=False)
-        assert core.recovery["interrupt_vectors"].keys() == {"shutdown"}
+        console = Console(core, mount_io_devices=False)
 
-        # 没有 idle 角色：监督程序睡回去之后的空闲是严重错误；先验证中断确实送到。
-        with pytest.raises(KernelPanic, match="没有声明 idle"):
-            core.run()
-        assert core.mem["markers"]["shutdown_ran"] == "1"
-        assert any(record["type"] == "shutdown"
-                   for record in core.interrupts.last_dispatch or [])
+        response = console.request_shutdown()
+        assert response["status"] == "stopping"
+        assert response["interrupt"] == "shutdown"
+        assert response["warning"] is None
+        assert core._stop_requested is False, "关机请求不再直接停内核"
+        assert core.interrupts.pending_types() == ["shutdown"]
 
-    def test_stale_request_at_boot_does_not_wake_supervisor(self, tmp_path):
-        init_code = (
-            "def init():\n"
-            "    yield from memory_write('$MEM.markers.init_ran', '1')\n"
-        )
-        mem = self._mem_with_power(init_code)
-        mem["sys"]["value"]["power"]["value"]["request"]["value"] = "shutdown"
-        image = write_image(
-            tmp_path, mem=mem,
-            init={"name": "init", "system_ref": "$MEM.programs.init",
-                  "user": "yield from init()", "para_ref": "$MEM.para.python"},
-        )
-        with open(image, encoding="utf-8") as f:
-            doc = json.load(f)
-        doc["meta"]["guest_programs"] = {"shutdown": "$MEM.programs.shutdown"}
-        with open(image, "w", encoding="utf-8") as f:
-            json.dump(doc, f, ensure_ascii=False)
+        thread, errors = _run_in_thread(core)
+        try:
+            _wait_for(lambda: core.mem["markers"]["shutdown_ran"] == "1",
+                      message="shutdown 角色没有被中断唤醒")
+            assert any(record["type"] == "shutdown"
+                       for record in core.interrupts.last_dispatch or [])
+            # 监督程序跑完这一轮后系统回到空闲：执行权交给面板并阻塞。
+            _wait_for(lambda: core._active_cid == console.panel.cid,
+                      message="监督程序结束后没有回到面板空闲态")
+            assert thread.is_alive() and not errors
+        finally:
+            _stop_run(core, thread, console)
+        assert errors == []
+
+    def test_no_shutdown_role_warns_and_keeps_running(self, tmp_path):
+        image = _guest_image(tmp_path, roles=("boot",))
         core = boot(image, mode="reset", refresh_models=False)
-        with pytest.raises(KernelPanic, match="没有声明 idle"):
-            core.run()
-        # 存量请求（resume 会恢复上一次关机写下的值）不重新唤醒监督程序
-        assert core.mem["markers"]["shutdown_ran"] == ""
-        assert not core.interrupts.last_dispatch
+        console = Console(core, mount_io_devices=False)
+
+        response = console.request_shutdown()
+        assert response["status"] == "stopping"
+        assert response["interrupt"] is None
+        assert response["warning"] and "shutdown" in response["warning"]
+        assert not core.interrupts.pending_types(), "没有接收方就不挂中断"
+        assert core._stop_requested is False
+
+        thread, errors = _run_in_thread(core)
+        try:
+            _wait_for(lambda: core._active_cid == console.panel.cid,
+                      message="没有 shutdown 角色时应停在面板空闲态")
+            assert thread.is_alive(), "没有 shutdown 角色时不自行断电"
+            assert not errors
+        finally:
+            _stop_run(core, thread, console)
+        assert errors == []
 
 
 # ----------------------------------------------------------------------
@@ -690,56 +701,64 @@ class TestPowerBoundary:
 
 
 # ----------------------------------------------------------------------
-# 控制台：关机请求走 OS 约定，不再直接 request_stop
+# 控制台：关机挂中断，不再写世界节点、不再直接 request_stop
 # ----------------------------------------------------------------------
 
 class TestConsoleShutdownRequest:
-    def _console(self, tmp_path, mem=None):
-        image = write_image(tmp_path, mem=mem or _power_mem())
+    def _console(self, tmp_path, *, roles=("boot", "shutdown")):
+        image = _guest_image(tmp_path, roles=roles)
         core = load_core(image)
         core.attach_journal(core.journal_path)
         console = Console(core, mount_io_devices=False)
         return core, console
 
-    def test_shutdown_writes_os_request_through_panel(self, tmp_path):
+    def test_shutdown_raises_interrupt_and_wakes_role(self, tmp_path):
         core, console = self._console(tmp_path)
         response = console.request_shutdown()
 
         assert response["status"] == "stopping"
-        assert response["entry"] == "$MEM.sys.power.request"
+        assert response["interrupt"] == "shutdown"
+        assert response["payload"] == "yield from shutdown()"
+        assert response["warning"] is None
         assert core._stop_requested is False, "关机请求不再直接停内核"
         assert console.lifecycle == "stopping"
-        assert console.channel.status()["pending_actions"] == 2
+        assert console.channel.status()["pending_actions"] == 0, \
+            "关机不再经保留对话提交动作"
+        assert core.interrupts.pending_types() == ["shutdown"]
 
-        _advance_panel(core, console)
-        assert core.mem["sys"]["power"]["request"] == "shutdown"
-        effects = [
-            change["effect"]
-            for record in core.journal.read()
-            for change in record["changes"]
-            if change["kind"] == "effect"
-        ]
-        assert any(effect["kind"] == "memory_set"
-                   and effect["ref"] == "$MEM.sys.power.request"
-                   and effect["value"] == "shutdown" for effect in effects)
+        core.interrupts.dispatch()
+        assert core._active_cid == core.guest_roles["shutdown"]["cid"]
+        for _ in range(20):
+            if core._active_cid is None:
+                break
+            core.advance_conversation()
+        assert core.mem["markers"]["shutdown_ran"] == "1"
         # 再次提交关机请求被拒
         with pytest.raises(ConsoleConflict):
             console.request_shutdown()
 
-    def test_shutdown_without_os_entry_warns_but_submits(self, tmp_path):
-        from persist_helpers import base_image_mem
-
-        core, console = self._console(tmp_path, mem=base_image_mem())
+    def test_panel_blocked_gets_end_action_on_shutdown(self, tmp_path):
+        """空闲态面板阻塞在操作员通道上：关机要结束它这一轮才能派发中断。"""
+        core, console = self._console(tmp_path)
+        core._active_cid = console.panel.cid
         response = console.request_shutdown()
+
+        assert response["interrupt"] == "shutdown"
+        assert console.channel.status()["pending_actions"] == 1, \
+            "面板阻塞时应提交一个 end 释放执行权"
+        assert core.interrupts.pending_types() == ["shutdown"]
+
+    def test_shutdown_without_declared_role_warns(self, tmp_path):
+        core, console = self._console(tmp_path, roles=("boot",))
+        response = console.request_shutdown()
+
         assert response["status"] == "stopping"
-        assert response["warning"] and "power.request" in response["warning"]
-        _advance_panel(core, console)
-        # 缺失节点时写入以工具错误结束，不崩内核
+        assert response["warning"] and "shutdown" in response["warning"]
+        assert response["interrupt"] is None
+        assert not core.interrupts.pending_types(), "没有接收方就不挂中断"
         assert core._stop_requested is False
 
     def test_force_stop_immediately_ends_host_without_snapshot(self, tmp_path):
-        import threading
-
         core, console = self._console(tmp_path)
         exited = threading.Event()
         console.force_stop_hook = exited.set
@@ -751,9 +770,7 @@ class TestConsoleShutdownRequest:
         assert response == {"status": "force-stopped", "snapshot_written": False}
         assert console.lifecycle == "stopped"
         assert exited.wait(timeout=2), "force-stop 回调（宿主退出）被调用"
-        assert not os.path.exists(
-            out_path(str(tmp_path / "image.json"), "run.snapshot.json")
-        ), "强制退出不写快照"
+        assert not os.path.exists(core.snapshot_path), "强制退出不写快照"
 
 
 # ----------------------------------------------------------------------
