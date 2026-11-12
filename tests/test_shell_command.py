@@ -134,18 +134,21 @@ def test_cold_boot_creates_shell_service():
     ) == "$MEM.para.builder"
 
 
-def test_help_lists_registered_commands_with_summaries():
+def test_help_lists_registered_commands_with_summaries_and_usage():
     core, shell = cold_shell()
     output = send(core, shell, "help")
+    assert "命令格式：<名字> <参数...>" in output
     assert "builder" in output
     assert "构造/更新" in output, "列表要带注册表里的摘要，而不是空名字"
-    assert "help <名字> 查看用法" in output
+    assert "调用：builder {" in output, "列表要给出在 shell 里的调用形式"
+    assert "用 help <名字> 查看详细用法" in output
 
 
-def test_help_name_dispatches_to_command_for_usage():
-    """help <名字> 把 help 作为参数分发给命令程序，由程序回答自己的用法。"""
+def test_help_name_shows_shell_invocation_and_dispatches_help():
+    """help <名字> 先给 shell 调用形式，再把 help 分发给命令程序回答用法。"""
     core, shell = cold_shell()
     output = send(core, shell, "help builder")
+    assert output.startswith("在 shell 里调用：builder {"), output
     assert '"ops"' in output and '"mode"' in output
     assert "create" in output and "update" in output
     assert "错误:" not in output

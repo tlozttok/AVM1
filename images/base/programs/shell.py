@@ -8,15 +8,18 @@ JSON 摘要）；shell 自己不做解析、不做包装。
 
 命令：
 
-    help              列出已注册命令与摘要
-    help <名字>       把 `help` 作为参数分发给该命令程序，由程序回答自己的用法
+    help              列出已注册命令、摘要与 shell 调用形式
+    help <名字>       先给 shell 调用形式，再把 `help` 分发给命令程序由其回答用法
     <名字> <参数...>  分发；第一个空格之后的整段参数原样传给子命令
 
 注册表只存引用、不存 cid：命令程序按需现建现用。新增命令 = 建一个
 `ctrl.type="python"` 的命令程序节点 + 在 `$MEM.sys.shell.commands` 下登记同名
-条目（`program`、`para`、可选 `summary` 三个 str 子节点），不需要改这个程序、
-也不需要重启。命令程序应把自己的用法放在 `summary`（列表用）并处理 `help`
-输入（详情用）；shell 自己不猜用法。
+条目（`program`、`para`、可选 `summary` / `usage` 四个 str 子节点），不需要改
+这个程序、也不需要重启。约定：
+- `summary`：`help` 列表的一行说明；
+- `usage`：**在 shell 里怎么调用**的命令行示例（含 `help <名字>` 的头部）；
+- 命令程序处理 `help` 输入，回答自己的参数格式（详情）。
+shell 自己不猜用法，只把列表、调用形式与 help 转发串起来。
 
 失败一律返回 `错误: shell: ...`（不抛穿 Core）：空命令、未知命令、args 写入失败、
 程序内部异常。子命令自己的 Error/Illegal 响应按「工具响应原样返回」直接返回。
@@ -100,25 +103,35 @@ def _help(args):
         names = yield from _command_names()
         if not names:
             return "已注册命令：（无）"
-        lines = ["已注册命令（" + str(len(names)) + "）："]
+        lines = ["命令格式：<名字> <参数...>（第一个空格后的内容原样传给命令程序）",
+                 "已注册命令（" + str(len(names)) + "）："]
         for command in names:
             summary = yield from _read_str(
                 _COMMANDS_REF + "." + command + ".summary"
             )
+            usage = yield from _read_str(
+                _COMMANDS_REF + "." + command + ".usage"
+            )
             extra = summary.strip() if summary is not None else ""
             lines.append("  " + command + ("  " + extra if extra else ""))
-        lines.append("用 help <名字> 查看用法")
+            if usage is not None and usage.strip():
+                lines.append("    调用：" + usage.strip())
+        lines.append("用 help <名字> 查看详细用法")
         return "\n".join(lines)
     command = name.split()[0]
     refs = yield from _registered(command)
     if refs is None:
         return _unknown(command)
     program, para = refs
+    usage = yield from _read_str(_COMMANDS_REF + "." + command + ".usage")
     response = yield from memory_write(_ARGS_REF, "help")
     if _is_error(response):
         return _error("写入参数失败：" + str(response))
     result = yield from create_sub(program, _ARGS_REF, para)
-    return str(result)
+    head = ""
+    if usage is not None and usage.strip():
+        head = "在 shell 里调用：" + usage.strip() + "\n\n"
+    return head + str(result)
 
 
 def _dispatch(name, args):

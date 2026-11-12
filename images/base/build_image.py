@@ -168,6 +168,11 @@ def build():
                                                 "构造/更新 settingup/python/handler/para "
                                                 "节点与批量指令（JSON 规格）"
                                             ),
+                                            "usage": _str(
+                                                'builder {"mode":"create","ops":[{"type":"python",'
+                                                '"path":"$MEM.workshop.hello","name":"hello",'
+                                                '"content":"..."}]}'
+                                            ),
                                         },
                                         meta="构造器命令",
                                     ),

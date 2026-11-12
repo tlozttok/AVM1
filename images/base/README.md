@@ -146,12 +146,22 @@ assistant 消息（例如 builder 直接返回的 JSON 摘要）。需要同步�
 
 | 命令 | 行为 |
 |---|---|
-| `help` | 列出 `$MEM.sys.shell.commands` 里已注册的命令名与各自的 `summary` |
-| `help <名字>` | 把 `help` 作为参数分发给该命令程序，由程序回答自己的用法 |
+| `help` | 列出已注册命令、`summary`，以及每个命令在 shell 里的调用形式（`usage`） |
+| `help <名字>` | 先显示 shell 调用形式，再把 `help` 分发给该命令程序，由程序回答自己的参数格式 |
 
-shell 不猜用法：列表里的说明来自注册项 `summary` 字段，详细用法由命令程序自己的
-`handle("help")` 返回。命令程序应同时提供两者，否则 `help <名字>` 只会得到该程序
-对 `help` 这个参数的正常处理结果。
+shell 不猜用法：列表里的说明来自注册项 `summary`，shell 调用形式来自 `usage`，
+详细参数格式由命令程序自己的 `handle("help")` 返回。命令程序应同时提供
+`summary`、`usage` 并处理 `help` 输入，否则 `help <名字>` 只会得到该程序对
+`help` 这个参数的正常处理结果。
+
+在 shell 里调用 builder 的完整命令（整行就是投递给 shell 的字符串）：
+
+```
+builder {"mode":"create","ops":[{"type":"python","path":"$MEM.workshop.hello","name":"hello","content":"..."}]}
+```
+
+命令名之后的内容原样作为参数传给命令程序：空格、引号、换行都不被 shell 处理
+（JSON 里的空格不影响解析）；分发是同步的，返回的就是命令程序的输出。
 
 **分发机制。** 从 `$MEM.sys.shell.commands.<名字>` 读 `program` 与 `para` 两个 str
 子节点；读不到（或读出来是 Error/Illegal）时返回
@@ -172,8 +182,8 @@ shell 把那条工具响应原样返回——子命令返回的 JSON 摘要、�
 1. 建一个 `ctrl.type="python"` 命令程序节点（正文是 `plm.command` 程序，定义
    `handle(cmd)`）；para 的 `model` 为 `plm.command`，可以复用 `$MEM.para.shell`。
 2. 在 `$MEM.sys.shell.commands` 下建同名 dict，写 `program`、`para` 两个 str
-   子节点指向上面两个节点，再写可选的 `summary` str 子节点（`help` 列表里的一行
-   说明）；命令程序自己处理 `help` 输入返回详细用法。
+   子节点指向上面两个节点，再写可选的 `summary`（列表一行说明）与 `usage`
+   （shell 调用形式）两个 str 子节点；命令程序自己处理 `help` 输入返回详细用法。
 3. 无需重启：下一条命令即按新注册表分发。注册表只存引用、不存 cid，命令程序
    按需现建现用。
 
