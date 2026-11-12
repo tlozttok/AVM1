@@ -177,6 +177,11 @@ export interface LinkNode {
   ctrl: Record<string, unknown> | null
 }
 
+/**
+ * str 节点在 `/api/memory` 里就是纯字符串：正文之外的 ctrl 不可见。
+ * TODO(issue): 节点工作台的数据类型区域对 str 节点只能显示这个边界；
+ * 若作者要 str 的 ctrl 也可见/可改，需要扩展 `GET /api/memory`（后端契约变化，另立计划）。
+ */
 export type MemoryNode = DictNode | ListNode | DeviceNode | LinkNode | string
 
 export interface MemoryResponse {

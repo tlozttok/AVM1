@@ -1,322 +1,245 @@
 import { expect, test } from '@playwright/test'
 
 /**
- * 四个场景，共用一个 mock console（worker=1，串行）：
- * 观测、工具选择、三步交互、喂输入。后端契约变了这里会先红。
+ * 操作面板 e2e：真实后端（`avm.console`）+ 脚本化 MockLMU。
+ * 一个 worker 串行跑；每个用例从空闲态开始（init 跑完两轮后把执行权交给面板）。
  */
 test.describe.configure({ mode: 'serial' })
 
 const CONSOLE_URL = process.env.AVM_CONSOLE_URL ?? 'http://127.0.0.1:8791'
 
-test('观测：调度、对话详情、内存索引与设备信息', async ({ page }) => {
-  await page.goto('/')
+interface ConversationRow {
+  cid: number
+  name: string | null
+  identity: string
+}
 
-  await expect(page.getByTestId('status-banner')).toContainText('运行中')
-  await expect(page.getByTestId('event-log-connected')).toContainText('SSE 已连接')
-  // 指令表只有后端一份：GET /api/tools，表里有几条就得读到几条（读不到就是红）
-  const toolsResp = (await (await page.request.get('/api/tools')).json()) as {
-    tools: { function: { name: string } }[]
+async function shellCid(page: import('@playwright/test').Page): Promise<number> {
+  const state = (await (await page.request.get('/api/state')).json()) as {
+    conversations: ConversationRow[]
   }
-  await expect(page.getByTestId('action-tools-source')).toContainText(
-    `GET /api/tools（${toolsResp.tools.length} 条）`,
-  )
+  const shell = state.conversations.find((conv) => conv.name === 'shell' || conv.identity === 'shell')
+  if (!shell) throw new Error('mock 里没有 shell 对话')
+  return shell.cid
+}
 
-  const list = page.getByTestId('conversation-list')
-  await expect(list).toContainText('init')
-  await expect(list).toContainText('面板')
+test('首屏：顶栏空闲、资源栏、命令台默认 shell、系统日志条、抽屉收起', async ({ page }) => {
+  await page.goto('/')
+  await expect(page.getByTestId('topbar-status')).toContainText('空闲（等待操作员）')
+  await expect(page.getByTestId('topbar-active')).toHaveText('—')
 
-  // 对话详情：正在跑的 init 对话，历史里有脚本执行器写的助手消息
-  await page.getByTestId('conversation-item-0').click()
-  await expect(page.getByTestId('conversation-detail')).toContainText('cid 0')
-  await expect(page.getByTestId('conversation-detail')).toContainText('第 1 轮')
-
-  // 内存索引：点节点看内容
+  // 左栏：对话树与内存树都在
+  await expect(page.getByTestId('conversation-list')).toContainText('init')
+  await expect(page.getByTestId('conversation-list')).toContainText('shell')
   const tree = page.getByTestId('memory-tree')
-  await expect(tree).toContainText('note')
-  await tree.locator('[data-ref="$MEM.note"]').getByRole('button', { name: '看' }).click()
-  await expect(page.getByTestId('memory-view')).toContainText('一条笔记')
-
-  // 链接节点：一行 link，报出 target，不展开（曾经的 bug：前端把 link 当 list，整棵面板崩掉）
-  await expect(tree.locator('[data-ref="$MEM.alias"]')).toContainText('link')
+  await expect(tree).toContainText('programs')
   await expect(tree.locator('[data-ref="$MEM.alias"]')).toContainText('→ $MEM.note')
-  await tree.locator('[data-ref="$MEM.alias"]').getByRole('button', { name: '看' }).click()
-  await expect(page.getByTestId('memory-view')).toContainText('$MEM.note')
 
-  // 挂载点：行来自内存树（链接节点），标出设备类型，`看` 进设备视图；只画一行
-  const inputs = tree.locator('[data-ref="$MEM.inputs"]')
-  await expect(inputs).toHaveCount(1)
-  await expect(inputs).toContainText('device IOInputDevice')
-  await inputs.getByRole('button', { name: '看' }).click()
-  const device = page.getByTestId('device-view')
-  await expect(device).toContainText('IOInputDevice')
-  await expect(device).toContainText('投喂一行输入')
+  // 主入口：命令台默认目标是 shell，输入行就绪
+  const cid = await shellCid(page)
+  const deck = page.getByTestId('command-deck')
+  await expect(deck).toBeVisible()
+  await expect(deck).toContainText(`cid ${cid}`)
+  await expect(deck).toContainText('操作员以 cid -1 身份发 send_instruction')
+  await expect(page.getByTestId('command-input')).toBeEnabled()
 
-  // 嵌套挂载：$MEM.state 展开后，log 那行也在树里（不是父段算法另注入的行）
-  await tree.locator('[data-ref="$MEM.state"]').getByRole('button', { name: /state/ }).click()
-  const nested = tree.locator('[data-ref="$MEM.state.log"]')
-  await expect(nested).toHaveCount(1)
-  await expect(nested).toContainText('device StringDevice')
-
-  // 读一个具体路径：ref 输入框
-  await page.getByTestId('ref-input').fill('$MEM.note.v')
-  await page.getByTestId('ref-read').click()
-  await expect(page.getByTestId('memory-view')).toContainText('$MEM.note.v')
-
-  // 阻塞读提示按命名子键认：$MEM.inputs.next 会等到有人喂输入；普通路径不提示
-  // （旧的按下标规则在接口从 -1 改名 next 之后失效了，这条断言防再漂）
-  await page.getByTestId('ref-input').fill('$MEM.inputs.next')
-  await expect(page.getByTestId('ref-blocking-hint')).toBeVisible()
-  await page.getByTestId('ref-input').fill('$MEM.note.v')
-  await expect(page.getByTestId('ref-blocking-hint')).toHaveCount(0)
+  // 调试能力默认收起，底部系统日志条在（后台线程持续写 $MEM.outputs）
+  await expect(page.getByTestId('debug-drawer-body')).toHaveCount(0)
+  await expect(page.getByTestId('syslog-latest')).toContainText('mock 输出')
 })
 
-test('工具选择：指令表里每条都在下拉里，未知名可以手输且不被顶回', async ({ page }) => {
+test('命令台：一行命令 → send_instruction + resume → shell 回复进历史', async ({ page }) => {
   await page.goto('/')
+  await expect(page.getByTestId('topbar-status')).toContainText('空闲')
 
-  // 下拉 = 指令表里的每一条（顺序一致），末尾一项「其它（手输）」；少一条就是红的
-  // （曾经的 bug：datalist 只按已输入内容过滤，看起来只剩一条）
-  const toolsResp = (await (await page.request.get('/api/tools')).json()) as {
-    tools: { function: { name: string } }[]
-  }
-  const names = toolsResp.tools.map((t) => t.function.name)
-  await expect(page.getByTestId('action-tool').locator('option')).toHaveText([
-    ...names,
-    '其它（手输）',
-  ])
-
-  // 选中哪条，参数表单就跟着换
-  await page.getByTestId('action-tool').selectOption('edit_metadata')
-  await expect(page.getByTestId('action-field-type')).toBeVisible()
-
-  // 手输未知名：这是后端有意允许的路径，名字必须留得住（曾经的 bug：effect 每敲一下就顶回第一项）
-  await page.getByTestId('action-tool').selectOption({ label: '其它（手输）' })
-  await page.getByTestId('action-tool-manual').fill('no_such_tool')
-  await page.waitForTimeout(700)
-  await expect(page.getByTestId('action-tool-manual')).toHaveValue('no_such_tool')
-
-  // 切回已知的一条，手输框收起来
-  await page.getByTestId('action-tool').selectOption('memory_read')
-  await expect(page.getByTestId('action-tool-manual')).toHaveCount(0)
-  await expect(page.getByTestId('action-field-ref')).toBeVisible()
-})
-
-test('三步交互：暂停 → 提交动作 → 继续', async ({ page }) => {
-  await page.goto('/')
-
-  await page.getByTestId('pause-button').click()
-  await expect(page.getByTestId('status-banner')).toContainText('已暂停')
-
-  await page.getByTestId('action-tool').selectOption('memory_write')
-  await page.getByTestId('action-field-ref').fill('$MEM.note')
-  await page.getByTestId('action-field-content').fill('来自面板的一次写入')
-  await page.getByTestId('action-submit').click()
-  await expect(page.getByTestId('action-result')).toContainText('已提交 memory_write')
-
-  const log = page.getByTestId('event-log')
-  // 工具调用与工具响应都由面板通道发出（init 的指令不产生 tool_call 帧）
-  await expect(log.getByTestId('log-entry-tool_call').filter({ hasText: 'memory_write' }).first())
-    .toBeVisible()
-  await expect(log.getByTestId('log-entry-tool_result').filter({ hasText: 'Success set' }).first())
-    .toBeVisible()
-  await expect(log.getByTestId('log-entry-event').filter({ hasText: 'memory_write' }).first())
-    .toBeVisible()
-
-  await page.getByTestId('resume-button').click()
-  await expect(page.getByTestId('status-banner')).toContainText('运行中')
-})
-
-test('事件流：搜索、cid / 工具过滤、配对摘要与点事件切中栏', async ({ page }) => {
-  await page.goto('/')
-  const log = page.getByTestId('event-log')
-  await expect(log.getByTestId('log-entry-event').first()).toBeVisible()
-
-  // 文本搜索：命中与不匹配；过滤只影响可见条目，不清帧
-  await page.getByTestId('log-search').fill('memory_write')
-  await expect(log.getByTestId('log-entry-event').first()).toBeVisible()
-  await page.getByTestId('log-search').fill('绝对不存在的串 zzzz')
-  await expect(log.getByTestId('log-entry-event')).toHaveCount(0)
-  await expect(log).toContainText('还没有事件')
-  await page.getByTestId('log-search').fill('')
-
-  // 关联键来自 SSE 既有字段：before 的 source.initiator_cid / after 的 payload.actor_cid
-  await expect(page.getByTestId('log-filter-cid').locator('option[value="0"]')).toHaveCount(1)
-  await page.getByTestId('log-filter-cid').selectOption('0')
-  await expect(log.getByTestId('log-entry-event').first()).toBeVisible()
-  await page.getByTestId('log-filter-cid').selectOption('')
-  await expect(page.getByTestId('log-filter-tool').locator('option[value="memory_write"]')).toHaveCount(1)
-  await page.getByTestId('log-filter-tool').selectOption('memory_write')
-  await expect(log.getByTestId('log-entry-event').first()).toBeVisible()
-  await page.getByTestId('log-filter-tool').selectOption('')
-
-  // 点事件带 cid 切中栏对话，并留下「来自哪条事件」
-  await log.getByTestId('log-locate').first().click()
-  await expect(page.getByTestId('conversation-detail')).toContainText('cid 0')
-  await expect(page.getByTestId('selection-source')).toContainText('来自 事件')
-
-  // 手动上滚关闭跟随，回到底部自动恢复
-  const follow = page.locator('.filters input[type="checkbox"]').first()
-  const scroll = log.locator('.log-scroll')
-  await expect(follow).toBeChecked()
-  await scroll.hover()
-  await page.mouse.wheel(0, -300)
-  await expect(follow).not.toBeChecked()
-  await scroll.evaluate((el) => {
-    el.scrollTop = el.scrollHeight
+  const seen: string[] = []
+  const bodies: { path: string; body: string }[] = []
+  page.on('request', (request) => {
+    if (!request.url().includes('/api/')) return
+    const path = new URL(request.url()).pathname
+    seen.push(`${request.method()} ${path}`)
+    if (request.postData() !== null) bodies.push({ path, body: request.postData() ?? '' })
   })
-  await expect(follow).toBeChecked()
+
+  await page.getByTestId('command-input').fill('help')
+  await page.getByTestId('command-input').press('Enter')
+  await expect(page.getByTestId('command-transcript')).toContainText('shell 收到：help')
+  await expect(page.getByTestId('command-transcript')).toContainText('help')
+  await expect(page.getByTestId('command-note')).toContainText('已投递')
+
+  // 入口就是两个既有端点：投递 + 让出；不是新的输入机制
+  expect(seen).toContain('POST /api/action')
+  expect(seen).toContain('POST /api/resume')
+  const send = bodies.find((item) => item.body.includes('send_instruction'))
+  expect(send).toBeTruthy()
+  const payload = JSON.parse(send!.body) as { tool: string; arguments: { content: string } }
+  expect(payload.tool).toBe('send_instruction')
+  expect(payload.arguments.content).toBe('help')
+
+  // 发送后系统回到空闲，命令台继续可用
+  await expect(page.getByTestId('topbar-status')).toContainText('空闲')
+  await expect(page.getByTestId('command-input')).toBeEnabled()
 })
 
-test('复制出口：对话 cid、事件参数、ref-input 与参数框共用暂存值', async ({ page }) => {
+test('节点工作台：区域一节点类型编辑 + 区域二 ctrl.type 快捷修改/校验', async ({ page }) => {
   await page.goto('/')
-
-  await page.getByTestId('conversation-item-0').getByTestId('copy-conversation-cid').click()
-  await expect(page.getByTestId('value-tray')).toContainText('cid')
-  await expect(page.getByTestId('value-tray-selected')).toContainText('0')
-
-  const log = page.getByTestId('event-log')
-  await expect(log.getByTestId('copy-arguments').first()).toBeVisible()
-  await log.getByTestId('copy-arguments').first().click()
-  await expect(page.getByTestId('value-tray-selected')).toContainText('ref')
-
-  // 左栏读过的地址直接送进 ref-input；右栏参数框用同一份暂存值
-  const tree = page.getByTestId('memory-tree')
-  await tree.locator('[data-ref="$MEM.note"]').getByTestId('copy-memory-ref').click()
-  await page.getByTestId('ref-fill').click()
-  await expect(page.getByTestId('ref-input')).toHaveValue('$MEM.note')
-  await page.getByTestId('action-tool').selectOption('memory_read')
-  await page.getByTestId('action-fill-ref').click()
-  await expect(page.getByTestId('action-field-ref')).toHaveValue('$MEM.note')
-
-  // 中栏两个视图的头部也各有复制出口
-  await tree.locator('[data-ref="$MEM.note"]').getByRole('button', { name: '看' }).click()
-  await page.getByTestId('copy-view-ref').click()
-  await expect(page.getByTestId('value-tray-selected')).toContainText('$MEM.note')
-})
-
-test('参数随手可得：复制地址 → 填入 → 摘要确认 → 动作卡看到响应', async ({ page }) => {
-  await page.goto('/')
+  await expect(page.getByTestId('topbar-status')).toContainText('空闲')
 
   const tree = page.getByTestId('memory-tree')
-  await tree.locator('[data-ref="$MEM.note"]').getByTestId('copy-memory-ref').click()
-  await expect(page.getByTestId('value-tray')).toContainText('$MEM.note')
+  await tree.locator('[data-ref="$MEM.programs"] .mem-twist').click()
+  await tree.locator('[data-ref="$MEM.programs.shell"]').click()
 
-  await page.getByTestId('action-tool').selectOption('memory_write')
-  await page.getByTestId('action-fill-ref').click()
-  await expect(page.getByTestId('action-field-ref')).toHaveValue('$MEM.note')
-  await page.getByTestId('action-field-content').fill('来自暂存值的一次写入')
+  const workbench = page.getByTestId('node-workbench')
+  await expect(workbench).toContainText('$MEM.programs.shell')
+  await expect(page.getByTestId('node-shape')).toContainText('dict')
+  await expect(page.getByTestId('node-ctrl-type')).toContainText('ctrl.type=python')
+  await expect(page.getByTestId('node-region-shape')).toBeVisible()
+  await expect(page.getByTestId('node-region-type')).toBeVisible()
+  await expect(page.getByTestId('node-region-device')).toHaveCount(0)
+  await expect(page.getByTestId('node-checks')).toContainText('para_ref')
 
-  await page.getByTestId('pause-button').click()
-  await expect(page.getByTestId('status-banner')).toContainText('已暂停')
+  // 区域二：快捷修改写的是 content 子 str 节点
+  await page.getByTestId('node-quick-content').fill("def handle(cmd):\n    return 'echo: ' + cmd\n")
+  await page.getByTestId('node-quick-save-content').click()
+  await expect(page.getByTestId('node-result')).toContainText('Success set')
 
-  // 从暂存值填入过的提交先看 payload 摘要，返回修改与取消都不发 /api/action
-  await page.getByTestId('action-submit').click()
-  await expect(page.getByTestId('action-summary')).toContainText('$MEM.note')
-  await expect(page.getByTestId('action-result')).toHaveCount(0)
-  await page.getByTestId('action-summary-back').click()
-  await expect(page.getByTestId('action-summary')).toHaveCount(0)
-  await page.getByTestId('action-submit').click()
-  await page.getByTestId('action-summary-cancel').click()
-  await expect(page.getByTestId('action-result')).toHaveCount(0)
+  // 区域一：新建子节点（memory_make）
+  await page.getByTestId('node-new-key').fill('hello')
+  await page.getByTestId('node-make').click()
+  await expect(page.getByTestId('node-result')).toContainText('Success created')
 
-  // 重新点一次填入，再走确认路径
-  await page.getByTestId('action-fill-ref').click()
-  await page.getByTestId('action-submit').click()
-  await page.getByTestId('action-summary-confirm').click()
-  await expect(page.getByTestId('action-result')).toContainText('已提交 memory_write')
-  await expect(page.getByTestId('action-card')).toContainText('按序关联')
-  await expect(page.getByTestId('action-card-content')).toContainText('Success set')
-
-  // 同一 call_id 的调用与响应在事件流里互相标出配对摘要，两行 testid 仍在
-  const log = page.getByTestId('event-log')
-  await expect(log.getByTestId('log-entry-tool_call').first()).toBeVisible()
-  await expect(log.getByTestId('log-entry-tool_result').first()).toBeVisible()
-  await expect(log.getByTestId('log-pair-summary').first()).toBeVisible()
-
-  // tool_result 到达时内存树补刷（裁决三 A）。这里不断言「有变更」标记消失：
-  // 脚本化 MockLMU 每 0.5s 还在写 $MEM.state.tick，标记会随新事件再次亮起，
-  // 那是「显式刷新」约定的自然结果，不是补刷没发生。
-  await expect(page.getByTestId('memory-tree')).toBeVisible()
-  await page.getByTestId('resume-button').click()
-  await expect(page.getByTestId('status-banner')).toContainText('运行中')
+  // 区域二：ctrl 原样编辑（edit_metadata set）
+  await page.getByTestId('node-ctrl-input-type').fill('python')
+  await page.getByTestId('node-ctrl-set-type').click()
+  await expect(page.getByTestId('node-result')).toContainText('ctrl.type')
 })
 
-test('喂输入：多行文本整段进队列，被下一次读取取走', async ({ page }) => {
+test('handler 节点：区域二类型动作是监听（注册/查看）', async ({ page }) => {
   await page.goto('/')
+  await expect(page.getByTestId('topbar-status')).toContainText('空闲')
 
-  const field = page.getByTestId('input-feed-field')
-  await field.fill('第一行\n第二行')
-  // 回车只换行，不投喂；投喂走 Ctrl+Enter 或按钮
-  await field.press('Enter')
-  await expect(page.getByTestId('input-feed-result')).toHaveCount(0)
-  await field.press('Control+Enter')
-  await expect(page.getByTestId('input-feed-result')).toContainText('已排队')
+  const tree = page.getByTestId('memory-tree')
+  await tree.locator('[data-ref="$MEM.handlers"] .mem-twist').click()
+  await tree.locator('[data-ref="$MEM.handlers.guard"]').click()
 
-  // init 的下一轮改读 $MEM.inputs.next（阻塞读取的命名接口），事件流里出现这次读
-  const log = page.getByTestId('event-log')
-  await expect(log.getByTestId('log-entry-event').filter({ hasText: 'inputs' }).first())
-    .toBeVisible()
+  await expect(page.getByTestId('node-ctrl-type')).toContainText('ctrl.type=handler')
+  await expect(page.getByTestId('node-region-type')).toContainText('监听')
+  await page.getByTestId('node-register-listener').click()
+  await expect(page.getByTestId('node-result')).toContainText('已注册')
 
-  // 被读走的那段留在设备列表里（$MEM.inputs.0 是普通下标读，不阻塞）：两行在同一项里，没被拆开。
-  // 不查对话详情的 user_batch：它在 Core 每次 exec 后被清空（avm/core.py:1108），只在亚秒窗口内可见。
-  await page.getByTestId('ref-input').fill('$MEM.inputs.0')
-  await page.getByTestId('ref-read').click()
-  const view = page.getByTestId('memory-view')
-  await expect(view).toContainText('第一行')
-  await expect(view).toContainText('第二行')
+  await page.getByTestId('node-view-listeners').click()
+  await expect(page.getByTestId('debug-drawer-body')).toBeVisible()
+  await expect(page.getByTestId('listener-editor')).toBeVisible()
 })
 
-test('操作面板：顶栏、输出流、定向输入与调试抽屉', async ({ page }) => {
+test('设备节点：只有区域三，设备声明的调试动作可运行', async ({ page }) => {
   await page.goto('/')
+  await expect(page.getByTestId('topbar-status')).toContainText('空闲')
 
-  // 顶栏回答「现在健康吗、跑到哪了」；恢复摘要来自 /api/state.recovery
-  await expect(page.getByTestId('operation-bar')).toBeVisible()
-  await expect(page.getByTestId('operation-status')).toContainText('运行中')
-  await expect(page.getByTestId('operation-recovery')).toContainText('冷启动')
+  await page.getByTestId('memory-tree').locator('[data-ref="$MEM.inputs"]').click()
+  await expect(page.getByTestId('node-device')).toContainText('设备节点')
+  await expect(page.getByTestId('node-region-device')).toBeVisible()
+  await expect(page.getByTestId('node-region-type')).toHaveCount(0)
 
-  // 输出流是宿主侧的另一条 SSE：普通输出与通知两条都在，通知有独立标记
-  const out = page.getByTestId('output-console')
-  await expect(out.getByTestId('output-entry').first()).toBeVisible()
-  await expect(out.getByTestId('output-notify').first()).toBeVisible()
-  await expect(out.getByTestId('output-connected')).toContainText('SSE 已连接')
+  await page.getByTestId('node-device-run-1').click()
+  await expect(page.getByTestId('node-device-result-1')).toContainText('queued')
+})
 
-  // 定向输入只走 /api/io/input，不经面板对话、不发起工具调用
-  await page.getByTestId('input-target').selectOption('0')
-  await page.getByTestId('input-text').fill('给 cid 0 的一句话')
-  await page.getByTestId('input-send').click()
-  await expect(page.getByTestId('input-result')).toContainText('cid 0')
+test('状态语义：空闲时暂停不可用；运行中暂停 → 操作员接管 → 继续', async ({ page }) => {
+  await page.goto('/')
+  await expect(page.getByTestId('topbar-status')).toContainText('空闲（等待操作员）')
+  // 空闲 = 面板已持有执行权，暂停没有意义
+  await expect(page.getByTestId('topbar-pause')).toBeDisabled()
 
-  // 关机入口：确认流程出现后取消，不真的关掉共用的 mock 服务。
-  // 强制退出不是常驻按钮：只有请求关机并等满后端给的收尾时间才出现。
-  await expect(page.getByTestId('operation-force-stop')).toHaveCount(0)
-  await page.getByTestId('operation-shutdown').click()
-  await expect(page.getByTestId('operation-shutdown-confirm')).toBeVisible()
-  await page.locator('.operation-confirm').getByRole('button', { name: '取消' }).click()
+  // 让 worker 跑起来（两个既有端点：投递 + 让出），系统进入运行中
+  const state = (await (await page.request.get('/api/state')).json()) as {
+    conversations: ConversationRow[]
+  }
+  const worker = state.conversations.find((conv) => conv.name === 'worker' || conv.identity === 'worker')
+  expect(worker).toBeTruthy()
+  await page.request.post('/api/action', {
+    data: { tool: 'send_instruction', arguments: { cid: worker!.cid, content: 'go' } },
+  })
+  await page.request.post('/api/resume', { data: {} })
+  await expect(page.getByTestId('topbar-status')).toContainText('运行中')
+  await expect(page.getByTestId('topbar-active')).toContainText('worker')
 
-  // 抽屉里的监听器编辑：改 enabled 走 PATCH /api/listeners/<id>
+  // 运行中点暂停：下一个安全点派发 operator 中断 → 操作员接管
+  await page.getByTestId('topbar-pause').click()
+  await expect(page.getByTestId('topbar-status')).toContainText('操作员接管（系统暂停）')
+  await expect(page.getByTestId('topbar-pause')).toBeDisabled()
+  await expect(page.getByTestId('topbar-resume')).toBeEnabled()
+
+  // 继续 → 让出；worker 跑完或被关闭后回到空闲
+  await page.getByTestId('topbar-resume').click()
+  await expect(page.getByTestId('topbar-status')).toContainText(/运行中|空闲/)
+
+  await page.request.post('/api/action', {
+    data: { tool: 'close_conversation', arguments: { cid: worker!.cid } },
+  })
+  await page.request.post('/api/resume', { data: {} })
+  await expect(page.getByTestId('topbar-status')).toContainText('空闲（等待操作员）')
+
+  await page.getByTestId('topbar-shutdown').click()
+  await expect(page.getByTestId('topbar-shutdown-confirm')).toBeVisible()
+  await page.locator('.topbar-confirm').getByRole('button', { name: '取消' }).click()
+  await expect(page.getByTestId('topbar-shutdown-confirm')).toHaveCount(0)
+})
+
+test('调试抽屉：原始动作、事件流、监听器编辑、系统信息', async ({ page }) => {
+  await page.goto('/')
+  await expect(page.getByTestId('topbar-status')).toContainText('空闲')
+
+  await page.getByTestId('debug-toggle').click()
+  await expect(page.getByTestId('debug-drawer-body')).toBeVisible()
+  await expect(page.getByTestId('drawer-pane-raw')).toBeVisible()
+
+  await page.getByTestId('drawer-tab-events').click()
+  await expect(page.getByTestId('event-log')).toBeVisible()
+
+  await page.getByTestId('drawer-tab-listeners').click()
   const editor = page.getByTestId('listener-editor')
-  await expect(editor.getByTestId('listener-row')).toHaveCount(1)
-  await editor.getByTestId('listener-edit').click()
+  // 前面的 handler 用例会新注册监听器，所以只断言列表非空、改第一条
+  await expect(editor.getByTestId('listener-row').first()).toBeVisible()
+  await editor.getByTestId('listener-edit').first().click()
   await editor.getByTestId('listener-field-enabled').uncheck()
   await editor.getByTestId('listener-save').click()
   await expect(editor.getByTestId('listener-result')).toContainText('已更新')
-  await expect(editor.getByTestId('listener-row')).toContainText('停用')
+  await expect(editor.getByTestId('listener-row').first()).toContainText('停用')
 
-  // 调试能力默认展开（既有 testid 都在这里），可一键收起再展开
-  await expect(page.getByTestId('memory-tree')).toBeVisible()
+  await page.getByTestId('drawer-tab-system').click()
+  await expect(page.getByTestId('drawer-pane-system')).toContainText('生命周期')
+
+  // 收起后再展开仍然可用
   await page.getByTestId('debug-toggle').click()
-  await expect(page.getByTestId('debug-drawer')).toBeHidden()
+  await expect(page.getByTestId('debug-drawer-body')).toHaveCount(0)
   await page.getByTestId('debug-toggle').click()
-  await expect(page.getByTestId('memory-tree')).toBeVisible()
+  await expect(page.getByTestId('debug-drawer-body')).toBeVisible()
+})
+
+test('系统日志条：默认一行，展开后列输出、通知可过滤、可清屏', async ({ page }) => {
+  await page.goto('/')
+  await expect(page.getByTestId('syslog-latest')).toContainText('mock 输出')
+
+  await page.getByTestId('system-log').locator('.syslog-bar').click()
+  await expect(page.getByTestId('syslog-body')).toBeVisible()
+  await expect(page.getByTestId('syslog-row').first()).toBeVisible()
+  await expect(page.getByTestId('syslog-notify-row').first()).toBeVisible()
+
+  await page.getByTestId('syslog-notify-only').check()
+  await expect(page.getByTestId('syslog-row')).toHaveCount(0)
+  await expect(page.getByTestId('syslog-notify-row').first()).toBeVisible()
+  await page.getByTestId('syslog-notify-only').uncheck()
+
+  await page.getByTestId('syslog-clear').click()
+  await expect(page.getByTestId('syslog-row')).toHaveCount(0)
 })
 
 test('构建产物由 console 自己托管：同一个面板从 8791 打开', async ({ page }) => {
-  // 生产路径（计划 C9）：不经过 Vite，直接吃 web/dist。`npm run e2e` 会先构建。
   await page.goto(CONSOLE_URL)
-  await expect(page.getByTestId('status-banner')).toContainText('运行中')
-  await expect(page.getByTestId('action-tools-source')).toContainText('GET /api/tools')
-  await expect(page.getByTestId('event-log-connected')).toContainText('SSE 已连接')
-  // 内存树在构建产物里也要能画链接节点（崩溃是渲染期的，产物同样中招）
+  await expect(page.getByTestId('topbar-status')).toContainText(/空闲|运行中/)
+  await expect(page.getByTestId('command-deck')).toBeVisible()
   const tree = page.getByTestId('memory-tree')
   await expect(tree.locator('[data-ref="$MEM.alias"]')).toContainText('→ $MEM.note')
-  await expect(tree.locator('[data-ref="$MEM.inputs"]')).toHaveCount(1)
+  await expect(tree).toContainText('programs')
 })

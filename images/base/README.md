@@ -208,6 +208,9 @@ shell 把那条工具响应原样返回——子命令返回的 JSON 摘要、�
 输入路径冻结：UI 是设备，输入格式待作者定义。`POST /api/io/input` 只发布到宿主侧
 IO 总线，是不进日志的调试通道。base 不预置 inbox/面板输入服务。
 
+操作面板的主入口是命令台：它经面板对话（cid -1）向 name=shell 的对话发
+`send_instruction`，随后让出执行权；这不是 UI 输入设备，也不写 `$MEM.sys.inbox`。
+
 ## 关机
 
 `POST /api/system/shutdown` 由宿主直接挂 `shutdown` 中断（中断是 VM 通知软件的

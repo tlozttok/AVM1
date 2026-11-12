@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "AVM 调试面板前端：观测运行中的 Core、经面板对话介入、看事件流。构建产物由 python -m avm.console 托管。",
+  "description": "AVM 操作面板前端：命令台 + 节点工作台 + 调试抽屉；构建产物由 python -m avm.console 托管。",
   "scripts": {
     "dev": "vite",
     "build": "vite build",

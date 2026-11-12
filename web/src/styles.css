@@ -1,15 +1,16 @@
 :root {
-  --bg: #14161a;
-  --bg-soft: #1b1e24;
-  --bg-pane: #1f232a;
-  --line: #2c313a;
-  --fg: #d8dce3;
-  --fg-muted: #8b93a1;
-  --accent: #6aa9ff;
-  --ok: #63c58a;
-  --warn: #e0b34c;
-  --error: #ef6b6b;
-  --paused: #b98cff;
+  /* 作者 2026-11-12：主体统一中性深色，强调色只给交互与选中，语义色只给状态/错误/警告。 */
+  --bg: #1e1e1e;
+  --bg-soft: #252526;
+  --bg-pane: #2a2a2b;
+  --line: #3c3c3c;
+  --fg: #cccccc;
+  --fg-muted: #9d9d9d;
+  --accent: #4d9cf5;
+  --ok: #89d185;
+  --warn: #cca700;
+  --error: #f14c4c;
+  --paused: #9d9d9d;
   font-family: system-ui, -apple-system, 'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif;
   font-size: 13px;
   color-scheme: dark;
