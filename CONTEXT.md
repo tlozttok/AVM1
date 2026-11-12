@@ -127,7 +127,7 @@ _Avoid_: 聊天对象、对话伙伴
 _Avoid_: 模型注册表、白名单
 
 **生命周期三段**:
-内核启动的显式三步：**创建空核心**（`Core()`）→ **加载镜像**（`load_image(core, path)`，要求核心还没有对话）→ **启动核心**（`start_core(core)`：刷新模型目录、装 API 失败的运行者策略）。`avm/boot.py` 是加载区，三段都收在那里，宿主通常只调 `boot(image_path)`。`boot(mode=auto|resume|reboot|reset)`（默认 `auto`：快照可读则等价 `resume`，否则等价 `reset`）选择世界从快照/快照世界段/原始镜像来；日志记录版本 3、快照版本 2，旧版本恢复输入被明确拒绝并提示 `reset`。声明了 `meta.guest_programs` 的镜像在冷启动 init 之后创建 guest 角色对话（`boot` / `idle` / `shutdown`）并注册同名中断向量。
+内核启动的显式三步：**创建空核心**（`Core()`）→ **加载镜像**（`load_image(core, path)`，要求核心还没有对话）→ **启动核心**（`start_core(core)`：刷新模型目录；宿主可显式安装 API 失败策略，缺省走内核内置策略）。`avm/boot.py` 是加载区，三段都收在那里，宿主通常只调 `boot(image_path)`。`boot(mode=auto|resume|reboot|reset)`（默认 `auto`：快照可读则等价 `resume`，否则等价 `reset`）选择世界从快照/快照世界段/原始镜像来；日志记录版本 3、快照版本 2，旧版本恢复输入被明确拒绝并提示 `reset`。声明了 `meta.guest_programs` 的镜像在冷启动 init 之后创建 guest 角色对话（`boot` / `idle` / `shutdown`）并注册同名中断向量。
 _Avoid_: 引导、初始化
 
 **根 (Root)**:
@@ -168,5 +168,5 @@ _Avoid_: 容错、兜底、吞掉
 _Avoid_: 崩溃、报错退出
 
 **API 失败 (API failure)**:
-外部 API 调用失败（缺 key、断网、超时、协议错误）。处置：记帧后停下等运行者选择——更新环境 / 继续 / 退出；选择由宿主装的 `api_error_policy` 收（终端提示见 `avm/runner_prompt.py`），内核自身不含终端逻辑。
-_Avoid_: 重试、降级、自愈
+外部 API 调用失败（缺 key、断网、超时、协议错误、限流、余额不足、上下文超限）。处置按原因分类：余额不足暂停执行；上下文超限跳过该对话（不关闭、回休眠、错误信息留在对话设备，回收/总结由软件任务处理）并继续其他对话；其余重试同一轮，重试次数超过 `Core.api_error_max_retries`（默认 5，即失败 6 次后暂停）后暂停。暂停由宿主恢复（`Core.clear_api_pause()`）；成功一轮后连续失败计数清零。宿主可用 `api_error_policy` 覆盖内置策略；内核自身不含终端逻辑。
+_Avoid_: API 报错、接口异常

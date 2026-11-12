@@ -56,12 +56,19 @@ class VMResourceError(VMError):
 
 
 class APIError(VMError):
-    """外部 API 调用失败：网络、鉴权、超时、协议错误。
+    """外部 API 调用失败：网络、鉴权、超时、协议错误、余额不足、上下文超限。
 
-    与其它异常分开的理由：它要停下来问运行者怎么办（更新环境 / 继续 / 退出），
-    不是内核缺陷。
+    与其它异常分开的理由：它的处置由外部原因决定（暂停 / 跳过对话 / 重试），
+    不是内核缺陷。``category`` 由 ``avm.api_errors.classify_api_error`` 填写；
+    ``status_code`` 与 ``detail`` 保留分类依据。文本格式保持 ``{类型}: {信息}``，
+    分类不改变异常消息。
     """
-    pass
+
+    def __init__(self, message="", *, category=None, status_code=None, detail=None):
+        super().__init__(message)
+        self.category = category
+        self.status_code = status_code
+        self.detail = dict(detail or {})
 
 
 class RunnerStop(VMError):

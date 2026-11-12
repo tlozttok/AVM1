@@ -230,10 +230,12 @@ class TestApiErrorPolicy:
         with pytest.raises(RunnerStop):
             core.advance_conversation()
 
-    def test_no_policy_means_exit(self):
+    def test_no_policy_uses_builtin_retry_then_pauses(self):
         core, _conv = self._ready(fail_times=99)
-        with pytest.raises(RunnerStop):
-            core.advance_conversation()
+        core.advance_conversation()
+        assert core.paused is True
+        assert core.pause_category == "other"
+        assert core.lmu.n_calls == 6, "内置策略：重试 5 次，第 6 次失败后暂停"
 
     def test_broken_policy_means_exit(self):
         core, _conv = self._ready(fail_times=99)

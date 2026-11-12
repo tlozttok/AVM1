@@ -10,6 +10,7 @@ import json
 from .capabilities import grant_target_segments
 from .exceptions import IllegalOperationError, VMMemoryError
 from .memory_device import MemoryDevice
+from .types import message_to_api_dict
 
 # 监听器 priority 的结构上限（非负整数）
 MAX_LISTENER_PRIORITY = 10000
@@ -74,7 +75,7 @@ class ConversationsDevice(MemoryDevice):
     """$MEM.conversations：读对话列表/详情；写 groups/roots/meta（批次三控制面）。"""
 
     WRITABLE_FIELDS = ("groups", "roots", "meta")
-    READABLE_FIELDS = ("groups", "roots", "meta", "mode", "tools")
+    READABLE_FIELDS = ("groups", "roots", "meta", "mode", "tools", "context", "messages")
 
     def __init__(self, core):
         self._core = core
@@ -150,8 +151,48 @@ class ConversationsDevice(MemoryDevice):
             return conv.caps.mode
         if field == "tools":
             return json.dumps(sorted(conv.caps.tools), ensure_ascii=False)
+        if field == "context":
+            return self._read_context_json(conv)
+        if field == "messages":
+            return self._read_messages_json(conv)
         raise VMMemoryError(
             f"$MEM.conversations.<cid> 字段只支持 {list(self.READABLE_FIELDS)}，得到 {field!r}"
+        )
+
+    def _read_context_json(self, conv) -> str:
+        """对话上下文摘要：消息量、最近一次 API 失败与上下文上限。
+
+        全部从运行态计算，不写内存树；last_error 在成功一轮后由 Core 清掉。
+
+        TODO: 模型目录还没有上下文窗口字段，`context_limit` 目前只能从最近一次
+        API 错误里解析；上游清单能给出模型窗口后应补进 `$MEM.model_catalog`，让
+        回收软件不依赖一次失败也能判断上下文占比。
+        """
+        last_error = getattr(conv, "last_api_error", None)
+        context_limit = None
+        if isinstance(last_error, dict):
+            last_error = dict(last_error)
+            context_limit = last_error.get("context_limit")
+        elif last_error is not None:
+            last_error = None
+        data = {
+            "messages": len(conv.messages),
+            "chars": sum(len(m.content or "") for m in conv.messages),
+            "tool_messages": sum(1 for m in conv.messages if m.role == "tool"),
+            "last_error": last_error,
+            "context_limit": context_limit,
+        }
+        return json.dumps(data, ensure_ascii=False, sort_keys=True)
+
+    def _read_messages_json(self, conv) -> str:
+        """对话历史全文（只读）：给总结/回收软件读的 transcript。
+
+        只含已进入历史的 messages，不含未消费的待发批次；字段随消息类型变化
+        （assistant 带 tool_calls / reasoning_content，tool 带 tool_call_id）。
+        """
+        return json.dumps(
+            [message_to_api_dict(m) for m in conv.messages],
+            ensure_ascii=False,
         )
 
     def _read_meta_key(self, cid: int, key: str) -> str:
@@ -249,7 +290,7 @@ class ConversationsDevice(MemoryDevice):
         if len(path) == 3 and path[1] == "meta":
             return self._read_meta_key(cid, path[2])
         raise VMMemoryError(
-            "$MEM.conversations 支持 <cid>、<cid>.groups/roots/meta/mode/tools、"
+            "$MEM.conversations 支持 <cid>、<cid>.groups/roots/meta/mode/tools/context、"
             "<cid>.meta.<key>"
         )
 

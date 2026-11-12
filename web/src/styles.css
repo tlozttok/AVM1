@@ -593,7 +593,8 @@ pre.content {
   color: var(--ok);
 }
 
-.operation-status.status-stopping {
+.operation-status.status-stopping,
+.operation-status.status-paused {
   color: var(--warn);
 }
 

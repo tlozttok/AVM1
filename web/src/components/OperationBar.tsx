@@ -26,6 +26,7 @@ export default function OperationBar({ state, schedule, onRefresh }: Props) {
   const [busy, setBusy] = useState(false)
 
   const lifecycle = state?.lifecycle ?? (state?.running ? 'running' : 'stopped')
+  const paused = Boolean(state?.paused)
   const remaining = state?.force_stop_remaining ?? 0
   // 强制退出不是常驻按钮：先请求关机，收尾等满后端给的秒数之后才出现
   const forceAllowed = lifecycle === 'stopping' && remaining <= 0
@@ -34,9 +35,11 @@ export default function OperationBar({ state, schedule, onRefresh }: Props) {
       ? '关机中'
       : lifecycle === 'stopped'
         ? '已停止'
-        : state?.running
-          ? '运行中'
-          : '未运行'
+        : paused
+          ? 'API 暂停'
+          : state?.running
+            ? '运行中'
+            : '未运行'
 
   const call = async (path: string, okText: string) => {
     setBusy(true)
@@ -72,6 +75,11 @@ export default function OperationBar({ state, schedule, onRefresh }: Props) {
           ? state.client.held ? '单客户端：已接入' : '单客户端：空闲'
           : '单客户端：未启用'}
       </span>
+      {paused ? (
+        <span className="hint warn inline" data-testid="operation-api-pause">
+          API 暂停（{state?.pause_category ?? '未知分类'}）：{state?.pause_reason ?? '原因未知'}
+        </span>
+      ) : null}
       <span className="operation-actions">
         <button
           type="button"
@@ -89,6 +97,16 @@ export default function OperationBar({ state, schedule, onRefresh }: Props) {
         >
           继续
         </button>
+        {paused ? (
+          <button
+            type="button"
+            data-testid="operation-api-resume"
+            disabled={busy}
+            onClick={() => void call('/api/system/resume', '已恢复执行')}
+          >
+            恢复
+          </button>
+        ) : null}
         <button
           type="button"
           data-testid="operation-shutdown"

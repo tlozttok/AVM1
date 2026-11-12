@@ -16,6 +16,7 @@ from .capabilities import (
     targets_prefix_free,
 )
 from .exceptions import IllegalOperationError, VMSyntaxError, VMMemoryError, APIError, RunnerStop, KernelPanic
+from .api_errors import CONTEXT_LIMIT, INSUFFICIENT_BALANCE, CATEGORIES, classify_api_error
 from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, message_to_api_dict, LinkNode
 from .types import message_to_dict, batch_to_dict
 from .memory import Memory, check_new_key
@@ -1584,7 +1585,13 @@ class LMU:
             }
             # 失败时历史与输入批次都没动过（追加在下面、clear 在 exec 返回之后），
             # 所以从这里重试同一轮是干净的，不需要检查点或回退。
-            raise APIError(f"{type(e).__name__}: {e}") from e
+            category, detail = classify_api_error(e)
+            raise APIError(
+                f"{type(e).__name__}: {e}",
+                category=category,
+                status_code=detail["status_code"],
+                detail=detail,
+            ) from e
 
         choice = response.choices[0]
         message = choice.message
@@ -1688,8 +1695,23 @@ class Core:
         self.monitor: Monitor = Monitor()
         self.para_ref: str = "$MEM.model_params"
         # API 失败时的运行者策略：callable(error, attempt) -> "retry" | "reload" | "exit"。
-        # 宿主安装（终端提示见 avm/runner_prompt.py）；没装时按退出处理。
+        # 这是宿主覆盖：装了它，内核不再套用内置的三类处置；没装时由
+        # `advance_conversation` 按分类决定（余额不足暂停 / 上下文超限跳过 / 其余重试）。
+        # 终端提示见 avm/runner_prompt.py，由宿主显式安装。
         self.api_error_policy = None
+        # 内置 API 失败策略：余额不足暂停、上下文超限跳过对话、其余重试。
+        # 连续失败达到这个次数就暂停执行；镜像 meta.api_error.max_retries 覆盖，
+        # 运行期可直接改 Core.api_error_max_retries。
+        self.api_error_max_retries: int = 5
+        self.paused: bool = False
+        self.pause_reason: Optional[str] = None
+        self.pause_category: Optional[str] = None
+        # 本次暂停由哪个对话的连续失败触发；clear_api_pause 只重置它的计数，
+        # 不遍历对话表（宿主线程恢复时主线程可能还在动表）。
+        self._paused_cid: Optional[int] = None
+        # run() 只做一次启动初始化（基线帧、断电边沿基线、resume 的 boot 唤醒）；
+        # API 暂停后宿主再次进入 run() 时不能重复做这些事。
+        self._run_started: bool = False
         # 内核转储：镜像可用 core_dump_to / core_dump 覆盖（见 load_image）
         self.core_dump_to: Optional[str] = None
         self.core_dump_enabled: bool = True
@@ -2301,21 +2323,23 @@ class Core:
         self.events.cancel_all_for_owner(cid)
         self._executors.pop(cid, None)
 
-    def _answer_parent_on_sub_close(self, sub: Conversation) -> None:
-        """亚对话在返回结果前被关闭：给还活着的父对话补一条 Error 响应并唤醒它。"""
+    def _answer_parent_on_sub_close(self, sub: Conversation,
+                                    reason: Optional[str] = None) -> None:
+        """亚对话在返回结果前被关闭/跳过：给还活着的父对话补一条 Error 响应并唤醒它。"""
         if not sub.is_sub or sub.metadata.get("returned"):
             return
         parent = sub.parent
         if parent is None or parent.cid in self._finished:
             return
         call_id = sub.metadata.get("call_id", "direct_output")
-        parent.user_batch.add_tool_response(
-            f"Error: 亚对话（cid={sub.cid}）在返回结果前被关闭", call_id
-        )
+        text = (f"Error: 亚对话（cid={sub.cid}）在返回结果前被关闭"
+                if reason is None
+                else f"Error: 亚对话（cid={sub.cid}）{reason}")
+        parent.user_batch.add_tool_response(text, call_id)
         self.note_effect(
             "delivery", to_cid=parent.cid,
             tool_responses=[{
-                "content": f"Error: 亚对话（cid={sub.cid}）在返回结果前被关闭",
+                "content": text,
                 "tool_call_id": call_id,
             }],
         )
@@ -2326,7 +2350,7 @@ class Core:
                 self._dormant_cids.remove(parent.cid)
             if parent.cid not in self._ready_cids:
                 self._ready_cids.insert(0, parent.cid)  # 亚对话结束后父对话先跑
-        _report_tool_error(sub, f"亚对话被关闭，已给父对话 cid={parent.cid} 补一条响应")
+        _report_tool_error(sub, f"亚对话被跳过，已给父对话 cid={parent.cid} 补一条响应")
 
     def _pick_next_active(self):
         while self._ready_cids:
@@ -2375,6 +2399,9 @@ class Core:
                 executor = self._get_executor(conv, para)
                 before_count = len(conv.messages)
                 result, return_calls, _ = executor.exec(conv, para)
+                # 外部调用成功：该对话的连续失败计数与最近错误一并清零。
+                conv.api_error_streak = 0
+                conv.last_api_error = None
                 # 本轮写进历史的"实际消息"（消费进历史的批次 + 新的 assistant 消息）。
                 # 日志按实际消息记而不是按生成它的效果推导：before 事件可以改写 payload。
                 history_delta = [
@@ -2405,12 +2432,37 @@ class Core:
                 finally:
                     self._recording = False
             except APIError as e:
-                # 外部失败：记帧，然后停下问运行者。失败时历史与输入批次都没动过，
-                # 选 retry/reload 就重跑本轮（attempt 只用于提示，不自动放弃）。
+                # 外部失败：先分类并记帧。失败时历史与输入批次都没动过，所以重试
+                # 同一轮是干净的。宿主装了 api_error_policy 时走宿主策略（旧语义）；
+                # 没装时走内置策略：余额不足暂停、上下文超限跳过对话、其余重试。
                 attempt += 1
+                category, detail = self._classify_api_error(e)
+                self._remember_api_error(conv, detail)
                 self.monitor.record(self, error=e, last_call=self._last_call_for(executor))
-                if self._resolve_api_error(e, conv, attempt, executor) == "exit":
-                    raise RunnerStop(f"API 调用失败，运行者选择退出：{e}") from e
+                if self.api_error_policy is not None:
+                    if self._resolve_api_error(e, conv, attempt, executor) == "exit":
+                        raise RunnerStop(f"API 调用失败，运行者选择退出：{e}") from e
+                    continue
+                if category == INSUFFICIENT_BALANCE:
+                    self._pause_for_api_error(
+                        category,
+                        f"API 调用失败：余额不足，执行已暂停（{e}）",
+                        cid=conv.cid,
+                    )
+                    return
+                if category == CONTEXT_LIMIT:
+                    self._skip_conversation_for_context_limit(conv)
+                    return
+                conv.api_error_streak += 1
+                limit = self._api_error_retry_limit()
+                if conv.api_error_streak > limit:
+                    self._pause_for_api_error(
+                        category,
+                        f"API 调用连续失败 {conv.api_error_streak} 次"
+                        f"（重试上限 {limit}，超过后暂停），执行已暂停（{e}）",
+                        cid=conv.cid,
+                    )
+                    return
                 continue
             except Exception as e:
                 self.monitor.record(self, error=e, last_call=self._last_call_for(executor))
@@ -2454,6 +2506,96 @@ class Core:
             if callable(reset):
                 reset()
         return action
+
+    # ------------------------------------------------------------------
+    # 内置 API 失败策略
+    # ------------------------------------------------------------------
+
+    def _classify_api_error(self, error: APIError):
+        """取 (category, detail)：外部执行器已经分类的直接用，否则在这里补分类。
+
+        LMU 在抛错前把分类放进 APIError；其它执行器（镜像自定义 PLM、测试替身）
+        可能只抛一个普通 APIError，这里按同样的纯函数再判一次。
+        """
+        category = getattr(error, "category", None)
+        detail = getattr(error, "detail", None)
+        if category in CATEGORIES:
+            detail = dict(detail or {})
+            detail.setdefault("category", category)
+            detail.setdefault("message", str(error))
+            detail.setdefault("status_code", getattr(error, "status_code", None))
+            detail.setdefault("context_limit", None)
+            return category, detail
+        return classify_api_error(
+            error, status_code=getattr(error, "status_code", None)
+        )
+
+    def _remember_api_error(self, conv: Conversation, detail: dict) -> None:
+        """把分类信息挂到对话运行态（不写内存树）；成功一轮后由调用方清掉。
+
+        只保留设备契约里的五个字段：外部执行器给的 detail 可能带额外键，设备面
+        不因此漂移。
+        """
+        conv.last_api_error = {
+            "category": detail.get("category"),
+            "message": detail.get("message", ""),
+            "status_code": detail.get("status_code"),
+            "context_limit": detail.get("context_limit"),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+
+    def _api_error_retry_limit(self) -> int:
+        """连续失败达到这个次数就暂停；运行期改 Core.api_error_max_retries 立即生效。"""
+        limit = getattr(self, "api_error_max_retries", 5)
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+            return 5
+        return limit
+
+    def _pause_for_api_error(self, category: str, reason: str,
+                             cid: Optional[int] = None) -> None:
+        """暂停执行：run() 在下一个安全点返回，宿主持有恢复权；不关对话、不抛异常。"""
+        self.paused = True
+        self.pause_category = category
+        self.pause_reason = reason
+        self._paused_cid = cid
+
+    def clear_api_pause(self) -> None:
+        """清除 API 暂停并重置本次重试计数（宿主 resume 时调用）。"""
+        self.paused = False
+        self.pause_category = None
+        self.pause_reason = None
+        cid, self._paused_cid = self._paused_cid, None
+        if cid is None:
+            return
+        conv = self._conv_by_cid.get(cid)
+        if conv is not None:
+            conv.api_error_streak = 0
+
+    def _skip_conversation_for_context_limit(self, conv: Conversation) -> None:
+        """上下文超限：本轮跳过该对话（不关闭、不重试、不消费输入），继续调度其他对话。
+
+        跳过不是结束：错误信息挂在对话运行态（`$MEM.conversations.<cid>.context`），
+        回收/总结是软件任务，由 OS 软件读设备信息后决定（裁剪上下文、总结、或关闭）。
+        普通对话回休眠等待再次被唤醒；亚对话不能留在等待链外——给父补一条
+        Error 响应后按"用完即删"删除个体。
+        """
+        cid = conv.cid
+        conv.api_error_streak = 0
+        if conv.is_sub:
+            self._answer_parent_on_sub_close(conv, reason="上下文超限，已跳过该亚对话")
+            self._delete_conversation(cid)
+            if self._active_cid == cid:
+                self._active_cid = None
+            self._pick_next_active()
+            return
+        while cid in self._ready_cids:
+            self._ready_cids.remove(cid)
+        if (cid in self._conv_by_cid and cid not in self._finished
+                and cid not in self._dormant_cids):
+            self._dormant_cids.append(cid)
+        if self._active_cid == cid:
+            self._active_cid = None
+        self._pick_next_active()
 
     def _get_executor(self, conv: Conversation, para: MetaDict):
         """按对话的程序类型选择执行器（由 Core 管理，不挂在对话上）。
@@ -3095,13 +3237,15 @@ class Core:
         self.interrupts.raise_("boot", payload=payload)
 
     def run(self):
-        self._pick_next_active()
+        if not self._run_started:
+            self._run_started = True
+            self._pick_next_active()
 
-        self.monitor.record_baseline(self)
-        # 启动时的存量断电不是新请求：边沿基线从安全点第一次观察开始。
-        self._power_state_seen = self.read_power_state()
-        # resume：boot 角色由中断唤醒，宿主的事实 last_exit 随 payload 进入口。
-        self._wake_resumed_boot()
+            self.monitor.record_baseline(self)
+            # 启动时的存量断电不是新请求：边沿基线从安全点第一次观察开始。
+            self._power_state_seen = self.read_power_state()
+            # resume：boot 角色由中断唤醒，宿主的事实 last_exit 随 payload 进入口。
+            self._wake_resumed_boot()
         idle_retry = False
         idle_cid = None
 
@@ -3110,6 +3254,10 @@ class Core:
             # 的边界——预算中断用的是同一个边界。中断在这里夺取执行权。
             # 中断表为空时这一行没有副作用。
             self.interrupts.dispatch()
+            # API 暂停：宿主负责恢复。暂停检查放在中断派发之后，让已经挂起的
+            # shutdown 等中断仍能在这个安全点落到接收方；对话本身不推进。
+            if self.paused:
+                return
             # 日志与内存的提交位置必须追平（恢复路径由 boot 保证）。
             self._check_journal_seq()
             try:

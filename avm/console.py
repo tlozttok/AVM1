@@ -297,8 +297,10 @@ class Console:
 
         self.auth_token = auth_token
         self.force_stop_hook = force_stop_hook
-        self.lifecycle = "running"                 # running / stopping / stopped
+        self.lifecycle = "running"                 # running / paused / stopping / stopped
         self.stopping_since: Optional[float] = None
+        # API 暂停后主线程等待恢复信号；POST /api/system/resume 置位并清除内核暂停。
+        self._api_resume_event = threading.Event()
         # 关机流程：请求关机后要等满 force_stop_delay 秒才允许强制退出。
         self.force_stop_delay = float(force_stop_delay)
         # 单客户端准入是宿主策略：真实面板宿主开启，单测与 e2e mock 关闭。
@@ -464,6 +466,10 @@ class Console:
             "snapshots": len(self._snapshots),
             # 操作面板首屏：生命周期、本次恢复摘要、IO 两条流的 seq 与丢弃计数
             "lifecycle": self.lifecycle,
+            # API 暂停是内核状态（core.paused），生命周期是宿主视角，两者一起给面板。
+            "paused": bool(getattr(core, "paused", False)),
+            "pause_reason": getattr(core, "pause_reason", None),
+            "pause_category": getattr(core, "pause_category", None),
             "recovery": getattr(core, "recovery", {}),
             "io": self.io_bus.status(),
             "force_stop_after": self.force_stop_delay,
@@ -767,6 +773,28 @@ class Console:
         self.channel.submit_action({"end": True})
         return {"submitted": True}
 
+    # -- API 暂停与恢复 ------------------------------------------------
+
+    def resume_api_pause(self) -> dict:
+        """清除内核的 API 暂停，并唤醒等待恢复的主线程。
+
+        只有真正处于暂停时才接受：没有暂停时调它说明操作员按错了，回 409 比假装
+        成功更诚实。清除暂停后主线程重新进入 core.run()。
+        """
+        core = self.core
+        with self._client_lock:
+            if not getattr(core, "paused", False):
+                raise ConsoleConflict("系统没有处于 API 暂停")
+            core.clear_api_pause()
+            self.lifecycle = "running"
+            self._api_resume_event.set()
+        return {"status": "resumed", "paused": False}
+
+    def wait_for_api_resume(self) -> None:
+        """主线程在 API 暂停后等待操作员恢复；关机请求也会置位（见 request_shutdown）。"""
+        self._api_resume_event.wait()
+        self._api_resume_event.clear()
+
     def invoke_device_action(self, mount: str, index: int,
                              arguments: Optional[dict] = None) -> dict:
         """调用设备自己声明的调试动作。不入核心、不产生事件。"""
@@ -831,10 +859,15 @@ class Console:
         让阻塞的面板回合回到安全点（作者 2026-11-11 定）。面板没有占执行权时中断
         在下一个安全点自然派发，不提交动作，避免在通道里留下一枚过早的 end。
         这不是"经保留对话写世界"：只是让阻塞的面板让出执行权。新输入从这一刻起被拦住。
+
+        API 暂停中也可以请求关机：关机优先于暂停，先清暂停并唤醒主线程，让 shutdown
+        中断在下一个安全点能够派发；否则主线程停在暂停等待里，中断永远到不了接收方。
+        没有 shutdown 处理程序时回到正常运行（warning 不变），force-stop 仍按秒数放行。
         """
         with self._client_lock:
-            if self.lifecycle != "running":
+            if self.lifecycle not in ("running", "paused"):
                 raise ConsoleConflict(f"面板处于 {self.lifecycle} 状态，不再接收关机请求")
+            was_paused = self.lifecycle == "paused"
             self.lifecycle = "stopping"
             self.stopping_since = time.time()
         info = self.core.guest_roles.get("shutdown")
@@ -851,6 +884,10 @@ class Console:
                 # 面板关机按钮同时向操作员通道提交一次：结束面板这一轮，Core 回到
                 # 安全点才能派发 shutdown 中断（作者 2026-11-11 定）。
                 self.channel.submit_action({"end": True})
+        if was_paused:
+            # 中断已挂起；清暂停让主线程重新进入 run()，在安全点派发它。
+            self.core.clear_api_pause()
+            self._api_resume_event.set()
         return {
             "status": "stopping",
             "request": "shutdown",
@@ -1176,6 +1213,8 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
                     body.get("client_id") or self._client_id()))
             elif path == "/api/system/shutdown":
                 self._send_json(202, console.request_shutdown())
+            elif path == "/api/system/resume":
+                self._send_json(200, console.resume_api_pause())
             elif path == "/api/system/force-stop":
                 self._send_json(202, console.force_stop())
             else:
@@ -1371,13 +1410,36 @@ def main(argv=None) -> int:
               f"cd web && npm install && npm run build；/ 会给出同样的提示", file=sys.stderr)
 
     console.running = True
-    # API 失败停下问运行者：策略由加载区（avm/boot.py）统一安装，面板宿主一样走终端
     if args.no_core_dump:
         core.core_dump_enabled = False
     status = 0
     clean_exit = True
     try:
-        core.run()
+        while True:
+            core.run()
+            if not core.paused:
+                # 恢复/关机端点可能抢在主线程读到暂停之前清掉 core.paused 并置位
+                # 事件；事件已置位说明这是暂停后的继续，不是正常退出。
+                if console._api_resume_event.is_set():
+                    console._api_resume_event.clear()
+                    continue
+                break
+            # API 暂停：HTTP 服务保持存活，操作员可从面板恢复；暂停不写快照、
+            # 不关对话，主线程停在这里等 resume（或关机请求置位后继续处理中断）。
+            # 已请求关机时保留 stopping，避免暂停覆盖掉宿主生命周期。
+            if console.lifecycle != "stopping":
+                console.lifecycle = "paused"
+            print(
+                f"[console] API 暂停（{core.pause_category}）：{core.pause_reason}",
+                file=sys.stderr,
+            )
+            print(
+                "[console] 等待 POST /api/system/resume 恢复；force-stop 仍可用",
+                file=sys.stderr,
+            )
+            console.wait_for_api_resume()
+            if console.lifecycle == "paused":
+                console.lifecycle = "running"
     except RunnerStop as e:
         print(f"[console] {e}", file=sys.stderr)
     except KeyboardInterrupt:

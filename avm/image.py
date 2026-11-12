@@ -718,6 +718,16 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
                 or snapshot_every < 0):
             raise ImageError("meta.snapshot_every 必须是非负整数")
         core.snapshot_every = snapshot_every or None
+    api_error = meta.get("api_error")
+    if api_error is not None:
+        if not isinstance(api_error, dict):
+            raise ImageError("meta.api_error 必须是对象")
+        max_retries = api_error.get("max_retries")
+        if max_retries is not None:
+            if (not isinstance(max_retries, int) or isinstance(max_retries, bool)
+                    or max_retries < 0):
+                raise ImageError("meta.api_error.max_retries 必须是非负整数")
+            core.api_error_max_retries = max_retries
     device_markers = []
     root = MetaDict(data={})
     for key, node in image["mem"].items():

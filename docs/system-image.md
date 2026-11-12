@@ -14,7 +14,7 @@ python -m avm.image <image.json>
 
 | 键 | 必填 | 说明 |
 |---|---|---|
-| `meta` | 否 | 元信息：`version` 必须为 1；`instruction_budget` 可覆盖每轮指令预算（正整数，默认 50）；`snapshot_every` 为正整数时每 N 个已提交回合写一次定时快照（缺省不写）；`guest_programs` 声明 guest 角色程序（见 init 与启动流程） |
+| `meta` | 否 | 元信息：`version` 必须为 1；`instruction_budget` 可覆盖每轮指令预算（正整数，默认 50）；`snapshot_every` 为正整数时每 N 个已提交回合写一次定时快照（缺省不写）；`guest_programs` 声明 guest 角色程序（见 init 与启动流程）；`api_error.max_retries` 覆盖 API 其它类失败的重试上限（非负整数，默认 5） |
 | `mem` | 是 | 内存树（对象，顶层键 → 显式节点） |
 | `para_ref` | 否 | para 节点路径，默认 `$MEM.model_params` |
 | `devices` | 否 | 设备挂载列表 |
@@ -188,7 +188,7 @@ init 强制内核态：程序 `ctrl.caps.mode` 声明 `user` 时装载报 `Image
 
 ## 启动流程
 
-生命周期显式三段（`avm/boot.py` 是加载区）：**创建空核心**（`Core()`）→ **加载镜像**（`load_image(core, image_path)`，要求核心还没有对话，否则抛 `ImageError`）→ **启动核心**（`start_core(core)`：刷新模型目录、装 API 失败的运行者策略）。宿主通常只调 `boot(image_path)`，三段串在一起。
+生命周期显式三段（`avm/boot.py` 是加载区）：**创建空核心**（`Core()`）→ **加载镜像**（`load_image(core, image_path)`，要求核心还没有对话，否则抛 `ImageError`）→ **启动核心**（`start_core(core)`：刷新模型目录；宿主可显式安装 API 失败策略，缺省走内核内置策略）。宿主通常只调 `boot(image_path)`，三段串在一起。
 
 **加载镜像**依次做：
 
@@ -201,7 +201,7 @@ init 强制内核态：程序 `ctrl.caps.mode` 声明 `user` 时装载报 `Image
 
 启动模式决定第 6 步与日志怎么处理：`resume` 跳过 init/guest 创建，由快照恢复对话、内存、调度、监听器与设备表，再重放快照之后的日志尾部；`reboot` 只从快照恢复世界段（内存/安全配置/para/设备来源表）并重放日志尾部的世界类效果，然后重跑 init 与 guest 创建；`reset` 用原始镜像重跑 init，并把当前日志/快照归档后开新代际。`resume`/`reboot` 没有可读快照时拒绝启动并提示 `reset`；`auto`（默认）在快照可读时等价 `resume`，否则等价 `reset`，没有"镜像 + 日志重放"的冷启动路径。语义见 [runtime.md 的「启动模式与 guest 程序」](runtime.md#启动模式与-guest-程序)。
 
-**启动核心**依次做：拉一次上游 `GET /models` 填模型目录（失败只警告，不拦启动）；装 API 失败的运行者策略（终端三选项：更新环境 / 继续 / 退出）。
+**启动核心**依次做：拉一次上游 `GET /models` 填模型目录（失败只警告，不拦启动）；缺省不装 API 失败策略（内核按余额不足暂停 / 上下文超限跳过对话 / 其余重试超过上限后暂停处置）；宿主传入 `api_error_policy` 时按旧语义覆盖（终端三选项：更新环境 / 继续 / 退出）。重试上限在镜像 `meta.api_error.max_retries`（默认 5），运行期也可改 `Core.api_error_max_retries`。
 
 之后 `core.run()`；若声明 `persist_to`，在 `finally` 中写回内存（异常也写）；若声明 `snapshot_to`，在安全点退出时写重启快照（中断与未捕获异常不写，避免把半截回合拍进缓存）。
 

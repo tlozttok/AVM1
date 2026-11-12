@@ -64,6 +64,32 @@ def _print_frames(core) -> None:
         print(line, file=sys.stderr)
 
 
+def _wait_for_api_resume(core) -> str:
+    """终端宿主遇到 API 暂停：等一次回车再继续；非 tty/EOF 按退出处理。
+
+    返回 "resume"（清暂停后继续 run）、"eof"（写回内存后退出）或
+    "interrupt"（Ctrl+C，按中断退出、不写快照）。
+    """
+    print(
+        f"[AVM] API 暂停（{core.pause_category}）：{core.pause_reason}",
+        file=sys.stderr,
+    )
+    stdin = sys.stdin
+    is_tty = bool(getattr(stdin, "isatty", lambda: False)())
+    if stdin is None or not is_tty:
+        print("[AVM] 输入不是终端，按退出处理（写回内存）", file=sys.stderr)
+        return "eof"
+    try:
+        input("[AVM] 按回车恢复执行（Ctrl+C 退出）：")
+    except EOFError:
+        print("\n[AVM] EOF，按退出处理（写回内存）", file=sys.stderr)
+        return "eof"
+    except KeyboardInterrupt:
+        print("\n[AVM] 收到中断，写回后退出", file=sys.stderr)
+        return "interrupt"
+    return "resume"
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="AVM 调试入口")
     parser.add_argument("image", nargs="?", help="系统镜像 JSON 文件路径（缺省时从 --debug-config 读取）")
@@ -126,7 +152,17 @@ def main(argv=None) -> int:
     status = 0
     snapshot_ok = True  # 只有安全点退出才写重启快照
     try:
-        core.run()
+        while True:
+            core.run()
+            if not core.paused:
+                break
+            action = _wait_for_api_resume(core)
+            if action != "resume":
+                if action == "interrupt":
+                    status = 130
+                    snapshot_ok = False
+                break
+            core.clear_api_pause()
     except RunnerStop as e:
         print(f"[AVM] {e}", file=sys.stderr)
     except KeyboardInterrupt:

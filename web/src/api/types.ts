@@ -129,6 +129,10 @@ export interface State {
   snapshots: number
   // 操作面板后端新增；可选是为了兼容不提供这些字段的旧后端 / e2e mock
   lifecycle?: string
+  /** 内核 API 暂停（余额不足 / 重试超限）；恢复走 `POST /api/system/resume`。 */
+  paused?: boolean
+  pause_reason?: string | null
+  pause_category?: string | null
   recovery?: RecoveryState
   io?: IoStatus
   force_stop_after?: number

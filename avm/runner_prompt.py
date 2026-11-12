@@ -1,7 +1,9 @@
 """运行者提示：内核停在需要人做决定的地方时，从终端收一个选择。
 
-宿主在启动时把 `prompt_api_error` 装到 `Core.api_error_policy` 上。内核不认识终端，
-只认识回调的返回值（retry / reload / exit）。面板宿主与终端宿主都用这一条路径。
+这是**显式安装**的宿主覆盖：把 `prompt_api_error` 传进 `start_core(api_error_policy=...)`
+或直接赋给 `Core.api_error_policy`。缺省不安装——内核走内置策略（余额不足暂停 /
+上下文超限跳过对话 / 其余重试并暂停）。内核不认识终端，只认识回调的返回值
+（retry / reload / exit）。
 
 EOF、非 tty、Ctrl+C 一律按退出处理：停下等一个不会来的选择，比退出更糟。无人值守
 策略（等多久、要不要重试）另行决定，不在这里。

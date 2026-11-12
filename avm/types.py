@@ -409,6 +409,10 @@ class Conversation:
     is_python: bool = False  # 程序类型：True = Python 对话（system_ref 指向 type="python" 节点），False = LLM 对话
     caps: 'Capability' = None  # 对话能力（模式/组/根表/工具集）；None 时用默认内核态全能力
     attrs: Dict[str, str] = None  # 自由元数据（镜像层权限策略用；不写内存树）
+    # 运行态（不序列化、不写内存树）：最近一次 API 失败的分类详情与连续失败计数。
+    # 由 Core 维护，$MEM.conversations.<cid>.context 从这里生成；成功后清空。
+    last_api_error: Optional[dict] = None
+    api_error_streak: int = 0
 
     def __init__(self, messages: List[Message] = None, cid: int = 0, is_sub:bool=False, parent: Optional['Conversation'] = None, is_root: bool = False, metadata: Dict[str, str] = None, name: Optional[str] = None, caps: Optional['Capability'] = None, attrs: Dict[str, str] = None):
         self.messages = messages or []
@@ -421,6 +425,8 @@ class Conversation:
         self.name = name
         self.caps = caps if caps is not None else default_kernel_caps()
         self.attrs = dict(attrs or {})
+        self.last_api_error = None
+        self.api_error_streak = 0
         self.validate(require_last_assistant=False)
 
     @property

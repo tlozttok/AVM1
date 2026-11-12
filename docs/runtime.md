@@ -503,6 +503,8 @@ Guard 是软件层（镜像/OS 程序）注册的一个普通内核态监听器�
 | `...<cid>.meta` | JSON 对象（字符串→字符串） | 开（v1） | 自由元数据进 `Conversation.attrs`（与内部 `metadata` 分开） |
 | `...<cid>.meta.<key>` | 字符串 | 开（v1） | 单键写入；删除用整体替换 `.meta` |
 | `...<cid>.mode` / `.tools` | 字符串 / JSON 数组 | 只读 | 运行期改模式与工具集留后续 |
+| `...<cid>.context` | JSON 对象：`messages` / `chars` / `tool_messages` / `last_error` / `context_limit` | 只读 | 对话上下文摘要；`last_error` 是最近一次 API 失败的分类信息（`category` / `message` / `status_code` / `context_limit` / `at`），成功一轮后清空 |
+| `...<cid>.messages` | JSON 数组 | 只读 | 对话历史 transcript（`role` / `content`；assistant 带 `tool_calls` / `reasoning_content`，tool 带 `tool_call_id`）；供总结/回收软件读取，不含未消费的待发批次 |
 
 `.roots` 校验：根名规则；目标以 `$MEM` 开头且非空；内核态对话写 `.roots` 一律拒绝（用户态 `MEM` 根不存在，无法授予）；`caps` 自述根不可覆盖；新目标不落在内核控制面设备路径（显式授予设备本身允许）、与其他存活对话的根目标及根注册表前缀无关（相同目标允许共享）。成功写入记 `conversation_roots` 日志效果。
 
@@ -538,7 +540,7 @@ Guard 是软件层（镜像/OS 程序）注册的一个普通内核态监听器�
 
 一个 JSON 文件 + 若干设备 Python 文件 = 一个标准 AVM 系统镜像。规范见 [docs/system-image.md](system-image.md)，要点：
 
-**生命周期三段**（`avm/boot.py` 是加载区，把三段串起来给宿主用）：**创建空核心**（`Core()`）→ **加载镜像**（`load_image(core, path)`，要求核心还没有对话）→ **启动核心**（`start_core(core)`：刷新模型目录、装 API 失败的运行者策略）。宿主通常只调 `boot(image_path)`。
+**生命周期三段**（`avm/boot.py` 是加载区，把三段串起来给宿主用）：**创建空核心**（`Core()`）→ **加载镜像**（`load_image(core, path)`，要求核心还没有对话）→ **启动核心**（`start_core(core)`：刷新模型目录；宿主可显式安装 API 失败策略，缺省走内核内置策略）。宿主通常只调 `boot(image_path)`。
 
 - **显式节点**：内存每个节点都是 `{ "kind": "str"|"dict"|"list"|"device"|"link", "meta"?, "ctrl"?, "value" }`，无任何隐式转换（str 也必须显式包装）。`kind="device"` 是任意层级都可出现的可读性标记，实际挂载在 `devices` 段；`kind="link"` 用 `target` 声明链接（`$MEM` 地址或设备标识符），不写 `value`。
 - **para**：`ctrl.type="para"` 的 dict 节点存放模型调用参数（`model`、`temperature`、`use_tool`、`extra_body`、`reasoning_effort` 等），均以字符串存储，每次调用 API 前把数值型参数转回数值。
@@ -599,7 +601,7 @@ Guard 是软件层（镜像/OS 程序）注册的一个普通内核态监听器�
 
 ### 回合日志（journal）
 
-一轮 = 一次推理 + 该轮产生的全部指令。执行完回到 `Core.advance_conversation` 的安全点（`monitor.record` 之后）记一条记录；API 失败重试与未捕获异常不提交，该回合视为未发生。
+一轮 = 一次推理 + 该轮产生的全部指令。执行完回到 `Core.advance_conversation` 的安全点（`monitor.record` 之后）记一条记录；API 失败的重试/跳过回合与未捕获异常不提交，该回合视为未发生。
 
 一条记录是**有序变化序列**（`v=3`，完整形状见 `avm/journal.py` 模块 docstring）：`{"v": 3, "generation", "seq", "cid", "at", "changes": [...]}`。`changes` 按执行顺序列出：
 
@@ -701,11 +703,12 @@ cd web && npm run dev                    # 开发期：Vite 代理 /api 到 AVM_
 
 面板自身：`cd web && npm run test:unit` 跑纯逻辑用例，`cd web && npm run e2e` 起一个脚本化 MockLMU 的控制台并在浏览器里跑五个场景（观测、工具选择、三步交互、喂输入、产物由 console 托管）。
 
+- **API 暂停生命周期**：`core.run()` 返回且 `core.paused` 为真时，宿主把 `lifecycle` 置为 `paused`，HTTP 服务保持存活；`/api/state` 增 `paused` / `pause_reason` / `pause_category`，`POST /api/system/resume` 调 `core.clear_api_pause()` 并唤醒主线程重新进入 `core.run()`。暂停期间请求关机会先清暂停、唤醒主线程，让 shutdown 中断能在安全点派发；force-stop 仍按秒数放行。终端宿主 `main.py` 打印原因后等回车；非 tty / EOF 按退出处理（写回内存）。
 - **操作员对话（保留 cid -1）**：cid 是作者规定的保留值，不参与正常分配；控制台在 `boot` 返回后、`core.run()` 之前把 `plm.operator` 通道绑到它，没有就创建。对话随快照与日志正常恢复：日志里出现它的回合而它还不存在时（只靠日志恢复），重放先补建它，回合按普通记录应用；快照里它与普通对话一起保存和恢复。**隐藏标记在对话 attrs**（`host: "console"`、`hidden: "1"`），不是内存树节点：对普通对话隐藏——`$MEM.conversations` / `$MEM.scheduler` / `$MEM.caps` 列表与监测帧过滤，`send_instruction` / `close_conversation` 与 `$conv.<cid>` / `$batch.<cid>` 一律按「不存在」处理；隐藏只由对话 `attrs` 决定，cid 不参与判定。隐藏只是显示与寻址策略，不影响恢复，宿主控制台自己仍能看到它（`/api/state` 与 `/api/conversations/-1`）。初始进休眠队列、不进就绪队列——只有中断能激活。它活跃就等于全局暂停（其他对话都不推进）。`POST /api/interrupt` 挂起 `operator` 中断（在下一个安全点生效；`core.run()` 已返回时不再生效），`POST /api/resume` 让它结束本轮、让出执行权。`POST /api/action` 提交一条动作，未暂停时先自动中断；未知工具名有意允许（响应里有 `known_tool` 与提示）。
-- **读取端点**：`GET /api/state`（运行状态、调度、对话（不过滤 cid -1）、中断、屏蔽账本、生命周期、恢复报告、IO 总线状态）、`/api/tools`（十条指令表）、`/api/conversations/<cid>`、`/api/memory`（可带 `ref`，整树无分页）、`/api/memory/diff?from=&to=`、`/api/listeners`、`/api/devices`、`/api/events`（SSE：面板输出与调度变化的有序流，按 `seq` 增量读）、`/api/io/stream?after=`（SSE：宿主 IO 输出流）。
-- **介入端点**：`POST /api/action`（面板对话执行一条工具调用）、`POST /api/io/input`（调试输入 → 宿主 IO 总线，200 返回 `debug: true`）、`POST /api/system/shutdown`（挂 shutdown 中断通知 OS，见下）、`POST /api/system/force-stop`（操作员强制退出，见下）、`POST /api/device/inspect`（只读检查设备文件：路径/大小/sha256/类名/挂载/args/现有来源表条目，不 import、不挂载、不写内存）、`POST /api/device-action`（调设备自己声明的调试动作，如给 `$inputs` 投喂一行）、`/api/memory/snapshot`、`PATCH /api/listeners/<id>`（就地启停监听器、改 priority/tier）、`POST|DELETE /api/mask/memory`、`/api/mask/device`（临时摘下一个内存节点或卸载一台设备，`DELETE` 还原；调试原语不产生事件）、`POST /api/session/acquire|release`（单客户端席位）。
+- **读取端点**：`GET /api/state`（运行状态、调度、对话（不过滤 cid -1）、中断、屏蔽账本、生命周期、API 暂停、恢复报告、IO 总线状态）、`/api/tools`（十条指令表）、`/api/conversations/<cid>`、`/api/memory`（可带 `ref`，整树无分页）、`/api/memory/diff?from=&to=`、`/api/listeners`、`/api/devices`、`/api/events`（SSE：面板输出与调度变化的有序流，按 `seq` 增量读）、`/api/io/stream?after=`（SSE：宿主 IO 输出流）。
+- **介入端点**：`POST /api/action`（面板对话执行一条工具调用）、`POST /api/io/input`（调试输入 → 宿主 IO 总线，200 返回 `debug: true`）、`POST /api/system/shutdown`（挂 shutdown 中断通知 OS，见下）、`POST /api/system/resume`（清除 API 暂停并唤醒主线程继续 run）、`POST /api/system/force-stop`（操作员强制退出，见下）、`POST /api/device/inspect`（只读检查设备文件：路径/大小/sha256/类名/挂载/args/现有来源表条目，不 import、不挂载、不写内存）、`POST /api/device-action`（调设备自己声明的调试动作，如给 `$inputs` 投喂一行）、`/api/memory/snapshot`、`PATCH /api/listeners/<id>`（就地启停监听器、改 priority/tier）、`POST|DELETE /api/mask/memory`、`/api/mask/device`（临时摘下一个内存节点或卸载一台设备，`DELETE` 还原；调试原语不产生事件）、`POST /api/session/acquire|release`（单客户端席位）。
 - **关机与强制退出**：`POST /api/system/shutdown` 不执行关机语义，只挂 `shutdown` 中断通知镜像声明的处理程序（中断是 VM 通知软件的通道）；面板占执行权（系统空闲态）时，关机按钮同时在操作员通道提交一次 `{"end": True}`，让阻塞的面板回合回到安全点才能派发中断。OS 软件收尾后写 `$MEM.sys.power.state = "off"`，宿主在安全点看到该边沿后写快照并退出。没有声明 shutdown 处理程序时请求停在挂起（warning），VM 不自行断电；请求关机 `force_stop_after` 秒后可用 `POST /api/system/force-stop` 强制退出——**不写快照、不写 clean**，响应 `{"status": "force-stopped", "snapshot_written": false}`。
-- **界面当前接的**：三栏界面（对话列表 / 内存索引与对话·内存·设备详情 / 暂停与动作·事件流）；对话列表与详情带 caps 摘要（mode/groups/根名/工具集）、暂停与继续、十条指令的结构化动作表单（下拉 +「其它（手输）」+ 原始 JSON 兜底）、事件流、主输入框与调试抽屉（当前都走调试 IO 总线；正式可扩展 IO 待实现，标注不重放）、设备审批面板（先用 `/api/device/inspect` 取哈希，再带 `approved_sha256` 提交装载）。内存索引照树画：链接节点一行，没有子节点可展开；挂载点那行标出设备类型（`device InputsListDevice`），点它打开设备视图，描述与动作来自 `GET /api/devices`。监听器编辑、屏蔽还原、快照与 diff 视图、设备动作全量都已有后端端点、界面未接。
+- **界面当前接的**：三栏界面（对话列表 / 内存索引与对话·内存·设备详情 / 暂停与动作·事件流）；对话列表与详情带 caps 摘要（mode/groups/根名/工具集）、暂停与继续、API 暂停原因与恢复按钮（`POST /api/system/resume`）、十条指令的结构化动作表单（下拉 +「其它（手输）」+ 原始 JSON 兜底）、事件流、主输入框与调试抽屉（当前都走调试 IO 总线；正式可扩展 IO 待实现，标注不重放）、设备审批面板（先用 `/api/device/inspect` 取哈希，再带 `approved_sha256` 提交装载）。内存索引照树画：链接节点一行，没有子节点可展开；挂载点那行标出设备类型（`device InputsListDevice`），点它打开设备视图，描述与动作来自 `GET /api/devices`。监听器编辑、屏蔽还原、快照与 diff 视图、设备动作全量都已有后端端点、界面未接。
 - **边界**：面板对话的消息随每次动作增长，且不能存检查点（v1 检查点不支持 Python 对话）；面板输出是容量 4000 条的有界环形缓冲，丢弃数记在状态里；`GET /api/devices` 的动作账本只留最近 50 条；阻塞读的路径末段是已知会阻塞的命名子键（当前只有 `next`，如 `$MEM.inputs.next`）时面板先标出、点击才发请求（8 秒超时）。
 
 ### 思维链内容
@@ -722,7 +725,15 @@ LLM 响应中的 `reasoning_content`（思维链）被完整存入对话历史�
 - **内核恐慌**：六条具名不变量（调度互斥、活跃有来源、历史配对、值域、设备表一致、预算计数）在每轮安全点自检，违反即 `KernelPanic` 并留监测帧。可判定的输入不该走到这里——出现说明某条边界少了一条判定。
 - **内核缺陷**：约定错误类之外的异常不再被读路径吞掉；记录监测帧后向上抛，进程退出。
 
-API 调用失败（缺 key、断网、超时）不再结束进程：内核记帧后停下问运行者，终端给三个选择——更新环境（重建客户端后重试本轮）、继续（直接重试）、退出（写回内存后干净退出）。宿主通过 `Core.api_error_policy` 安装策略，默认实现见 `avm/runner_prompt.py`；EOF 与非终端输入按退出处理。
+API 调用失败（缺 key、断网、超时、限流、余额不足、上下文超限）按原因分类处置（`avm/api_errors.py` 是纯分类函数）：
+
+- **余额不足**（HTTP 402，或消息含 `insufficient_quota` / `insufficient balance` / `余额` / `billing` / `payment` / `credit`）：暂停执行，不重试、不关闭对话。429 的普通限流不含这些标记，归入“其它”。
+- **上下文超限**（HTTP 400/413/422 且消息含 `context_length_exceeded` / `maximum context length` / `context window` / `too many tokens` / `exceeds the maximum` / `上下文` / `token limit`）：跳过该对话——不关闭、不重试、不消费待发输入；普通对话回休眠等待再次被唤醒（亚对话不能留在等待链外，给父补一条 `Error:` 后按用完即删删除个体），分类信息记在对话运行态的 `last_api_error` 上，随后继续调度其他对话。回收/总结由软件任务负责：读 `$MEM.conversations.<cid>.context` 与 `.messages` 后决定裁剪、总结或显式关闭。能解析出上限时一并记录（如 `maximum context length is 128000 tokens` → 128000）。
+- **其它**（网络、鉴权、超时、普通限流等）：重试同一轮（失败回合不提交历史与日志），重试次数超过 `Core.api_error_max_retries`（默认 5，即失败 6 次后暂停；镜像 `meta.api_error.max_retries` 可覆盖，运行期也可直接改）后暂停执行。成功执行一轮后该对话的连续失败计数清零。
+
+**暂停执行**的语义：`core.paused = True`，`core.pause_reason`（人类可读）与 `core.pause_category` 可读；`run()` 在下一个安全点返回，不抛异常、不写快照、不关闭对话。宿主负责恢复：`Core.clear_api_pause()` 清除暂停并重置本次重试计数，然后再次进入 `run()`；暂停期间 force-stop 仍可用。对话自己的错误信息不写内存树，读 `$MEM.conversations.<cid>.context` 可取上下文摘要与最近一次 API 失败。
+
+宿主仍可通过 `Core.api_error_policy` 覆盖内置策略（回调返回 `retry` / `reload` / `exit`，语义与旧版相同）；`start_core()` 缺省不再安装终端提示策略，`avm/runner_prompt.py` 仅供显式传入的宿主使用。
 
 **一个工具调用只写一条工具响应**。after 事实事件的发布失败只记 stderr（fail-open），不改调用者看到的返回值——发布属于观测面，让它再写一条同 `call_id` 的响应会破坏"assistant 的 `tool_calls` 与 tool 消息一一配对"，下一次请求会被 API 拒绝。同理，亚对话的返回通道只在第一次完成时使用：再次完成不写回父对话（亚对话本不该被再次唤醒，这条是兜底）；亚对话在返回前被关闭时，内核给父补一条 `Error: 亚对话（cid=N）在返回结果前被关闭`。**亚对话不能向主对话（含祖先）发送消息**：`send_instruction` 会返回 `Illegal:`，返回只能走 `create_sub` 的通道；对等待返回的父对话，`send_instruction` 与事件 `notify` 的内容只进批次、不唤醒它。
 

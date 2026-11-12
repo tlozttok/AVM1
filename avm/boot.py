@@ -6,7 +6,7 @@
 2. **加载镜像**：`avm.image.load_image(core, image_path)`——解析 mem / devices / init /
    persist_to，并在整树替换之后重装启动自带的模型目录（`$MEM.model_catalog`）；
 3. **启动核心**：`start_core(core)`——刷新模型目录（拉一次上游 `/models`，失败只警告）、
-   装运行者策略（API 失败时问运行者的终端提示）。
+   按宿主要求装 API 失败策略（缺省不装，内核走内置的暂停/跳过/重试策略）。
 
 之后把 Core 交给宿主自己 `run()`。宿主通常只调 `boot()`，它把三段串起来；要单独测试或
 分步使用某一段时，直接调对应的函数。
@@ -39,7 +39,6 @@ from typing import Optional
 from .core import Core
 from .image import ImageError, load_image, restore_guest_roles, start_cold
 from .journal import Journal, JournalError, apply_world_record, archive_file
-from .runner_prompt import prompt_api_error
 from .snapshot import SnapshotError, read_snapshot, restore_world
 
 BOOT_MODES = ("auto", "resume", "reboot", "reset")
@@ -58,10 +57,13 @@ def start_core(
 ) -> Core:
     """启动核心（第三段）：刷新模型目录、装运行者策略。不跑调度循环。
 
-    api_error_policy 缺省装终端三选项；要关掉它，传一个返回 "exit" 的策略，或
-    在返回后把 `core.api_error_policy` 置空。
+    api_error_policy 是宿主覆盖：传了才装（旧语义：回调返回 retry/reload/exit）。
+    缺省不装，内核走内置策略——余额不足暂停、上下文超限跳过对话、其余重试，
+    超过 `core.api_error_max_retries` 后暂停。终端三选项策略（avm/runner_prompt.py）
+    仍可供显式传入的宿主使用。
     """
-    core.api_error_policy = api_error_policy if api_error_policy is not None else prompt_api_error
+    if api_error_policy is not None:
+        core.api_error_policy = api_error_policy
     if refresh_models:
         core.refresh_model_catalog(timeout=timeout)
     return core
