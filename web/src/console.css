@@ -727,6 +727,23 @@ details.transcript-line.is-tools[open] summary::before {
   min-height: 90px;
 }
 
+.node-field > textarea {
+  flex: 1;
+  min-width: 0;
+}
+
+.node-value-textarea {
+  max-height: 420px;
+  resize: vertical;
+  line-height: 1.6;
+}
+
+.node-field-hint {
+  margin: -2px 0 8px 138px;
+  color: var(--fg-muted);
+  font-size: 10.5px;
+}
+
 .node-actions {
   display: flex;
   align-items: center;

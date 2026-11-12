@@ -112,6 +112,16 @@ test('节点工作台：区域一节点类型编辑 + 区域二 ctrl.type 快捷
   await page.getByTestId('node-ctrl-input-type').fill('python')
   await page.getByTestId('node-ctrl-set-type').click()
   await expect(page.getByTestId('node-result')).toContainText('ctrl.type')
+
+  // 区域一 str 叶子：正文是多行文本框（长程序正文不再横向截断），保存走 memory_write
+  await tree.locator('[data-ref="$MEM.state"] .mem-twist').click()
+  await tree.locator('[data-ref="$MEM.state.tick"]').click()
+  const valueBox = page.getByTestId('node-value')
+  await expect(valueBox).toHaveJSProperty('tagName', 'TEXTAREA')
+  await valueBox.fill('第一行\n第二行\n第三行')
+  await expect(page.getByTestId('node-value-meta')).toContainText('3 行')
+  await page.getByTestId('node-save-value').click()
+  await expect(page.getByTestId('node-result')).toContainText('Success set')
 })
 
 test('handler 节点：区域二类型动作是监听（注册/查看）', async ({ page }) => {

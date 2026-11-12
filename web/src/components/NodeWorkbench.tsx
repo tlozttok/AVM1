@@ -63,6 +63,12 @@ const SHAPE_HINT: Record<NodeShape, string> = {
   device: '挂载点：行为由设备自己声明',
 }
 
+/** 正文文本框的行数：按内容行数自适应，夹在 4..20 行之间，剩下的交给拖拽/滚动。 */
+function autoRows(value: string): number {
+  const lines = value === '' ? 1 : value.split('\n').length
+  return Math.min(Math.max(lines + 1, 4), 20)
+}
+
 function formatResult(content: string | null): ResultNote {
   if (content === null || content === '') return { kind: 'note', text: '工具响应为空' }
   return { kind: isErrorMessage(content) ? 'error' : 'ok', text: content }
@@ -269,7 +275,18 @@ export default function NodeWorkbench({
             <>
               <div className="node-field">
                 <label htmlFor="node-value">正文</label>
-                <input id="node-value" data-testid="node-value" value={value} onChange={(event) => setValue(event.target.value)} />
+                <textarea
+                  id="node-value"
+                  className="node-value-textarea"
+                  data-testid="node-value"
+                  rows={autoRows(value)}
+                  value={value}
+                  spellCheck={false}
+                  onChange={(event) => setValue(event.target.value)}
+                />
+              </div>
+              <div className="node-field-hint" data-testid="node-value-meta">
+                {value === '' ? 0 : value.split('\n').length} 行 · {value.length} 字符 · 等宽显示，可拖拽调高
               </div>
               <div className="node-actions">
                 <button type="button" className="primary" data-testid="node-save-value" disabled={busy} onClick={() => void run(memoryWrite(refName, value))}>
@@ -397,7 +414,9 @@ export default function NodeWorkbench({
                             <textarea
                               id={`quick-${field.key}`}
                               data-testid={`node-quick-${field.key}`}
+                              rows={autoRows(quickValues[field.key] ?? '')}
                               value={quickValues[field.key] ?? ''}
+                              spellCheck={false}
                               onChange={(event) => setQuickValues((prev) => ({ ...prev, [field.key]: event.target.value }))}
                             />
                           ) : (
