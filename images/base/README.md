@@ -146,8 +146,12 @@ assistant 消息（例如 builder 直接返回的 JSON 摘要）。需要同步�
 
 | 命令 | 行为 |
 |---|---|
-| `help` | 列出 `$MEM.sys.shell.commands` 里已注册的命令名 |
-| `help <名字>` | 显示该命令注册的 `program` / `para` 引用 |
+| `help` | 列出 `$MEM.sys.shell.commands` 里已注册的命令名与各自的 `summary` |
+| `help <名字>` | 把 `help` 作为参数分发给该命令程序，由程序回答自己的用法 |
+
+shell 不猜用法：列表里的说明来自注册项 `summary` 字段，详细用法由命令程序自己的
+`handle("help")` 返回。命令程序应同时提供两者，否则 `help <名字>` 只会得到该程序
+对 `help` 这个参数的正常处理结果。
 
 **分发机制。** 从 `$MEM.sys.shell.commands.<名字>` 读 `program` 与 `para` 两个 str
 子节点；读不到（或读出来是 Error/Illegal）时返回
@@ -168,7 +172,8 @@ shell 把那条工具响应原样返回——子命令返回的 JSON 摘要、�
 1. 建一个 `ctrl.type="python"` 命令程序节点（正文是 `plm.command` 程序，定义
    `handle(cmd)`）；para 的 `model` 为 `plm.command`，可以复用 `$MEM.para.shell`。
 2. 在 `$MEM.sys.shell.commands` 下建同名 dict，写 `program`、`para` 两个 str
-   子节点，指向上面两个节点。
+   子节点指向上面两个节点，再写可选的 `summary` str 子节点（`help` 列表里的一行
+   说明）；命令程序自己处理 `help` 输入返回详细用法。
 3. 无需重启：下一条命令即按新注册表分发。注册表只存引用、不存 cid，命令程序
    按需现建现用。
 

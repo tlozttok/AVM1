@@ -35,21 +35,26 @@ create 模式不覆盖已存在的节点（记错误并跳过）；update 模式
 
 错误不抛给 Core：非法规格直接返回 `错误: builder: ...` 且不产生工具调用；
 构造期单点失败记进摘要的 errors，继续做其余步骤。
+
+不知道怎么写规格时，把 `help` 作为命令交给它：返回下面这段用法说明。
 """
 
 # 本文件就是 plm.command 的 system 消息：运行时把整份源码编译进受限命名空间，
 # 每条命令调用一次 handle(cmd)。沙箱只注入 math/json/re 与工具函数，不能 import；
 # 工具函数都是生成器，必须 `yield from` 才会挂起并把响应送回来。
 
-# 构造器自己能直通调用的工具：plm.command 注入的命令执行子集。
+# 构造器自己能直通调用的工具：plm.command 注入的全部 10 条指令。
 _CALL_TOOLS = frozenset({
     "memory_read",
     "memory_write",
     "memory_make",
     "memory_delete",
     "edit_metadata",
+    "create_cmd",
+    "create_sub",
     "send_instruction",
     "close_conversation",
+    "listen_event",
 })
 
 _NODE_TYPES = ("settingup", "python", "handler", "para")
@@ -417,12 +422,33 @@ def _run(spec):
     return json.dumps(summary, ensure_ascii=False)
 
 
+_USAGE = """builder —— 构造/更新内存节点与批量指令
+
+命令 = 一个 JSON 对象：
+  {"mode": "create|update",           缺省 create（不覆盖已有节点）
+   "ops": [
+     {"type": "settingup|python", "path": "$MEM.programs.x",
+      "name": "...", "content": "...", "signature": "...", "meta": "..."},
+     {"type": "handler", "path": "$MEM.handlers.h", "name": "...",
+      "content": "...", "condition": {"events": [...], "phase": [...]}},
+     {"type": "para", "path": "$MEM.para.x",
+      "fields": {"model": "plm.python", "temperature": "0.2"}}
+   ],
+   "calls": [{"tool": "memory_read", "arguments": {"ref": "$MEM.x"}}]}
+
+返回 JSON 摘要：ok / mode / built / updated / skipped / errors / calls / verified。
+create 遇到已存在节点记 error+skipped；update 只改已有节点。"""
+
+
 def handle(cmd):
-    """命令入口：cmd 是 JSON 规格字符串；返回摘要 JSON 或 `错误: builder: ...`。
+    """命令入口：cmd 是 JSON 规格字符串（或 help）；返回摘要 JSON 或 `错误: builder: ...`。
 
     沙箱里不能定义异常类（没有 __build_class__），所以规格错误统一用 ValueError：
     handle 把 ValueError 当作"只给调用者看的规格错误"，其它异常才是内部异常。
     """
+    text = cmd.strip() if isinstance(cmd, str) else ""
+    if not text or text in ("help", "-h", "--help"):
+        return _USAGE
     try:
         spec = _parse_spec(cmd)
     except ValueError as e:

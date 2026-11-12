@@ -8,13 +8,15 @@ JSON 摘要）；shell 自己不做解析、不做包装。
 
 命令：
 
-    help              列出已注册命令
-    help <名字>       显示该命令注册的 program / para 引用
+    help              列出已注册命令与摘要
+    help <名字>       把 `help` 作为参数分发给该命令程序，由程序回答自己的用法
     <名字> <参数...>  分发；第一个空格之后的整段参数原样传给子命令
 
 注册表只存引用、不存 cid：命令程序按需现建现用。新增命令 = 建一个
 `ctrl.type="python"` 的命令程序节点 + 在 `$MEM.sys.shell.commands` 下登记同名
-条目（`program`、`para` 两个 str 子节点），不需要改这个程序、也不需要重启。
+条目（`program`、`para`、可选 `summary` 三个 str 子节点），不需要改这个程序、
+也不需要重启。命令程序应把自己的用法放在 `summary`（列表用）并处理 `help`
+输入（详情用）；shell 自己不猜用法。
 
 失败一律返回 `错误: shell: ...`（不抛穿 Core）：空命令、未知命令、args 写入失败、
 程序内部异常。子命令自己的 Error/Illegal 响应按「工具响应原样返回」直接返回。
@@ -92,20 +94,31 @@ def _command_names():
 
 
 def _help(args):
-    """内建 help：无参数列出命令；有参数显示该命令注册的引用。"""
+    """内建 help：列表读注册表摘要；详情把 `help` 分发给命令程序自己回答。"""
     name = args.strip()
     if not name:
         names = yield from _command_names()
         if not names:
             return "已注册命令：（无）"
-        return ("已注册命令（" + str(len(names)) + "）：" + "、".join(names)
-                + "；用 help <名字> 查看 program/para")
+        lines = ["已注册命令（" + str(len(names)) + "）："]
+        for command in names:
+            summary = yield from _read_str(
+                _COMMANDS_REF + "." + command + ".summary"
+            )
+            extra = summary.strip() if summary is not None else ""
+            lines.append("  " + command + ("  " + extra if extra else ""))
+        lines.append("用 help <名字> 查看用法")
+        return "\n".join(lines)
     command = name.split()[0]
     refs = yield from _registered(command)
     if refs is None:
         return _unknown(command)
     program, para = refs
-    return command + ": program=" + program + " para=" + para
+    response = yield from memory_write(_ARGS_REF, "help")
+    if _is_error(response):
+        return _error("写入参数失败：" + str(response))
+    result = yield from create_sub(program, _ARGS_REF, para)
+    return str(result)
 
 
 def _dispatch(name, args):

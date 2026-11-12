@@ -134,19 +134,21 @@ def test_cold_boot_creates_shell_service():
     ) == "$MEM.para.builder"
 
 
-def test_help_lists_registered_commands():
+def test_help_lists_registered_commands_with_summaries():
     core, shell = cold_shell()
     output = send(core, shell, "help")
     assert "builder" in output
-    assert "help <名字>" in output
+    assert "构造/更新" in output, "列表要带注册表里的摘要，而不是空名字"
+    assert "help <名字> 查看用法" in output
 
 
-def test_help_shows_registered_refs():
+def test_help_name_dispatches_to_command_for_usage():
+    """help <名字> 把 help 作为参数分发给命令程序，由程序回答自己的用法。"""
     core, shell = cold_shell()
     output = send(core, shell, "help builder")
-    assert output.startswith("builder:")
-    assert "$MEM.sys.programs.builder" in output
-    assert "$MEM.para.builder" in output
+    assert '"ops"' in output and '"mode"' in output
+    assert "create" in output and "update" in output
+    assert "错误:" not in output
 
 
 def test_builder_command_is_dispatched_through_shell():
@@ -229,8 +231,8 @@ def test_registered_command_can_be_added_and_dispatched(tmp_path):
     core, shell = cold_shell(image)
 
     assert "echo" in send(core, shell, "help")
-    refs = send(core, shell, "help echo")
-    assert "$MEM.sys.programs.echo" in refs and "$MEM.para.echo" in refs
+    # 命令程序没实现 help 时原样返回它自己的输出（这里 echo 把 help 当参数回显）
+    assert send(core, shell, "help echo") == "echo:help"
 
     output = send(core, shell, "echo a b")
     assert output == "echo:a b"

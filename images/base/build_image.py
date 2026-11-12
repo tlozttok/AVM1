@@ -164,6 +164,10 @@ def build():
                                         {
                                             "program": _str("$MEM.sys.programs.builder"),
                                             "para": _str("$MEM.para.builder"),
+                                            "summary": _str(
+                                                "构造/更新 settingup/python/handler/para "
+                                                "节点与批量指令（JSON 规格）"
+                                            ),
                                         },
                                         meta="构造器命令",
                                     ),

@@ -259,7 +259,6 @@ def test_update_rewrites_existing_content_and_fills_missing_field():
     {"ops": [{"type": "python", "path": "$MEM.x"}]},
     {"ops": [{"type": "handler", "path": "$MEM.x", "content": "code"}]},
     {"calls": [{"tool": "not_an_instruction", "arguments": {}}]},
-    {"calls": [{"tool": "create_cmd", "arguments": {}}]},
     {"calls": [{"tool": "memory_read", "arguments": "not-an-object"}]},
 ])
 def test_invalid_spec_returns_error_without_tool_calls(bad):
