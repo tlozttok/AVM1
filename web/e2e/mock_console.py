@@ -103,6 +103,8 @@ def build(port: int, host: str, tick: float) -> None:
     core.mem["model_params"] = MetaDict(data={"model": "mock"}, ctrl={"type": "para"})
     core.mem["note"] = MetaDict(data={"v": "hi"}, metadata="一条笔记", ctrl={"owner": "0"})
     core.mem["state"] = MetaDict(data={"tick": ""}, metadata="脚本执行器的计数", ctrl={"owner": "0"})
+    # 没有 ctrl.type 的普通容器：e2e 用它测「描述编辑 + 设置 ctrl.type + 新增 ctrl」
+    core.mem["plain"] = MetaDict(data={"a": "1"}, metadata="无 ctrl.type 的普通容器")
     core.mem._data["alias"] = LinkNode(target="$MEM.note", metadata="指向 note 的链接")
 
     # 节点工作台三个维度用的节点：程序节点（ctrl.type=python）、para、handler。

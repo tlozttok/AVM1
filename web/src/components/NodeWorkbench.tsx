@@ -112,6 +112,7 @@ export default function NodeWorkbench({
   const [ctrlDrafts, setCtrlDrafts] = useState<Record<string, string>>({})
   const [ctrlKey, setCtrlKey] = useState('')
   const [ctrlValue, setCtrlValue] = useState('')
+  const [newCtrlType, setNewCtrlType] = useState('')
   const [listenCandidates, setListenCandidates] = useState<Listener[]>([])
   const [deviceArgs, setDeviceArgs] = useState<Record<number, string>>({})
   const [deviceResults, setDeviceResults] = useState<Record<number, string>>({})
@@ -141,6 +142,7 @@ export default function NodeWorkbench({
     )
     setCtrlKey('')
     setCtrlValue('')
+    setNewCtrlType('')
   }, [node, ctrlType])
 
   useEffect(() => {
@@ -390,7 +392,27 @@ export default function NodeWorkbench({
             </header>
 
             {ctrlType === null ? (
-              <div className="node-note">没有数据类型：只有区域一的通用编辑。需要 ctrl.type 时用下面的 ctrl 编辑或原始动作的 `edit_metadata` 设置。</div>
+              <div className="node-type-empty">
+                <div className="node-note">
+                  没有数据类型：区域一给通用编辑；这个节点也可以在这里直接设置 <code>ctrl.type</code>，设置后按该类型显示快捷修改与类型动作。
+                </div>
+                <div className="node-field-row" data-testid="node-set-ctrl-type-row">
+                  <input
+                    data-testid="node-set-ctrl-type-input"
+                    placeholder="ctrl.type，如 python / handler / para"
+                    value={newCtrlType}
+                    onChange={(event) => setNewCtrlType(event.target.value)}
+                  />
+                  <button
+                    type="button"
+                    data-testid="node-set-ctrl-type"
+                    disabled={busy || newCtrlType.trim() === ''}
+                    onClick={() => void run(ctrlSet(refName, 'type', newCtrlType.trim()))}
+                  >
+                    设置 ctrl.type
+                  </button>
+                </div>
+              </div>
             ) : (
               <>
                 {summary ? <div className="node-type-summary">{summary}</div> : null}
@@ -486,13 +508,24 @@ export default function NodeWorkbench({
             )}
 
             <div className="node-ctrl" data-testid="node-ctrl">
-              <div className="node-region-sub">控制数据 ctrl（edit_metadata set / del）</div>
-              {ctrl === null || Object.keys(ctrl).length === 0 ? (
-                <div className="node-note">没有控制数据。</div>
-              ) : null}
-              {ctrl === null ? null : (
+              <div className="node-region-sub">控制数据 ctrl（元数据的控制部分，edit_metadata set / del）</div>
+              {shape === 'link' ? (
                 <>
-                  {Object.entries(ctrl).map(([key, raw]) => (
+                  <div className="node-note" data-testid="node-ctrl-link-note">
+                    链接的引用会进入目标：这里显示的是链接节点自己的 ctrl，指令层没有直接改链接自身控制数据的路径，只读展示；
+                    要改目标节点的 ctrl，请打开目标节点。
+                  </div>
+                  {Object.entries(ctrl ?? {}).map(([key, raw]) => (
+                    <div className="node-ctrl-row" key={key}>
+                      <span className="node-ctrl-key mono">{key}</span>
+                      <input readOnly value={String(raw)} />
+                    </div>
+                  ))}
+                  {Object.keys(ctrl ?? {}).length === 0 ? <div className="node-note">（没有控制数据）</div> : null}
+                </>
+              ) : (
+                <>
+                  {Object.entries(ctrl ?? {}).map(([key, raw]) => (
                     <div className="node-ctrl-row" key={key}>
                       <span className="node-ctrl-key mono">{key}</span>
                       <input
@@ -508,20 +541,25 @@ export default function NodeWorkbench({
                       </button>
                     </div>
                   ))}
+                  <div className="node-note">
+                    {ctrl === null || Object.keys(ctrl).length === 0
+                      ? '还没有控制数据（ctrl 为空）；在下面填键值即可新增。'
+                      : '新增或覆盖一条控制数据：'}
+                  </div>
+                  <div className="node-ctrl-row">
+                    <input placeholder="新键" data-testid="node-ctrl-new-key" value={ctrlKey} onChange={(event) => setCtrlKey(event.target.value)} />
+                    <input placeholder="值" data-testid="node-ctrl-new-value" value={ctrlValue} onChange={(event) => setCtrlValue(event.target.value)} />
+                    <button
+                      type="button"
+                      data-testid="node-ctrl-add"
+                      disabled={busy || ctrlKey.trim() === ''}
+                      onClick={() => void run(ctrlSet(refName, ctrlKey.trim(), ctrlValue))}
+                    >
+                      新增键值
+                    </button>
+                  </div>
                 </>
               )}
-              <div className="node-ctrl-row">
-                <input placeholder="新键" data-testid="node-ctrl-new-key" value={ctrlKey} onChange={(event) => setCtrlKey(event.target.value)} />
-                <input placeholder="值" data-testid="node-ctrl-new-value" value={ctrlValue} onChange={(event) => setCtrlValue(event.target.value)} />
-                <button
-                  type="button"
-                  data-testid="node-ctrl-add"
-                  disabled={busy || ctrlKey.trim() === ''}
-                  onClick={() => void run(ctrlSet(refName, ctrlKey.trim(), ctrlValue))}
-                >
-                  新增键值
-                </button>
-              </div>
             </div>
           </section>
         )}

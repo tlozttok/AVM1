@@ -122,6 +122,24 @@ test('节点工作台：区域一节点类型编辑 + 区域二 ctrl.type 快捷
   await expect(page.getByTestId('node-value-meta')).toContainText('3 行')
   await page.getByTestId('node-save-value').click()
   await expect(page.getByTestId('node-result')).toContainText('Success set')
+
+  // 没有 ctrl.type 的普通 dict：描述数据可编辑，且能直接设置 ctrl.type / 新增 ctrl
+  await tree.locator('[data-ref="$MEM.plain"]').click()
+  await expect(page.getByTestId('node-ctrl-type')).toContainText('无 ctrl.type')
+  await page.getByTestId('node-desc').fill('普通容器的新描述')
+  await page.getByTestId('node-save-desc').click()
+  await expect(page.getByTestId('node-result')).toContainText('Success set')
+  await page.getByTestId('node-set-ctrl-type-input').fill('test')
+  await page.getByTestId('node-set-ctrl-type').click()
+  await expect(page.getByTestId('node-ctrl-type')).toContainText('ctrl.type=test')
+  await page.getByTestId('node-ctrl-new-key').fill('flag')
+  await page.getByTestId('node-ctrl-new-value').fill('1')
+  await page.getByTestId('node-ctrl-add').click()
+  await expect(page.getByTestId('node-result')).toContainText('ctrl.flag')
+
+  // 链接节点：ctrl 只读（引用进入目标，指令层没有改链接自身的路径）
+  await tree.locator('[data-ref="$MEM.alias"]').click()
+  await expect(page.getByTestId('node-ctrl-link-note')).toContainText('只读')
 })
 
 test('handler 节点：区域二类型动作是监听（注册/查看）', async ({ page }) => {
