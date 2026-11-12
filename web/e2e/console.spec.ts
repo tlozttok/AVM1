@@ -129,9 +129,17 @@ test('节点工作台：区域一节点类型编辑 + 区域二 ctrl.type 快捷
   await page.getByTestId('node-desc').fill('普通容器的新描述')
   await page.getByTestId('node-save-desc').click()
   await expect(page.getByTestId('node-result')).toContainText('Success set')
-  await page.getByTestId('node-set-ctrl-type-input').fill('test')
+  await page.getByTestId('node-set-ctrl-type-input').fill('python')
   await page.getByTestId('node-set-ctrl-type').click()
-  await expect(page.getByTestId('node-ctrl-type')).toContainText('ctrl.type=test')
+  await expect(page.getByTestId('node-ctrl-type')).toContainText('ctrl.type=python')
+
+  // 数据类型的快捷修改：content 子节点不存在时自动 memory_make 再 memory_write
+  await page.getByTestId('node-quick-content').fill("def handle(cmd):\n    return 'auto'\n")
+  await page.getByTestId('node-quick-save-content').click()
+  await expect(page.getByTestId('node-result')).toContainText('Success')
+  await expect(page.getByTestId('node-children')).toContainText('content')
+  await expect(page.getByTestId('node-checks').locator('.node-check.is-ok')).toHaveCount(1)
+
   await page.getByTestId('node-ctrl-new-key').fill('flag')
   await page.getByTestId('node-ctrl-new-value').fill('1')
   await page.getByTestId('node-ctrl-add').click()

@@ -5,6 +5,7 @@ import { useOperatorAction } from '../api/useOperatorAction'
 import type { FrameState } from '../lib/frames'
 import {
   childEntries,
+  childNode,
   ctrlTypeOf,
   isHandlerType,
   isProgramType,
@@ -17,6 +18,7 @@ import {
   structureChecks,
   typeSummary,
   type NodeShape,
+  type QuickField,
 } from '../lib/nodeModel'
 import {
   childRef,
@@ -199,6 +201,51 @@ export default function NodeWorkbench({
     }
   }
 
+  /**
+   * 按顺序提交多条指令，只有最后一条让出执行权。
+   * 数据类型的快捷修改用它：目标子节点不存在时先 `memory_make` 建 str，再 `memory_write` 写值，
+   * 两条指令在同一轮安全点前排队，不会在中间把执行权让出去。
+   */
+  const runSequence = async (actions: OperatorAction[]) => {
+    if (!status.canOperate) {
+      setResult({ kind: 'error', text: `${status.label}：当前不可操作` })
+      return
+    }
+    if (actions.length === 0) return
+    setBusy(true)
+    setResult({ kind: 'note', text: `已提交 ${actions.map((action) => action.tool).join(' → ')}，等待工具响应…` })
+    try {
+      for (let index = 0; index < actions.length; index += 1) {
+        const last = index === actions.length - 1
+        await submit({ ...actions[index], release: last })
+      }
+    } catch (err) {
+      setResult({ kind: 'error', text: describeError(err) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** 数据类型的快捷修改：目标子节点不存在时自动用 memory_make 建出来，再写值。 */
+  const saveQuickField = (field: QuickField) => {
+    const value = quickValues[field.key] ?? ''
+    const target = childRef(refName, field.key)
+    const existing = childNode(node, field.key)
+    if (existing !== undefined && existing.kind !== 'str') {
+      setResult({ kind: 'error', text: `${field.label} 对应的子节点不是 str，不能用快捷修改覆盖` })
+      return
+    }
+    if (existing === undefined) {
+      if (shape !== 'dict' && shape !== 'list') {
+        setResult({ kind: 'error', text: `${shapeLabel(shape)} 不能有子节点：无法自动创建 ${field.key}` })
+        return
+      }
+      void runSequence([memoryMake(refName, field.key, 'str'), memoryWrite(target, value)])
+      return
+    }
+    void run(memoryWrite(target, value))
+  }
+
   const runDeviceAction = async (index: number) => {
     if (!device) return
     let args: Record<string, unknown> = {}
@@ -236,6 +283,7 @@ export default function NodeWorkbench({
 
   const checks = structureChecks(node, ctrlType)
   const quick = quickFields(node, ctrlType)
+  const missingQuick = quick.filter((field) => childNode(node, field.key) === undefined)
   const summary = typeSummary(ctrlType)
   const children = childEntries(node)
   const paraRef = quickValues.para_ref ?? paraRefOf(node) ?? ''
@@ -428,6 +476,12 @@ export default function NodeWorkbench({
                 ) : null}
                 {quick.length > 0 ? (
                   <div className="node-quick" data-testid="node-quick">
+                    {missingQuick.length > 0 ? (
+                      <div className="node-note" data-testid="node-quick-missing">
+                        字段 {missingQuick.map((field) => field.key).join('、')} 对应的子节点还不存在：保存时会先
+                        `memory_make` 建 str 节点，再 `memory_write` 写入。
+                      </div>
+                    ) : null}
                     {quick.map((field) => (
                       <div className="node-field" key={field.key}>
                         <label htmlFor={`quick-${field.key}`}>{field.label}</label>
@@ -453,7 +507,7 @@ export default function NodeWorkbench({
                             type="button"
                             data-testid={`node-quick-save-${field.key}`}
                             disabled={busy}
-                            onClick={() => void run(memoryWrite(childRef(refName, field.key), quickValues[field.key] ?? ''))}
+                            onClick={() => saveQuickField(field)}
                           >
                             保存
                           </button>
