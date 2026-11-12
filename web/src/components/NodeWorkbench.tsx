@@ -134,7 +134,7 @@ export default function NodeWorkbench({
   // 节点数据刷新（保存成功后 App 会重取整树）：只同步字段草稿，不清操作结果。
   useEffect(() => {
     setDesc(nodeDescription(node))
-    setValue(typeof node === 'string' ? node : '')
+    setValue(node.kind === 'str' ? node.value : '')
     setQuickValues(Object.fromEntries(quickFields(node, ctrlType).map((field) => [field.key, field.value])))
     setCtrlDrafts(
       Object.fromEntries(Object.entries(nodeCtrl(node) ?? {}).map(([key, raw]) => [key, String(raw)])),
@@ -293,7 +293,7 @@ export default function NodeWorkbench({
                   保存正文（memory_write）
                 </button>
               </div>
-              <div className="node-note">str 节点只有控制数据、没有描述数据；它的 ctrl 经 `/api/memory` 不可见（后端边界）。</div>
+              <div className="node-note">str 节点只有控制数据、没有描述数据；ctrl 在下方控制数据区域查看与编辑。</div>
             </>
           ) : shape === 'link' ? (
             <div className="node-kv">
@@ -349,8 +349,8 @@ export default function NodeWorkbench({
                   {children.map(([key, child]) => (
                     <button key={key} type="button" className="node-child" onClick={() => onSelectNode(childRef(refName, key), child)}>
                       <b>{key}</b>
-                      <span>{typeof child === 'string' ? 'str' : child.kind}</span>
-                      {typeof child !== 'string' && child.kind !== 'device' && child.ctrl && typeof child.ctrl.type === 'string' ? (
+                      <span>{child.kind}</span>
+                      {child.kind !== 'device' && child.ctrl && typeof child.ctrl.type === 'string' ? (
                         <em>{child.ctrl.type}</em>
                       ) : null}
                     </button>
@@ -487,9 +487,10 @@ export default function NodeWorkbench({
 
             <div className="node-ctrl" data-testid="node-ctrl">
               <div className="node-region-sub">控制数据 ctrl（edit_metadata set / del）</div>
-              {ctrl === null ? (
-                <div className="node-note">str 节点的 ctrl 经 `/api/memory` 不可见（后端边界）；要改请用原始动作的 `edit_metadata`。</div>
-              ) : (
+              {ctrl === null || Object.keys(ctrl).length === 0 ? (
+                <div className="node-note">没有控制数据。</div>
+              ) : null}
+              {ctrl === null ? null : (
                 <>
                   {Object.entries(ctrl).map(([key, raw]) => (
                     <div className="node-ctrl-row" key={key}>
@@ -507,21 +508,20 @@ export default function NodeWorkbench({
                       </button>
                     </div>
                   ))}
-                  {Object.keys(ctrl).length === 0 ? <div className="node-note">没有控制数据。</div> : null}
-                  <div className="node-ctrl-row">
-                    <input placeholder="新键" data-testid="node-ctrl-new-key" value={ctrlKey} onChange={(event) => setCtrlKey(event.target.value)} />
-                    <input placeholder="值" data-testid="node-ctrl-new-value" value={ctrlValue} onChange={(event) => setCtrlValue(event.target.value)} />
-                    <button
-                      type="button"
-                      data-testid="node-ctrl-add"
-                      disabled={busy || ctrlKey.trim() === ''}
-                      onClick={() => void run(ctrlSet(refName, ctrlKey.trim(), ctrlValue))}
-                    >
-                      新增键值
-                    </button>
-                  </div>
                 </>
               )}
+              <div className="node-ctrl-row">
+                <input placeholder="新键" data-testid="node-ctrl-new-key" value={ctrlKey} onChange={(event) => setCtrlKey(event.target.value)} />
+                <input placeholder="值" data-testid="node-ctrl-new-value" value={ctrlValue} onChange={(event) => setCtrlValue(event.target.value)} />
+                <button
+                  type="button"
+                  data-testid="node-ctrl-add"
+                  disabled={busy || ctrlKey.trim() === ''}
+                  onClick={() => void run(ctrlSet(refName, ctrlKey.trim(), ctrlValue))}
+                >
+                  新增键值
+                </button>
+              </div>
             </div>
           </section>
         )}

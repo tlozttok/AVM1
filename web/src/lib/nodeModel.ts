@@ -6,13 +6,11 @@ import type { MemoryNode } from '../api/types'
  *   ② 数据类型：ctrl.type（python / settingup / handler / para …）—— 决定快捷修改与类型动作；
  *   ③ 设备：挂载点，行为由设备自己声明。
  *
- * 注意 str 节点在 `/api/memory` 里是纯字符串：它的 ctrl 不可见（后端只导出正文）。
- * 这是当前 API 的边界，界面上如实标注，不在前端猜。
+ * str 节点同样显式导出：`{kind:"str", value, ctrl}`，ctrl 可见可编辑。
  */
 export type NodeShape = 'str' | 'dict' | 'list' | 'link' | 'device'
 
 export function nodeShape(node: MemoryNode): NodeShape {
-  if (typeof node === 'string') return 'str'
   return node.kind
 }
 
@@ -32,14 +30,14 @@ export function shapeLabel(shape: NodeShape): string {
 }
 
 export function nodeDescription(node: MemoryNode): string {
-  if (typeof node === 'string' || node.kind === 'device') return ''
+  if (node.kind === 'device' || node.kind === 'str') return ''
   const meta = node.metadata
   if (meta === null || meta === undefined) return ''
   return typeof meta === 'string' ? meta : JSON.stringify(meta)
 }
 
 export function nodeCtrl(node: MemoryNode): Record<string, unknown> | null {
-  if (typeof node === 'string' || node.kind === 'device') return null
+  if (node.kind === 'device') return null
   return node.ctrl ?? null
 }
 
@@ -89,7 +87,6 @@ export function typeSummary(type: string | null): string | null {
 }
 
 export function childNode(node: MemoryNode, key: string): MemoryNode | undefined {
-  if (typeof node === 'string') return undefined
   if (node.kind === 'dict') return node.children[key]
   if (node.kind === 'list') return node.children[Number(key)]
   return undefined
@@ -97,7 +94,7 @@ export function childNode(node: MemoryNode, key: string): MemoryNode | undefined
 
 export function childString(node: MemoryNode, key: string): string | null {
   const child = childNode(node, key)
-  return typeof child === 'string' ? child : null
+  return child !== undefined && child.kind === 'str' ? child.value : null
 }
 
 export function paraRefOf(node: MemoryNode): string | null {
@@ -105,7 +102,6 @@ export function paraRefOf(node: MemoryNode): string | null {
 }
 
 export function childEntries(node: MemoryNode): [string, MemoryNode][] {
-  if (typeof node === 'string') return []
   if (node.kind === 'dict') return Object.entries(node.children)
   if (node.kind === 'list') return node.children.map((child, index) => [String(index), child])
   return []
@@ -161,9 +157,9 @@ export function quickFields(node: MemoryNode, type: string | null): QuickField[]
   }
   if (isParaType(type)) {
     return childEntries(node)
-      .filter(([, child]) => typeof child === 'string')
+      .filter(([, child]) => child.kind === 'str')
       .slice(0, 8)
-      .map(([key, child]) => ({ key, label: key, kind: 'text' as const, value: child as string }))
+      .map(([key, child]) => ({ key, label: key, kind: 'text' as const, value: child.kind === 'str' ? child.value : '' }))
   }
   return []
 }

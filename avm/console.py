@@ -45,7 +45,7 @@ from .exceptions import VMMemoryError, RunnerStop
 from .io_bus import IOBus
 from .io_devices import IOInputDevice, IOOutputDevice
 from .memory_device import MemoryDevice, MetaListDevice
-from .types import MetaDict, MetaList, LinkNode
+from .types import MetaDict, MetaList, LinkNode, StrNode
 
 
 # ----------------------------------------------------------------------
@@ -127,23 +127,32 @@ def _describe_device(device: MemoryDevice) -> dict:
     return out
 
 
-def _jsonable(value: Any) -> Any:
-    """把内存节点与运行时对象转成可 JSON 化的结构。"""
-    if value is None or isinstance(value, (bool, int, float, str)):
+def _jsonable(value: Any, node_view: bool = False) -> Any:
+    """把内存节点与运行时对象转成可 JSON 化的结构。
+
+    node_view=True 用于 `/api/memory`：str 叶子也按节点导出（kind/value/ctrl），
+    ctrl 因此可见；其它用途（事件、动作结果）保持 str 的普通 JSON 语义。
+    """
+    if isinstance(value, str):
+        if node_view:
+            ctrl = value.get_ctrl() if isinstance(value, StrNode) else None
+            return {"kind": "str", "metadata": None, "ctrl": ctrl, "value": str(value)}
+        return value
+    if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, MetaDict):
         return {
             "kind": "dict",
             "metadata": value.get_metadata(),
             "ctrl": value.get_ctrl(),
-            "children": {str(k): _jsonable(v) for k, v in value.items()},
+            "children": {str(k): _jsonable(v, node_view) for k, v in value.items()},
         }
     if isinstance(value, MetaList):
         return {
             "kind": "list",
             "metadata": value.get_metadata(),
             "ctrl": value.get_ctrl(),
-            "children": [_jsonable(v) for v in value],
+            "children": [_jsonable(v, node_view) for v in value],
         }
     if isinstance(value, LinkNode):
         # 链接节点：只报 target 与元数据，不跟随（面板展示的是树本身）
@@ -156,9 +165,9 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, MemoryDevice):
         return _describe_device(value)
     if isinstance(value, dict):
-        return {str(k): _jsonable(v) for k, v in value.items()}
+        return {str(k): _jsonable(v, node_view) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
-        return [_jsonable(v) for v in value]
+        return [_jsonable(v, node_view) for v in value]
     return repr(value)
 
 
@@ -550,7 +559,7 @@ class Console:
         # （host_flags["console"]）这一读等在面板输入队列上，所以这个端点会挂起，
         # 直到有人在面板里喂一行（POST /api/device-action）——不再是挂起在终端上等敲键盘。
         target = ref if ref else "$MEM"
-        return {"ref": target, "node": _jsonable(self.core.unwrap(target, for_llm=False))}
+        return {"ref": target, "node": _jsonable(self.core.unwrap(target, for_llm=False), node_view=True)}
 
     def listeners(self) -> dict:
         from .events import EventSystem

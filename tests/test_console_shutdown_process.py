@@ -273,7 +273,7 @@ def test_shutdown_interrupt_writes_snapshot_and_restart_recovers(tmp_path):
         # resume 后 boot 角色由中断唤醒并把断电寄存器复位成 on，第二次关机才有边沿。
         _wait_for(
             lambda: _request(port2, "/api/memory?ref=$MEM.sys.power.state",
-                             token=token2)[1]["node"] == "on",
+                             token=token2)[1]["node"]["value"] == "on",
             message="resume 后 boot 没有复位 power.state",
         )
         code, body = _request(port2, "/api/system/shutdown", "POST", {}, token2)

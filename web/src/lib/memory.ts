@@ -6,7 +6,7 @@ export function resolveRef(root: MemoryNode, ref: string): MemoryNode | null {
   const parts = ref.split('.').slice(1)
   let node: MemoryNode = root
   for (const part of parts) {
-    if (typeof node === 'string' || node.kind === 'device') return null
+    if (node.kind === 'device' || node.kind === 'str') return null
     // 链接节点在树里没有子节点：能定位到它自己，再往下不跟随（跟随是寻址的事）
     if (node.kind === 'link') return null
     if (node.kind === 'dict') {

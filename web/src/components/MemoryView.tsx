@@ -1,8 +1,8 @@
 import type { DictNode, ListNode, MemoryNode } from '../api/types'
 
 function NodeBody({ node, depth }: { node: MemoryNode; depth: number }) {
-  if (typeof node === 'string') {
-    return <div className="value">{node === '' ? <span className="muted">（空字符串）</span> : node}</div>
+  if (node.kind === 'str') {
+    return <div className="value">{node.value === '' ? <span className="muted">（空字符串）</span> : node.value}</div>
   }
   if (node.kind === 'device') {
     return (
@@ -69,7 +69,7 @@ function NodeBody({ node, depth }: { node: MemoryNode; depth: number }) {
             <tr key={key}>
               <td className="key-cell">{key}</td>
               <td>
-                {typeof child === 'string' || child.kind === 'device' ? (
+                {child.kind === 'device' || child.kind === 'str' ? (
                   <NodeBody node={child} depth={depth + 1} />
                 ) : depth >= 2 ? (
                   <span className="muted">（更深一层，去左栏展开）</span>

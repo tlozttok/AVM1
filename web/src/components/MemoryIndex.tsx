@@ -21,7 +21,6 @@ function mountedDevice(ref: string, devices: DeviceInfo[]): DeviceInfo | undefin
 }
 
 function childEntries(node: MemoryNode): [string, MemoryNode][] {
-  if (typeof node === 'string') return []
   if (node.kind === 'dict') return Object.entries(node.children)
   if (node.kind === 'list') return node.children.map((child, index) => [String(index), child])
   return []
@@ -53,11 +52,11 @@ export default function MemoryIndex({
     const children = childEntries(node)
     const isContainer = children.length > 0
     const isOpen = expanded.has(ref)
-    const device = typeof node !== 'string' && node.kind === 'link' ? mountedDevice(ref, devices) : undefined
+    const device = node.kind === 'link' ? mountedDevice(ref, devices) : undefined
     const shape = nodeShape(node)
     let kindText: string
     if (device) kindText = device.type
-    else if (typeof node !== 'string' && node.kind === 'link') kindText = `→ ${node.target}`
+    else if (node.kind === 'link') kindText = `→ ${node.target}`
     else kindText = shapeLabel(shape)
     const ctrlType = ctrlTypeOf(node)
 

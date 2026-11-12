@@ -17,7 +17,7 @@ import pytest
 from avm.console import Console, serve
 from avm.core import Core, _build_tools
 from avm.memory_device import InputsListDevice, MemoryDevice
-from avm.types import MetaDict
+from avm.types import MetaDict, StrNode
 
 
 class MockLMU:
@@ -100,6 +100,7 @@ def env(tmp_path):
     core = Core()
     core.lmu = MockLMU()
     core.mem["note"] = MetaDict(data={"v": "hi"}, metadata="一条笔记", ctrl={"owner": "0"})
+    core.mem["tag"] = StrNode("important", ctrl={"type": "tag"})
     core.mem["h"] = MetaDict(data={"content": "def handle(event):\n    return {}\n"},
                              ctrl={"type": "handler"})
     core.mem["own"] = MetaDict(data={"child": ""}, ctrl={"owner": "0"})
@@ -166,7 +167,17 @@ class TestReadEndpoints:
         assert body["node"]["kind"] == "dict"
         assert body["node"]["metadata"] == "一条笔记"
         assert body["node"]["ctrl"] == {"owner": "0"}
-        assert body["node"]["children"]["v"] == "hi"
+        assert body["node"]["children"]["v"] == {
+            "kind": "str", "metadata": None, "ctrl": None, "value": "hi",
+        }
+
+    def test_memory_str_node_exports_ctrl(self, env):
+        code, body = request(env[2], "GET", "/api/memory?ref=$MEM.tag")
+        assert code == 200
+        assert body["node"] == {
+            "kind": "str", "metadata": None,
+            "ctrl": {"type": "tag"}, "value": "important",
+        }
 
     def test_memory_whole_tree(self, env):
         code, body = request(env[2], "GET", "/api/memory")

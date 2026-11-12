@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import { resolveRef } from './memory'
-import type { LinkNode, MemoryNode } from '../api/types'
+import type { LinkNode, MemoryNode, StrNode } from '../api/types'
 
 const link: LinkNode = { kind: 'link', target: '$MEM.note', metadata: '链接', ctrl: null }
+
+function str(value: string): StrNode {
+  return { kind: 'str', metadata: null, ctrl: null, value }
+}
 
 const root: MemoryNode = {
   kind: 'dict',
@@ -13,17 +17,17 @@ const root: MemoryNode = {
       kind: 'dict',
       metadata: '一条笔记',
       ctrl: { owner: '0' },
-      children: { v: 'hi' },
+      children: { v: str('hi') },
     },
-    items: { kind: 'list', metadata: null, ctrl: null, children: ['a', 'b'] },
+    items: { kind: 'list', metadata: null, ctrl: null, children: [str('a'), str('b')] },
     alias: link,
   },
 }
 
 describe('resolveRef', () => {
   it('按段定位 dict 与 list 子节点', () => {
-    expect(resolveRef(root, '$MEM.note.v')).toBe('hi')
-    expect(resolveRef(root, '$MEM.items.1')).toBe('b')
+    expect(resolveRef(root, '$MEM.note.v')).toEqual(str('hi'))
+    expect(resolveRef(root, '$MEM.items.1')).toEqual(str('b'))
     expect(resolveRef(root, '$MEM.items.2')).toBeNull()
     expect(resolveRef(root, '$MEM.note.ghost')).toBeNull()
   })
@@ -46,7 +50,7 @@ describe('resolveRef', () => {
           pretend_as_type: null,
           preview: 'box',
         },
-        leaf: 'text',
+        leaf: str('text'),
       },
     } as MemoryNode
     expect(resolveRef(withDevice, '$MEM.dev')).not.toBeNull()
