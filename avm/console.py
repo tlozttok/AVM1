@@ -600,26 +600,15 @@ class Console:
     # -- 设备审批：只读检查 -------------------------------------------
 
     def _inspect_roots(self) -> List[str]:
-        """允许检查的目录：镜像目录 + 已安装程序包的源目录。
+        """允许检查的目录：只认镜像目录。
 
         审批弹窗只能检查宿主世界里的设备文件；任意路径（/etc/passwd、用户 home）
-        一律拒绝。包源目录来自安装记录，已卸载的包不再出现在允许范围里。
+        一律拒绝。镜像之外的目录由 OS 自己在镜像里组织，不进审批可见范围。
         """
         roots = []
         image_dir = getattr(self.core, "image_dir", None)
         if isinstance(image_dir, str) and image_dir:
             roots.append(os.path.realpath(image_dir))
-        records = self.core.mem._data.get("package_records")
-        if isinstance(records, MetaDict):
-            for _name, versions in records.items():
-                if not isinstance(versions, MetaDict):
-                    continue
-                for _version, record in versions.items():
-                    if not isinstance(record, MetaDict):
-                        continue
-                    source = record.get("source")
-                    if isinstance(source, str) and source:
-                        roots.append(os.path.dirname(os.path.realpath(source)))
         return sorted(set(roots))
 
     def _existing_device_spec(self, path: str, mount: Optional[str] = None) -> Optional[dict]:
@@ -655,7 +644,7 @@ class Console:
         """只读检查一台设备文件：路径、大小、哈希、类名、挂载信息与现有来源表条目。
 
         不 import 设备代码（类名从 AST 取），不挂载、不写内存。路径必须落在
-        镜像目录或程序包源目录内；拒绝只读探测宿主任意文件。
+        镜像目录内；拒绝只读探测宿主任意文件。
         """
         from .image import _sha256_file
 
@@ -667,13 +656,13 @@ class Console:
             raise ValueError("args 必须是对象")
         roots = self._inspect_roots()
         if not roots:
-            raise ValueError("当前内核没有镜像目录或程序包目录，拒绝检查任意路径")
+            raise ValueError("当前内核没有镜像目录，拒绝检查任意路径")
         base = roots[0]
         target = os.path.realpath(
             path if os.path.isabs(path) else os.path.join(base, path)
         )
         if not _path_within(target, roots):
-            raise ValueError(f"设备文件路径必须落在镜像目录或程序包目录内：{path}")
+            raise ValueError(f"设备文件路径必须落在镜像目录内：{path}")
         if not os.path.isfile(target):
             raise ValueError(f"设备文件不存在：{path}")
         classes = _device_classes_in_file(target)

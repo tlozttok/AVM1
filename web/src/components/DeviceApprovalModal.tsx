@@ -14,7 +14,7 @@ interface Props {
  * 设备审批的全屏模态。
  *
  * 默认拒绝：焦点在"拒绝"；"允许"必须先用复选框主动确认，键盘没有直接允许的快捷键。
- * 这里只展示与确认，不自己提交；装载请求由外层经 `/api/action` 写 `$MEM.loader`。
+ * 这里只展示与确认，不自己提交；装载请求由外层经 `/api/action` 写 `$MEM.device_loader`。
  */
 export default function DeviceApprovalModal({
   inspection,
@@ -102,7 +102,7 @@ export default function DeviceApprovalModal({
               </li>
               <li>批准绑定的是上面这个文件的 sha256；文件内容变化必须重新审批。</li>
               <li>
-                审批是人的决定，不是内核强制的安全沙箱：能写 <code>$MEM.loader</code> 的对话知道哈希就能装载。
+                审批是人的决定，不是内核强制的安全沙箱：能写 <code>$MEM.device_loader</code> 的对话知道哈希就能装载。
               </li>
             </ul>
           </div>

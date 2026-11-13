@@ -243,7 +243,7 @@ def _rebuild_memory_and_devices(core, doc: dict) -> None:
                 "args": spec.get("args") or {},
                 "id": spec.get("id"),
                 # 恢复只带记录哈希；快照里的 approved_sha256 是历史审批事实，
-                # 不参与本次核对（否则像包安装那样它可能是程序包哈希而非设备哈希）。
+                # 不参与本次核对。
                 "sha256": recorded_sha256,
             }, base=None)
         except ValueError as e:  # ImageError：报错里已有设备名、路径与期望/实际哈希

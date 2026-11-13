@@ -83,7 +83,7 @@ Python 程序对同样的输入序列只有同样的输出；非最后一条消�
 
 ## 持久运行与跨轮状态
 
-镜像可以声明 `journal_to`（回合日志）与 `snapshot_to`（重启快照）：每个提交回合记一条状态增量，正常退出时写快照；快照只是加速缓存。重启用 `--mode resume|reboot|reset`（`resume` = 快照 + 日志尾部，`reboot` = 快照世界段 + 世界类效果重放，`reset` = 原始镜像），或直接启动——不传 mode 时 `boot` 自动使用可读快照。机制细节见 [docs/runtime.md 的「启动模式与 guest 程序」](runtime.md#启动模式与-guest-程序)与[「持久运行」](runtime.md#持久运行重启恢复--回合日志--程序包)。
+镜像可以声明 `journal_to`（回合日志）与 `snapshot_to`（重启快照）：每个提交回合记一条状态增量，正常退出时写快照；快照只是加速缓存。重启用 `--mode resume|reboot|reset`（`resume` = 快照 + 日志尾部，`reboot` = 快照世界段 + 世界类效果重放，`reset` = 原始镜像），或直接启动——不传 mode 时 `boot` 自动使用可读快照。机制细节见 [docs/runtime.md 的「启动模式与 guest 程序」](runtime.md#启动模式与-guest-程序)与[「持久运行」](runtime.md#持久运行重启恢复--回合日志)。
 
 对写程序的人来说只有一条硬约定：**Python 程序的跨轮状态必须落在 `$MEM`**。PLM 的命名空间不序列化——恢复后执行器重建，Core 重放 system 消息（setup 代码），但历史里的 user/tool 消息不会被重新执行（副作用不能重复发生）。把状态存在命名空间变量里，恢复后就丢了。
 

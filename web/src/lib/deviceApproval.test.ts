@@ -50,7 +50,7 @@ describe('buildLoadDeviceCommand', () => {
     })
   })
 
-  it('不会把 password 写进命令（密码字段已从 loader 移除）', () => {
+  it('不会把 password 写进命令（密码字段已从设备装载入口移除）', () => {
     const command = buildLoadDeviceCommand({
       inspection: inspection(),
       mount: 'extra',

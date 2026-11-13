@@ -2,7 +2,7 @@
   "meta": {
     "name": "base",
     "version": 1,
-    "description": "母板镜像：持久化三件套 + 装载设备 + OS 程序（boot/shutdown 角色与 clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架 + 构造器命令程序与统一命令入口 shell（均为 plm.command）。空闲由宿主面板对话承担；不带业务；其余基础由作者在系统内手动搭建。",
+    "description": "母板镜像：持久化三件套 + 设备装载入口 + OS 程序（boot/shutdown 角色与 clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架 + 构造器命令程序与统一命令入口 shell（均为 plm.command）。空闲由宿主面板对话承担；不带业务；其余基础由作者在系统内手动搭建。",
     "instruction_budget": 100,
     "snapshot_every": 200,
     "guest_programs": {
@@ -314,16 +314,6 @@
       },
       "meta": "系统分区"
     },
-    "packages": {
-      "kind": "dict",
-      "value": {},
-      "meta": "已安装程序包（由装载设备管理）"
-    },
-    "package_records": {
-      "kind": "dict",
-      "value": {},
-      "meta": "程序包安装记录"
-    },
     "workshop": {
       "kind": "dict",
       "value": {},
@@ -334,7 +324,7 @@
       "value": {},
       "meta": "个人持久数据区"
     },
-    "loader": {
+    "device_loader": {
       "kind": "device"
     },
     "AVMRepo": {
@@ -349,9 +339,9 @@
   },
   "devices": [
     {
-      "path": "loader",
-      "file": "../packages/loader.py",
-      "class": "LoaderDevice",
+      "path": "device_loader",
+      "file": "../devices/device_loader.py",
+      "class": "DeviceLoader",
       "args": {}
     },
     {

@@ -1,6 +1,6 @@
 """生成 base 镜像：`python images/base/build_image.py`。
 
-base 只放八样：持久化三件套、装载设备 + 只读仓库设备、OS 程序节点
+base 只放八样：持久化三件套、设备装载入口 + 只读仓库设备、OS 程序节点
 （boot/shutdown 两个 guest 角色程序 + clock_a/clock_b 服务程序）、可编辑的常驻
 服务清单、空分区骨架、标准 IO 设备、构造器命令程序（`plm.command`：一个程序节点
 `$MEM.sys.programs.builder` + 一个 para 档 `$MEM.para.builder`，作者可直接
@@ -11,8 +11,9 @@ create_cmd 出来用）、统一命令入口 shell（`plm.command`：程序节�
 声明 idle 角色、不预置 inbox/面板服务；关机由宿主挂 `shutdown` 中断唤醒
 supervisor。其余基础由作者在系统内手动搭建，见 README.md。
 
-设备文件按相对路径引用（`../packages/loader.py`、`../devices/*`），因此镜像可以
-直接放在仓库里运行；装载设备/程序包必须带面板审批得到的 `approved_sha256`。
+设备文件按相对路径引用（`../devices/*`），因此镜像可以直接放在仓库里运行；
+运行期装载设备代码必须带面板审批得到的 `approved_sha256`（设备装载入口只做这一件事，
+软件包怎么分发与安装是 OS 的事，见 docs/porting-contract.md）。
 
 base.json 由本脚本首次生成后就是种子：仓库里的 base.json 已提交，作者在系统内
 改它；只有需要从程序源重建镜像时才重新运行本脚本。
@@ -110,7 +111,7 @@ def build():
             "name": "base",
             "version": 1,
             "description": (
-                "母板镜像：持久化三件套 + 装载设备 + OS 程序（boot/shutdown 角色与 "
+                "母板镜像：持久化三件套 + 设备装载入口 + OS 程序（boot/shutdown 角色与 "
                 "clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架 + "
                 "构造器命令程序与统一命令入口 shell（均为 plm.command）。"
                 "空闲由宿主面板对话承担；不带业务；其余基础由作者在系统内手动搭建。"
@@ -208,20 +209,18 @@ def build():
                 },
                 meta="系统分区",
             ),
-            "packages": _dict({}, meta="已安装程序包（由装载设备管理）"),
-            "package_records": _dict({}, meta="程序包安装记录"),
             "workshop": _dict({}, meta="系统内生长、试验新程序节点的区域"),
             "home": _dict({}, meta="个人持久数据区"),
-            "loader": {"kind": "device"},
+            "device_loader": {"kind": "device"},
             "AVMRepo": {"kind": "device"},
             "inputs": {"kind": "device"},
             "outputs": {"kind": "device"},
         },
         "devices": [
             {
-                "path": "loader",
-                "file": "../packages/loader.py",
-                "class": "LoaderDevice",
+                "path": "device_loader",
+                "file": "../devices/device_loader.py",
+                "class": "DeviceLoader",
                 "args": {},
             },
             {

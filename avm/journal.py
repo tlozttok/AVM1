@@ -423,7 +423,7 @@ def _effect_memory_delete(core, effect) -> None:
 
 
 def _effect_memory_attach(core, effect) -> None:
-    """把一段子树挂到真实段路径（程序包安装用；内核态整体替换，不建中间节点元数据）。"""
+    """把一段子树挂到真实段路径（内核态整体替换，不建中间节点元数据）。"""
     path = effect.get("path")
     if not isinstance(path, list) or not path:
         raise VMMemoryError("memory_attach 的 path 必须是非空段列表")
@@ -452,7 +452,7 @@ def _effect_memory_attach(core, effect) -> None:
 
 
 def _effect_memory_detach(core, effect) -> None:
-    """摘除真实段路径上的子树（程序包卸载用；整棵子树回收留给内存管理计划）。"""
+    """摘除真实段路径上的子树（整棵子树回收留给内存管理计划）。"""
     path = effect.get("path")
     if not isinstance(path, list) or not path:
         raise VMMemoryError("memory_detach 的 path 必须是非空段列表")

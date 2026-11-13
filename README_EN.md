@@ -29,7 +29,7 @@ python main.py <image.json> --frames      # print monitor frame summary after ru
 python main.py <image.json> --transcript api.txt  # write full API calls to a file
 ```
 
-Debug settings live in `debug.json` (`image` / `frames` / `transcript` / `checkpoint_in`) so the command line does not need to change (VSCode runs `python main.py` fixed; `--debug-config <file>` selects another config file). Example images: `images/base/base.json` (motherboard image; long-running persistence + OS programs) and `images/packages/packages_demo.json` (loader/package demo). See the "System Images" section of [docs/runtime.md](docs/runtime.md) for the composition and key points.
+Debug settings live in `debug.json` (`image` / `frames` / `transcript` / `checkpoint_in`) so the command line does not need to change (VSCode runs `python main.py` fixed; `--debug-config <file>` selects another config file). Example image: `images/base/base.json` (motherboard image; long-running persistence + OS programs). See the "System Images" section of [docs/runtime.md](docs/runtime.md) for the composition and key points.
 
 ### Debug Panel
 

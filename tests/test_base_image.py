@@ -6,9 +6,11 @@
    `$MEM.sys.idle.state` 之类节点；
 2. 清单：manifest 有服务时 boot 程序按清单创建对话并写 registry；
 3. 面板写入：面板对话的普通写入进日志、可重放，快照 + 日志尾部恢复后仍在；
-4. 装载设备：经 loader 装入临时设备，日志重放后设备仍在；
+4. 设备装载入口：经 device_loader 装入临时设备，日志重放后设备仍在；
 5. 无阻塞：base 的程序里都没有 `$MEM.inputs.next` 阻塞读；
-6. 约定清理：base 不再有 inbox / idle.state / power.request 节点。
+6. 约定清理：base 不再有 inbox / idle.state / power.request 节点；
+7. 分区与设备集合：mem 只有 para / sys / workshop / home / device_loader 与设备挂载
+   点；设备是 device_loader / AVMRepo / inputs / outputs。
 """
 
 import hashlib
@@ -267,7 +269,7 @@ def test_panel_write_survives_snapshot_and_journal_tail(tmp_path):
     assert f"cid={PANEL_CID} " not in restored.unwrap("$MEM.conversations")
 
 
-def test_loader_mounts_device_and_replay_keeps_it(tmp_path):
+def test_device_loader_mounts_device_and_replay_keeps_it(tmp_path):
     device_source = tmp_path / "echo_dev.py"
     device_source.write_text(
         "from avm.memory_device import MemoryDevice\n"
@@ -300,7 +302,7 @@ def test_loader_mounts_device_and_replay_keeps_it(tmp_path):
     panel = core.bind_console_conversation(channel, para_ref="$MEM.para.python")
     _panel_actions(core, channel, panel, [
         {"tool": "memory_write",
-         "arguments": {"ref": "$MEM.loader", "content": command}},
+         "arguments": {"ref": "$MEM.device_loader", "content": command}},
         {"end": True},
     ])
     assert "echo" in core.mem._devices
@@ -336,3 +338,20 @@ def test_base_image_drops_old_os_conventions():
         "boot": "$MEM.sys.programs.boot",
         "shutdown": "$MEM.sys.programs.supervisor",
     }
+
+
+def test_base_image_mem_partitions_and_device_loader():
+    with open(BASE_IMAGE, encoding="utf-8") as f:
+        image = json.load(f)
+    # 包机制归 OS：base 的 mem 只有这些分区，不再有包与安装记录的空分区。
+    assert set(image["mem"]) == {
+        "para", "sys", "workshop", "home", "device_loader",
+        "AVMRepo", "inputs", "outputs",
+    }
+    assert image["mem"]["device_loader"] == {"kind": "device"}
+    devices = {dev["path"]: dev for dev in image["devices"]}
+    assert set(devices) == {"device_loader", "AVMRepo", "inputs", "outputs"}
+    entry = devices["device_loader"]
+    assert entry["file"] == "../devices/device_loader.py"
+    assert entry["class"] == "DeviceLoader"
+    assert entry["args"] == {}

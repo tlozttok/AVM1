@@ -269,28 +269,28 @@ class TestDeviceInspect:
         assert body["existing"]["sha256"] == digest
         assert body["existing"]["approved_via"] == "panel-1"
 
-    def test_inspect_allows_installed_package_directory(self, env, tmp_path):
+    def test_inspect_only_accepts_image_directory(self, env, tmp_path):
         core, console, base, _ = env
         image_dir = tmp_path / "image"
         image_dir.mkdir()
         core.image_dir = str(image_dir)
-        package_dir = tmp_path / "pkg"
-        package_dir.mkdir()
-        device_file = self._device_file(package_dir, "pkg_dev.py")
-        record = MetaDict(data={})
-        record["source"] = str(package_dir / "demo.pkg.json")
-        versions = MetaDict(data={})
-        versions["1_0_0"] = record
-        records = MetaDict(data={})
-        records["demo"] = versions
-        core.mem._data["package_records"] = records
+        outside_dir = tmp_path / "pkg"
+        outside_dir.mkdir()
+        outside = self._device_file(outside_dir, "pkg_dev.py")
 
+        # 审批可见目录只认镜像目录：镜像之外的目录一律拒绝。
         code, body = request(base, "POST", "/api/device/inspect", {
-            "path": str(device_file),
+            "path": str(outside),
+        })
+        assert code == 400
+        assert "镜像目录" in body["error"]
+
+        inside = self._device_file(image_dir, "inside.py")
+        code, body = request(base, "POST", "/api/device/inspect", {
+            "path": str(inside),
         })
         assert code == 200, body
-        assert body["path"] == str(device_file.resolve())
-        assert body["class"] == "EchoDevice"
+        assert body["path"] == str(inside.resolve())
 
     def test_inspect_rejects_path_outside_image_directory(self, env, tmp_path):
         core, console, base, _ = env
@@ -302,7 +302,7 @@ class TestDeviceInspect:
             "path": str(outside),
         })
         assert code == 400
-        assert "镜像目录或程序包目录" in body["error"]
+        assert "镜像目录" in body["error"]
 
     def test_inspect_rejects_arbitrary_absolute_path(self, env, tmp_path):
         core, console, base, _ = env
@@ -313,7 +313,7 @@ class TestDeviceInspect:
             "path": "/etc/passwd",
         })
         assert code == 400
-        assert "镜像目录或程序包目录" in body["error"]
+        assert "镜像目录" in body["error"]
 
     def test_inspect_rejects_class_not_in_file(self, env, tmp_path):
         core, console, base, _ = env

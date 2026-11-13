@@ -1,5 +1,5 @@
 /**
- * 设备审批的纯逻辑：哈希展示与 `memory_write $MEM.loader` 命令构造。
+ * 设备审批的纯逻辑：哈希展示与 `memory_write $MEM.device_loader` 命令构造。
  *
  * 后端契约：审批值就是设备文件的内容哈希（`sha256`），装载时内核会重新计算并核对；
  * 面板只负责把"人看到的那段代码"的哈希随命令送进操作员通道。
@@ -7,7 +7,7 @@
 
 import type { DeviceInspection } from '../api/types'
 
-/** 短哈希：首 12 位（与安装记录/首屏展示一致）。 */
+/** 短哈希：首 12 位（与来源表/首屏展示一致）。 */
 export function shortHash(hash: string, length = 12): string {
   return hash.slice(0, length)
 }
@@ -21,7 +21,7 @@ export interface LoadDeviceRequest {
   approvedVia: string
 }
 
-/** 构造 loader 的 load_device 命令（JSON 字符串，写入 `$MEM.loader`）。 */
+/** 构造 device_loader 的 load_device 命令（JSON 字符串，写入 `$MEM.device_loader`）。 */
 export function buildLoadDeviceCommand(req: LoadDeviceRequest): string {
   const command: Record<string, unknown> = {
     action: 'load_device',
@@ -36,7 +36,7 @@ export function buildLoadDeviceCommand(req: LoadDeviceRequest): string {
   return JSON.stringify(command)
 }
 
-/** 旧哈希摘要：首次安装返回 null，覆盖旧版本时给弹窗显示。 */
+/** 旧哈希摘要：首次装载返回 null，覆盖旧代码时给弹窗显示。 */
 export function previousHash(inspection: DeviceInspection): string | null {
   return inspection.existing?.sha256 ?? null
 }

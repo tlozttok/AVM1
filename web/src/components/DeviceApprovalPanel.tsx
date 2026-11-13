@@ -12,7 +12,7 @@ interface Props {
  * 装载设备的最小入口：填写文件/挂载/类，先只读检查，再弹全屏审批。
  *
  * 允许后把 load_device 命令（带 `approved_sha256`）经 `/api/action` 写进
- * `$MEM.loader`——与操作员手工提交一条 memory_write 完全相同，走面板对话、
+ * `$MEM.device_loader`——与操作员手工提交一条 memory_write 完全相同，走面板对话、
  * 自动中断与可重放日志。拒绝则只在本地丢弃，不碰内核。
  */
 export default function DeviceApprovalPanel({ onRefresh }: Props) {
@@ -102,7 +102,7 @@ export default function DeviceApprovalPanel({ onRefresh }: Props) {
       })
       await apiSend<ActionResponse>('/api/action', 'POST', {
         tool: 'memory_write',
-        arguments: { ref: '$MEM.loader', content: command },
+        arguments: { ref: '$MEM.device_loader', content: command },
       })
       setMessage('已提交装载请求（面板对话执行后出现在设备表）')
       setInspection(null)
@@ -127,7 +127,7 @@ export default function DeviceApprovalPanel({ onRefresh }: Props) {
           <input
             type="text"
             data-testid="device-approval-file"
-            placeholder="设备文件路径（镜像目录或包目录内）"
+            placeholder="设备文件路径（镜像目录内）"
             value={file}
             onChange={(e) => setFile(e.target.value)}
           />

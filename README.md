@@ -17,7 +17,7 @@ AVM 不是 Agent 框架。它不预设编排模式，不提供业务提示词，
 ```json
 {
   "meta": { "name": "base", "version": 1,
-            "description": "母板镜像：持久化三件套 + 装载设备 + OS 程序 + 空分区骨架",
+            "description": "母板镜像：持久化三件套 + 设备装载入口 + OS 程序 + 空分区骨架",
             "instruction_budget": 100, "snapshot_every": 200,
             "guest_programs": { "boot": "$MEM.sys.programs.boot",
                                 "shutdown": "$MEM.sys.programs.supervisor" } },
@@ -32,13 +32,13 @@ AVM 不是 Agent 框架。它不预设编排模式，不提供业务提示词，
                     "value": { "content": { "kind": "str", "value": "def boot(): ..." } } } } }
       }
     },
-    "loader": { "kind": "device" },
+    "device_loader": { "kind": "device" },
     "inputs": { "kind": "device" },
     "outputs": { "kind": "device" }
   },
   "para_ref": "$MEM.para.python",
   "devices": [
-    { "path": "loader",  "file": "../packages/loader.py", "class": "LoaderDevice",      "args": {} },
+    { "path": "device_loader", "file": "../devices/device_loader.py", "class": "DeviceLoader", "args": {} },
     { "path": "inputs",  "file": "../devices/io.py",      "class": "InputsListDevice",  "args": {} },
     { "path": "outputs", "file": "../devices/io.py",      "class": "OutputsListDevice", "args": {} }
   ],
@@ -73,11 +73,11 @@ python scripts/run_console.py images/base/base.json
 
 Windows 上如果控制台是英文 locale（cp1252），入口脚本打印的中文进度行会报 `UnicodeEncodeError`；设 `PYTHONIOENCODING=utf-8` 即可。
 
-示例镜像保留两块：母板镜像 `images/base/base.json`（长期运行、持久化与 OS 程序，见 [images/base/README.md](images/base/README.md)）与程序包装载演示 `images/packages/packages_demo.json`（loader + 示例包，见 [images/packages/README.md](images/packages/README.md)）。系统镜像的组成与要点见 [docs/runtime.md](docs/runtime.md) 的「系统镜像」一节。
+示例镜像只保留母板镜像 `images/base/base.json`（长期运行、持久化与 OS 程序，见 [images/base/README.md](images/base/README.md)）。系统镜像的组成与要点见 [docs/runtime.md](docs/runtime.md) 的「系统镜像」一节。
 
 ## 状态
 
-- 用例数约 1141，全部走 MockLMU；CI 覆盖 ubuntu / windows × Python 3.12 / 3.13 四个组合。
+- 用例数约 1198，全部走 MockLMU；CI 覆盖 ubuntu / windows × Python 3.12 / 3.13 四个组合。
 - 尚未发布 release。接口仍在变动，镜像格式以 `docs/system-image.md` 为准。
 - 许可证 AGPL-3.0：个人使用、修改、分发都可以；把它嵌进对外提供的服务需要同样开源。
 
@@ -90,4 +90,4 @@ Windows 上如果控制台是英文 locale（cp1252），入口脚本打印的�
 - [docs/system-image.md](docs/system-image.md) — 系统镜像格式规范
 - [docs/examples/python_as_conversation.md](docs/examples/python_as_conversation.md) — 示例：Python 程序如何无损表示为"对话 + 工具调用"
 - [docs/capabilities.md](docs/capabilities.md) — 能力模型与权限机制：根表与动态授予根/工具面/事件策略/Guard/ACL 示例
-- [docs/porting-contract.md](docs/porting-contract.md) — 移植契约：把外部编排方案写成 AVM 程序包的交付约定
+- [docs/porting-contract.md](docs/porting-contract.md) — 移植契约：把外部编排方案交付成 AVM 软件的约定

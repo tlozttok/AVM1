@@ -2015,7 +2015,7 @@ class Core:
         self._turn_effects.append({"kind": kind, **payload})
 
     def note_effects(self, effects: List[dict]) -> None:
-        """批量记效果（程序包安装/卸载等一步产生多条状态变化的操作用）。"""
+        """批量记效果（一步产生多条状态变化的操作用）。"""
         if not self._journaling():
             return
         self._turn_effects.extend(effects)

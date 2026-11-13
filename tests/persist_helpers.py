@@ -1,4 +1,4 @@
-"""持久运行（journal / snapshot / packages）测试共用夹具。
+"""持久运行（journal / snapshot / 设备装载）测试共用夹具。
 
 不调真实 API：LLM 对话用脚本化执行器（行为与真 LMU 一致：消费批次、提交历史、
 返回 return_calls）；需要确定性时用 `plm.python` 的 Python 对话。

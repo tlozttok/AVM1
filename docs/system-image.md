@@ -157,7 +157,7 @@ python -m avm.image <image.json>
 - `model` 是 PLM 注册名（如 `plm.custom`），不能与内建注册表重名；
 - `file` 是实现文件，相对镜像目录；`class` 必须是 `avm.python_server.PLMServer` 的子类；
 - 装载发生在模型目录安装之前，因此模型目录会列出它；`create_cmd` / `create_sub` 的程序节点用 `para.model` 选择它；
-- 镜像声明的 PLM 只在当前核内可见，不随程序包分发（移植契约的硬约束）。
+- 镜像声明的 PLM 只在当前核内可见，不随交付物分发（移植契约的硬约束）。
 
 镜像也可以声明自定义 PLM；普通确定性服务优先写成 `plm.command` 程序——程序正文本身就是内存节点，改动不需要换执行器，也不需要新增 PLM 类型。参考 [images/base/README.md](../images/base/README.md) 的「构造器命令程序（plm.command）」一节。
 
@@ -205,7 +205,7 @@ init 强制内核态：程序 `ctrl.caps.mode` 声明 `user` 时装载报 `Image
 
 之后 `core.run()`；若声明 `persist_to`，在 `finally` 中写回内存（异常也写）；若声明 `snapshot_to`，在安全点退出时写重启快照（中断与未捕获异常不写，避免把半截回合拍进缓存）。
 
-恢复与快照的语义见 [runtime.md 的「持久运行」](runtime.md#持久运行重启恢复--回合日志--程序包)。宿主入口：`python -m avm.image <image.json> --mode resume|reboot|reset` / `--restore <snapshot>`（等价于显式快照的 `resume`），`python main.py <image.json>` 同样支持，控制台入口 `python -m avm.console` 也接受这两个参数。
+恢复与快照的语义见 [runtime.md 的「持久运行」](runtime.md#持久运行重启恢复--回合日志)。宿主入口：`python -m avm.image <image.json> --mode resume|reboot|reset` / `--restore <snapshot>`（等价于显式快照的 `resume`），`python main.py <image.json>` 同样支持，控制台入口 `python -m avm.console` 也接受这两个参数。
 
 错误不吞：格式错误输出到 stderr，CLI 退出码 1。
 

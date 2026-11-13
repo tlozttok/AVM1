@@ -166,7 +166,7 @@ def _device_entry_fields(dev: dict, base: Optional[str], subject: str = "设备"
     """解析设备条目的形状并解析文件路径，不 import、不读文件。
 
     返回字段字典：path/subject/class/args/builtin/file_path/device_id。
-    镜像 devices 段、程序包 devices 段、日志重放与 loader 热装共用。
+    镜像 devices 段、日志重放与运行期设备装载共用。
     """
     if not isinstance(dev, dict):
         raise ImageError(f"{subject}条目必须是对象，得到 {type(dev).__name__}")
@@ -211,7 +211,7 @@ def _verify_device_sha256(fields: dict, dev: dict) -> Optional[str]:
     这是哈希校验的唯一落点（设备审批计划的 B 段），四条装载路径都经过
     `mount_device_entry`。规则：
 
-    - 带 `approved_sha256`（loader 热装请求）时，文件哈希必须与批准值相等；
+    - 带 `approved_sha256`（运行期设备装载请求）时，文件哈希必须与批准值相等；
     - 不带批准值但 spec 里有 `sha256`（快照恢复 / 日志重放 / 镜像重载）时，
       必须与记录值相等；
     - 两者都没有（镜像首次冷装载）时，计算并记录实际哈希。
@@ -239,7 +239,7 @@ def _verify_device_sha256(fields: dict, dev: dict) -> Optional[str]:
 
 def resolve_device_entry(dev: dict, base: Optional[str], subject: str = "设备",
                          *, file_sha256: Optional[str] = None):
-    """解析一条 devices 条目（镜像 devices 段或程序包 devices 段）→ (cls, args, id, spec)。
+    """解析一条 devices 条目（镜像 devices 段或运行期装载请求）→ (cls, args, id, spec)。
 
     纯解析 + 加载设备模块，不挂载。spec 是设备来源表条目（快照/日志重放用）：
     绝对路径 + 类名 + 构造参数 + 标识符 + 是否内建；文件型设备带内容哈希 sha256。
@@ -269,7 +269,7 @@ def resolve_device_entry(dev: dict, base: Optional[str], subject: str = "设备"
     }
     if file_path is not None:
         spec["sha256"] = file_sha256
-    # 审批记录只在 loader 装载时随请求带上；镜像冷装载与日志重放都不带这些字段。
+    # 审批记录只在运行期装载时随请求带上；镜像冷装载与日志重放都不带这些字段。
     for key in ("approved_sha256", "approved_at", "approved_via"):
         value = dev.get(key)
         if value is not None:
@@ -278,7 +278,7 @@ def resolve_device_entry(dev: dict, base: Optional[str], subject: str = "设备"
 
 
 def instantiate_device(cls, args: dict, device_id, subject: str = "设备"):
-    """实例化一台设备并设置标识符（args 与构造函数不匹配是镜像/包格式错误）。"""
+    """实例化一台设备并设置标识符（args 与构造函数不匹配是设备条目错误）。"""
     try:
         device = cls(**args)
     except TypeError as e:
@@ -296,7 +296,7 @@ def mount_device_entry(core: Core, dev: dict, base: Optional[str] = None) -> dic
     哈希校验只在这里发生（设备审批计划的唯一落点）：文件型设备在 import 之前
     重算 sha256，与请求的 approved_sha256 或 spec 的 sha256 比对；不相等拒绝装载。
     挂载是纯内存操作（Memory.mount 只改设备表与挂载点链接节点，不发事件），
-    所以在指令执行中途调用是安全的；程序包装载、日志重放与镜像装载共用这一条路径。
+    所以在指令执行中途调用是安全的；运行期装载、日志重放与镜像装载共用这一条路径。
     """
     fields = _device_entry_fields(dev, base)
     actual_sha256 = _verify_device_sha256(fields, dev)
