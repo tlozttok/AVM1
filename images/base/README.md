@@ -30,7 +30,17 @@ python -m avm.console images/base/base.json
 | `$MEM.workshop` / `$MEM.home` | 试验区 / 个人数据区（空） |
 | `$MEM.device_loader` | 设备装载入口：宿主/操作员审批后把一段宿主 Python 挂成设备，命令只保留 `load_device` |
 | `$MEM.AVMRepo` | 仓库只读设备（查文档用） |
+| `$MEM.pkgrepo` | OS 包仓库设备（只读）：向根地址写入一行相对路径装载；验证后读 `.manifest` / `.data` / `.files` / `.read."<相对路径>"`。设备不 import 设备代码、不写安装事务，装载/安装归 OS |
 | `$MEM.inputs` / `$MEM.outputs` | 标准 IO 设备；操作面板宿主会替换成总线设备 |
+
+包仓库设备的最小用法（`root` 缺省是仓库根，写入路径相对它）：
+
+```text
+memory_write $MEM.pkgrepo "pkgs/demo"
+memory_read  $MEM.pkgrepo.data
+```
+
+装载只验证路径与包格式并缓存文件清单；安装仍是 OS 程序读设备后写 `$MEM` 的事。
 
 OS 程序节点里 `ctrl.type="python"`、`value.content` 是程序源、`value.para_ref` 指向
 `$MEM.para.python`；服务节点的 `value.name`（`clock_a` / `clock_b` / `shell`）会成为

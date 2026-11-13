@@ -2,7 +2,7 @@
   "meta": {
     "name": "base",
     "version": 1,
-    "description": "母板镜像：持久化三件套 + 设备装载入口 + OS 程序（boot/shutdown 角色与 clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架 + 构造器命令程序与统一命令入口 shell（均为 plm.command）。空闲由宿主面板对话承担；不带业务；其余基础由作者在系统内手动搭建。",
+    "description": "母板镜像：持久化三件套 + 设备装载入口 + 包仓库设备（只读，OS 的包接入示例）+ OS 程序（boot/shutdown 角色与 clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架 + 构造器命令程序与统一命令入口 shell（均为 plm.command）。空闲由宿主面板对话承担；不带业务；其余基础由作者在系统内手动搭建。",
     "instruction_budget": 100,
     "snapshot_every": 200,
     "guest_programs": {
@@ -309,7 +309,7 @@
         },
         "handbook": {
           "kind": "str",
-          "value": "base 约定：sys.boot.manifest 是常驻服务清单（JSON 字符串）；sys.registry 是 manifest 服务名字→cid；sys.shell 是统一命令入口（commands 注册 program/para 引用、args 暂存）；sys.clock 是设备事件钟；sys.power.state 是断电寄存器（OS 写 off，VM 在安全点读取）；空闲由宿主面板对话承担（idle 中断向量指向面板），关机由宿主挂 shutdown 中断唤醒 supervisor；改 sys.programs.boot 的内容就是改下一次启动运行的引导程序。"
+          "value": "base 约定：sys.boot.manifest 是常驻服务清单（JSON 字符串）；sys.registry 是 manifest 服务名字→cid；sys.shell 是统一命令入口（commands 注册 program/para 引用、args 暂存）；sys.clock 是设备事件钟；sys.power.state 是断电寄存器（OS 写 off，VM 在安全点读取）；空闲由宿主面板对话承担（idle 中断向量指向面板），关机由宿主挂 shutdown 中断唤醒 supervisor；pkgrepo 是 OS 的包接入设备（只读接入，装载/安装归 OS）；改 sys.programs.boot 的内容就是改下一次启动运行的引导程序。"
         }
       },
       "meta": "系统分区"
@@ -330,6 +330,9 @@
     "AVMRepo": {
       "kind": "device"
     },
+    "pkgrepo": {
+      "kind": "device"
+    },
     "inputs": {
       "kind": "device"
     },
@@ -348,6 +351,12 @@
       "path": "AVMRepo",
       "file": "../devices/avm_repo.py",
       "class": "RepoDevice",
+      "args": {}
+    },
+    {
+      "path": "pkgrepo",
+      "file": "../devices/pkg_repo.py",
+      "class": "PackageRepoDevice",
       "args": {}
     },
     {

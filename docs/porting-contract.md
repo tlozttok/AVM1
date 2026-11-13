@@ -41,7 +41,17 @@ description: "把外部编排方案交付成 AVM 软件的契约：交付物、O
 
 VM 只提供内存树、指令与设备。包怎么分发、装到哪里、装什么，由 OS 决定；下面三条是 **OS 侧约定**，不是 VM 的校验规则：
 
-1. **接入**：OS 在宿主侧挂一台只读包仓库设备（例如把宿主上的包目录暴露为 `$MEM.pkgrepo`），按现有 `MemoryDevice` 子类实现，读接口只取内容、哈希与元数据。包进入 AVM 的唯一通道是设备。
+1. **接入**：base 镜像已带示例设备 `$MEM.pkgrepo`（`PackageRepoDevice`，`images/devices/pkg_repo.py`），只读，按现有 `MemoryDevice` 子类实现。向根地址写入一行相对路径装载，验证通过后读接口暴露包文件：
+
+   ```text
+   memory_write $MEM.pkgrepo "pkgs/demo"      # 空串或纯空白清除装载；失败保留旧包
+   $MEM.pkgrepo.manifest                      # manifest.json 原文
+   $MEM.pkgrepo.data                          # data.json 原文（显式节点，根为 dict）
+   $MEM.pkgrepo.files                         # 每行：相对路径 字节 sha256
+   $MEM.pkgrepo.read."devices/echo.py"        # 包内已列文件全文
+   ```
+
+   这个设备的包格式（`manifest.json` / `data.json` / 可选 `install.py` / 可选 `devices/*.py`）是 **OS 层约定**：设备按它验证路径与内容，VM 不校验、不理解；设备不 import/执行包里的 Python，也不写安装事务。
 2. **搬运**：OS 的安装程序读仓库设备内容，按 OS 自己的分区约定用 `memory_make` / `memory_write` / `edit_metadata` 把节点搬到 `$MEM`，自己维护安装记录、版本指针、升级与回滚策略。
 3. **设备代码**：宿主 Python 由宿主/操作员审批后挂载；`mount_device_entry` 在 import 前重算文件哈希并核对。base 镜像的 `$MEM.device_loader`（`load_device` 命令）是这条通道的示例入口，不是 VM 规定的唯一入口。
 
@@ -129,7 +139,7 @@ python -m pytest <交付目录或 tests/ 下的自测> -q    # 全绿
 - 文件放一起：数据节点包目录、安装程序节点正文、设备文件、`README.md`、账本、场景、自测。
 - 包格式与版本字段是 OS 自己的约定，VM 不读；把版本写进 `$MEM` 键时不能含点号。
 - 升级/回滚由 OS 的安装程序与分区约定实现；VM 不提供版本指针。
-- 交付时说明它依赖镜像的哪些前提（例如需要 OS 挂的只读包仓库设备、需要 `$MEM.device_loader` 之类的设备装载入口、需要某个 PLM 类型）。
+- 交付时说明它依赖镜像的哪些前提（例如需要镜像挂的只读包仓库设备（base 的 `$MEM.pkgrepo`）、需要 `$MEM.device_loader` 之类的设备装载入口、需要某个 PLM 类型）。
 
 ## 讨论区
 

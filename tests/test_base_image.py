@@ -10,7 +10,7 @@
 5. 无阻塞：base 的程序里都没有 `$MEM.inputs.next` 阻塞读；
 6. 约定清理：base 不再有 inbox / idle.state / power.request 节点；
 7. 分区与设备集合：mem 只有 para / sys / workshop / home / device_loader 与设备挂载
-   点；设备是 device_loader / AVMRepo / inputs / outputs。
+   点；设备是 device_loader / AVMRepo / pkgrepo / inputs / outputs。
 """
 
 import hashlib
@@ -343,15 +343,21 @@ def test_base_image_drops_old_os_conventions():
 def test_base_image_mem_partitions_and_device_loader():
     with open(BASE_IMAGE, encoding="utf-8") as f:
         image = json.load(f)
-    # 包机制归 OS：base 的 mem 只有这些分区，不再有包与安装记录的空分区。
+    # 包机制归 OS：base 的 mem 只有这些分区，不再有包与安装记录的空分区；
+    # pkgrepo 是 OS 的包接入设备（只读，装载/安装归 OS）。
     assert set(image["mem"]) == {
         "para", "sys", "workshop", "home", "device_loader",
-        "AVMRepo", "inputs", "outputs",
+        "AVMRepo", "pkgrepo", "inputs", "outputs",
     }
     assert image["mem"]["device_loader"] == {"kind": "device"}
+    assert image["mem"]["pkgrepo"] == {"kind": "device"}
     devices = {dev["path"]: dev for dev in image["devices"]}
-    assert set(devices) == {"device_loader", "AVMRepo", "inputs", "outputs"}
+    assert set(devices) == {"device_loader", "AVMRepo", "pkgrepo", "inputs", "outputs"}
     entry = devices["device_loader"]
     assert entry["file"] == "../devices/device_loader.py"
     assert entry["class"] == "DeviceLoader"
     assert entry["args"] == {}
+    pkg_entry = devices["pkgrepo"]
+    assert pkg_entry["file"] == "../devices/pkg_repo.py"
+    assert pkg_entry["class"] == "PackageRepoDevice"
+    assert pkg_entry["args"] == {}

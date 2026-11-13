@@ -1,12 +1,12 @@
 """生成 base 镜像：`python images/base/build_image.py`。
 
-base 只放八样：持久化三件套、设备装载入口 + 只读仓库设备、OS 程序节点
-（boot/shutdown 两个 guest 角色程序 + clock_a/clock_b 服务程序）、可编辑的常驻
-服务清单、空分区骨架、标准 IO 设备、构造器命令程序（`plm.command`：一个程序节点
-`$MEM.sys.programs.builder` + 一个 para 档 `$MEM.para.builder`，作者可直接
-create_cmd 出来用）、统一命令入口 shell（`plm.command`：程序节点
-`$MEM.sys.programs.shell` + para 档 `$MEM.para.shell` + 注册表分区
-`$MEM.sys.shell`，boot 按名字创建常驻服务对话）。
+base 只放九样：持久化三件套、设备装载入口 + 只读仓库设备、OS 包仓库设备、
+OS 程序节点（boot/shutdown 两个 guest 角色程序 + clock_a/clock_b 服务程序）、
+可编辑的常驻服务清单、空分区骨架、标准 IO 设备、构造器命令程序
+（`plm.command`：一个程序节点 `$MEM.sys.programs.builder` + 一个 para 档
+`$MEM.para.builder`，作者可直接 create_cmd 出来用）、统一命令入口 shell
+（`plm.command`：程序节点 `$MEM.sys.programs.shell` + para 档
+`$MEM.para.shell` + 注册表分区 `$MEM.sys.shell`，boot 按名字创建常驻服务对话）。
 空闲由宿主 console 的面板对话承担（内核把 `idle` 中断向量指向面板），镜像不再
 声明 idle 角色、不预置 inbox/面板服务；关机由宿主挂 `shutdown` 中断唤醒
 supervisor。其余基础由作者在系统内手动搭建，见 README.md。
@@ -111,9 +111,10 @@ def build():
             "name": "base",
             "version": 1,
             "description": (
-                "母板镜像：持久化三件套 + 设备装载入口 + OS 程序（boot/shutdown 角色与 "
-                "clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架 + "
-                "构造器命令程序与统一命令入口 shell（均为 plm.command）。"
+                "母板镜像：持久化三件套 + 设备装载入口 + 包仓库设备（只读，OS 的包接入"
+                "示例）+ OS 程序（boot/shutdown 角色与 clock_a/clock_b 服务）+ 可编辑的"
+                "常驻服务清单 + 空分区骨架 + 构造器命令程序与统一命令入口 shell"
+                "（均为 plm.command）。"
                 "空闲由宿主面板对话承担；不带业务；其余基础由作者在系统内手动搭建。"
             ),
             "instruction_budget": 100,
@@ -203,6 +204,7 @@ def build():
                         "sys.power.state 是断电寄存器（OS 写 off，VM 在安全点读取）；"
                         "空闲由宿主面板对话承担（idle 中断向量指向面板），关机由宿主挂 "
                         "shutdown 中断唤醒 supervisor；"
+                        "pkgrepo 是 OS 的包接入设备（只读接入，装载/安装归 OS）；"
                         "改 sys.programs.boot 的内容就是改下一次启动运行的引导程序。",
                         "分区与自举约定；作者可编辑",
                     ),
@@ -213,6 +215,7 @@ def build():
             "home": _dict({}, meta="个人持久数据区"),
             "device_loader": {"kind": "device"},
             "AVMRepo": {"kind": "device"},
+            "pkgrepo": {"kind": "device"},
             "inputs": {"kind": "device"},
             "outputs": {"kind": "device"},
         },
@@ -227,6 +230,12 @@ def build():
                 "path": "AVMRepo",
                 "file": "../devices/avm_repo.py",
                 "class": "RepoDevice",
+                "args": {},
+            },
+            {
+                "path": "pkgrepo",
+                "file": "../devices/pkg_repo.py",
+                "class": "PackageRepoDevice",
                 "args": {},
             },
             {
