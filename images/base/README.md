@@ -41,6 +41,9 @@ memory_read  $MEM.pkgrepo.data
 ```
 
 装载只验证路径与包格式并缓存文件清单；安装仍是 OS 程序读设备后写 `$MEM` 的事。
+`.files` 每行 `相对路径 字节 sha256`、无表头，行序固定为 `manifest.json`、`data.json`、
+`install.py`（若有）、`devices/*.py`（按文件名排序）。base 的 `root` 缺省是仓库根，方便在
+仓库里试；正式系统应在自己的镜像里把 `devices.args.root` 指向专门的包目录。
 
 OS 程序节点里 `ctrl.type="python"`、`value.content` 是程序源、`value.para_ref` 指向
 `$MEM.para.python`；服务节点的 `value.name`（`clock_a` / `clock_b` / `shell`）会成为

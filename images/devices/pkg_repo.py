@@ -6,7 +6,9 @@
     $MEM.pkgrepo.manifest              manifest.json 原文
     $MEM.pkgrepo.data                  data.json 原文
     $MEM.pkgrepo.installer             install.py 原文（包没有该文件时报错）
-    $MEM.pkgrepo.files                 文件清单：每行 `<相对路径> <字节> <sha256>`
+    $MEM.pkgrepo.files                 文件清单：每行 `<相对路径> <字节> <sha256>`，无表头；
+                                      行序固定为 manifest.json、data.json、install.py（若有）、
+                                      devices/*.py（按文件名排序）
     $MEM.pkgrepo.read."<相对路径>"      读包内已列文件全文
 
 写接口只在根地址：向 `$MEM.pkgrepo` 写入**一行相对路径**（相对本设备的 root）装载包；
