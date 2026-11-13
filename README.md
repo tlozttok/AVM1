@@ -77,7 +77,7 @@ Windows 上如果控制台是英文 locale（cp1252），入口脚本打印的�
 
 ## 状态
 
-- 用例数约 1256，全部走 MockLMU；CI 覆盖 ubuntu / windows × Python 3.12 / 3.13 四个组合。
+- 用例数约 1257，全部走 MockLMU；CI 覆盖 ubuntu / windows × Python 3.12 / 3.13 四个组合。
 - 尚未发布 release。接口仍在变动，镜像格式以 `docs/system-image.md` 为准。
 - 许可证 AGPL-3.0：个人使用、修改、分发都可以；把它嵌进对外提供的服务需要同样开源。
 

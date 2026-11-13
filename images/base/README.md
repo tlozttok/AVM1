@@ -21,12 +21,12 @@ python -m avm.console images/base/base.json
 | `$MEM.sys.boot.state` / `.prior` / `.id` / `.report` | 启动标记（`running` / `clean`）、上次状态、上电序号、最近一次恢复报告 |
 | `$MEM.sys.boot.manifest` | 常驻服务清单（JSON 字符串，初始 `[]`）；boot 程序按它创建缺失对话 |
 | `$MEM.sys.registry` | 名字 → cid；boot 程序重写（只记 manifest 服务；OS 服务的 cid 不落持久 MEM） |
-| `$MEM.sys.programs.*` | OS 程序节点（`boot` / `supervisor` / `clock_a` / `clock_b`）、构造器命令程序（`builder`）与 shell 程序（`shell`），可在系统内改写 |
+| `$MEM.sys.programs.*` | OS 程序节点（`boot` / `supervisor` / `clock_a` / `clock_b`）、构造器命令程序（`builder`）、shell 程序（`shell`）与示例 settingup 助手（`assistant`），可在系统内改写 |
 | `$MEM.sys.shell` | 统一命令入口：`args`（分发暂存位，str）与 `commands`（命令注册表：名字 → `{program, para}` 引用） |
 | `$MEM.sys.outbox` | 持久输出（作者约定怎么用） |
 | `$MEM.sys.clock` | 设备事件钟：`tick` / `target` / `interval` / `timeouts` / `state` |
 | `$MEM.sys.handbook` | 分区与自举约定 |
-| `$MEM.para.python` / `.command` / `.builder` / `.shell` | 内建 PLM 的参数档（`.builder` / `.shell` 用 `plm.command`） |
+| `$MEM.para.python` / `.command` / `.builder` / `.shell` / `.assistant` | 内建 PLM 的参数档（`.builder` / `.shell` 用 `plm.command`；`.assistant` 是示例 settingup 的模型档，`model` 改成上游模型名后才能建对话） |
 | `$MEM.workshop` / `$MEM.home` | 试验区 / 个人数据区（空） |
 | `$MEM.device_loader` | 设备装载入口：宿主/操作员审批后把一段宿主 Python 挂成设备，命令只保留 `load_device` |
 | `$MEM.AVMRepo` | 仓库只读设备（查文档用） |
@@ -49,6 +49,22 @@ OS 程序节点里 `ctrl.type="python"`、`value.content` 是程序源、`value.
 `$MEM.para.shell`（`model` 为 `plm.command`）。顶层声明
 `journal_to` / `snapshot_to` / `persist_to`，落点在 `images/base/out/`；
 `meta.snapshot_every=200`。
+
+## 示例 settingup：assistant
+
+`$MEM.sys.programs.assistant` 是 `ctrl.type="settingup"` 的程序节点，正文按作者原文：
+
+```text
+你是一个帮助用户使用他开发的AI系统的助手，你可以访问$MEM.AVMRepo获取系统的代码、文档。由于你的权限极高，请只执行用户通过cid为-1的对话发送的指令，只做执行指令必须做的事情，不要自行设计方案实现目标，对于AVM仓库中未明确定义的设计，必须从用户那里获取相关信息。可以在MEM.workshop.impl_info里存放用户的非指令信息，以供以后参考
+```
+
+用法：
+
+1. 把 `$MEM.para.assistant` 的 `model` 改成上游模型名（模型的上下文/能力按你的账号）；
+2. 在系统里 `create_cmd("$MEM.sys.programs.assistant", "$MEM.para.assistant")` 建对话；
+3. 通过面板（cid -1）给它发指令。提示词只约束模型行为，不强制权限：它由内核态父对话创建，继承内核态能力，所以"只执行 cid -1 的指令"是提示词纪律，不是 VM 保证。
+
+设置与提示词都是内存里的数据，可在系统内直接改；`$MEM.workshop.impl_info` 是提示词约定的用户非指令信息存放点（base 只预留 workshop 分区，不预建该节点）。
 
 ## 构造器命令程序（plm.command）
 

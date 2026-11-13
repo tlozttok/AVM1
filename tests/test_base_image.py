@@ -10,7 +10,8 @@
 5. 无阻塞：base 的程序里都没有 `$MEM.inputs.next` 阻塞读；
 6. 约定清理：base 不再有 inbox / idle.state / power.request 节点；
 7. 分区与设备集合：mem 只有 para / sys / workshop / home / device_loader 与设备挂载
-   点；设备是 device_loader / AVMRepo / pkgrepo / inputs / outputs。
+   点；设备是 device_loader / AVMRepo / pkgrepo / inputs / outputs；
+8. 示例 settingup：$MEM.sys.programs.assistant 的提示词按作者原文，para 可改模型。
 """
 
 import hashlib
@@ -320,10 +321,32 @@ def test_base_programs_have_no_blocking_input_read():
     programs = image["mem"]["sys"]["value"]["programs"]["value"]
     assert set(programs) == {
         "boot", "supervisor", "clock_a", "clock_b", "builder", "shell",
+        "assistant",
     }
     for name, node in programs.items():
         content = node["value"]["content"]["value"]
         assert "$MEM.inputs.next" not in content, f"程序 {name} 含阻塞读"
+
+
+def test_base_assistant_settingup_example():
+    """示例 settingup：提示词按作者原文，模型档位可改，节点可被 create_cmd 使用。"""
+    with open(BASE_IMAGE, encoding="utf-8") as f:
+        image = json.load(f)
+    programs = image["mem"]["sys"]["value"]["programs"]["value"]
+    node = programs["assistant"]
+    assert node["ctrl"] == {"type": "settingup"}
+    assert node["value"]["name"] == {"kind": "str", "value": "assistant"}
+    expected = (
+        "你是一个帮助用户使用他开发的AI系统的助手，你可以访问$MEM.AVMRepo获取系统的代码、文档。"
+        "由于你的权限极高，请只执行用户通过cid为-1的对话发送的指令，只做执行指令必须做的事情，"
+        "不要自行设计方案实现目标，对于AVM仓库中未明确定义的设计，必须从用户那里获取相关信息。"
+        "可以在MEM.workshop.impl_info里存放用户的非指令信息，以供以后参考"
+    )
+    assert node["value"]["content"] == {"kind": "str", "value": expected}
+    para = image["mem"]["para"]["value"]["assistant"]
+    assert para["ctrl"] == {"type": "para"}
+    assert isinstance(para["value"]["model"]["value"], str)
+    assert para["value"]["model"]["value"]
 
 
 def test_base_image_drops_old_os_conventions():

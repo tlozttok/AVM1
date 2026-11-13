@@ -1,12 +1,14 @@
 """生成 base 镜像：`python images/base/build_image.py`。
 
-base 只放九样：持久化三件套、设备装载入口 + 只读仓库设备、OS 包仓库设备、
+base 只放十样：持久化三件套、设备装载入口 + 只读仓库设备、OS 包仓库设备、
 OS 程序节点（boot/shutdown 两个 guest 角色程序 + clock_a/clock_b 服务程序）、
 可编辑的常驻服务清单、空分区骨架、标准 IO 设备、构造器命令程序
 （`plm.command`：一个程序节点 `$MEM.sys.programs.builder` + 一个 para 档
 `$MEM.para.builder`，作者可直接 create_cmd 出来用）、统一命令入口 shell
 （`plm.command`：程序节点 `$MEM.sys.programs.shell` + para 档
-`$MEM.para.shell` + 注册表分区 `$MEM.sys.shell`，boot 按名字创建常驻服务对话）。
+`$MEM.para.shell` + 注册表分区 `$MEM.sys.shell`，boot 按名字创建常驻服务对话）、
+示例 settingup 助手（`$MEM.sys.programs.assistant` + `$MEM.para.assistant`，
+提示词按作者原文；模型档位与提示词由作者在系统内改）。
 空闲由宿主 console 的面板对话承担（内核把 `idle` 中断向量指向面板），镜像不再
 声明 idle 角色、不预置 inbox/面板服务；关机由宿主挂 `shutdown` 中断唤醒
 supervisor。其余基础由作者在系统内手动搭建，见 README.md。
@@ -80,9 +82,27 @@ def _program_python(source, meta, name=None, para_ref="$MEM.para.python"):
     return _dict(value, meta=meta, ctrl={"type": "python"})
 
 
+def _program_settingup(content, meta, name):
+    """settingup 程序节点：ctrl.type="settingup"，value 里是 name + 提示词正文。"""
+    return _dict(
+        {"name": _str(name), "content": _str(content)},
+        meta=meta,
+        ctrl={"type": "settingup"},
+    )
+
+
 def _read_program(filename):
     with open(os.path.join(PROGRAM_DIR, filename), "r", encoding="utf-8") as f:
         return f.read()
+
+
+# 作者原文：base 的示例 settingup 提示词。不要改措辞；作者要改会在系统内改节点。
+ASSISTANT_PROMPT = (
+    "你是一个帮助用户使用他开发的AI系统的助手，你可以访问$MEM.AVMRepo获取系统的代码、文档。"
+    "由于你的权限极高，请只执行用户通过cid为-1的对话发送的指令，只做执行指令必须做的事情，"
+    "不要自行设计方案实现目标，对于AVM仓库中未明确定义的设计，必须从用户那里获取相关信息。"
+    "可以在MEM.workshop.impl_info里存放用户的非指令信息，以供以后参考"
+)
 
 
 def build():
@@ -105,6 +125,11 @@ def build():
         name="shell",
         para_ref="$MEM.para.shell",
     )
+    programs["assistant"] = _program_settingup(
+        ASSISTANT_PROMPT,
+        "示例 settingup：高权限助手（提示词按作者原文；模型档位与提示词作者可改）",
+        name="assistant",
+    )
 
     image = {
         "meta": {
@@ -114,7 +139,7 @@ def build():
                 "母板镜像：持久化三件套 + 设备装载入口 + 包仓库设备（只读，OS 的包接入"
                 "示例）+ OS 程序（boot/shutdown 角色与 clock_a/clock_b 服务）+ 可编辑的"
                 "常驻服务清单 + 空分区骨架 + 构造器命令程序与统一命令入口 shell"
-                "（均为 plm.command）。"
+                "（均为 plm.command）+ 示例 settingup 助手（高权限提示词，模型档位可改）。"
                 "空闲由宿主面板对话承担；不带业务；其余基础由作者在系统内手动搭建。"
             ),
             "instruction_budget": 100,
@@ -132,6 +157,11 @@ def build():
                     "command": _para("plm.command"),
                     "builder": _para("plm.command"),
                     "shell": _para("plm.command"),
+                    "assistant": _dict(
+                        {"model": _str("gpt-4o-mini")},
+                        meta="示例 settingup 的模型档位：把 model 改成你的上游模型名后再 create_cmd",
+                        ctrl={"type": "para"},
+                    ),
                 },
                 meta="模型档位；新的 para 由作者在系统内添加",
             ),
@@ -205,6 +235,8 @@ def build():
                         "空闲由宿主面板对话承担（idle 中断向量指向面板），关机由宿主挂 "
                         "shutdown 中断唤醒 supervisor；"
                         "pkgrepo 是 OS 的包接入设备（只读接入，装载/安装归 OS）；"
+                        "sys.programs.assistant 是示例 settingup（高权限助手），"
+                        "para.assistant 的 model 改成上游模型名后才能创建对话；"
                         "改 sys.programs.boot 的内容就是改下一次启动运行的引导程序。",
                         "分区与自举约定；作者可编辑",
                     ),

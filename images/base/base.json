@@ -2,7 +2,7 @@
   "meta": {
     "name": "base",
     "version": 1,
-    "description": "母板镜像：持久化三件套 + 设备装载入口 + 包仓库设备（只读，OS 的包接入示例）+ OS 程序（boot/shutdown 角色与 clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架 + 构造器命令程序与统一命令入口 shell（均为 plm.command）。空闲由宿主面板对话承担；不带业务；其余基础由作者在系统内手动搭建。",
+    "description": "母板镜像：持久化三件套 + 设备装载入口 + 包仓库设备（只读，OS 的包接入示例）+ OS 程序（boot/shutdown 角色与 clock_a/clock_b 服务）+ 可编辑的常驻服务清单 + 空分区骨架 + 构造器命令程序与统一命令入口 shell（均为 plm.command）+ 示例 settingup 助手（高权限提示词，模型档位可改）。空闲由宿主面板对话承担；不带业务；其余基础由作者在系统内手动搭建。",
     "instruction_budget": 100,
     "snapshot_every": 200,
     "guest_programs": {
@@ -63,6 +63,19 @@
             }
           },
           "meta": "模型调用参数",
+          "ctrl": {
+            "type": "para"
+          }
+        },
+        "assistant": {
+          "kind": "dict",
+          "value": {
+            "model": {
+              "kind": "str",
+              "value": "gpt-4o-mini"
+            }
+          },
+          "meta": "示例 settingup 的模型档位：把 model 改成你的上游模型名后再 create_cmd",
           "ctrl": {
             "type": "para"
           }
@@ -272,6 +285,23 @@
               "ctrl": {
                 "type": "python"
               }
+            },
+            "assistant": {
+              "kind": "dict",
+              "value": {
+                "name": {
+                  "kind": "str",
+                  "value": "assistant"
+                },
+                "content": {
+                  "kind": "str",
+                  "value": "你是一个帮助用户使用他开发的AI系统的助手，你可以访问$MEM.AVMRepo获取系统的代码、文档。由于你的权限极高，请只执行用户通过cid为-1的对话发送的指令，只做执行指令必须做的事情，不要自行设计方案实现目标，对于AVM仓库中未明确定义的设计，必须从用户那里获取相关信息。可以在MEM.workshop.impl_info里存放用户的非指令信息，以供以后参考"
+                }
+              },
+              "meta": "示例 settingup：高权限助手（提示词按作者原文；模型档位与提示词作者可改）",
+              "ctrl": {
+                "type": "settingup"
+              }
             }
           },
           "meta": "系统程序节点（OS 程序 + 作者程序）"
@@ -309,7 +339,7 @@
         },
         "handbook": {
           "kind": "str",
-          "value": "base 约定：sys.boot.manifest 是常驻服务清单（JSON 字符串）；sys.registry 是 manifest 服务名字→cid；sys.shell 是统一命令入口（commands 注册 program/para 引用、args 暂存）；sys.clock 是设备事件钟；sys.power.state 是断电寄存器（OS 写 off，VM 在安全点读取）；空闲由宿主面板对话承担（idle 中断向量指向面板），关机由宿主挂 shutdown 中断唤醒 supervisor；pkgrepo 是 OS 的包接入设备（只读接入，装载/安装归 OS）；改 sys.programs.boot 的内容就是改下一次启动运行的引导程序。"
+          "value": "base 约定：sys.boot.manifest 是常驻服务清单（JSON 字符串）；sys.registry 是 manifest 服务名字→cid；sys.shell 是统一命令入口（commands 注册 program/para 引用、args 暂存）；sys.clock 是设备事件钟；sys.power.state 是断电寄存器（OS 写 off，VM 在安全点读取）；空闲由宿主面板对话承担（idle 中断向量指向面板），关机由宿主挂 shutdown 中断唤醒 supervisor；pkgrepo 是 OS 的包接入设备（只读接入，装载/安装归 OS）；sys.programs.assistant 是示例 settingup（高权限助手），para.assistant 的 model 改成上游模型名后才能创建对话；改 sys.programs.boot 的内容就是改下一次启动运行的引导程序。"
         }
       },
       "meta": "系统分区"
