@@ -39,6 +39,8 @@ description: "把外部编排方案交付成 AVM 软件的契约：交付物、O
 
 ## 包数据怎么进 AVM
 
+一个可照抄的最小示例见 [packages/sysinfo](../packages/sysinfo/README.md)（数据节点包 + `plm.command` 安装程序 + 设备代码，含手动安装步骤）。
+
 VM 只提供内存树、指令与设备。包怎么分发、装到哪里、装什么，由 OS 决定；下面三条是 **OS 侧约定**，不是 VM 的校验规则：
 
 1. **接入**：base 镜像已带示例设备 `$MEM.pkgrepo`（`PackageRepoDevice`，`images/devices/pkg_repo.py`），只读，按现有 `MemoryDevice` 子类实现。向根地址写入一行相对路径装载，验证通过后读接口暴露包文件：

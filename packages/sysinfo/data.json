@@ -1,0 +1,21 @@
+{
+  "kind": "dict",
+  "value": {
+    "name": {
+      "kind": "str",
+      "value": "sysinfo"
+    },
+    "package_version": {
+      "kind": "str",
+      "value": "1_0_0"
+    },
+    "source": {
+      "kind": "str",
+      "value": "AVM 内 assistant 写于 2026-11-14，从 generation-9 journal cid=6 还原"
+    },
+    "usage": {
+      "kind": "str",
+      "value": "安装后读 $MEM.sysinfo / .os / .python / .resource / .proc / .env / .tools / .disk.\"<path>\""
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "format": "avm.os-package",
+  "version": 1,
+  "name": "sysinfo",
+  "package_version": "1_0_0",
+  "description": "示例 OS 包：宿主系统信息只读设备（代码由 AVM 内 assistant 写于 2026-11-14，从 generation-9 journal 还原）",
+  "device": {
+    "file": "devices/sysinfo.py",
+    "class": "SysInfoDevice",
+    "mount": "sysinfo",
+    "args": {
+      "probe_versions": [
+        "git",
+        "python3",
+        "pip3"
+      ]
+    }
+  }
+}
