@@ -12,10 +12,12 @@ import DeviceApprovalPanel from './DeviceApprovalPanel'
 import EventLog from './EventLog'
 import InputFeed from './InputFeed'
 import ListenerEditor from './ListenerEditor'
+import OperatorDetail from './OperatorDetail'
 import ValueTray from './ValueTray'
 
 export type DrawerTab =
   | 'raw'
+  | 'operator'
   | 'events'
   | 'listeners'
   | 'io'
@@ -26,6 +28,7 @@ export type DrawerTab =
 
 const TAB_LABEL: Record<DrawerTab, string> = {
   raw: '原始动作（cid -1）',
+  operator: '面板对话（cid -1）',
   events: '事件流',
   listeners: '监听器编辑',
   io: 'IO 调试输入',
@@ -37,6 +40,7 @@ const TAB_LABEL: Record<DrawerTab, string> = {
 
 const TAB_ORDER: DrawerTab[] = [
   'raw',
+  'operator',
   'events',
   'listeners',
   'io',
@@ -159,6 +163,13 @@ export default function DebugDrawer({
                   {channel?.pending_actions ?? '—'}
                   {channel && channel.dropped > 0 ? ` · 丢弃 ${channel.dropped}` : ''}
                 </div>
+                <div className="drawer-meta">
+                  每次动作的返回值在
+                  <button type="button" className="link" data-testid="open-operator-detail" onClick={() => onTab('operator')}>
+                    面板对话（cid -1）
+                  </button>
+                  页签按 call_id 列出。
+                </div>
                 <ActionCard trace={trace} />
                 <ActionForm
                   tools={tools}
@@ -167,6 +178,10 @@ export default function DebugDrawer({
                   onSubmitted={onSubmitted}
                 />
               </div>
+            ) : null}
+
+            {tab === 'operator' ? (
+              <OperatorDetail cid={state?.panel.cid ?? -1} frames={frames} />
             ) : null}
 
             {tab === 'events' ? (

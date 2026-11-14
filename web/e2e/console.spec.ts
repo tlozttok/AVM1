@@ -222,13 +222,22 @@ test('状态语义：空闲时暂停不可用；运行中暂停 → 操作员接
   await expect(page.getByTestId('topbar-shutdown-confirm')).toHaveCount(0)
 })
 
-test('调试抽屉：原始动作、事件流、监听器编辑、系统信息', async ({ page }) => {
+test('调试抽屉：原始动作与面板对话工具返回值、事件流、监听器、系统信息', async ({ page }) => {
   await page.goto('/')
   await expect(page.getByTestId('topbar-status')).toContainText('空闲')
 
   await page.getByTestId('debug-toggle').click()
   await expect(page.getByTestId('debug-drawer-body')).toBeVisible()
   await expect(page.getByTestId('drawer-pane-raw')).toBeVisible()
+
+  // 原始动作：执行一次 memory_read，然后在「面板对话（cid -1）」页看它收到的返回值
+  await page.getByTestId('action-tool').selectOption('memory_read')
+  await page.getByTestId('action-field-ref').fill('$MEM.note.v')
+  await page.getByTestId('action-submit').click()
+  await expect(page.getByTestId('action-card-content')).toContainText('hi')
+  await page.getByTestId('drawer-tab-operator').click()
+  await expect(page.getByTestId('operator-detail')).toContainText('memory_read')
+  await expect(page.getByTestId('operator-return-result').last()).toContainText('hi')
 
   await page.getByTestId('drawer-tab-events').click()
   await expect(page.getByTestId('event-log')).toBeVisible()
