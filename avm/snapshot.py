@@ -143,6 +143,8 @@ def restore(core, doc: dict) -> None:
     """
     doc = _validate_doc(doc)
     _rebuild_memory_and_devices(core, doc)
+    # 旧快照可能没有后加的宿主内建设备（device_specs 里没有）：补齐，保证恢复后可用。
+    core.install_host_devices()
     _rebuild_conversations(core, doc)
     _rebuild_listeners(core, doc)
     _restore_security_and_pointer(core, doc)
@@ -162,6 +164,7 @@ def restore_world(core, doc: dict) -> None:
     """
     doc = _validate_doc(doc)
     _rebuild_memory_and_devices(core, doc)
+    core.install_host_devices()
     _restore_security_and_pointer(core, doc)
     core.journal_generation = _generation_of(doc)
     core._journal_seq = int(doc.get("seq", 0) or 0)

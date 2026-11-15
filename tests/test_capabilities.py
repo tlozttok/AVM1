@@ -21,6 +21,7 @@ from avm.capabilities import (
 )
 from avm.core import _instruction_registry
 from avm.exceptions import IllegalOperationError
+from avm.modules import GRANTABLE_MODULE_NAMES
 from avm.types import Conversation, SystemMessage, UserMessage
 
 
@@ -38,6 +39,7 @@ class TestCapabilityDefaults:
         assert caps.has_mem()
         assert caps.tools == ALL_TOOL_NAMES
         assert caps.groups == ()
+        assert caps.imports == GRANTABLE_MODULE_NAMES
 
     def test_user_caps_with_workspace_and_subset_tools(self):
         caps = Capability(

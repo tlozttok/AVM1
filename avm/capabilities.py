@@ -1,4 +1,4 @@
-"""对话能力（caps）：模式、组、根表与工具集。
+"""对话能力（caps）：模式、组、根表、工具集与模块导入白名单。
 
 权限体系的机制层数据。本模块不依赖 Core 与 Conversation，供两者引用：
 
@@ -6,6 +6,9 @@
 - 组（groups）：镜像层权限策略使用的标签，事件载荷会带上它。
 - 根表（roots）：根名 -> `$MEM` 之后的真实段序列。解析引用时第一段按本表匹配。
 - 工具集（tools）：本对话可调用的指令名集合，是 ALL_TOOL_NAMES 的子集。
+- 导入白名单（imports）：本对话额外可 import 的模块名，是宿主模块目录
+  （`avm/modules.py` 的 GRANTABLE_MODULE_NAMES）的子集；基线模块 math/json/re
+  不可裁剪、也不需要声明。
 
 `AddressSpace` 是一次解析的地址上下文；`Memory` 的公开方法接受它，None 表示
 只允许 `MEM` 根（宿主与旧路径）。设计见：
@@ -16,6 +19,7 @@
 from typing import Dict, Iterable, Mapping, Optional, Tuple
 
 from .exceptions import IllegalOperationError, VMMemoryError
+from .modules import GRANTABLE_MODULE_NAMES
 
 MODE_KERNEL = "kernel"
 # 内核控制面设备（挂载在 $MEM 下）：它们的路径是保留区，不能被镜像根注册表
@@ -100,6 +104,23 @@ def _normalize_tools(tools: Optional[Iterable[str]]) -> frozenset:
     return toolset
 
 
+def _normalize_imports(imports: Optional[Iterable[str]]) -> frozenset:
+    """模块导入白名单：非空字符串、不含点号（与 import 的顶层模块语义一致）。
+
+    目录成员资格由 Core 在创建对话时校验（capabilities 不依赖目录内容）。
+    """
+    if imports is None:
+        return frozenset()
+    names = []
+    for name in imports:
+        if not isinstance(name, str) or not name:
+            raise IllegalOperationError(f"导入白名单项必须是非空字符串，得到 {name!r}")
+        if "." in name:
+            raise IllegalOperationError(f"导入白名单项不能包含点号（只支持顶层模块）：{name!r}")
+        names.append(name)
+    return frozenset(names)
+
+
 class AddressSpace:
     """一次引用解析的地址上下文：根名 -> 真实段序列。
 
@@ -132,12 +153,12 @@ class AddressSpace:
 
 
 class Capability:
-    """对话能力：模式、组、根表与工具集。
+    """对话能力：模式、组、根表、工具集与模块导入白名单。
 
     对象创建后按只读使用；需要变体时用 `copy()` 重建。
     """
 
-    __slots__ = ("mode", "groups", "roots", "tools")
+    __slots__ = ("mode", "groups", "roots", "tools", "imports")
 
     def __init__(
         self,
@@ -145,6 +166,7 @@ class Capability:
         groups: Iterable[str] = (),
         roots: Optional[Mapping[str, Iterable[str]]] = None,
         tools: Optional[Iterable[str]] = None,
+        imports: Optional[Iterable[str]] = None,
     ):
         check_mode(mode)
         self.mode = mode
@@ -158,6 +180,7 @@ class Capability:
         if mode == MODE_USER and MEM_ROOT_NAME in self.roots:
             raise IllegalOperationError("用户态根表不能包含 MEM 根")
         self.tools: frozenset = _normalize_tools(tools)
+        self.imports: frozenset = _normalize_imports(imports)
 
     # ------------------------------------------------------------------
     # 查询
@@ -172,6 +195,9 @@ class Capability:
     def tool_allowed(self, name: str) -> bool:
         return name in self.tools
 
+    def import_allowed(self, name: str) -> bool:
+        return name in self.imports
+
     def space(self) -> AddressSpace:
         return AddressSpace(self.roots)
 
@@ -182,12 +208,14 @@ class Capability:
         groups: Optional[Iterable[str]] = None,
         roots: Optional[Mapping[str, Iterable[str]]] = None,
         tools: Optional[Iterable[str]] = None,
+        imports: Optional[Iterable[str]] = None,
     ) -> "Capability":
         return Capability(
             mode=self.mode if mode is None else mode,
             groups=self.groups if groups is None else groups,
             roots=self.roots if roots is None else roots,
             tools=self.tools if tools is None else tools,
+            imports=self.imports if imports is None else imports,
         )
 
     # ------------------------------------------------------------------
@@ -201,12 +229,14 @@ class Capability:
             and self.groups == other.groups
             and self.roots == other.roots
             and self.tools == other.tools
+            and self.imports == other.imports
         )
 
     def __repr__(self) -> str:
         return (
             f"Capability(mode={self.mode!r}, groups={self.groups!r}, "
-            f"roots={self.roots!r}, tools={sorted(self.tools)!r})"
+            f"roots={self.roots!r}, tools={sorted(self.tools)!r}, "
+            f"imports={sorted(self.imports)!r})"
         )
 
     # ------------------------------------------------------------------
@@ -215,8 +245,8 @@ class Capability:
 
     @classmethod
     def kernel_full(cls) -> "Capability":
-        """默认内核态全能力：MEM 根、全部工具、无组。"""
-        return cls()
+        """默认内核态全能力：MEM 根、全部工具、无组、模块目录全部可授予项。"""
+        return cls(imports=GRANTABLE_MODULE_NAMES)
 
 
 def default_kernel_caps() -> Capability:
@@ -234,6 +264,7 @@ def caps_to_dict(cap: Capability) -> dict:
         "groups": list(cap.groups),
         "roots": {name: list(segs) for name, segs in cap.roots.items()},
         "tools": sorted(cap.tools),
+        "imports": sorted(cap.imports),
     }
 
 
@@ -244,7 +275,9 @@ def caps_from_dict(data) -> Capability:
     groups = data.get("groups") or ()
     roots = data.get("roots")
     tools = data.get("tools")
-    return Capability(mode=mode, groups=groups, roots=roots, tools=tools)
+    imports = data.get("imports")
+    # 旧检查点没有 imports 字段：按空集恢复，不静默扩权（基线模块仍可用）。
+    return Capability(mode=mode, groups=groups, roots=roots, tools=tools, imports=imports)
 
 # ----------------------------------------------------------------------
 # 路径前缀与授予根目标

@@ -10,6 +10,7 @@ import json
 from .capabilities import grant_target_segments
 from .exceptions import IllegalOperationError, VMMemoryError
 from .memory_device import MemoryDevice
+from .modules import BASE_MODULES
 from .types import message_to_api_dict
 
 # 监听器 priority 的结构上限（非负整数）
@@ -600,6 +601,10 @@ class CapsDevice(MemoryDevice):
             "groups": list(conv.caps.groups),
             "roots": roots,
             "tools": sorted(conv.caps.tools),
+            "imports": {
+                "base": list(BASE_MODULES),
+                "granted": sorted(conv.caps.imports),
+            },
         }
 
     def to_llm_string(self):
@@ -625,7 +630,7 @@ class CapsDevice(MemoryDevice):
             if path[1] in conv.caps.roots and path[1] != "MEM":
                 return "$" + path[1]
             raise VMMemoryError(
-                "$MEM.caps.<cid> 支持 mode/groups/roots/tools/identity/name"
+                "$MEM.caps.<cid> 支持 mode/groups/roots/tools/imports/identity/name"
             )
         if len(path) == 3 and path[1] == "roots":
             name = path[2]

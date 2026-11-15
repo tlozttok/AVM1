@@ -21,7 +21,8 @@ from typing import Any, Dict, List, Optional
 
 from .capabilities import AddressSpace
 from .exceptions import IllegalOperationError, VMMemoryError
-from .sandbox import safe_globals, exec_safe
+from .modules import BASE_MODULES, CATALOG_EXPORTS, import_function, shared_view
+from .sandbox import check_code, safe_globals
 from .types import MetaDict, MetaList
 
 EVENT_TYPES = [
@@ -103,6 +104,10 @@ def listener_from_snapshot(data: dict) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"监听器快照必须是对象，得到 {type(data).__name__}")
     listener = copy.deepcopy(data)
+    imports = listener.get("imports")
+    if imports is not None:
+        if not isinstance(imports, list) or not all(isinstance(name, str) for name in imports):
+            raise ValueError("监听器的 imports 必须是字符串列表")
     roots = listener.get("space")
     listener["space"] = (
         AddressSpace({name: tuple(segments) for name, segments in roots.items()})
@@ -334,6 +339,7 @@ class EventSystem:
             ),
             "handler_ref": handler_ref,
             "handler_code": handler_code,
+            "imports": self._owner_imports(owner_cid),
             "phase": phase,
             "enabled": True,
             "tier": tier,
@@ -850,6 +856,7 @@ class EventSystem:
             "priority": listener.get("priority", 0),
             "tier": listener.get("tier", NORMAL_TIER),
             "enabled": listener.get("enabled", True),
+            "imports": sorted(listener.get("imports") or BASE_MODULES),
         }
 
     def _target_full(self, target_ref, follow_final: bool = True):
@@ -995,14 +1002,39 @@ class EventSystem:
             raise ValueError("handler_ref 节点的 content 必须是字符串")
         return content
 
+    def _owner_imports(self, owner_cid: int) -> list:
+        """注册者对话可 import 的模块名：基线 ∪ owner 对话 caps.imports。
+
+        注册监听器时抄进记录（与 handler_code 同一种「注册时快照」语义）；owner 对话
+        关闭/恢复后处理器仍按注册时的白名单运行。
+        """
+        conv = self._core._conv_by_cid.get(owner_cid)
+        granted = conv.caps.imports if conv is not None else frozenset()
+        return sorted(set(BASE_MODULES) | set(granted))
+
+    @staticmethod
+    def _handler_namespace(allowed) -> dict:
+        """处理器命名空间：基线视图 + 该监听器白名单的实例 `__import__`。"""
+        namespace = safe_globals({
+            "math": shared_view("math"),
+            "json": shared_view("json"),
+            "re": shared_view("re"),
+        })
+        namespace["__builtins__"]["__import__"] = import_function(allowed, {})
+        return namespace
+
     def _run_listener(self, listener: dict, event: dict) -> dict:
         """在全新受限命名空间执行处理器，返回规范化输出。
 
         处理器错误统一抛 EventHandlerError（before fail closed / after fail open 由 dispatch 决定）。
+        导入白名单取注册时抄下的 `listener["imports"]`（旧快照没有该字段时只有基线）。
         """
-        namespace = safe_globals({"json": json})
+        allowed = listener.get("imports") or list(BASE_MODULES)
+        namespace = self._handler_namespace(allowed)
         try:
-            exec_safe(listener["handler_code"], namespace)
+            check_code(listener["handler_code"], allow_import=True,
+                       imports=allowed, exports=CATALOG_EXPORTS)
+            exec(compile(listener["handler_code"], "<handler>", "exec"), namespace)
         except Exception as e:
             raise EventHandlerError(
                 listener["listener_id"],
@@ -1290,6 +1322,7 @@ class EventSystem:
             "target_ref": target.get("refs", {}).get("normal") if target else None,
             "handler_ref": handler_ref,
             "handler_code": handler_code,
+            "imports": self._owner_imports(owner_cid),
             "phase": "all" if set(condition["phases"]) == {"before", "after"} else condition["phases"][0],
             "enabled": True,
             "tier": tier,

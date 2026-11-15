@@ -166,6 +166,17 @@ Core 内置只读信息设备：`$MEM.conversations`（对话列表与单对话�
 - 名字（`plm.*` 与带点的模型 id）装在列表项的 `name` / `id` 字段里，不当键——`$MEM` 寻址按点号切段，带点的键读不回来。
 - `Core.refresh_model_catalog(timeout)` 拉一次上游 `GET {base_url}/models` 填充 `models`：自己校验信封（`object="list"` 且 `data` 是数组）、除 `id` 外全部按可选字段读、任何失败都收敛成 `source="unavailable"` 并只打一行 stderr。原始响应的解析兼容 openai 各版本（1.x 的 `.json()`、2.x 的 `.http_response`/`.text`），不依赖 SDK 的强类型页面对象。清单只当参考：取不到时不拦启动，也不拦模型名。宿主在启动时调一次（`avm/boot.py` 的 `start_core`）。
 
+### 模块目录（`$MEM.module_catalog`）
+
+宿主在 `Core()` 里挂载的只读设备（`avm/modules.py` 的 `ModuleCatalogDevice`），与导入机制共用同一份宿主模块目录（`BASE_MODULES` / `MODULE_CATALOG`）。它回答「AVM 内部有什么模块可用、每个模块导出哪些名字」，不参与导入执行。
+
+- 根读取给摘要：基线模块（`math` / `json` / `re`，不可裁剪、不需要授予）、可授予模块名单与数量、读法提示；
+- `$MEM.module_catalog.<模块名>` 返回 JSON：`name` / `kind`（`base` / `grantable`）/ `note` / `exports`（导出名列表）；`.<模块名>.exports` 只读导出名列表；
+- 只读：根与子路径写入都报「设备不支持直接写入」；
+- 可见性：内核态对话经 `$MEM` 直接读；用户态对话要由镜像按根授予（根目标可以指向设备本身）；每对话实际授予的导入白名单见 `$MEM.caps.<cid>.imports`；
+- 旧快照/旧日志恢复后由 `Core.install_host_devices()` 补挂（快照生成时还没有这只设备也不影响）；
+- `$MEM.module_catalog` 是宿主保留挂载路径：镜像 mem 里出现同名键会被挂载点覆盖（与 `scheduler` / `caps` 等相同）。
+
 ### 命名空间校验（输入边界）
 
 `model` 一个字段承载两种命名：LLM 模型名与 PLM 注册表名。`create_cmd` / `create_sub` 在建对话前交叉校验：
@@ -192,8 +203,9 @@ Core 提供权限机制的构件：每个对话的能力（`caps`）、地址空
 | `groups` | 组标签（镜像层策略使用；进事件载荷 `source.conversation.groups`） |
 | `roots` | 根表：根名 → `$MEM` 之后的真实段序列 |
 | `tools` | 工具集：本对话可调用的指令名集合 |
+| `imports` | 模块导入白名单：本对话额外可 import 的模块名（宿主模块目录的子集；基线 `math`/`json`/`re` 不可裁剪、不需要声明） |
 
-默认值：宿主侧创建的对话（`Core.start`、操作员对话、旧检查点恢复）是内核态全能力（`MEM` 根 + 10 条工具）。检查点保存 `caps` 与 `attrs`（自由元数据）。
+默认值：宿主侧创建的对话（`Core.start`、操作员对话）是内核态全能力（`MEM` 根 + 10 条工具 + 模块目录全部可授予项）。检查点保存 `caps` 与 `attrs`（自由元数据）；旧检查点没有 `imports` 字段时按空集恢复（基线模块仍可用，不静默扩权）。
 
 ### 程序声明能力：`value.caps`
 
@@ -204,7 +216,8 @@ Core 提供权限机制的构件：每个对话的能力（`caps`）、地址空
   "mode": {"kind": "str", "value": "user"},
   "groups": {"kind": "list", "value": [{"kind": "str", "value": "worker"}]},
   "roots": {"kind": "list", "value": [{"kind": "str", "value": "lib"}]},
-  "tools": {"kind": "list", "value": [{"kind": "str", "value": "memory_read"}]}
+  "tools": {"kind": "list", "value": [{"kind": "str", "value": "memory_read"}]},
+  "imports": {"kind": "list", "value": [{"kind": "str", "value": "itertools"}]}
 }}
 ```
 
@@ -212,6 +225,7 @@ Core 提供权限机制的构件：每个对话的能力（`caps`）、地址空
 
 - `mode` 缺省继承父模式；用户态父对话不能创建内核态子对话；亚对话不能跨模式；镜像 init 强制内核态。
 - `tools` 缺省继承父工具集；显式声明时必须 ⊆ 父工具集；未知工具名报错。
+- `imports` 缺省继承父白名单；显式声明时必须 ⊆ 父白名单；名字必须在宿主模块目录的可授予集合里（目录外名字在创建对话时失败；基线模块名声明即报错）。
 - `groups` 缺省继承；用户态父对话只能给子对话父已有的组。
 - `roots` 是**根注册表里的名字列表**（见下），只能由内核态父对话授予；同域创建（亚对话、用户态父对话建子对话）只能沿用父根表。
 - `workspace` 已移除：程序声明它会得到「`value.caps.workspace` 已移除」错误。内核不再分配工作目录——目录由软件用 `memory_make` 建，根在创建之后写 `$MEM.conversations.<cid>.roots` 动态加（见下）。
@@ -363,7 +377,7 @@ yield from pack()
 - 输出：每段 stdout 随该回合返回；程序结束时 `return` 字符串追加到最终输出；`return` 为 `None` 时只返回 stdout，其它类型报错；
 - 工具调用必须是 `yield from tool(...)` 的直接形式；直接调用或嵌套在其它表达式里，在编译检查时以 `错误: SecurityError: ...` 拒绝；setup 里会被执行的代码不能调用工具，但 setup 定义的函数体里可以写 `yield from`（不执行）；
 - 新的 user 消息会关闭仍挂起的旧程序，从新程序开始（确定性边界）；
-- 沙箱：安全 builtins 白名单 + AST 检查（禁 import、禁双下划线属性、禁危险调用），另有工具调用位置检查。
+- 沙箱：安全 builtins 白名单 + AST 检查（双下划线属性、内省属性、危险调用名、导入白名单），另有工具调用位置检查；导入见下节「沙箱」。
 
 ### 确定性
 
@@ -371,11 +385,23 @@ Python 程序输出是确定性的：执行器通过比较上一次输入与本�
 
 ### 沙箱
 
-PLM 代码运行在受限环境：安全 builtins 白名单 + AST 检查（禁止 import、禁止双下划线属性访问、禁止危险调用名如 open/eval/exec）。它防止 Python 程序访问宿主系统（文件、网络、进程、时钟、熵源）；AVM 内部行为不受限。真正强隔离（子进程 + OS 级隔离）超出 VM 范围。
+PLM 代码运行在受限环境：安全 builtins 白名单 + AST 检查（双下划线属性、内省属性、危险调用名如 open/eval/exec）+ 导入白名单。它防止 Python 程序访问宿主系统（文件、网络、进程、时钟、熵源）；AVM 内部行为不受限。真正强隔离（子进程 + OS 级隔离）超出 VM 范围。
 
-白名单（`avm/sandbox.py` 的 `SAFE_BUILTIN_NAMES`）：`abs all any bin bool chr dict divmod enumerate filter float format frozenset hash hex int isinstance issubclass callable iter next len list map max min oct ord pow range repr reversed round set slice sorted str sum tuple zip print`，以及常用异常类（`ArithmeticError AssertionError AttributeError Exception KeyError IndexError NameError RuntimeError StopIteration TypeError ValueError ZeroDivisionError`）。`isinstance` / `issubclass` / `callable` / `iter` / `next` 是类型与迭代工具，不构成逃逸面。
+**导入**：`import` 语法可用，底层 `__import__` 由运行时接管（沙箱命名空间的 `__builtins__` 里注入实例闭包），按「基线 ∪ 对话 `caps.imports`」返回**模块视图**：
+
+- 基线 `math` / `json` / `re` 不可裁剪、所有 Python 对话可用，且照旧以原名注入命名空间（旧镜像不写 import 也能用）；
+- 其余模块来自宿主目录（`avm/modules.py` 的 `MODULE_CATALOG`：首期 `itertools` / `functools` / `collections`），由程序节点的 `value.caps.imports` 逐对话授予；
+- 视图是 `GuestModule`（`types.ModuleType` 子类）：只暴露目录里审计过的导出名、双下划线属性不可见、只读、每 PLM 实例独立缓存；不向 guest 返回宿主真模块；
+- 静态检查（编译期）与运行期 `__import__` 双层裁决：白名单外、相对导入、子模块导入、`from x import *`、双下划线名字、未导出的 `from` 名字都以 `SecurityError` 拒绝；`from <视图> import <宿主真子模块名>` 不会回退到宿主 `sys.modules`；
+- `$MEM.module_catalog` 设备告诉 AVM 内部「有什么模块、每个模块导出什么」，`$MEM.caps.<cid>.imports` 给出本对话的授予面；运行期不提供修改白名单的入口。
+
+白名单（`avm/sandbox.py` 的 `SAFE_BUILTIN_NAMES`）：`abs all any bin bool chr dict divmod enumerate filter float format frozenset hash hex int isinstance issubclass callable iter next len list map max min oct ord pow range repr reversed round set slice sorted str sum tuple zip print`，以及常用异常类（`ArithmeticError AssertionError AttributeError Exception KeyError IndexError NameError RuntimeError StopIteration TypeError ValueError ZeroDivisionError`，导入相关另有 `ImportError` / `ModuleNotFoundError`）。`isinstance` / `issubclass` / `callable` / `iter` / `next` 是类型与迭代工具，不构成逃逸面。
 
 白名单**不包含 `BaseException`**：Python 程序（PLM 代码、事件处理器）不能触发"紧急停止"——`raise BaseException("x")` 只是一句普通的 `NameError`。停机信号只来自宿主：人按 Ctrl+C、宿主主动退出，宿主在 `finally` 里写回 `persist_to` 之后退出。
+
+**内省属性**：除双下划线外，`gi_frame` / `gi_code` / `f_globals` / `f_builtins` / `f_local` / `f_back` / `f_code` / `tb_frame` / `tb_next` / `co_consts` / `co_code` 等帧/生成器/代码对象属性在 AST 检查里一律拒绝；guest 不能改写 `__builtins__`。
+
+**事件处理器**：处理器命名空间同样注入基线视图；导入白名单取注册时抄下的 owner 对话白名单（`listener["imports"]`），因此在注册时拥有 `caps.imports` 的对话，其处理器可以 import 对应模块（写入 `$MEM.listeners` 摘要的 `imports` 字段可查）；旧快照/旧日志的监听器没有该字段时按基线恢复，不静默扩权。
 
 ## 事件模型 v1
 
@@ -426,7 +452,7 @@ before 语义：操作被请求，不保证到达执行组件；可被 `allow` �
 
 ### 监听器：类型、级别与顺序
 
-- 监听器是 `ctrl.type="handler"` 节点：`content` 是处理器代码，`condition` 是声明式条件数据叶子。每次事件在全新受限沙箱命名空间执行（只提供 `json` 和受限 builtins），不创建对话、不保留处理器实例状态。**处理器代码与条件在注册时抄副本**：之后改内存里的节点不会自动生效，必须 `listen_event action=modify` 一次重新解析。
+- 监听器是 `ctrl.type="handler"` 节点：`content` 是处理器代码，`condition` 是声明式条件数据叶子。每次事件在全新受限沙箱命名空间执行（安全 builtins + 基线视图 `math`/`json`/`re`），不创建对话、不保留处理器实例状态；处理器可 import 的模块取**注册者对话**的白名单（注册时抄进 `listener["imports"]`，与代码/条件同一种快照语义；旧快照没有该字段时只有基线）。**处理器代码与条件在注册时抄副本**：之后改内存里的节点不会自动生效，必须 `listen_event action=modify` 一次重新解析。
 - 条件 schema（handler 节点 `condition`，JSON 字符串叶）：`events`（事件类型列表）、`phase`（before/after 列表）、`target`（`exact`/`subtree` + `$` 引用，或 `cid_owner`/`self_lifecycle`）、`source`（`mode`/`groups` 过滤）。匹配用 canonical 目标。
 - 用户态对话只能用命名条件子集（preset）：`inbox`（发往自己的 `send_instruction`）、`self.lifecycle`（自己相关的创建/关闭/监听生命周期事件）；自定义条件被拒绝。内核态可以写完整条件，`subtree` 或省略 target 用于全局监听（例如禁止访问表）。
 - 已删除的条件形态：`target.kind="owned_by_owner"`、`source.cid`、preset `own_work.memory` / `own_nodes.memory`。handler 节点使用它们时注册报「已移除」（使用错误，不是兼容入口）。

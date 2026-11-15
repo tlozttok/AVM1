@@ -25,8 +25,9 @@ AVM 的权限不放在 Core 的硬编码规则里，分两层：
 | `groups` | 组标签（字符串元组），进事件载荷 `source.conversation.groups`，供 ACL 规则使用 |
 | `roots` | 根表：根名 → `$MEM` 之后的真实段序列；解析引用时第一段按根表匹配 |
 | `tools` | 工具集：本对话可调用的指令名集合 |
+| `imports` | 模块导入白名单：本对话额外可 import 的模块名（宿主模块目录的子集；基线 `math`/`json`/`re` 不可裁剪、不需要声明） |
 
-宿主侧创建（`Core.start`、操作员对话、旧检查点）默认内核态全能力：`MEM` 根 + 全部 10 条工具。检查点保存 `caps` 与 `attrs`；旧检查点回退内核态全能力。
+宿主侧创建（`Core.start`、操作员对话）默认内核态全能力：`MEM` 根 + 全部 10 条工具 + 模块目录全部可授予项。检查点保存 `caps` 与 `attrs`；旧检查点的 caps 没有 `imports` 字段时按空集恢复（基线模块仍可用，不静默扩权）。
 
 ### 2.1 创建时委托：程序节点的 `value.caps`
 
@@ -44,7 +45,8 @@ AVM 的权限不放在 Core 的硬编码规则里，分两层：
         "mode":      {"kind": "str",  "value": "user"},
         "groups":    {"kind": "list", "value": [{"kind": "str", "value": "worker"}]},
         "roots":     {"kind": "list", "value": [{"kind": "str", "value": "lib"}]},
-        "tools":     {"kind": "list", "value": [{"kind": "str", "value": "memory_read"}]}
+        "tools":     {"kind": "list", "value": [{"kind": "str", "value": "memory_read"}]},
+        "imports":   {"kind": "list", "value": [{"kind": "str", "value": "itertools"}]}
       }
     }
   }
@@ -57,12 +59,23 @@ AVM 的权限不放在 Core 的硬编码规则里，分两层：
 
 - `mode` 缺省继承父模式；用户态父对话只能创建用户态对话；亚对话（`create_sub`）不能跨模式；镜像 init 强制内核态。
 - `tools` 缺省继承父工具集；显式声明必须 ⊆ 父工具集；未知指令名报错。
+- `imports` 缺省继承父白名单；显式声明必须 ⊆ 父白名单；名字必须在宿主模块目录的可授予集合里（目录外的名字在创建对话时失败；基线模块名声明即报错——它们不可裁剪、也不需要声明）。
 - `groups` 缺省继承父组；用户态父对话只能给子对话父已有的组（内核态父对话可以指定任意组，这是策略权限）。
 - `roots` 是镜像 `security.roots` 注册表里的**名字列表**，只有内核态父对话能授予；同域创建（亚对话、用户态父建子对话）只能沿用父根表，不能新增根。
 - `workspace` 已移除：程序声明它会报错。内核不分配工作目录，目录由软件用 `memory_make` 建、根由控制面动态加（见 3.3）。
 - 没有 `caps` 的程序继承父能力（旧镜像行为不变）。
 
-### 2.2 模式的实际差别
+### 2.2 导入白名单
+
+`caps.imports` 控制 Python 对话（以及 `plm.command` / `plm.function` 等执行器）能 import 哪些宿主模块：
+
+- 可导入宇宙是宿主目录（`avm/modules.py`），不是 Python 解释器里存在的全部模块。首期：基线 `math` / `json` / `re`（不可裁剪、所有 Python 对话可用）+ 可授予 `itertools` / `functools` / `collections`。
+- 模块以**视图**（`GuestModule`）出现：只暴露目录里审计过的导出名，双下划线/内省属性不可见，只读；每个 PLM 实例一份缓存，视图不跨对话共享。
+- 静态（编译期）与运行期 `__import__` 双层检查：白名单外模块、相对导入、子模块导入、star import、未导出的 `from` 名字都以 `SecurityError` 拒绝。
+- `$MEM.module_catalog` 是宿主挂载的只读目录设备（根摘要 + `<模块名>` JSON），回答「有什么模块、每个模块导出哪些名字」；`$MEM.caps.<cid>.imports` 给本对话的授予面。
+- 运行期不提供修改白名单的入口（与 `mode` / `tools` 一致）。事件处理器按**注册者对话**的白名单导入：注册时把 owner 对话的基线 ∪ `caps.imports` 抄进监听器记录（`listener["imports"]`），每次事件在全新命名空间按该快照检查；旧快照没有该字段时只有基线。
+
+### 2.3 模式的实际差别
 
 - 根表：内核态含 `MEM`；用户态没有 `MEM`，因此无法命名内核设备、`$conv`/`$batch` 伪根与设备路径简写。
 - 工具面：由 `tools` 决定，与模式独立（模式不硬编码工具宇宙）。普通对话是否能有 `create_cmd`/`listen_event`/`close_conversation` 由镜像授予。
@@ -165,7 +178,8 @@ def handle(event):
 | --- | --- | --- |
 | 观测面（只读） | `$MEM.scheduler`、`$MEM.memory`、`$MEM.monitor` | 读运行时状态；写入拒绝 |
 | 控制面（可写） | `$MEM.conversations`、`$MEM.listeners`、`$MEM.roots` | 读实时状态；写固定字段直接改 Core 对象 |
-| 能力自述（只读） | `$MEM.caps` | 用户态经保留根 `caps` 读自己的能力摘要 |
+| 能力自述（只读） | `$MEM.caps` | 用户态经保留根 `caps` 读自己的能力摘要（含 `imports` 的基线与授予面） |
+| 目录（只读） | `$MEM.module_catalog` | 宿主挂载的模块目录：基线/可授予模块、导出名；内核态直接读，用户态要授根 |
 | 镜像设备 | 镜像 `devices` 段挂载的设备 | 各自定义，与内核控制面分开 |
 
 ### 6.1 控制面
@@ -263,7 +277,7 @@ after 处理器失败不改变结果、只记录 `error_count`/`last_error` 与 
 
 ## 8. 当前边界（未实现）
 
-- `mode` / `tools` 运行期写入（控制面只读）。
+- `mode` / `tools` / `imports` 运行期写入（控制面只读）。
 - 监听器 `.handler_ref` 控制面写入（用 `listen_event action=modify`）。
 - 节点级内存访问权限（密码、访问回调等）未实现；设备 `authorize_access` 不做。
 - 整棵子树删除、授予根的自动回收；事件持久化、条件触发、定时器。

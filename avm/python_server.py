@@ -4,7 +4,6 @@ import contextlib
 import inspect
 import io
 import json
-import math
 import re
 import sys
 from typing import List, Optional
@@ -14,7 +13,8 @@ from .types import (
     Conversation, MetaDict, MetaList, Role, message_to_api_dict, Message,
     SystemMessage, UserMessage, AssistantMessage, ToolMessage,
 )
-from .sandbox import SecurityError, safe_globals, exec_safe, check_code
+from .modules import BASE_MODULES, CATALOG_EXPORTS, sandbox_globals
+from .sandbox import SecurityError, check_code
 
 
 def message_list_from_api_dict(messages: List[dict]) -> List[Message]:
@@ -59,6 +59,10 @@ class PLMServer(ABC):
         self._tools: dict = {}  # 工具定义：name → {"description", "parameters"}
         self._tools_declared: bool = False  # params 里是否显式给了 tools（空列表表示"没有工具"）
         self._call_records: dict = {}  # 基类保证的函数调用记录：call_id → {"name", "arguments"}，用于返回与调用配对
+        # 导入白名单与实例视图缓存：白名单由 Core 每次调用经 params["imports"] 传入
+        # （= 基线 ∪ caps.imports）；默认只有基线，旧行为不变。
+        self._imports: frozenset = frozenset(BASE_MODULES)
+        self._module_cache: dict = {}
 
     def _new_input_messages(self, raw_messages: List[dict]) -> List[dict]:
         """比较上一次输入与本次输入，返回本次新增的消息（共同前缀之后的切片）"""
@@ -86,6 +90,36 @@ class PLMServer(ABC):
         if not self._tools_declared:
             return True
         return name in self._tools
+
+    # ------------------------------------------------------------------
+    # 导入白名单（沙箱）
+    # ------------------------------------------------------------------
+
+    def _capture_imports(self, params: dict) -> None:
+        """解析本次调用允许导入的模块名（Core 经 params["imports"] 传入）。
+
+        缺省只有基线模块；白名单在对话生命周期内稳定，变化只可能发生在实例第一次
+        调用（或旧路径直接调用 PLM 的测试里），届时通过 `_on_imports_changed` 让子类
+        重建命名空间。
+        """
+        declared = params.get("imports")
+        new_imports = frozenset(declared) if declared is not None else frozenset(BASE_MODULES)
+        if new_imports != self._imports:
+            self._imports = new_imports
+            self._on_imports_changed()
+
+    def _on_imports_changed(self) -> None:
+        """白名单变化钩子；需要重建命名空间的执行器覆写。"""
+        return None
+
+    def _sandbox_globals(self, extra=None) -> dict:
+        """本实例的受限命名空间：安全 builtins + 基线视图 + 实例 __import__。"""
+        return sandbox_globals(extra, self._imports, self._module_cache)
+
+    def _check_code(self, code: str, mode: str = "exec") -> None:
+        """静态检查：在基类规则之上按本实例白名单检查 import。"""
+        check_code(code, mode=mode, allow_import=True,
+                   imports=self._imports, exports=CATALOG_EXPORTS)
 
     def _dispatch(self, msg) -> None:
         """按消息类型派发执行；system 不返回，user/tool 可以返回消息。"""
@@ -139,8 +173,9 @@ class PLMServer(ABC):
         return response
 
     def handle_messages(self, raw_messages, params):
-        # 解析工具定义，放到实例字段（供程序了解可用工具）
+        # 解析工具定义与导入白名单，放到实例字段（供程序了解可用工具/可导入模块）
         self._capture_tools(params)
+        self._capture_imports(params)
         # 通过比较上一次的输入和这一次的输入，获取最新的输入消息列表
         new_messages = message_list_from_api_dict(self._new_input_messages(raw_messages))
         self._prev_input = raw_messages
@@ -176,6 +211,7 @@ class PLMServer(ABC):
         """
         if params is not None:
             self._capture_tools(params)
+            self._capture_imports(params)
         for item in raw_messages:
             if isinstance(item, dict) and item.get("role") == "system":
                 self._execute_system_message(item.get("content") or "")
@@ -228,7 +264,7 @@ class SimplePLM(PLMServer):
     仅测试调试，暂存；不推荐使用，不维护。
 
     固定行为模式：
-    - 用户提示词：消息内容直接作为一行表达式，eval 求值（受限命名空间：无内置函数，提供 math）；
+    - 用户提示词：消息内容直接作为一行表达式，eval 求值（受限命名空间：安全 builtins + 基线模块视图）；
     - 系统 / 工具消息：计算器无状态，不处理。
     """
 
@@ -238,9 +274,9 @@ class SimplePLM(PLMServer):
     def _execute_user_message(self, content: str):
         expr = content
         try:
-            # eval 模式天然只接受单个表达式；受限命名空间（安全 builtins + math）
+            # eval 模式天然只接受单个表达式；受限命名空间（安全 builtins + 基线视图）
             check_code(expr, mode="eval")
-            value = eval(compile(expr, "<expr>", "eval"), safe_globals({"math": math}), {})
+            value = eval(compile(expr, "<expr>", "eval"), self._sandbox_globals(), {})
             result = str(value)
         except Exception as e:
             result = f"错误: {type(e).__name__}: {e}"
@@ -270,62 +306,87 @@ def _bind_tool_args(name, names, required, args, kwargs):
     return arguments
 
 
-class _SetupToolScan(ast.NodeVisitor):
-    """扫描 setup 里**会被执行**的代码；函数体不执行，允许在里面定义工具调用。
+def _yieldfrom_value_ids(tree) -> set:
+    """源码里所有 `yield from <expr>` 的 expr 节点 id（工具调用位置判定用）。"""
+    return {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.YieldFrom)}
 
-    setup 本来就是用来定义程序函数的；先前的"任何工具调用都拒绝"会把
-    `def pack(): yield from memory_read(...)` 也拦下。
+
+class _SetupToolScan(ast.NodeVisitor):
+    """检查 setup 代码里的工具调用位置。
+
+    setup 的顶层代码会被执行：那里出现工具调用直接拒绝。函数/方法/lambda 的体延迟
+    执行，允许写工具调用，但必须是 `yield from tool(...)` 的直接值——直接调用会拿到
+    宿主生成器对象（`g = memory_read(...)` 后 `g.gi_frame.f_globals` 会暴露宿主
+    globals，见计划 1.3）。
     """
 
-    def __init__(self, tool_names):
+    def __init__(self, tool_names, direct_ids):
         self._tool_names = set(tool_names)
+        self._direct_ids = direct_ids
+        self._scope_depth = 0
 
-    def _scan_def_header(self, node):
+    def _visit_function(self, node):
         for item in getattr(node, "decorator_list", []) or []:
             self.visit(item)
-        if hasattr(node, "args") and hasattr(node.args, "defaults"):
-            for item in node.args.defaults:
+        args = getattr(node, "args", None)
+        if args is not None:
+            for item in getattr(args, "defaults", []) or []:
                 self.visit(item)
-            for item in node.args.kw_defaults:
+            for item in getattr(args, "kw_defaults", []) or []:
                 if item is not None:
                     self.visit(item)
+        self._scope_depth += 1
+        try:
+            if isinstance(node.body, list):
+                for stmt in node.body:
+                    self.visit(stmt)
+            else:  # Lambda：body 是表达式
+                self.visit(node.body)
+        finally:
+            self._scope_depth -= 1
 
     def visit_FunctionDef(self, node):
-        self._scan_def_header(node)
+        self._visit_function(node)
 
     def visit_AsyncFunctionDef(self, node):
-        self._scan_def_header(node)
+        self._visit_function(node)
 
     def visit_Lambda(self, node):
-        pass
+        self._visit_function(node)
 
     def visit_ClassDef(self, node):
-        self._scan_def_header(node)
-        for stmt in node.body:
-            self.visit(stmt)
+        # 类体在 def 执行时就会运行；里面的函数体仍延迟执行（由 visit_FunctionDef 处理）。
+        self.generic_visit(node)
 
     def visit_Call(self, node):
         if isinstance(node.func, ast.Name) and node.func.id in self._tool_names:
-            raise SecurityError(
-                f"系统提示词（setup 代码）里不能调用工具：{node.func.id}；"
-                f"工具调用放进 init 的 user 消息里"
-            )
+            name = node.func.id
+            if self._scope_depth == 0:
+                raise SecurityError(
+                    f"系统提示词（setup 代码）里不能调用工具：{name}；"
+                    f"工具调用放进 init 的 user 消息里"
+                )
+            if id(node) not in self._direct_ids:
+                raise SecurityError(
+                    f"系统提示词（setup 代码）里的工具调用必须写成 yield from {name}(...)："
+                    f"直接调用会拿到宿主生成器对象"
+                )
         self.generic_visit(node)
 
 
 def _check_program_tools(source: str, tool_names, allowed, context: str = "program") -> None:
     """检查用户程序 / 系统提示词里的工具调用位置。
 
-    - setup：会被执行的代码里出现工具调用就拒绝；函数体里的定义允许（不执行）；
-    - 用户程序：工具调用必须正好是 `yield from tool(...)` 的直接值，且工具已授权。
+    - setup：会被执行的代码里出现工具调用就拒绝；函数体里的工具调用必须是
+      `yield from tool(...)` 的直接值；
+    - 用户程序/命令行程序：工具调用必须正好是 `yield from tool(...)` 的直接值，
+      且工具已授权。
     """
     tree = ast.parse(source)
+    direct = _yieldfrom_value_ids(tree)
     if context == "setup":
-        _SetupToolScan(tool_names).visit(tree)
+        _SetupToolScan(tool_names, direct).visit(tree)
         return
-    direct = {
-        id(node.value) for node in ast.walk(tree) if isinstance(node, ast.YieldFrom)
-    }
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
@@ -350,6 +411,13 @@ def _program_global_names(source: str) -> list:
             names.add(node.id)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(node.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname or alias.name)
     return sorted(names)
 
 
@@ -411,11 +479,16 @@ class PythonPLM(_GeneratorToolPLM):
     # ------------------------------------------------------------------
 
     def _reset_namespace(self):
-        extra = {"math": math, "json": json, "re": re}
+        extra = {}
         for name in PYTHON_TOOL_SPECS:
             if self._tool_allowed(name):
                 extra[name] = self._make_tool(name)
-        self.namespace = safe_globals(extra)
+        self.namespace = self._sandbox_globals(extra)
+
+    def _on_imports_changed(self):
+        # 白名单变化只发生在实例第一次调用（之后在对话生命周期内稳定）；此时命名
+        # 空间里还没有用户变量，重建安全。
+        self._reset_namespace()
 
     def _make_tool(self, name):
         required, optional = PYTHON_TOOL_SPECS[name]
@@ -439,12 +512,13 @@ class PythonPLM(_GeneratorToolPLM):
         self._abandon()
         self._reset_namespace()
         _check_program_tools(content, set(PYTHON_TOOL_SPECS), set(), context="setup")
-        exec_safe(content, self.namespace)
+        self._check_code(content)
+        exec(compile(content, "<python-setup>", "exec"), self.namespace)
 
     def _execute_user_message(self, content: str):
         self._abandon()
         try:
-            check_code(content)
+            self._check_code(content)
             _check_program_tools(
                 content, set(PYTHON_TOOL_SPECS), self._allowed_tool_names(),
             )
@@ -528,7 +602,7 @@ class FunctionPLM(PLMServer):
 
     def _execute_system_message(self, content: str):
         try:
-            check_code(content)
+            self._check_code(content)
             self._compiled = compile(content, "<function>", "exec")
             self._parse_error = None
         except Exception as e:
@@ -544,7 +618,7 @@ class FunctionPLM(PLMServer):
         except Exception as e:
             return f"错误: FunctionPLM: {type(e).__name__}: {e}"
         try:
-            namespace = safe_globals({"math": math, "json": json, "re": re})
+            namespace = self._sandbox_globals()
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 exec(self._compiled, namespace)
@@ -779,7 +853,7 @@ class StateMachinePLM(PLMServer):
     def _eval_expr(self, expr: str, context: dict):
         check_code(expr, mode="eval")
         compiled = compile(expr, "<fsm>", "eval")
-        return eval(compiled, safe_globals({"math": math}), dict(context))
+        return eval(compiled, self._sandbox_globals(), dict(context))
 
     def _execute_user_message(self, content: str):
         if self._parse_error is not None:
@@ -978,7 +1052,9 @@ class CommandPLM(_GeneratorToolPLM):
         self._compiled = None
         self._parse_error = None
         try:
-            check_code(content)
+            self._check_code(content)
+            _check_program_tools(content, set(COMMAND_TOOLS),
+                                 set(self._allowed_command_tools()), context="program")
             self._compiled = compile(content, "<command>", "exec")
         except Exception as e:
             self._parse_error = f"{type(e).__name__}: {e}"
@@ -994,9 +1070,8 @@ class CommandPLM(_GeneratorToolPLM):
         return {name: fn for name, fn in COMMAND_TOOLS.items() if self._tool_allowed(name)}
 
     def _fresh_namespace(self) -> dict:
-        extra = {"math": math, "json": json, "re": re}
-        extra.update(self._allowed_command_tools())
-        return safe_globals(extra)
+        extra = dict(self._allowed_command_tools())
+        return self._sandbox_globals(extra)
 
     def _output(self, value):
         """命令输出：字符串原样返回，None 视为空输出，其它类型报错。"""

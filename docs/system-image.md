@@ -64,10 +64,11 @@ python -m avm.image <image.json>
            "caps": {"kind": "dict", "value": {
              "mode": {"kind": "str", "value": "user"},
              "roots": {"kind": "list", "value": [{"kind": "str", "value": "lib"}]},
-             "tools": {"kind": "list", "value": [{"kind": "str", "value": "memory_read"}]}}}}}
+             "tools": {"kind": "list", "value": [{"kind": "str", "value": "memory_read"}]},
+             "imports": {"kind": "list", "value": [{"kind": "str", "value": "itertools"}]}}}}}
 ```
 
-缺省字段继承父对话；`roots` 是 `security.roots` 注册表里的名字列表；`tools` 必须是父工具集的子集；`workspace` 已移除（声明即报错）——内核不分配工作目录，目录由软件建、根由 `$MEM.conversations.<cid>.roots` 动态加。没有 `caps` 的程序继承父能力。程序节点的 `caps` 在创建对话时校验，非法时不创建对话。
+缺省字段继承父对话；`roots` 是 `security.roots` 注册表里的名字列表；`tools` 必须是父工具集的子集；`imports` 必须是宿主模块目录可授予集合的子集（基线 `math`/`json`/`re` 不可声明，目录外的名字创建对话时报错）；`workspace` 已移除（声明即报错）——内核不分配工作目录，目录由软件建、根由 `$MEM.conversations.<cid>.roots` 动态加。没有 `caps` 的程序继承父能力。程序节点的 `caps` 在创建对话时校验，非法时不创建对话。
 
 运行期可用 `edit_metadata` 指令给节点补 ctrl（例如给运行时创建的 dict 节点设置 `type='settingup'` / `'python'`），配合 `memory_make` / `memory_write` 组合出可被 `create_cmd` 使用的程序节点——程序节点不一定只在镜像中预置。
 
@@ -158,6 +159,7 @@ python -m avm.image <image.json>
 - `file` 是实现文件，相对镜像目录；`class` 必须是 `avm.python_server.PLMServer` 的子类；
 - 装载发生在模型目录安装之前，因此模型目录会列出它；`create_cmd` / `create_sub` 的程序节点用 `para.model` 选择它；
 - 镜像声明的 PLM 只在当前核内可见，不随交付物分发（移植契约的硬约束）。
+- 可导入模块的目录由宿主提供（`avm/modules.py`），宿主挂载只读设备 `$MEM.module_catalog` 供 AVM 内部查询；镜像只在程序节点 `value.caps.imports` 里做授予，不能扩展目录。
 
 镜像也可以声明自定义 PLM；普通确定性服务优先写成 `plm.command` 程序——程序正文本身就是内存节点，改动不需要换执行器，也不需要新增 PLM 类型。参考 [images/base/README.md](../images/base/README.md) 的「构造器命令程序（plm.command）」一节。
 

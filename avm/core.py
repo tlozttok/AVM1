@@ -22,6 +22,7 @@ from .types import message_to_dict, batch_to_dict
 from .memory import Memory, check_new_key
 from .memory_device import MemoryDevice
 from .monitor import Monitor
+from .modules import BASE_MODULES, GRANTABLE_MODULE_NAMES, ModuleCatalogDevice
 from .python_server import HOST_ONLY_PLMS, PLM_REGISTRY, create_plm
 from .events import EventSystem, build_event, EVENT_TYPES
 from .journal import (
@@ -1185,6 +1186,17 @@ def _build_tools(conv: Optional[Conversation] = None) -> list:
     return [t for t in tools if conv.caps.tool_allowed((t.get("function") or {}).get("name"))]
 
 
+def _build_imports(conv: Optional[Conversation] = None) -> list:
+    """一次 PLM 执行可 import 的模块名 = 基线 ∪ 对话 caps.imports。
+
+    与 `_build_tools` 同构：PLM 执行器每次调用经 params["imports"] 收到该清单；
+    白名单在对话生命周期内稳定（caps 创建后只读，运行期不提供修改入口）。
+    """
+    if conv is None:
+        return sorted(set(BASE_MODULES) | set(GRANTABLE_MODULE_NAMES))
+    return sorted(set(BASE_MODULES) | set(conv.caps.imports))
+
+
 class PLMExecutor:
     """把 PLMServer 适配成与 LMU 相同的 exec 接口，供 Core 统一调度。
 
@@ -1205,6 +1217,8 @@ class PLMExecutor:
 
         params = para.to_dict()
         params["tools"] = _build_tools(conversation)
+        # 覆盖 para 里可能同名出现的字段：白名单只由对话 caps 决定（防 para 伪造）。
+        params["imports"] = _build_imports(conversation)
         response = self.plm.handle_messages(messages, params)
         result = response.get("content", "") or ""
         return_calls = self._parse_tool_calls(response.get("tool_calls") or [])
@@ -1292,13 +1306,13 @@ def _check_model_namespace(core: 'Core', program_type: str, para: MetaDict, para
         )
 
 
-_CAPS_SPEC_KEYS = frozenset({"mode", "groups", "roots", "tools"})
+_CAPS_SPEC_KEYS = frozenset({"mode", "groups", "roots", "tools", "imports"})
 
 
 def _read_caps_value(caps_node, key: str):
     """把 value.caps 下的一个数据节点读成 Python 值。"""
     value = caps_node.get(key)
-    if key in ("groups", "roots", "tools"):
+    if key in ("groups", "roots", "tools", "imports"):
         if not isinstance(value, MetaList):
             raise IllegalOperationError(
                 f"程序节点的 value.caps.{key} 必须是 list 数据节点"
@@ -1387,6 +1401,29 @@ def _derive_child_caps(core: 'Core', parent: Optional[Conversation], node, is_su
         if extra:
             raise VMMemoryError(f"工具集不可超出父对话：{sorted(extra)}")
 
+    imports_spec = spec.get("imports")
+    if imports_spec is None:
+        imports = parent_caps.imports
+    else:
+        if not isinstance(imports_spec, list) or not all(isinstance(x, str) for x in imports_spec):
+            raise IllegalOperationError("程序 caps.imports 必须是字符串列表")
+        imports = frozenset(imports_spec)
+        declared_base = sorted(imports & set(BASE_MODULES))
+        if declared_base:
+            raise IllegalOperationError(
+                f"程序 caps.imports 不能声明基线模块：{declared_base}"
+                f"（基线 {list(BASE_MODULES)} 不可裁剪，也不需要声明）"
+            )
+        unknown = imports - GRANTABLE_MODULE_NAMES
+        if unknown:
+            raise VMMemoryError(
+                f"程序 caps.imports 引用了宿主模块目录之外的模块：{sorted(unknown)}"
+                f"（可授予：{sorted(GRANTABLE_MODULE_NAMES)}）"
+            )
+        extra = imports - parent_caps.imports
+        if extra:
+            raise VMMemoryError(f"模块导入不可超出父对话：{sorted(extra)}")
+
     groups_spec = spec.get("groups")
     if groups_spec is None:
         groups = parent_caps.groups
@@ -1424,7 +1461,7 @@ def _derive_child_caps(core: 'Core', parent: Optional[Conversation], node, is_su
         else:
             roots = grants
 
-    return Capability(mode=mode, groups=groups, roots=roots, tools=tools)
+    return Capability(mode=mode, groups=groups, roots=roots, tools=tools, imports=imports)
 
 
 def _build_conversation(core: 'Core', system_ref: str, para_ref: str, parent: Conversation, is_sub: bool,
@@ -1750,21 +1787,36 @@ class Core:
         # 设备来源表：挂载地址 → 设备 spec（文件/类/参数/标识符；内建设备 builtin）。
         # 快照要覆盖热装设备，而设备表里只有实例，没有"这是从哪来的"。
         self.device_specs: Dict[str, dict] = {}
-        self.mem.mount("conversations", ConversationsDevice(self))
-        self.mem.mount("scheduler", SchedulerDevice(self))
-        self.mem.mount("memory", MemorySummaryDevice(self))
-        self.mem.mount("monitor", MonitorDevice(self))
-        self.mem.mount("listeners", ListenersDevice(self))
-        self.mem.mount("roots", RootsDevice(self))
-        self.mem.mount("caps", CapsDevice(self))
-        for mount in ("conversations", "scheduler", "memory", "monitor",
-                      "listeners", "roots", "caps"):
-            self.device_specs[mount] = {
-                "builtin": True,
-                "class": type(self.mem._devices[mount]).__name__,
-            }
+        self.install_host_devices()
         # 启动自带的内存节点：模型目录（静态部分；LLM 清单由宿主 refresh_model_catalog 填）
         self.install_model_catalog()
+
+    def install_host_devices(self) -> None:
+        """挂载宿主内建设备（幂等）。
+
+        Core 启动时调用一次；镜像整树替换后由 `materialize_mount_links` 重物化挂载点；
+        旧快照/旧日志恢复后要再调用一次，补齐快照生成时还不存在的宿主设备
+        （例如 `module_catalog` 是后加的）。
+        """
+        factories = {
+            "conversations": lambda: ConversationsDevice(self),
+            "scheduler": lambda: SchedulerDevice(self),
+            "memory": lambda: MemorySummaryDevice(self),
+            "monitor": lambda: MonitorDevice(self),
+            "listeners": lambda: ListenersDevice(self),
+            "roots": lambda: RootsDevice(self),
+            "caps": lambda: CapsDevice(self),
+            "module_catalog": lambda: ModuleCatalogDevice(),
+        }
+        for mount, factory in factories.items():
+            if mount in self.mem._devices:
+                continue
+            device = factory()
+            self.mem.mount(mount, device)
+            self.device_specs[mount] = {
+                "builtin": True,
+                "class": type(device).__name__,
+            }
 
     def is_hidden_cid(self, cid) -> bool:
         """对话是否对普通对话隐藏、不可寻址（显示/寻址策略，不影响恢复）。
@@ -2630,7 +2682,7 @@ class Core:
         restore_state = getattr(executor.plm, "restore_state", None)
         if not callable(restore_state):
             return
-        restore_state(messages, {"tools": _build_tools(conv)})
+        restore_state(messages, {"tools": _build_tools(conv), "imports": _build_imports(conv)})
 
     def _get_para(self, conv: Conversation):
         """按对话自己的 para_ref 读取模型调用参数（缺省用 Core.para_ref）"""
