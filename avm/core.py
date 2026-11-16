@@ -1366,20 +1366,32 @@ def _program_caps_spec(node) -> dict:
 
 def _derive_child_caps(core: 'Core', parent: Optional[Conversation], node, is_sub: bool,
                        is_init: bool = False) -> Capability:
-    """按程序 ctrl.caps 与父能力计算子对话能力。
+    """按程序节点的 caps 声明，结合父对话能力算出子对话的能力。全部规则在此，缺省继承。
 
-    规则（批次一）：
     - 模式：缺省继承；用户态不能创建内核态；亚对话不能跨模式；init 强制内核态。
     - 工具集：缺省继承；显式声明时必须 ⊆ 父工具集。
     - 组：缺省继承；用户态父对话只能给子对话父已有的组（内核态父可指定）。
     - 根：内核态子对话固定 `{MEM: ()}`；用户态子对话的授予根来自 caps.roots 的
       `根名 -> $MEM 路径`（同域创建时只能沿用父根，不能新增）。用户态对话的工作
       目录不再由内核分配：目录由软件建，根由 `$MEM.conversations.<cid>.roots` 动态授予。
+
+    每一类各有一个 _derive_xxx：规则彼此独立，混在一个函数里会看不出"哪条规则拒了它"。
     """
     spec = _program_caps_spec(node)
     parent_caps = parent.caps if parent is not None else default_kernel_caps()
-    parent_mode = parent_caps.mode
+    # 按原来的校验顺序逐项求值（mode → tools → imports → groups → roots）：
+    # 同时有多处非法时，报哪一条也属于行为，写进 Capability(...) 实参会打乱顺序。
+    mode = _derive_mode(spec, parent_caps.mode, parent, is_sub, is_init)
+    tools = _derive_tools(spec, parent_caps)
+    imports = _derive_imports(spec, parent_caps)
+    groups = _derive_groups(spec, parent_caps, parent)
+    roots = _derive_roots(core, spec, mode, parent_caps, parent, is_sub)
+    return Capability(mode=mode, groups=groups, roots=roots, tools=tools, imports=imports)
 
+
+def _derive_mode(spec: dict, parent_mode: str, parent: Optional[Conversation],
+                 is_sub: bool, is_init: bool) -> str:
+    """模式：缺省继承；不能提权；亚对话不能跨模式；init 强制内核态。"""
     mode = spec.get("mode", parent_mode)
     if mode not in (MODE_KERNEL, MODE_USER):
         raise IllegalOperationError(f"程序 caps.mode 必须是 kernel/user，得到 {mode!r}")
@@ -1390,79 +1402,90 @@ def _derive_child_caps(core: 'Core', parent: Optional[Conversation], node, is_su
             raise VMMemoryError("模式不可提权：用户态对话只能创建用户态对话")
         if is_sub and mode != parent_mode:
             raise VMMemoryError("亚对话不能跨模式创建")
+    return mode
 
+
+def _derive_tools(spec: dict, parent_caps) -> frozenset:
+    """工具集：缺省继承；显式声明时必须 ⊆ 父工具集（不允许凭空多出工具）。"""
     tools_spec = spec.get("tools")
     if tools_spec is None:
-        tools = parent_caps.tools
-    else:
-        if not isinstance(tools_spec, list) or not all(isinstance(x, str) for x in tools_spec):
-            raise IllegalOperationError("程序 caps.tools 必须是字符串列表")
-        tools = frozenset(tools_spec)
-        extra = tools - parent_caps.tools
-        if extra:
-            raise VMMemoryError(f"工具集不可超出父对话：{sorted(extra)}")
+        return parent_caps.tools
+    if not isinstance(tools_spec, list) or not all(isinstance(x, str) for x in tools_spec):
+        raise IllegalOperationError("程序 caps.tools 必须是字符串列表")
+    tools = frozenset(tools_spec)
+    extra = tools - parent_caps.tools
+    if extra:
+        raise VMMemoryError(f"工具集不可超出父对话：{sorted(extra)}")
+    return tools
 
+
+def _derive_imports(spec: dict, parent_caps) -> frozenset:
+    """模块导入：缺省继承；不能声明基线模块、不能超出宿主目录、不能超出父对话。"""
     imports_spec = spec.get("imports")
     if imports_spec is None:
-        imports = parent_caps.imports
-    else:
-        if not isinstance(imports_spec, list) or not all(isinstance(x, str) for x in imports_spec):
-            raise IllegalOperationError("程序 caps.imports 必须是字符串列表")
-        imports = frozenset(imports_spec)
-        declared_base = sorted(imports & set(BASE_MODULES))
-        if declared_base:
-            raise IllegalOperationError(
-                f"程序 caps.imports 不能声明基线模块：{declared_base}"
-                f"（基线 {list(BASE_MODULES)} 不可裁剪，也不需要声明）"
-            )
-        unknown = imports - grantable_module_names()
-        if unknown:
-            raise VMMemoryError(
-                f"程序 caps.imports 引用了宿主模块目录之外的模块：{sorted(unknown)}"
-                f"（可授予：{sorted(grantable_module_names())}）"
-            )
-        extra = imports - parent_caps.imports
-        if extra:
-            raise VMMemoryError(f"模块导入不可超出父对话：{sorted(extra)}")
+        return parent_caps.imports
+    if not isinstance(imports_spec, list) or not all(isinstance(x, str) for x in imports_spec):
+        raise IllegalOperationError("程序 caps.imports 必须是字符串列表")
+    imports = frozenset(imports_spec)
+    declared_base = sorted(imports & set(BASE_MODULES))
+    if declared_base:
+        raise IllegalOperationError(
+            f"程序 caps.imports 不能声明基线模块：{declared_base}"
+            f"（基线 {list(BASE_MODULES)} 不可裁剪，也不需要声明）"
+        )
+    unknown = imports - grantable_module_names()
+    if unknown:
+        raise VMMemoryError(
+            f"程序 caps.imports 引用了宿主模块目录之外的模块：{sorted(unknown)}"
+            f"（可授予：{sorted(grantable_module_names())}）"
+        )
+    extra = imports - parent_caps.imports
+    if extra:
+        raise VMMemoryError(f"模块导入不可超出父对话：{sorted(extra)}")
+    return imports
 
+
+def _derive_groups(spec: dict, parent_caps, parent: Optional[Conversation]) -> tuple:
+    """组：缺省继承；显式声明时去重保序；用户态父对话不能给子对话父没有的组。"""
     groups_spec = spec.get("groups")
     if groups_spec is None:
-        groups = parent_caps.groups
-    else:
-        if not isinstance(groups_spec, list) or not all(isinstance(x, str) and x for x in groups_spec):
-            raise IllegalOperationError("程序 caps.groups 必须是非空字符串列表")
-        groups = tuple(dict.fromkeys(groups_spec))
-        if parent is not None and parent_mode == MODE_USER and not set(groups) <= set(parent_caps.groups):
-            raise VMMemoryError("组不可提权：用户态对话只能创建同组或更少组的子对话")
+        return parent_caps.groups
+    if not isinstance(groups_spec, list) or not all(isinstance(x, str) and x for x in groups_spec):
+        raise IllegalOperationError("程序 caps.groups 必须是非空字符串列表")
+    groups = tuple(dict.fromkeys(groups_spec))
+    if parent is not None and parent_caps.mode == MODE_USER and not set(groups) <= set(parent_caps.groups):
+        raise VMMemoryError("组不可提权：用户态对话只能创建同组或更少组的子对话")
+    return groups
 
+
+def _derive_roots(core: 'Core', spec: dict, mode: str, parent_caps,
+                  parent: Optional[Conversation], is_sub: bool) -> dict:
+    """根：内核态固定 `{MEM: ()}`；用户态按声明从根注册表取，同域创建只能沿用父根。"""
     if mode == MODE_KERNEL:
-        roots = {MEM_ROOT_NAME: ()}
-    else:
-        grants = {}
-        roots_spec = spec.get("roots") or []
-        if not isinstance(roots_spec, list) or not all(isinstance(x, str) for x in roots_spec):
-            raise IllegalOperationError(
-                "程序 caps.roots 必须是根名列表（名字来自镜像 security.roots 注册表）"
-            )
-        for name in roots_spec:
-            check_root_name(name)
-            if name == MEM_ROOT_NAME:
-                raise IllegalOperationError("程序 caps.roots 不能声明 MEM 根")
-            target = core.root_registry.get(name)
-            if target is None:
-                raise VMMemoryError(f"程序 caps.roots 引用了未注册的根：{name!r}")
-            grants[name] = tuple(target)
-        same_domain = is_sub or (parent is not None and parent_mode == MODE_USER)
-        if same_domain:
-            inherited = {n: t for n, t in parent_caps.roots.items() if n != MEM_ROOT_NAME}
-            for name, target in grants.items():
-                if inherited.get(name) != target:
-                    raise VMMemoryError(f"不能向子对话授予父对话没有的根：{name!r}")
-            roots = inherited
-        else:
-            roots = grants
+        return {MEM_ROOT_NAME: ()}
+    grants = {}
+    roots_spec = spec.get("roots") or []
+    if not isinstance(roots_spec, list) or not all(isinstance(x, str) for x in roots_spec):
+        raise IllegalOperationError(
+            "程序 caps.roots 必须是根名列表（名字来自镜像 security.roots 注册表）"
+        )
+    for name in roots_spec:
+        check_root_name(name)
+        if name == MEM_ROOT_NAME:
+            raise IllegalOperationError("程序 caps.roots 不能声明 MEM 根")
+        target = core.root_registry.get(name)
+        if target is None:
+            raise VMMemoryError(f"程序 caps.roots 引用了未注册的根：{name!r}")
+        grants[name] = tuple(target)
+    same_domain = is_sub or (parent is not None and parent_caps.mode == MODE_USER)
+    if not same_domain:
+        return grants
+    inherited = {n: t for n, t in parent_caps.roots.items() if n != MEM_ROOT_NAME}
+    for name, target in grants.items():
+        if inherited.get(name) != target:
+            raise VMMemoryError(f"不能向子对话授予父对话没有的根：{name!r}")
+    return inherited
 
-    return Capability(mode=mode, groups=groups, roots=roots, tools=tools, imports=imports)
 
 
 def _build_conversation(core: 'Core', system_ref: str, para_ref: str, parent: Conversation, is_sub: bool,
