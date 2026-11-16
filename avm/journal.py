@@ -216,7 +216,7 @@ def scheduler_to_snapshot(core) -> dict:
         "active": sched["active"],
         "ready": sched["ready"],
         "dormant": sched["dormant"],
-        "finished": sorted(core._finished),
+        "finished": core.finished_ids(),
         "activation_instructions": core._activation_instructions,
         "next_cid": core._next_cid,
     }
@@ -352,10 +352,10 @@ def _apply_scheduler_delta(core, change, seq) -> None:
             if _known(cid):
                 add(cid)
     for cid in change.get("finished_remove") or []:
-        core._finished.discard(cid)
+        core.remove_finished(cid)
     for cid in change.get("finished_add") or []:
         if _known(cid):
-            core._finished.add(cid)
+            core.add_finished(cid)
     if isinstance(change.get("activation_instructions"), int):
         core._activation_instructions = change["activation_instructions"]
     if isinstance(change.get("next_cid"), int):
@@ -396,7 +396,7 @@ def apply_scheduler(core, scheduler, source: str = "日志") -> None:
         [cid for cid in scheduler.get("ready") or [] if _known(cid)],
         [cid for cid in scheduler.get("dormant") or [] if _known(cid)],
     )
-    core._finished = {cid for cid in scheduler.get("finished") or [] if _known(cid)}
+    core.restore_finished({cid for cid in scheduler.get("finished") or [] if _known(cid)})
     if isinstance(scheduler.get("activation_instructions"), int):
         core._activation_instructions = scheduler["activation_instructions"]
     if isinstance(scheduler.get("next_cid"), int):
@@ -532,7 +532,7 @@ def _effect_conversation_close(core, effect) -> None:
     conv = core.get_conversation(cid)
     if conv is None:
         return
-    core._finished.add(cid)
+    core.add_finished(cid)
     core.drop_from_schedule(cid)
     core._executors.pop(cid, None)
 
@@ -548,7 +548,7 @@ def _effect_conversation_delete(core, effect) -> None:
         if conv is None:
             return
         core.drop_from_schedule(target_cid)
-        core._finished.discard(target_cid)
+        core.remove_finished(target_cid)
         core._executors.pop(target_cid, None)
 
     _delete(cid)
@@ -557,7 +557,7 @@ def _effect_conversation_delete(core, effect) -> None:
 def _effect_delivery(core, effect) -> None:
     cid = effect.get("to_cid")
     target = core.get_conversation(cid)
-    if target is None or cid in core._finished:
+    if target is None or core.is_finished(cid):
         print(f"[AVM] 日志投递效果：对话 {cid} 不存在或已关闭，跳过", file=sys.stderr)
         return
     for item in effect.get("tool_responses") or []:

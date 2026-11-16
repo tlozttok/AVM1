@@ -182,7 +182,7 @@ class LinkDevice(MemoryDevice):
             # 设备也不替 Core 猜策略；普通对话与内核态一视同仁。
             return True
         _, mount, dev_remainder = follow
-        device = self._core.mem._devices[mount]
+        device = self._core.mem.devices[mount]
         return device.authorize_listener(event_type, dev_remainder, owner_cid)
 
     def after_event(self, event_type: str, remainder: list, result: dict) -> Optional[dict]:

@@ -112,7 +112,7 @@ class ConversationsDevice(MemoryDevice):
 
     def _conv_write(self, cid: int):
         conv = self._conv_read(cid)
-        if cid in self._core._finished:
+        if self._core.is_finished(cid):
             raise VMMemoryError(f"对话 {cid} 已关闭")
         return conv
 

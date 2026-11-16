@@ -155,7 +155,7 @@ def _publish_memory_after(
         )
         return
     _, mount_key, remainder = follow
-    device = core.mem._devices[mount_key]
+    device = core.mem.devices[mount_key]
     extra = device.after_event(event_type, remainder, result or {})
     if extra is None:
         return
@@ -1811,7 +1811,7 @@ class Core:
             "module_loader": lambda: ModuleLoaderDevice(self),
         }
         for mount, factory in factories.items():
-            if mount in self.mem._devices:
+            if mount in self.mem.devices:
                 continue
             device = factory()
             self.mem.mount(mount, device)
@@ -1939,7 +1939,7 @@ class Core:
                 raise IllegalOperationError(
                     f"根 {name!r} 的目标落在内核控制面设备路径 $MEM.{target[0]}"
                 )
-            for mount in self.mem._devices:
+            for mount in self.mem.devices:
                 mount_segments = tuple(mount.split("."))
                 if target == mount_segments:
                     continue  # 显式授予设备本身是允许的
@@ -2139,6 +2139,29 @@ class Core:
         self._active_cid = active
         self._ready_cids = list(ready)
         self._dormant_cids = list(dormant)
+
+    # 已终结对话：终端提示、事件投递、中断、日志重放都要问"这个 cid 还能不能跑"。
+    # 归属是内核的记账，外部只该问和标记，不该自己 add/discard 一个 set。
+
+    def is_finished(self, cid) -> bool:
+        """该对话是否已终结（关闭/结束，不再参与调度与投递）。"""
+        return cid in self._finished
+
+    def finished_ids(self) -> List[int]:
+        """已终结 cid 的升序副本（观测输出用）。"""
+        return sorted(self._finished)
+
+    def add_finished(self, cid) -> None:
+        """标记为已终结（关闭对话、日志重放补记）。"""
+        self._finished.add(cid)
+
+    def remove_finished(self, cid) -> None:
+        """撤销终结标记（日志重放撤销）。"""
+        self._finished.discard(cid)
+
+    def restore_finished(self, cids) -> None:
+        """整体恢复终结集合（日志重放 / 快照恢复用）。"""
+        self._finished = set(cids)
 
     def checkpoint_path(self, cid: int) -> str:
         """调试用：单对话检查点的默认路径（镜像目录/out/<镜像名>.conv.json；无镜像上下文时用 checkpoints/conv-<cid>.json）"""
@@ -3011,7 +3034,7 @@ class Core:
     def _check_device_table(self) -> None:
         """设备表与挂载点一致：每个挂载地址有链接节点；每个标识符至少有一个挂载地址。"""
         mounted_ids = set()
-        for address, device in list(self.mem._devices.items()):
+        for address, device in list(self.mem.devices.items()):
             mounted_ids.add(getattr(device, "device_id", None) or address)
             node = self.mem.root
             for seg in address.split("."):
@@ -3020,7 +3043,7 @@ class Core:
                     break
             if not isinstance(node, LinkNode):
                 raise KernelPanic(f"设备表不一致：{address} 没有挂载点链接节点")
-        for device_id in list(self.mem._device_ids):
+        for device_id in self.mem.device_ids():
             if device_id not in mounted_ids:
                 raise KernelPanic(f"设备表不一致：标识符 {device_id!r} 没有挂载地址")
 
@@ -3279,7 +3302,7 @@ class Core:
             "listeners": listeners,
             "devices": [
                 {"mount": mount, "type": type(dev).__name__, "id": getattr(dev, "device_id", None)}
-                for mount, dev in list(self.mem._devices.items())
+                for mount, dev in list(self.mem.devices.items())
             ],
             "interrupts": {"last_dispatch": list(self.interrupts.last_dispatch)},
             "frames": frames,
@@ -3589,7 +3612,7 @@ class Core:
         只支持 memory_write before 事件；target 必须位于该设备路径下。
         走正常 before 管道，并返回处理后的 event，设备据此决定是否执行自改。
         """
-        if device_path not in self.mem._devices:
+        if device_path not in self.mem.devices:
             raise VMMemoryError(f"设备 {device_path} 未挂载")
         split = self.mem.split_path(target)
         if len(split) != 3 or split[0] != "device" or split[1] != device_path:

@@ -105,7 +105,7 @@ class InterruptTable:
             return self._drop(itype, f"没有为 {itype!r} 注册向量")
 
         target = core.get_conversation(cid)
-        if target is None or cid in core._finished:
+        if target is None or core.is_finished(cid):
             return self._drop(itype, f"目标对话 {cid} 不存在或已关闭")
 
         # 投递放在 noop 判断之前：switch 与 noop 两条路径都投，dropped 没有目标才不投。
@@ -123,7 +123,7 @@ class InterruptTable:
                     "reason": "目标已是活跃对话"}
 
         preempted = None
-        if current is not None and current not in core._finished:
+        if current is not None and not core.is_finished(current):
             preempted = current
             core.prioritize(current)  # 被抢占者插到队首，中断返回后立刻续跑
 

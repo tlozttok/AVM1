@@ -1,5 +1,6 @@
 """AVM 内存系统定义"""
-from typing import Any, Optional
+from types import MappingProxyType
+from typing import Any, List, Optional
 from .types import MetaList, MetaDict, LinkNode, StrNode
 from .exceptions import (VMMemoryError, IllegalOperationError, MemoryKeyNotFoundError, MemoryIndexOutOfRangeError,
                           MemoryTypeError, MemoryCircularReferenceError, MemoryLinkBrokenError)
@@ -153,6 +154,26 @@ class Memory:
         `materialize_mount_links()` 重新物化。
         """
         self._data = node
+
+    # -- 设备表（挂载路径 → 设备）----------------------------------------
+
+    @property
+    def devices(self):
+        """设备表的只读视图。
+
+        挂载/卸载走 mount / unmount：它们会同步树里的挂载点链接。外部若直接改表，
+        树与表就脱节，`Core._check_device_table` 会当成内核不一致。
+        """
+        return MappingProxyType(self._devices)
+
+    def device_ids(self) -> List[str]:
+        """设备标识符的副本（链接 target 不以 $ 开头时按此解析）。"""
+        return list(self._device_ids)
+
+    def clear_devices(self) -> None:
+        """清空设备表与标识符表（快照重建：清空后逐个重新挂载）。"""
+        self._devices.clear()
+        self._device_ids.clear()
 
     def _expand_ref_parts(self, parts: list, space: Optional[AddressSpace] = None):
         """根展开：返回 ("memory", 真实段, 显示段) 或 ("device", 请求段, 请求段)。

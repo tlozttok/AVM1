@@ -80,7 +80,7 @@ def snapshot(core) -> dict:
         "devices": [
             {"mount": mount, "type": type(device).__name__,
              "id": getattr(device, "device_id", None)}
-            for mount, device in list(core.mem._devices.items())
+            for mount, device in list(core.mem.devices.items())
         ],
         "device_specs": {
             mount: dict(spec) for mount, spec in core.device_specs.items()
@@ -210,11 +210,10 @@ def _validate_doc(doc: dict) -> dict:
 def _rebuild_memory_and_devices(core, doc: dict) -> None:
     from .image import mount_device_entry
 
-    old_devices = dict(core.mem._devices)
+    old_devices = dict(core.mem.devices)
     specs = doc.get("device_specs") or {}
     # 设备表与来源表按快照重建：镜像已挂载的镜像设备也重新实例化（设备状态不序列化）
-    core.mem._devices = {}
-    core.mem._device_ids = {}
+    core.mem.clear_devices()
     core.device_specs = {}
     memory_doc = doc.get("memory")
     if not isinstance(memory_doc, dict):
@@ -263,7 +262,7 @@ def _rebuild_memory_and_devices(core, doc: dict) -> None:
         # 来源表以快照记录为准（挂载路径可能被规范化，比较/重启要求逐字段一致）
         core.device_specs[mount] = dict(spec)
     # 设备挂载点重新物化（mount 已建链接；这里兜底快照树里没带的挂载点）
-    for mount in list(core.mem._devices):
+    for mount in list(core.mem.devices):
         node = core.mem.root
         for segment in mount.split(".")[:-1]:
             if not isinstance(node, (dict, MetaDict)):
@@ -271,8 +270,8 @@ def _rebuild_memory_and_devices(core, doc: dict) -> None:
             node = node.get(segment)
         if isinstance(node, (dict, MetaDict)) and mount.split(".")[-1] not in node:
             core.mem._plant_link(
-                mount, getattr(core.mem._devices[mount], "device_id", None) or mount,
-                type(core.mem._devices[mount]).__name__,
+                mount, getattr(core.mem.devices[mount], "device_id", None) or mount,
+                type(core.mem.devices[mount]).__name__,
             )
 
 
@@ -308,7 +307,7 @@ def _rebuild_conversations(core, doc: dict) -> None:
 
     core.clear_conversations()
     core.restore_schedule(None, [], [])
-    core._finished = set()
+    core.restore_finished(set())
     core._executors = {}
     briefs = doc.get("conversations") or []
     if not isinstance(briefs, list):

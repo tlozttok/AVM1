@@ -321,7 +321,7 @@ def _mount_devices(core: Core, image_path: str, devices: list, mem_device_paths:
             raise ImageError(f"mem 中标记 kind=device 的路径 {mp} 未在 devices 段声明")
 
     # 挂载完成后校验所有 LinkDevice 目标可达（面向运行者的诊断错误可含真实路径）。
-    for device in core.mem._devices.values():
+    for device in core.mem.devices.values():
         if getattr(device, "is_link", False):
             try:
                 device.validate()

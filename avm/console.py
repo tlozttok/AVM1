@@ -407,7 +407,7 @@ class Console:
             "active_cid": sched["active"],
             "ready": sched["ready"],
             "dormant": sched["dormant"],
-            "finished": sorted(core._finished),
+            "finished": core.finished_ids(),
             "instruction_budget": core._instruction_budget,
             "activation_instructions": core._activation_instructions,
             "panel_cid": self.panel.cid,
@@ -464,7 +464,7 @@ class Console:
 
     def _conversation_brief(self, cid: int, conv) -> dict:
         core = self.core
-        if cid in core._finished:
+        if core.is_finished(cid):
             status = "finished"
         elif core.active_conversation_id() == cid:
             status = "active"

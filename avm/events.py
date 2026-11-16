@@ -513,7 +513,7 @@ class EventSystem:
             split = self._core.mem.split_path(target, space=space)
             if split[0] == "device":
                 _, mount_key, remainder = split
-                device = self._core.mem._devices[mount_key]
+                device = self._core.mem.devices[mount_key]
                 if not device.authorize_listener(event_type, remainder, owner_cid):
                     raise ValueError(f"设备 {mount_key} 未授权对话 {owner_cid} 监听 {target}")
             return
@@ -576,7 +576,7 @@ class EventSystem:
                     split = self._core.mem.split_path(target, space=space)
                     if split[0] == "device":
                         _, mount_key, remainder = split
-                        device = self._core.mem._devices[mount_key]
+                        device = self._core.mem.devices[mount_key]
                         if not device.authorize_listener(event_type, remainder, owner_cid):
                             raise ValueError(f"设备 {mount_key} 未授权对话 {owner_cid} 监听 {target}")
                         return
@@ -630,7 +630,7 @@ class EventSystem:
         conv = self._core.get_conversation(cid)
         if conv is None:
             return None
-        if cid in self._core._finished:
+        if self._core.is_finished(cid):
             state = "finished"
         elif cid == self._core.active_conversation_id():
             state = "active"
@@ -815,7 +815,7 @@ class EventSystem:
             return info
         if tag == "device":
             mount_key, remainder = target_ref[1], list(target_ref[2])
-            device = self._core.mem._devices.get(mount_key)
+            device = self._core.mem.devices.get(mount_key)
             info.update({"kind": "device", "mount": mount_key, "remainder": remainder})
             if device is not None:
                 info["exists"] = True
@@ -1498,7 +1498,7 @@ class EventSystem:
             cid = item["cid"]
             content = item["content"]
             target = core.get_conversation(cid)
-            if target is None or cid in core._finished:
+            if target is None or core.is_finished(cid):
                 print(
                     f"[AVM] 事件通知投递失败：对话 {cid} 不存在或已关闭",
                     file=sys.stderr,
