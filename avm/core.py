@@ -2221,6 +2221,14 @@ class Core:
         """设定链内计数：断链时归零（重新给满预算），重放时按记录恢复。"""
         self._activation_instructions = int(count)
 
+    def stash_image_init(self, init) -> None:
+        """暂存镜像 init 段：恢复路径不建对话，留给冷启动模式补跑（见 avm.image.start_cold）。"""
+        self._image_init = init
+
+    def stashed_image_init(self):
+        """取出暂存的 init 段；没暂存过（非恢复路径）为 None。"""
+        return self._image_init
+
     def checkpoint_path(self, cid: int) -> str:
         """调试用：单对话检查点的默认路径（镜像目录/out/<镜像名>.conv.json；无镜像上下文时用 checkpoints/conv-<cid>.json）"""
         if self.image_dir and self.image_name:
