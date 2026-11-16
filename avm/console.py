@@ -1227,7 +1227,8 @@ def serve(console: Console, host: str = "127.0.0.1", port: int = 8700) -> Thread
 # 入口
 # ----------------------------------------------------------------------
 
-def main(argv=None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
+    """控制台的命令行参数：端口、绑定地址、面板准入、启动模式。"""
     parser = argparse.ArgumentParser(description="AVM 调试控制台后端")
     parser.add_argument("image", nargs="?", help="系统镜像 JSON 文件路径")
     parser.add_argument("--port", type=int, default=8700, help="监听端口（默认 8700）")
@@ -1239,44 +1240,54 @@ def main(argv=None) -> int:
     from .boot import add_core_dump_args, add_mode_arg
     add_core_dump_args(parser)
     add_mode_arg(parser)
-    args = parser.parse_args(argv)
+    return parser
 
-    if not args.image:
-        print("[console] 需要一个镜像路径", file=sys.stderr)
-        return 1
 
-    from .boot import boot, dump_on_death, write_snapshot
-    from .exceptions import VMMemoryError
+def _boot_core(args):
+    """按启动模式装载并启动内核；镜像类错误只报到 stderr 并返回 None。
+
+    返回 None 而不是抛：镜像错误是运行者的输入问题，控制台该给一行提示、
+    退出码 1，不给 traceback。
+    """
+    from .boot import boot
     from .image import ImageError
 
     try:
-        core = boot(args.image, mode=args.mode,
+        return boot(args.image, mode=args.mode,
                     checkpoint_in=args.checkpoint_in,
                     host_flags={"console": True})
     except (ImageError, VMMemoryError, OSError, ValueError) as e:
         print(f"[console] 镜像错误: {e}", file=sys.stderr)
-        return 1
+        return None
 
-    # 紧耦合登录：一次性 token 只在本次进程有效，登录本身即凭证。
-    # 单测与 e2e mock 直接构造 Console（auth_token=None），不启用这一层。
-    token = secrets.token_urlsafe(24)
 
+def _start_panel(core, token: str, args):
+    """绑定面板对话并起 HTTP 服务；返回 (console, server)。"""
     def force_exit():
         time.sleep(0.3)  # 让 202 响应先写回浏览器
         os._exit(1)
 
     console = Console(core, auth_token=token, force_stop_hook=force_exit,
                       single_client=not args.allow_multiple_clients)
-    server = serve(console, args.host, args.port)
+    return console, serve(console, args.host, args.port)
+
+
+def _announce(console, server, token: str, host: str) -> None:
+    """把连上之前必须知道的东西打到 stderr：面板 cid、准入开关、地址、凭证。"""
     print(f"[console] 面板对话 cid={console.panel.cid}，"
           f"中断向量 operator → {console.panel.cid}", file=sys.stderr)
     print(f"[console] 单客户端准入：{'开启' if console.single_client else '关闭（--allow-multiple-clients）'}",
           file=sys.stderr)
-    print(f"[console] http://{args.host}:{server.server_port}/", file=sys.stderr)
+    print(f"[console] http://{host}:{server.server_port}/", file=sys.stderr)
     print(f"[console] 面板凭证：{token}", file=sys.stderr)
-    token_path = os.path.join(
-        os.path.dirname(os.path.abspath(args.image)), "out", "console.token"
-    )
+
+
+def _write_token_file(image_path: str, token: str) -> None:
+    """把一次性凭证写到镜像目录 out/console.token（权限 0o600）。
+
+    写不成不拦启动：凭证同时打在终端上，运行者照着输就行。
+    """
+    token_path = os.path.join(os.path.dirname(os.path.abspath(image_path)), "out", "console.token")
     try:
         os.makedirs(os.path.dirname(token_path) or ".", exist_ok=True)
         with open(token_path, "w", encoding="utf-8") as f:
@@ -1288,15 +1299,42 @@ def main(argv=None) -> int:
         print(f"[console] 凭证已写入 {token_path}", file=sys.stderr)
     except OSError as e:
         print(f"[console] 凭证文件写入失败（以终端显示为准）：{e}", file=sys.stderr)
+
+
+def _warn_if_web_unbuilt(console) -> None:
+    """前端没构建过时说清怎么补，而不是让 / 变成 404。"""
     if not os.path.isfile(os.path.join(console.web_root, "index.html")):
         print(f"[console] 前端未构建（{console.web_root} 里没有 index.html）："
               f"cd web && npm install && npm run build；/ 会给出同样的提示", file=sys.stderr)
 
-    console.running = True
-    if args.no_core_dump:
-        core.core_dump_enabled = False
-    status = 0
-    clean_exit = True
+
+def _wait_while_paused(core, console) -> None:
+    """API 暂停：HTTP 服务保持存活，等面板发 resume（关机请求会置位后继续）。
+
+    暂停不写快照、不关对话，主线程就停在这里。
+    """
+    # 已请求关机时保留 stopping，避免暂停覆盖掉宿主生命周期。
+    if console.lifecycle != "stopping":
+        console.lifecycle = "paused"
+    print(
+        f"[console] API 暂停（{core.pause_category}）：{core.pause_reason}",
+        file=sys.stderr,
+    )
+    print(
+        "[console] 等待 POST /api/system/resume 恢复；force-stop 仍可用",
+        file=sys.stderr,
+    )
+    console.wait_for_api_resume()
+    if console.lifecycle == "paused":
+        console.lifecycle = "running"
+
+
+def _serve_until_stop(core, console) -> int:
+    """把内核跑到停下：正常停下返回 0，操作员中断返回 130。
+
+    内核异常死亡不在这里处理——那是 main 的活（先落现场快照再原样上抛），
+    所以只捕获"停止"这一类，其余 BaseException 让它穿过去。
+    """
     try:
         while True:
             core.run()
@@ -1307,49 +1345,72 @@ def main(argv=None) -> int:
                     console._api_resume_event.clear()
                     continue
                 break
-            # API 暂停：HTTP 服务保持存活，操作员可从面板恢复；暂停不写快照、
-            # 不关对话，主线程停在这里等 resume（或关机请求置位后继续处理中断）。
-            # 已请求关机时保留 stopping，避免暂停覆盖掉宿主生命周期。
-            if console.lifecycle != "stopping":
-                console.lifecycle = "paused"
-            print(
-                f"[console] API 暂停（{core.pause_category}）：{core.pause_reason}",
-                file=sys.stderr,
-            )
-            print(
-                "[console] 等待 POST /api/system/resume 恢复；force-stop 仍可用",
-                file=sys.stderr,
-            )
-            console.wait_for_api_resume()
-            if console.lifecycle == "paused":
-                console.lifecycle = "running"
+            _wait_while_paused(core, console)
     except RunnerStop as e:
         print(f"[console] {e}", file=sys.stderr)
     except KeyboardInterrupt:
         print("[console] 收到中断，写回后退出", file=sys.stderr)
-        status = 130
+        return 130
+    return 0
+
+
+def _shutdown(core, console, server, clean_exit: bool) -> None:
+    """收尾：摘状态、写重启快照、写回内存、关服务。
+
+    正常退出（含 OS 写 power.state=off 后的安全点返回、运行者停止）才写重启快照；
+    异常死亡与强制退出不拍——半截回合/未收尾的世界不能当恢复输入。
+    """
+    console.running = False
+    console.lifecycle = "stopped"
+    if clean_exit:
+        from .boot import write_snapshot
+        write_snapshot(core)
+    persist_to = getattr(core, "persist_to", None)
+    if persist_to:
+        try:
+            os.makedirs(os.path.dirname(persist_to) or ".", exist_ok=True)
+            core.mem.save(persist_to)
+            print(f"[console] 内存已写回 {persist_to}", file=sys.stderr)
+        except OSError as e:
+            print(f"[console] 写回失败: {e}", file=sys.stderr)
+    server.shutdown()
+
+
+def main(argv=None) -> int:
+    args = _build_parser().parse_args(argv)
+    if not args.image:
+        print("[console] 需要一个镜像路径", file=sys.stderr)
+        return 1
+
+    core = _boot_core(args)
+    if core is None:
+        return 1
+
+    # 紧耦合登录：一次性 token 只在本次进程有效，登录本身即凭证。
+    # 单测与 e2e mock 直接构造 Console（auth_token=None），不启用这一层。
+    token = secrets.token_urlsafe(24)
+    console, server = _start_panel(core, token, args)
+    _announce(console, server, token, args.host)
+    _write_token_file(args.image, token)
+    _warn_if_web_unbuilt(console)
+
+    console.running = True
+    if args.no_core_dump:
+        core.core_dump_enabled = False
+    status = 0
+    clean_exit = True
+    try:
+        status = _serve_until_stop(core, console)
     except BaseException as e:
         # 内核死亡：先落现场快照，再保留原始 traceback 往上抛
         clean_exit = False
+        from .boot import dump_on_death
         dump_on_death(core, e, args.core_dump)
         raise
     finally:
-        console.running = False
-        console.lifecycle = "stopped"
-        # 正常退出（含 OS 写 power.state=off 后的安全点返回、运行者停止）写重启快照；
-        # 异常死亡与强制退出不拍，半截回合/未收尾的世界不能当恢复输入。
-        if clean_exit:
-            write_snapshot(core)
-        persist_to = getattr(core, "persist_to", None)
-        if persist_to:
-            try:
-                os.makedirs(os.path.dirname(persist_to) or ".", exist_ok=True)
-                core.mem.save(persist_to)
-                print(f"[console] 内存已写回 {persist_to}", file=sys.stderr)
-            except OSError as e:
-                print(f"[console] 写回失败: {e}", file=sys.stderr)
-        server.shutdown()
+        _shutdown(core, console, server, clean_exit)
     return status
+
 
 
 if __name__ == "__main__":
