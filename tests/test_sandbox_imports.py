@@ -7,7 +7,7 @@ import pytest
 
 from avm.modules import (
     BASE_MODULES,
-    CATALOG_EXPORTS,
+    catalog_exports,
     GuestModule,
     sandbox_globals,
     shared_view,
@@ -16,6 +16,8 @@ from avm.python_server import create_plm
 from avm.sandbox import SecurityError, check_code
 
 ALLOWED = {"math", "json", "re", "itertools"}
+
+EXPORTS = catalog_exports()
 
 
 def _namespace(allowed=ALLOWED, cache=None):
@@ -30,38 +32,38 @@ def _run(code, allowed=ALLOWED, cache=None):
 
 class TestStaticImportCheck:
     def test_whitelisted_import_ok(self):
-        check_code("import math", allow_import=True, imports=ALLOWED, exports=CATALOG_EXPORTS)
+        check_code("import math", allow_import=True, imports=ALLOWED, exports=EXPORTS)
 
     def test_unknown_module_rejected(self):
         with pytest.raises(SecurityError, match="不在本对话的导入白名单"):
-            check_code("import os", allow_import=True, imports=ALLOWED, exports=CATALOG_EXPORTS)
+            check_code("import os", allow_import=True, imports=ALLOWED, exports=EXPORTS)
 
     def test_dotted_import_rejected(self):
         with pytest.raises(SecurityError, match="子模块"):
-            check_code("import a.b", allow_import=True, imports=ALLOWED, exports=CATALOG_EXPORTS)
+            check_code("import a.b", allow_import=True, imports=ALLOWED, exports=EXPORTS)
 
     def test_relative_import_rejected(self):
         with pytest.raises(SecurityError, match="相对导入"):
-            check_code("from . import x", allow_import=True, imports=ALLOWED, exports=CATALOG_EXPORTS)
+            check_code("from . import x", allow_import=True, imports=ALLOWED, exports=EXPORTS)
 
     def test_star_import_rejected(self):
         with pytest.raises(SecurityError, match=r"import \*"):
-            check_code("from math import *", allow_import=True, imports=ALLOWED, exports=CATALOG_EXPORTS)
+            check_code("from math import *", allow_import=True, imports=ALLOWED, exports=EXPORTS)
 
     def test_unexported_name_rejected(self):
         with pytest.raises(SecurityError, match="未导出"):
             check_code("from json import decoder", allow_import=True,
-                       imports=ALLOWED, exports=CATALOG_EXPORTS)
+                       imports=ALLOWED, exports=EXPORTS)
 
     def test_dunder_import_name_rejected(self):
         with pytest.raises(SecurityError, match="双下划线"):
             check_code("from json import __dict__", allow_import=True,
-                       imports=ALLOWED, exports=CATALOG_EXPORTS)
+                       imports=ALLOWED, exports=EXPORTS)
 
     def test_dunder_alias_rejected(self):
         with pytest.raises(SecurityError, match="双下划线别名"):
             check_code("import math as __m", allow_import=True,
-                       imports=ALLOWED, exports=CATALOG_EXPORTS)
+                       imports=ALLOWED, exports=EXPORTS)
 
     def test_builtins_store_rejected(self):
         with pytest.raises(SecurityError, match="__builtins__"):

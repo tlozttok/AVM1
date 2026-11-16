@@ -13,7 +13,7 @@ from .types import (
     Conversation, MetaDict, MetaList, Role, message_to_api_dict, Message,
     SystemMessage, UserMessage, AssistantMessage, ToolMessage,
 )
-from .modules import BASE_MODULES, CATALOG_EXPORTS, sandbox_globals
+from .modules import BASE_MODULES, catalog_exports, sandbox_globals
 from .sandbox import SecurityError, check_code
 
 
@@ -119,7 +119,7 @@ class PLMServer(ABC):
     def _check_code(self, code: str, mode: str = "exec") -> None:
         """静态检查：在基类规则之上按本实例白名单检查 import。"""
         check_code(code, mode=mode, allow_import=True,
-                   imports=self._imports, exports=CATALOG_EXPORTS)
+                   imports=self._imports, exports=catalog_exports())
 
     def _dispatch(self, msg) -> None:
         """按消息类型派发执行；system 不返回，user/tool 可以返回消息。"""

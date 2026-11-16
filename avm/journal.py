@@ -640,6 +640,28 @@ def _effect_device_unmount(core, effect) -> None:
     core.unmount_device(effect.get("mount"))
 
 
+def _effect_module_register(core, effect) -> None:
+    """重放运行期模块注册；模块已在目录里（快照/init 已注册）时幂等跳过。"""
+    from .modules import MODULE_CATALOG
+
+    spec = effect.get("spec")
+    if not isinstance(spec, dict):
+        raise VMMemoryError("module_register 缺少 spec 载荷")
+    name = spec.get("name")
+    if not isinstance(name, str) or not name:
+        raise VMMemoryError("module_register 的 spec 缺少模块名")
+    if name in MODULE_CATALOG:
+        return
+    core.register_module(
+        name,
+        source_kind=spec.get("source_kind"),
+        source=spec.get("source"),
+        export_names=tuple(spec.get("exports") or ()),
+        note=spec.get("note") or "",
+        journal=False,
+    )
+
+
 _EFFECTS = {
     "memory_set": _effect_memory_set,
     "memory_make": _effect_memory_make,
@@ -659,6 +681,7 @@ _EFFECTS = {
     "listener_cancel_all": _effect_listener_cancel_all,
     "device_mount": _effect_device_mount,
     "device_unmount": _effect_device_unmount,
+    "module_register": _effect_module_register,
 }
 
 # 世界类效果 vs 对话态效果：reboot 只用世界类效果重建世界（对话/监听器/调度全部丢弃）。
@@ -666,6 +689,7 @@ _EFFECTS = {
 WORLD_EFFECTS = frozenset({
     "memory_set", "memory_make", "memory_delete", "memory_attach",
     "memory_detach", "edit_metadata", "device_mount", "device_unmount",
+    "module_register",
 })
 CONVERSATION_EFFECTS = frozenset({
     "device_write",           # 设备写审计：只记录，重放不访问设备

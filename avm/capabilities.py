@@ -7,7 +7,7 @@
 - 根表（roots）：根名 -> `$MEM` 之后的真实段序列。解析引用时第一段按本表匹配。
 - 工具集（tools）：本对话可调用的指令名集合，是 ALL_TOOL_NAMES 的子集。
 - 导入白名单（imports）：本对话额外可 import 的模块名，是宿主模块目录
-  （`avm/modules.py` 的 GRANTABLE_MODULE_NAMES）的子集；基线模块 math/json/re
+  （`avm/modules.py` 的 grantable_module_names()）的子集；基线模块 math/json/re
   不可裁剪、也不需要声明。
 
 `AddressSpace` 是一次解析的地址上下文；`Memory` 的公开方法接受它，None 表示
@@ -19,7 +19,7 @@
 from typing import Dict, Iterable, Mapping, Optional, Tuple
 
 from .exceptions import IllegalOperationError, VMMemoryError
-from .modules import GRANTABLE_MODULE_NAMES
+from .modules import grantable_module_names
 
 MODE_KERNEL = "kernel"
 # 内核控制面设备（挂载在 $MEM 下）：它们的路径是保留区，不能被镜像根注册表
@@ -246,7 +246,7 @@ class Capability:
     @classmethod
     def kernel_full(cls) -> "Capability":
         """默认内核态全能力：MEM 根、全部工具、无组、模块目录全部可授予项。"""
-        return cls(imports=GRANTABLE_MODULE_NAMES)
+        return cls(imports=grantable_module_names())
 
 
 def default_kernel_caps() -> Capability:

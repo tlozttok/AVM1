@@ -11,7 +11,7 @@ from avm.capabilities import AddressSpace
 from avm.core import Core
 from avm.exceptions import VMMemoryError
 from avm.image import load_image
-from avm.modules import BASE_MODULES, GRANTABLE_MODULE_NAMES, MODULE_CATALOG
+from avm.modules import BASE_MODULES, MODULE_CATALOG, grantable_module_names
 from avm.snapshot import restore, snapshot
 
 
@@ -25,7 +25,7 @@ class TestCatalogRead:
         text = core.unwrap("$MEM.module_catalog", for_llm=True)
         for name in BASE_MODULES:
             assert name in text
-        for name in GRANTABLE_MODULE_NAMES:
+        for name in grantable_module_names():
             assert name in text
 
     def test_single_module_entry(self):

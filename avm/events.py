@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from .capabilities import AddressSpace
 from .exceptions import IllegalOperationError, VMMemoryError
-from .modules import BASE_MODULES, CATALOG_EXPORTS, import_function, shared_view
+from .modules import BASE_MODULES, catalog_exports, import_function, shared_view
 from .sandbox import check_code, safe_globals
 from .types import MetaDict, MetaList
 
@@ -1033,7 +1033,7 @@ class EventSystem:
         namespace = self._handler_namespace(allowed)
         try:
             check_code(listener["handler_code"], allow_import=True,
-                       imports=allowed, exports=CATALOG_EXPORTS)
+                       imports=allowed, exports=catalog_exports())
             exec(compile(listener["handler_code"], "<handler>", "exec"), namespace)
         except Exception as e:
             raise EventHandlerError(

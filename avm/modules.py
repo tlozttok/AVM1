@@ -25,9 +25,13 @@
   可被改写后影响宿主安全的属性。
 """
 
+import hashlib
+import importlib
+import importlib.util
 import json
+import os
 import types
-from typing import Dict, Mapping, Optional
+from typing import Dict, List, Mapping, Optional
 
 from .exceptions import VMMemoryError
 from .memory_device import MemoryDevice
@@ -156,14 +160,188 @@ _MODULE_SPECS = [
 ]
 
 MODULE_CATALOG: Dict[str, ModuleSpec] = {spec.name: spec for spec in _MODULE_SPECS}
-GRANTABLE_MODULE_NAMES = frozenset(
-    name for name, spec in MODULE_CATALOG.items() if spec.kind == "grantable"
-)
 
-# 静态检查用：模块名 → 可 from-import 的导出名集合（含基线）。
-CATALOG_EXPORTS: Dict[str, frozenset] = {
-    name: frozenset(spec.exports) for name, spec in MODULE_CATALOG.items()
-}
+# 运行期注册的模块描述（快照/journal 用）：name → {source_kind, source, exports, note, sha256}
+REGISTERED_MODULE_DESCRIPTORS: Dict[str, dict] = {}
+
+_GRANTABLE_CACHE = None
+_EXPORTS_CACHE = None
+
+
+def _invalidate_catalog_caches() -> None:
+    global _GRANTABLE_CACHE, _EXPORTS_CACHE
+    _GRANTABLE_CACHE = None
+    _EXPORTS_CACHE = None
+
+
+def grantable_module_names() -> frozenset:
+    """当前可授予模块名（含运行期注册；实时读目录，注册后立即生效）。"""
+    global _GRANTABLE_CACHE
+    if _GRANTABLE_CACHE is None:
+        _GRANTABLE_CACHE = frozenset(
+            name for name, spec in MODULE_CATALOG.items() if spec.kind == "grantable"
+        )
+    return _GRANTABLE_CACHE
+
+
+def catalog_exports() -> Dict[str, frozenset]:
+    """静态检查用：模块名 → 可 from-import 的导出名集合（含基线与运行期注册）。"""
+    global _EXPORTS_CACHE
+    if _EXPORTS_CACHE is None:
+        _EXPORTS_CACHE = {
+            name: frozenset(spec.exports) for name, spec in MODULE_CATALOG.items()
+        }
+    return _EXPORTS_CACHE
+
+
+def catalog_names() -> tuple:
+    return tuple(sorted(MODULE_CATALOG))
+
+
+def _check_export_names(name: str, export_names) -> None:
+    if not isinstance(name, str) or not name:
+        raise SecurityError("注册模块需要非空字符串名字")
+    if "." in name or name.startswith("_"):
+        raise SecurityError(f"模块名不能含点号或以 _ 开头：{name!r}")
+    if name in BASE_MODULES:
+        raise SecurityError(f"模块名 {name!r} 是基线模块，不可注册覆盖")
+    if not export_names:
+        raise SecurityError(f"模块 {name!r} 的导出名单不能为空")
+    for item in export_names:
+        if not isinstance(item, str) or not item:
+            raise SecurityError(f"模块 {name!r} 的导出名必须是非空字符串：{item!r}")
+        if item.startswith("_"):
+            raise SecurityError(f"模块 {name!r} 的导出名不能以 _ 开头：{item!r}")
+
+
+def register_module(name: str, exports: Optional[Mapping[str, object]] = None,
+                    note: str = "") -> ModuleSpec:
+    """把一个模块注册进宿主目录（运行期注册的唯一写入口的底层实现）。
+
+    `exports` 是导出名 → 宿主对象；导出值不允许是模块对象（视图里再套真模块会
+    绕开裁剪）。同描述重复注册由调用方（`register_module_from_source`）负责幂等；
+    这里只做结构校验并写入目录。
+    """
+    if not isinstance(name, str) or not name:
+        raise SecurityError("注册模块需要非空字符串名字")
+    if name in BASE_MODULES:
+        raise SecurityError(f"模块名 {name!r} 是基线模块，不可注册覆盖")
+    if name in MODULE_CATALOG:
+        raise SecurityError(f"模块 {name!r} 已在目录里，不能重复注册")
+    if not isinstance(exports, Mapping):
+        raise SecurityError(f"注册模块 {name!r} 需要导出映射（名字 → 宿主对象）")
+    export_names = tuple(exports.keys())
+    _check_export_names(name, export_names)
+    for export_name, value in exports.items():
+        if isinstance(value, types.ModuleType):
+            raise SecurityError(
+                f"模块 {name!r} 的导出 {export_name!r} 是模块对象：视图不能导出真模块"
+            )
+    frozen = dict(exports)
+    spec = ModuleSpec(name, "grantable", lambda: dict(frozen), note or "运行期注册")
+    MODULE_CATALOG[name] = spec
+    _invalidate_catalog_caches()
+    return spec
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_module_source(source_kind: str, source: str):
+    """按来源加载宿主模块（宿主代码，注册入口信任边界在上层）。"""
+    if source_kind == "module":
+        try:
+            return importlib.import_module(source)
+        except Exception as e:  # noqa: BLE001 - 宿主模块加载失败统一归类
+            raise SecurityError(f"加载宿主模块 {source!r} 失败：{type(e).__name__}: {e}") from None
+    if source_kind == "file":
+        if not isinstance(source, str) or not source:
+            raise SecurityError("file 来源需要非空路径")
+        file_path = os.path.abspath(source)
+        if not os.path.isfile(file_path):
+            raise SecurityError(f"模块文件不存在：{file_path}")
+        module_name = "_avm_host_module_" + hashlib.sha1(file_path.encode("utf-8")).hexdigest()[:12]
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, file_path)
+            if spec is None or spec.loader is None:
+                raise SecurityError(f"无法加载模块文件：{file_path}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+        except SecurityError:
+            raise
+        except Exception as e:  # noqa: BLE001 - 宿主模块加载失败统一归类
+            raise SecurityError(f"加载模块文件 {file_path} 失败：{type(e).__name__}: {e}") from None
+    raise SecurityError(f"未知模块来源：{source_kind!r}（file/module）")
+
+
+def register_module_from_source(name: str, source_kind: str, source: str,
+                                export_names, note: str = "") -> ModuleSpec:
+    """从文件/已安装模块注册：按导出名单裁剪后进目录。
+
+    同描述重复注册幂等（返回已有 spec，供 init 重跑、journal 重放使用）；
+    同名不同描述报错（不做运行期替换）。
+    """
+    if not isinstance(export_names, (list, tuple)):
+        raise SecurityError(f"模块 {name!r} 的导出名单必须是字符串列表")
+    _check_export_names(name, export_names)
+    existing = REGISTERED_MODULE_DESCRIPTORS.get(name)
+    if existing is not None:
+        if (existing.get("source_kind") == source_kind
+                and existing.get("source") == source
+                and existing.get("exports") == list(export_names)
+                and existing.get("note", "") == (note or "")):
+            return MODULE_CATALOG[name]
+        raise SecurityError(f"模块 {name!r} 已用不同描述注册过，不能替换")
+    if name in BASE_MODULES:
+        raise SecurityError(f"模块名 {name!r} 是基线模块，不可注册覆盖")
+    if name in MODULE_CATALOG:
+        raise SecurityError(f"模块 {name!r} 已在目录里，不能重复注册")
+    loaded = _load_module_source(source_kind, source)
+    exports = {}
+    missing = []
+    for export_name in export_names:
+        if hasattr(loaded, export_name):
+            exports[export_name] = getattr(loaded, export_name)
+        else:
+            missing.append(export_name)
+    if missing:
+        raise SecurityError(f"模块 {name!r} 缺少导出名：{sorted(missing)}")
+    spec = register_module(name, exports=exports, note=note)
+    descriptor = {
+        "name": name,
+        "kind": "grantable",
+        "source_kind": source_kind,
+        "source": os.path.abspath(source) if source_kind == "file" else source,
+        "exports": list(export_names),
+        "note": note or "",
+    }
+    if source_kind == "file":
+        descriptor["sha256"] = _sha256_file(descriptor["source"])
+    REGISTERED_MODULE_DESCRIPTORS[name] = descriptor
+    return spec
+
+
+def registered_module_descriptors() -> Dict[str, dict]:
+    """运行期注册的模块描述（快照/journal 用；JSON 安全副本）。"""
+    return {
+        name: {key: (list(value) if isinstance(value, list) else value)
+               for key, value in descriptor.items()}
+        for name, descriptor in REGISTERED_MODULE_DESCRIPTORS.items()
+    }
+
+
+def module_descriptor(name: str) -> dict:
+    descriptor = REGISTERED_MODULE_DESCRIPTORS.get(name)
+    if descriptor is None:
+        raise SecurityError(f"模块 {name!r} 不是运行期注册的模块")
+    return {key: (list(value) if isinstance(value, list) else value)
+            for key, value in descriptor.items()}
 
 # 事件处理器等没有实例缓存的位置使用的基线视图缓存（视图只读，可共享）。
 _SHARED_VIEWS: Dict[str, GuestModule] = {}
@@ -302,3 +480,80 @@ class ModuleCatalogDevice(MemoryDevice):
                 f"$MEM.module_catalog.<模块名> 支持 name/kind/note/exports，得到 {field!r}"
             )
         raise VMMemoryError("$MEM.module_catalog 支持 <模块名> 与 <模块名>.<字段>")
+
+class ModuleLoaderDevice(MemoryDevice):
+    """$MEM.module_loader：运行期模块注册入口（临时入口，审批流程后补）。
+
+    写入一段 JSON 命令：
+
+    ```json
+    {"action": "register", "name": "mylib", "file": "lib/mylib.py",
+     "exports": ["foo", "Bar"], "note": "可选说明"}
+    {"action": "register", "name": "stats", "module": "statistics",
+     "exports": ["mean"]}
+    ```
+
+    `file` 相对镜像目录解析；`module` 是宿主已安装模块名。注册 = 在宿主进程内
+    import 该文件/模块，按 exports 名单裁剪后进目录（宿主代码，信任边界目前是
+    「能写 $MEM 的内核态对话」；审批流程之后补，sha256 已记在描述里）。
+    同描述重复注册幂等：镜像 init 在 reboot/resume 后重跑同一命令不会报错。
+    """
+
+    def __init__(self, core=None):
+        self._core = core
+
+    def attach_core(self, core) -> None:
+        self._core = core
+
+    def pretend_as_type(self) -> str:
+        return "str"
+
+    def to_llm_string(self) -> str:
+        return (
+            "module_loader：运行期模块注册入口。写 JSON 命令："
+            "{\"action\": \"register\", \"name\": <名字>, "
+            "\"file\": <相对镜像目录的 .py 路径> 或 \"module\": <已安装模块名>, "
+            "\"exports\": [<导出名>...]}；注册后新创建的对话可按 caps.imports 使用"
+        )
+
+    def set_value(self, value) -> None:
+        core = self._core
+        if core is None:
+            raise VMMemoryError("模块注册入口未接入 Core")
+        try:
+            payload = json.loads(value)
+        except (TypeError, ValueError):
+            raise SecurityError("注册命令不是合法 JSON") from None
+        if not isinstance(payload, dict):
+            raise SecurityError("注册命令必须是 JSON 对象")
+        action = payload.get("action")
+        if action != "register":
+            raise SecurityError(f"注册命令 action 不支持：{action!r}")
+        name = payload.get("name")
+        exports = payload.get("exports")
+        note = payload.get("note") or ""
+        file_rel = payload.get("file")
+        module_name = payload.get("module")
+        if not isinstance(note, str):
+            raise SecurityError("注册命令的 note 必须是字符串")
+        if not isinstance(exports, list):
+            raise SecurityError("注册命令的 exports 必须是字符串数组")
+        has_file = isinstance(file_rel, str) and bool(file_rel)
+        has_module = isinstance(module_name, str) and bool(module_name)
+        if has_file == has_module:
+            raise SecurityError("注册命令必须在 file 与 module 中二选一")
+        if has_file:
+            base_dir = getattr(core, "image_dir", None) or os.getcwd()
+            source_kind, source = "file", (
+                file_rel if os.path.isabs(file_rel) else os.path.normpath(os.path.join(base_dir, file_rel))
+            )
+        else:
+            source_kind, source = "module", module_name
+        try:
+            core.register_module(
+                name, source_kind=source_kind, source=source,
+                export_names=tuple(exports), note=note,
+            )
+        except SecurityError as e:
+            # 注册失败按可判定错误返回（不回显写入原文，错误文本来自注册表校验）
+            raise VMMemoryError(f"模块注册失败：{e}") from None

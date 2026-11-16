@@ -22,7 +22,11 @@ from .types import message_to_dict, batch_to_dict
 from .memory import Memory, check_new_key
 from .memory_device import MemoryDevice
 from .monitor import Monitor
-from .modules import BASE_MODULES, GRANTABLE_MODULE_NAMES, ModuleCatalogDevice
+from .modules import (
+    BASE_MODULES, MODULE_CATALOG, ModuleCatalogDevice, ModuleLoaderDevice,
+    grantable_module_names, module_descriptor, register_module_from_source,
+    register_module as register_catalog_module, registered_module_descriptors,
+)
 from .python_server import HOST_ONLY_PLMS, PLM_REGISTRY, create_plm
 from .events import EventSystem, build_event, EVENT_TYPES
 from .journal import (
@@ -1193,7 +1197,7 @@ def _build_imports(conv: Optional[Conversation] = None) -> list:
     白名单在对话生命周期内稳定（caps 创建后只读，运行期不提供修改入口）。
     """
     if conv is None:
-        return sorted(set(BASE_MODULES) | set(GRANTABLE_MODULE_NAMES))
+        return sorted(set(BASE_MODULES) | set(grantable_module_names()))
     return sorted(set(BASE_MODULES) | set(conv.caps.imports))
 
 
@@ -1414,11 +1418,11 @@ def _derive_child_caps(core: 'Core', parent: Optional[Conversation], node, is_su
                 f"程序 caps.imports 不能声明基线模块：{declared_base}"
                 f"（基线 {list(BASE_MODULES)} 不可裁剪，也不需要声明）"
             )
-        unknown = imports - GRANTABLE_MODULE_NAMES
+        unknown = imports - grantable_module_names()
         if unknown:
             raise VMMemoryError(
                 f"程序 caps.imports 引用了宿主模块目录之外的模块：{sorted(unknown)}"
-                f"（可授予：{sorted(GRANTABLE_MODULE_NAMES)}）"
+                f"（可授予：{sorted(grantable_module_names())}）"
             )
         extra = imports - parent_caps.imports
         if extra:
@@ -1807,6 +1811,7 @@ class Core:
             "roots": lambda: RootsDevice(self),
             "caps": lambda: CapsDevice(self),
             "module_catalog": lambda: ModuleCatalogDevice(),
+            "module_loader": lambda: ModuleLoaderDevice(self),
         }
         for mount, factory in factories.items():
             if mount in self.mem._devices:
@@ -1817,6 +1822,43 @@ class Core:
                 "builtin": True,
                 "class": type(device).__name__,
             }
+
+    # ------------------------------------------------------------------
+    # 模块目录（运行期注册）
+    # ------------------------------------------------------------------
+
+    def refresh_panel_caps(self) -> None:
+        """-1 面板对话是完整权限、不是创建时固定的：目录变化后刷新它的导入白名单。
+
+        只刷新这一个保留对话；已有普通对话不扩权（作者 2026-11-16 定夺：新库只给
+        之后创建的新对话用）。
+        """
+        conv = self._conv_by_cid.get(PANEL_CID)
+        if conv is None:
+            return
+        current = grantable_module_names()
+        if conv.caps.imports != current:
+            conv.caps = conv.caps.copy(imports=current)
+
+    def register_module(self, name, *, source_kind="builtin", source=None,
+                        exports=None, export_names=None, note="", journal=True):
+        """运行期注册一个可授予模块（模块目录的唯一写入口）。
+
+        - `source_kind="builtin"`：直接给 exports 映射（宿主代码/测试；不持久化，
+          因为模块对象由宿主代码拥有）；
+        - `source_kind="file"` / `"module"`：宿主文件/已安装模块按导出名单裁剪；
+          注册描述进 journal（世界效果）与快照，重启恢复。
+        - 注册后刷新 -1 面板对话的完整目录；已有普通对话不扩权。
+        """
+        if source_kind == "builtin":
+            spec = register_catalog_module(name, exports=exports, note=note or "宿主注册")
+        else:
+            spec = register_module_from_source(
+                name, source_kind, source, tuple(export_names or ()), note or "")
+            if journal:
+                self.note_effect("module_register", spec=module_descriptor(name))
+        self.refresh_panel_caps()
+        return spec
 
     def is_hidden_cid(self, cid) -> bool:
         """对话是否对普通对话隐藏、不可寻址（显示/寻址策略，不影响恢复）。
@@ -2724,6 +2766,8 @@ class Core:
         """
         conv = self._conv_by_cid.get(PANEL_CID)
         if conv is not None:
+            # -1 是完整权限、非创建时固定的：每次取用时按当前目录刷新。
+            self.refresh_panel_caps()
             return conv
         conv = Conversation(
             messages=[SystemMessage(content=_OPERATOR_SYSTEM_PROMPT)],

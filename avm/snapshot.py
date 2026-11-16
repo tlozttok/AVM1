@@ -28,6 +28,10 @@ from typing import Optional
 
 from .events import listener_from_snapshot, listener_to_snapshot
 from .journal import apply_scheduler, scheduler_to_snapshot
+from .modules import (
+    MODULE_CATALOG, SecurityError as ModuleSecurityError,
+    register_module_from_source, registered_module_descriptors,
+)
 from .memory import Memory
 from .types import MetaDict
 
@@ -81,6 +85,7 @@ def snapshot(core) -> dict:
         "device_specs": {
             mount: dict(spec) for mount, spec in core.device_specs.items()
         },
+        "module_specs": registered_module_descriptors(),
         "interrupts": {"last_dispatch": list(core.interrupts.last_dispatch)},
     }
 
@@ -145,7 +150,10 @@ def restore(core, doc: dict) -> None:
     _rebuild_memory_and_devices(core, doc)
     # 旧快照可能没有后加的宿主内建设备（device_specs 里没有）：补齐，保证恢复后可用。
     core.install_host_devices()
+    _rebuild_modules(core, doc)
     _rebuild_conversations(core, doc)
+    # -1 面板对话是完整权限：目录恢复后按当前目录刷新它的导入白名单。
+    core.refresh_panel_caps()
     _rebuild_listeners(core, doc)
     _restore_security_and_pointer(core, doc)
     core.journal_generation = _generation_of(doc)
@@ -165,6 +173,7 @@ def restore_world(core, doc: dict) -> None:
     doc = _validate_doc(doc)
     _rebuild_memory_and_devices(core, doc)
     core.install_host_devices()
+    _rebuild_modules(core, doc)
     _restore_security_and_pointer(core, doc)
     core.journal_generation = _generation_of(doc)
     core._journal_seq = int(doc.get("seq", 0) or 0)
@@ -265,6 +274,33 @@ def _rebuild_memory_and_devices(core, doc: dict) -> None:
                 mount, getattr(core.mem._devices[mount], "device_id", None) or mount,
                 type(core.mem._devices[mount]).__name__,
             )
+
+
+def _rebuild_modules(core, doc: dict) -> None:
+    """恢复运行期注册的模块：按快照里的描述重新加载宿主文件/模块。
+
+    快照生成时还没有运行期模块（旧快照）→ `module_specs` 缺失，跳过。
+    文件缺失/导出名不再存在时拒绝恢复（与设备恢复同样严格，避免半恢复状态）。
+    """
+    specs = doc.get("module_specs") or {}
+    if not isinstance(specs, dict):
+        raise SnapshotError("快照 module_specs 必须是对象")
+    for name, spec in specs.items():
+        if not isinstance(spec, dict):
+            raise SnapshotError(f"module_specs.{name} 必须是对象")
+        if name in MODULE_CATALOG:
+            continue
+        try:
+            register_module_from_source(
+                name,
+                spec.get("source_kind"),
+                spec.get("source"),
+                tuple(spec.get("exports") or ()),
+                spec.get("note") or "",
+            )
+        except (ModuleSecurityError, OSError, ValueError, TypeError) as e:
+            raise SnapshotError(f"模块 {name} 恢复失败：{e}") from e
+    core.refresh_panel_caps()
 
 
 def _rebuild_conversations(core, doc: dict) -> None:

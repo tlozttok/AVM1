@@ -16,7 +16,7 @@ from avm.capabilities import (
 )
 from avm.core import Core, PLMExecutor, _build_conversation, _build_imports, _derive_child_caps
 from avm.exceptions import IllegalOperationError, VMMemoryError
-from avm.modules import BASE_MODULES, GRANTABLE_MODULE_NAMES
+from avm.modules import BASE_MODULES, grantable_module_names
 from avm.python_server import create_plm
 from avm.types import (
     Conversation, MetaDict, MetaList, StrNode, SystemMessage, UserMessage,
@@ -50,7 +50,7 @@ def _parent_conv(core):
 class TestCapabilityImportsData:
     def test_default_kernel_has_all_grantable_modules(self):
         caps = default_kernel_caps()
-        assert caps.imports == GRANTABLE_MODULE_NAMES
+        assert caps.imports == grantable_module_names()
 
     def test_bare_capability_has_no_grants(self):
         assert Capability().imports == frozenset()
@@ -132,7 +132,7 @@ class TestBuildImports:
     def test_kernel_default_effective_set_is_full_catalog(self):
         core = _core()
         conv = core.start("sys", "user")
-        assert _build_imports(conv) == sorted(set(BASE_MODULES) | set(GRANTABLE_MODULE_NAMES))
+        assert _build_imports(conv) == sorted(set(BASE_MODULES) | set(grantable_module_names()))
 
 
 class TestExecutorPropagation:

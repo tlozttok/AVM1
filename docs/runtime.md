@@ -168,7 +168,7 @@ Core 内置只读信息设备：`$MEM.conversations`（对话列表与单对话�
 
 ### 模块目录（`$MEM.module_catalog`）
 
-宿主在 `Core()` 里挂载的只读设备（`avm/modules.py` 的 `ModuleCatalogDevice`），与导入机制共用同一份宿主模块目录（`BASE_MODULES` / `MODULE_CATALOG`）。它回答「AVM 内部有什么模块可用、每个模块导出哪些名字」，不参与导入执行。
+宿主在 `Core()` 里挂载的只读设备（`avm/modules.py` 的 `ModuleCatalogDevice`），与导入机制共用同一份宿主模块目录（`BASE_MODULES` / `MODULE_CATALOG`）。它回答「AVM 内部有什么模块可用、每个模块导出哪些名字」，不参与导入执行。目录是内核状态，可由宿主在运行期经 `$MEM.module_loader` 扩展（见下），新增模块立即出现在本设备与白名单校验里。
 
 - 根读取给摘要：基线模块（`math` / `json` / `re`，不可裁剪、不需要授予）、可授予模块名单与数量、读法提示；
 - `$MEM.module_catalog.<模块名>` 返回 JSON：`name` / `kind`（`base` / `grantable`）/ `note` / `exports`（导出名列表）；`.<模块名>.exports` 只读导出名列表；
@@ -176,6 +176,22 @@ Core 内置只读信息设备：`$MEM.conversations`（对话列表与单对话�
 - 可见性：内核态对话经 `$MEM` 直接读；用户态对话要由镜像按根授予（根目标可以指向设备本身）；每对话实际授予的导入白名单见 `$MEM.caps.<cid>.imports`；
 - 旧快照/旧日志恢复后由 `Core.install_host_devices()` 补挂（快照生成时还没有这只设备也不影响）；
 - `$MEM.module_catalog` 是宿主保留挂载路径：镜像 mem 里出现同名键会被挂载点覆盖（与 `scheduler` / `caps` 等相同）。
+
+### 运行期模块注册（`$MEM.module_loader`）
+
+宿主内置的命令设备（`ModuleLoaderDevice`，与目录设备同批挂载），把「加一个可用库」变成一次 `memory_write`。写入一段 JSON：
+
+```json
+{"action": "register", "name": "mylib", "file": "lib/mylib.py",
+ "exports": ["foo", "Bar"], "note": "可选说明"}
+{"action": "register", "name": "stats", "module": "statistics", "exports": ["mean"]}
+```
+
+- `file` 相对镜像目录解析（宿主代码，注册时在宿主进程内 import）；`module` 是宿主已安装模块名。`exports` 必须显式列出，注册后 guest 只能看到这些名字（视图裁剪同样适用）。
+- 注册写入模块描述（source_kind/source/exports/note；文件来源记 sha256 供日后审批），同描述重复注册幂等（镜像 init 在 reboot/resume 后重跑同一命令不报错），同名不同描述拒绝（不做运行期替换）。
+- **作用范围**：已有普通对话的 `caps.imports` 不追溯（作者定夺：新库只给之后创建的新对话用）；`-1` 操作员对话是完整权限、不是创建时固定的，注册后刷新为当前完整目录，因此它创建的新对话可以声明/继承新模块。
+- **持久化**：注册描述进快照 `module_specs` 与 journal 世界效果 `module_register`；`resume`/`reboot` 恢复时重新加载宿主文件/模块，文件缺失按快照恢复失败处理（与设备恢复同样严格）；旧快照没有该字段时为空。
+- **信任边界**：注册即在宿主进程内 import，目前只经 `$MEM` 路径可达（内核态/授根者）；审批流程留下一步（描述里的 sha256 是给它的字段）。
 
 ### 命名空间校验（输入边界）
 
@@ -390,7 +406,7 @@ PLM 代码运行在受限环境：安全 builtins 白名单 + AST 检查（双�
 **导入**：`import` 语法可用，底层 `__import__` 由运行时接管（沙箱命名空间的 `__builtins__` 里注入实例闭包），按「基线 ∪ 对话 `caps.imports`」返回**模块视图**：
 
 - 基线 `math` / `json` / `re` 不可裁剪、所有 Python 对话可用，且照旧以原名注入命名空间（旧镜像不写 import 也能用）；
-- 其余模块来自宿主目录（`avm/modules.py` 的 `MODULE_CATALOG`：首期 `itertools` / `functools` / `collections`），由程序节点的 `value.caps.imports` 逐对话授予；
+- 其余模块来自宿主目录（`avm/modules.py` 的 `MODULE_CATALOG`：首期 `itertools` / `functools` / `collections`；可在运行期经 `$MEM.module_loader` 追加），由程序节点的 `value.caps.imports` 逐对话授予；已注册模块立即进入目录，但已有对话不扩权、新对话才可声明；
 - 视图是 `GuestModule`（`types.ModuleType` 子类）：只暴露目录里审计过的导出名、双下划线属性不可见、只读、每 PLM 实例独立缓存；不向 guest 返回宿主真模块；
 - 静态检查（编译期）与运行期 `__import__` 双层裁决：白名单外、相对导入、子模块导入、`from x import *`、双下划线名字、未导出的 `from` 名字都以 `SecurityError` 拒绝；`from <视图> import <宿主真子模块名>` 不会回退到宿主 `sys.modules`；
 - `$MEM.module_catalog` 设备告诉 AVM 内部「有什么模块、每个模块导出什么」，`$MEM.caps.<cid>.imports` 给出本对话的授予面；运行期不提供修改白名单的入口。
@@ -621,6 +637,8 @@ Guard 是软件层（镜像/OS 程序）注册的一个普通内核态监听器�
 
 **软承诺（重建结果，不是契约）**：监听器、调度队列、设备表按日志与快照重建；设备实例重新构造；LLM 对话沿用消息历史，Python 对话重放 system 消息（命名空间变量不恢复）。
 
+运行期模块注册的描述随快照 `module_specs` 与日志世界效果 `module_register` 恢复；恢复时重新加载宿主文件/模块，文件缺失按恢复失败处理。设备来源表与模块注册描述都属于「世界」的一部分，`reboot` 重放世界类效果时同样恢复模块目录。
+
 **明确不承诺**：设备内部状态与设备副作用；未提交回合的副作用（可能已经发生，日志里没有）；宿主特权操作（控制台屏蔽、直接改监听器、外部输入中未读的部分）；调度队列逐字段一致。
 
 日志只对产生它的镜像有效：换镜像视为新的世界。显式 `--restore` 严格——读不出来就报错；`auto` 在镜像声明了 `snapshot_to` 且文件可读时等价 `resume`，否则等价 `reset`；快照能读但引用的设备文件缺失时明确失败。
@@ -718,7 +736,7 @@ cd web && npm run dev                    # 开发期：Vite 代理 /api 到 AVM_
 面板自身：`cd web && npm run test:unit` 跑纯逻辑用例（状态语义、指令参数构造、节点类型/数据类型判定、命令台历史渲染），`cd web && npm run e2e` 起一个脚本化 MockLMU 的控制台并在浏览器里跑九个场景（首屏、命令台投递、节点工作台三个维度、handler 监听、设备动作、状态语义、调试抽屉、系统日志条、产物由 console 托管）。
 
 - **API 暂停生命周期**：`core.run()` 返回且 `core.paused` 为真时，宿主把 `lifecycle` 置为 `paused`，HTTP 服务保持存活；`/api/state` 增 `paused` / `pause_reason` / `pause_category`，`POST /api/system/resume` 调 `core.clear_api_pause()` 并唤醒主线程重新进入 `core.run()`。暂停期间请求关机会先清暂停、唤醒主线程，让 shutdown 中断能在安全点派发；force-stop 仍按秒数放行。终端宿主 `main.py` 打印原因后等回车；非 tty / EOF 按退出处理（写回内存）。
-- **操作员对话（保留 cid -1）**：cid 是作者规定的保留值，不参与正常分配；控制台在 `boot` 返回后、`core.run()` 之前把 `plm.operator` 通道绑到它，没有就创建。对话随快照与日志正常恢复：日志里出现它的回合而它还不存在时（只靠日志恢复），重放先补建它，回合按普通记录应用；快照里它与普通对话一起保存和恢复。**隐藏标记在对话 attrs**（`host: "console"`、`hidden: "1"`），不是内存树节点：对普通对话隐藏——`$MEM.conversations` / `$MEM.scheduler` / `$MEM.caps` 列表与监测帧过滤，`send_instruction` / `close_conversation` 与 `$conv.<cid>` / `$batch.<cid>` 一律按「不存在」处理；隐藏只由对话 `attrs` 决定，cid 不参与判定。隐藏只是显示与寻址策略，不影响恢复，宿主控制台自己仍能看到它（`/api/state` 与 `/api/conversations/-1`）。初始进休眠队列、不进就绪队列——只有中断能激活。它活跃就等于全局暂停（其他对话都不推进）。`POST /api/interrupt` 挂起 `operator` 中断（在下一个安全点生效；`core.run()` 已返回时不再生效），`POST /api/resume` 让它结束本轮、让出执行权。`POST /api/action` 提交一条动作，未暂停时先自动中断；未知工具名有意允许（响应里有 `known_tool` 与提示）。
+- **操作员对话（保留 cid -1）**：cid 是作者规定的保留值，不参与正常分配；控制台在 `boot` 返回后、`core.run()` 之前把 `plm.operator` 通道绑到它，没有就创建。对话随快照与日志正常恢复：日志里出现它的回合而它还不存在时（只靠日志恢复），重放先补建它，回合按普通记录应用；快照里它与普通对话一起保存和恢复。**隐藏标记在对话 attrs**（`host: "console"`、`hidden: "1"`），不是内存树节点：对普通对话隐藏——`$MEM.conversations` / `$MEM.scheduler` / `$MEM.caps` 列表与监测帧过滤，`send_instruction` / `close_conversation` 与 `$conv.<cid>` / `$batch.<cid>` 一律按「不存在」处理；隐藏只由对话 `attrs` 决定，cid 不参与判定。隐藏只是显示与寻址策略，不影响恢复，宿主控制台自己仍能看到它（`/api/state` 与 `/api/conversations/-1`）。它的 `caps` 是完整权限且**不在创建时固定**：模块目录变化后，注册/取用时按当前可授予目录刷新导入白名单（普通对话不追溯）。初始进休眠队列、不进就绪队列——只有中断能激活。它活跃就等于全局暂停（其他对话都不推进）。`POST /api/interrupt` 挂起 `operator` 中断（在下一个安全点生效；`core.run()` 已返回时不再生效），`POST /api/resume` 让它结束本轮、让出执行权。`POST /api/action` 提交一条动作，未暂停时先自动中断；未知工具名有意允许（响应里有 `known_tool` 与提示）。
 - **读取端点**：`GET /api/state`（运行状态、调度、对话（不过滤 cid -1）、中断、屏蔽账本、生命周期、API 暂停、恢复报告、IO 总线状态）、`/api/tools`（十条指令表）、`/api/conversations/<cid>`、`/api/memory`（可带 `ref`，整树无分页）、`/api/memory/diff?from=&to=`、`/api/listeners`、`/api/devices`、`/api/events`（SSE：面板输出与调度变化的有序流，按 `seq` 增量读）、`/api/io/stream?after=`（SSE：宿主 IO 输出流）。
 - **介入端点**：`POST /api/action`（面板对话执行一条工具调用）、`POST /api/io/input`（调试输入 → 宿主 IO 总线，200 返回 `debug: true`）、`POST /api/system/shutdown`（挂 shutdown 中断通知 OS，见下）、`POST /api/system/resume`（清除 API 暂停并唤醒主线程继续 run）、`POST /api/system/force-stop`（操作员强制退出，见下）、`POST /api/device/inspect`（只读检查设备文件：路径/大小/sha256/类名/挂载/args/现有来源表条目，不 import、不挂载、不写内存）、`POST /api/device-action`（调设备自己声明的调试动作，如给 `$inputs` 投喂一行）、`/api/memory/snapshot`、`PATCH /api/listeners/<id>`（就地启停监听器、改 priority/tier）、`POST|DELETE /api/mask/memory`、`/api/mask/device`（临时摘下一个内存节点或卸载一台设备，`DELETE` 还原；调试原语不产生事件）、`POST /api/session/acquire|release`（单客户端席位）。
 - **关机与强制退出**：`POST /api/system/shutdown` 不执行关机语义，只挂 `shutdown` 中断通知镜像声明的处理程序（中断是 VM 通知软件的通道）；面板占执行权（系统空闲态）时，关机按钮同时在操作员通道提交一次 `{"end": True}`，让阻塞的面板回合回到安全点才能派发中断。OS 软件收尾后写 `$MEM.sys.power.state = "off"`，宿主在安全点看到该边沿后写快照并退出。没有声明 shutdown 处理程序时请求停在挂起（warning），VM 不自行断电；请求关机 `force_stop_after` 秒后可用 `POST /api/system/force-stop` 强制退出——**不写快照、不写 clean**，响应 `{"status": "force-stopped", "snapshot_written": false}`。

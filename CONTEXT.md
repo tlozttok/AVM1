@@ -140,7 +140,7 @@ _Avoid_: 引导、初始化
 对话可调用的指令名集合。决定模型看到的工具 schema、PLM 注入的工具函数与 Core 实际接受的指令三处；宿主控制台的工具表始终是全量。旧对话（无 caps）默认全部 10 条。
 
 **模块导入白名单 (Import allowlist)**:
-对话可 import 的宿主模块名集合（`caps.imports`）。可导入宇宙是宿主模块目录（`avm/modules.py`）；基线 `math`/`json`/`re` 不可裁剪、所有 Python 对话可用，其余模块按白名单授予。每个 PLM 实例拿到的是裁剪过的只读模块视图（`GuestModule`），不是宿主真模块；`$MEM.module_catalog` 设备给出目录，`$MEM.caps.<cid>.imports` 给出本对话授予面。
+对话可 import 的宿主模块名集合（`caps.imports`）。可导入宇宙是宿主模块目录（`avm/modules.py`）；基线 `math`/`json`/`re` 不可裁剪、所有 Python 对话可用，其余模块按白名单授予。每个 PLM 实例拿到的是裁剪过的只读模块视图（`GuestModule`），不是宿主真模块；`$MEM.module_catalog` 设备给出目录，`$MEM.caps.<cid>.imports` 给出本对话授予面。目录可在运行期经 `$MEM.module_loader` 追加（注册只影响之后创建的新对话；`-1` 操作员对话例外，始终按当前完整目录刷新）；注册描述随快照/journal 恢复。
 
 ### 安全
 
