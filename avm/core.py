@@ -654,84 +654,79 @@ class EditMetadataInstruction(Instruction):
                 self.call_id,
             )
             return
-        ctrl = dict(node.get_ctrl() or {})
         if op == "set":
-            if not key:
-                conv.user_batch.add_tool_response(
-                    "Illegal: edit_metadata type=set 时 key 必须是非空字符串", self.call_id
-                )
-                return
-            if value is None:
-                conv.user_batch.add_tool_response(
-                    "Illegal: edit_metadata type=set 时 value 必需（可以是空字符串）", self.call_id
-                )
-                return
-            ctrl[key] = value
-            node.set_ctrl(ctrl)
-            if core.is_journaling():
-                core.note_effect(
-                    "edit_metadata", ref=self.ref, type="set", key=key, value=value,
-                    space=_effect_space(conv),
-                )
-            conv.user_batch.add_tool_response(f"ctrl.{key} = {value!r} 已写入", self.call_id)
-            _publish_core_after_safely(core, 
-                "edit_metadata",
-                conv,
-                self.ref,
-                {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
-                source_kind="memory",
-                target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
-            )
+            self._ctrl_set(core, conv, node, key, value)
         elif op == "get":
-            if not key:
-                conv.user_batch.add_tool_response(
-                    json.dumps(ctrl, ensure_ascii=False) if ctrl else "{}", self.call_id
-                )
-                _publish_core_after_safely(core, 
-                    "edit_metadata",
-                    conv,
-                    self.ref,
-                    {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
-                    source_kind="memory",
-                target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
-                )
-            elif key in ctrl:
-                conv.user_batch.add_tool_response(str(ctrl[key]), self.call_id)
-                _publish_core_after_safely(core, 
-                    "edit_metadata",
-                    conv,
-                    self.ref,
-                    {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
-                    source_kind="memory",
-                target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
-                )
-            else:
-                conv.user_batch.add_tool_response(f"Error: ctrl 中没有键 {key}", self.call_id)
-        else:  # del
-            if not key:
-                conv.user_batch.add_tool_response(
-                    "Illegal: edit_metadata type=del 时 key 必需", self.call_id
-                )
-                return
-            if key not in ctrl:
-                conv.user_batch.add_tool_response(f"Error: ctrl 中没有键 {key}", self.call_id)
-                return
-            del ctrl[key]
-            node.set_ctrl(ctrl)
-            if core.is_journaling():
-                core.note_effect(
-                    "edit_metadata", ref=self.ref, type="del", key=key,
-                    space=_effect_space(conv),
-                )
-            conv.user_batch.add_tool_response(f"ctrl.{key} 已删除", self.call_id)
-            _publish_core_after_safely(core, 
-                "edit_metadata",
-                conv,
-                self.ref,
-                {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
-                source_kind="memory",
-                target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
+            self._ctrl_get(core, conv, node, key, value)
+        else:
+            self._ctrl_del(core, conv, node, key, value)
+
+    def _respond(self, conv, text: str) -> None:
+        """把结果作为本次工具调用的响应写回（三条分支共用，省掉 call_id 重复）。"""
+        conv.user_batch.add_tool_response(text, self.call_id)
+
+    def _publish_after(self, core: 'Core', conv, op: str, key, value) -> None:
+        """写后事件。三种操作只差 payload 里的 type，其余完全相同——
+        原先五个分支各抄了一遍，缩进还抄歪了。"""
+        _publish_core_after_safely(
+            core,
+            "edit_metadata",
+            conv,
+            self.ref,
+            {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
+            source_kind="memory",
+            target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
+        )
+
+    def _ctrl_set(self, core: 'Core', conv, node, key, value) -> None:
+        """type=set：key/value 都必需（value 可以是空字符串，但不能缺）。"""
+        if not key:
+            self._respond(conv, "Illegal: edit_metadata type=set 时 key 必须是非空字符串")
+            return
+        if value is None:
+            self._respond(conv, "Illegal: edit_metadata type=set 时 value 必需（可以是空字符串）")
+            return
+        ctrl = dict(node.get_ctrl() or {})
+        ctrl[key] = value
+        node.set_ctrl(ctrl)
+        if core.is_journaling():
+            core.note_effect(
+                "edit_metadata", ref=self.ref, type="set", key=key, value=value,
+                space=_effect_space(conv),
             )
+        self._respond(conv, f"ctrl.{key} = {value!r} 已写入")
+        self._publish_after(core, conv, "set", key, value)
+
+    def _ctrl_get(self, core: 'Core', conv, node, key, value) -> None:
+        """type=get：不带 key 返回整个 ctrl（JSON）；带 key 返回值。读失败不发写后事件。"""
+        ctrl = dict(node.get_ctrl() or {})
+        if not key:
+            self._respond(conv, json.dumps(ctrl, ensure_ascii=False) if ctrl else "{}")
+        elif key in ctrl:
+            self._respond(conv, str(ctrl[key]))
+        else:
+            self._respond(conv, f"Error: ctrl 中没有键 {key}")
+            return
+        self._publish_after(core, conv, "get", key, value)
+
+    def _ctrl_del(self, core: 'Core', conv, node, key, value) -> None:
+        """type=del：key 必需且必须已存在。"""
+        if not key:
+            self._respond(conv, "Illegal: edit_metadata type=del 时 key 必需")
+            return
+        ctrl = dict(node.get_ctrl() or {})
+        if key not in ctrl:
+            self._respond(conv, f"Error: ctrl 中没有键 {key}")
+            return
+        del ctrl[key]
+        node.set_ctrl(ctrl)
+        if core.is_journaling():
+            core.note_effect(
+                "edit_metadata", ref=self.ref, type="del", key=key,
+                space=_effect_space(conv),
+            )
+        self._respond(conv, f"ctrl.{key} 已删除")
+        self._publish_after(core, conv, "del", key, value)
 
 
 class CreateInstruction(Instruction):
