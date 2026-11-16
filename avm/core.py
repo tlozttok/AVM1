@@ -1,5 +1,6 @@
 import dataclasses
 import traceback
+from types import MappingProxyType
 from typing import Optional, List, Dict, Type, Any
 
 from openai import OpenAI
@@ -9,7 +10,7 @@ import os
 import sys
 import time
 
-from .types import MetaList, MetaDict
+from .types import MetaList, MetaDict, PANEL_CID
 from .capabilities import (
     CONTROL_DEVICE_ROOTS, MEM_ROOT_NAME, MODE_KERNEL, MODE_USER, Capability, caps_to_dict,
     check_root_name, default_kernel_caps, grant_target_segments, path_is_prefix,
@@ -171,12 +172,8 @@ def _publish_memory_after(
 # 不在这套之内的异常是内核缺陷，由 advance_conversation 记帧后向上抛（不在这里吞）。
 _INSTRUCTION_ERRORS = (VMMemoryError, KeyError, IndexError, TypeError, ValueError)
 
-# 保留对话 cid（作者规定）：宿主侧操作员对话的身份，不参与正常分配，也不会撞上
-# `_next_cid` 的正数。它对普通对话隐藏：不出现在 $MEM.conversations / $MEM.scheduler
-# 里，也不可用 send_instruction / close_conversation 或 $conv.<cid> / $batch.<cid>
-# 寻址。隐藏只是显示/寻址策略：对话本身随快照/日志正常恢复，日志里它的回合按普通
-# 回合重放。
-PANEL_CID = -1
+# 保留对话 cid（作者规定）——定义与语义说明在 avm.types.PANEL_CID，此处只是重新导出，
+# 保持 `from avm.core import PANEL_CID` 的既有用法。
 
 
 # 启动自带的内存节点：模型目录。普通内存节点，不是设备——不产生事件、不参与调度。
@@ -2033,6 +2030,24 @@ class Core:
 
     def get_conversation(self, cid: int) -> Optional[Conversation]:
         return self._conv_by_cid.get(cid)
+
+    @property
+    def conversations(self):
+        """对话表的只读视图（cid → Conversation）。
+
+        持久化、事件、设备、宿主都只需要查表，不该直接摸 _conv_by_cid。收口到这里之后，
+        表结构变化只需要改本类，外部模块跟着接口走。返回只读代理，写操作仍走本类的
+        register / remove / clear。
+        """
+        return MappingProxyType(self._conv_by_cid)
+
+    def remove_conversation(self, cid: int) -> Optional[Conversation]:
+        """从对话表移除并返回该对话（日志重放撤销用）。不存在时返回 None。"""
+        return self._conv_by_cid.pop(cid, None)
+
+    def clear_conversations(self) -> None:
+        """清空对话表（快照恢复重建时用）。原地清空，保留字典对象本身。"""
+        self._conv_by_cid.clear()
 
     def checkpoint_path(self, cid: int) -> str:
         """调试用：单对话检查点的默认路径（镜像目录/out/<镜像名>.conv.json；无镜像上下文时用 checkpoints/conv-<cid>.json）"""

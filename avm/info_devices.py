@@ -18,7 +18,7 @@ MAX_LISTENER_PRIORITY = 10000
 
 
 def _caller_is_kernel(core, owner_cid) -> bool:
-    conv = core._conv_by_cid.get(owner_cid)
+    conv = core.get_conversation(owner_cid)
     return conv is not None and conv.caps.mode == "kernel"
 
 
@@ -87,7 +87,7 @@ class ConversationsDevice(MemoryDevice):
     def to_llm_string(self):
         """按状态分组列出存活对话；finished 与运行态分开，cid 空洞不做伪造补全。"""
         groups = {}
-        for cid, conv in self._core._conv_by_cid.items():
+        for cid, conv in self._core.conversations.items():
             if self._core.is_hidden_cid(cid):
                 continue
             groups.setdefault(_state_of(self._core, cid), []).append((cid, conv))
@@ -105,7 +105,7 @@ class ConversationsDevice(MemoryDevice):
         return "\n".join(lines)
 
     def _conv_read(self, cid: int):
-        conv = self._core._conv_by_cid.get(cid)
+        conv = self._core.get_conversation(cid)
         if conv is None or self._core.is_hidden_cid(cid):
             raise VMMemoryError(f"对话 {cid} 不存在")
         return conv
@@ -582,7 +582,7 @@ class CapsDevice(MemoryDevice):
         return "str"
 
     def _conv(self, cid: int):
-        conv = self._core._conv_by_cid.get(cid)
+        conv = self._core.get_conversation(cid)
         if conv is None or self._core.is_hidden_cid(cid):
             raise VMMemoryError(f"对话 {cid} 不存在")
         return conv
@@ -608,7 +608,7 @@ class CapsDevice(MemoryDevice):
         }
 
     def to_llm_string(self):
-        cids = [cid for cid in sorted(self._core._conv_by_cid)
+        cids = [cid for cid in sorted(self._core.conversations)
                 if not self._core.is_hidden_cid(cid)]
         return "能力自述：读 $MEM.caps.<cid> 查询（可用 cid：" + str(cids) + "）"
 

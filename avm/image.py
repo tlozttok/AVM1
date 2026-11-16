@@ -13,7 +13,6 @@
    snapshot_to 在正常退出时写重启快照。
 """
 
-import argparse
 import hashlib
 import importlib.util
 import json
@@ -23,7 +22,7 @@ from typing import Optional
 
 from .core import Core, _build_conversation, _derive_child_caps
 from .capabilities import grant_target_segments
-from .exceptions import IllegalOperationError, VMMemoryError, RunnerStop
+from .exceptions import IllegalOperationError, ImageError, VMMemoryError
 from .memory_device import MemoryDevice, BUILTIN_DEVICE_CLASSES
 from .python_server import PLM_REGISTRY, PLMServer
 from .runner_prompt import prompt_api_error
@@ -34,10 +33,6 @@ KINDS = ("str", "dict", "list", "device", "link")
 # 镜像 meta.guest_programs 允许的角色：内核按这个固定顺序在冷启动时创建对话。
 # 宿主用中断唤醒这些对话（向量名 = 角色名），不代替它们直接 send_instruction。
 GUEST_ROLES = ("boot", "idle", "shutdown")
-
-
-class ImageError(ValueError):
-    """镜像格式错误：面向运行者，应修复镜像而不是吞掉"""
 
 
 def _parse_node(value, path, markers):
@@ -594,7 +589,7 @@ def restore_guest_roles(core: Core, decl: Optional[dict] = None) -> dict:
     """
     roles = dict(decl if decl is not None else getattr(core, "guest_programs_decl", {}) or {})
     found = {}
-    for conv in core._conv_by_cid.values():
+    for conv in core.conversations.values():
         role = (conv.attrs or {}).get("guest_role")
         if not isinstance(role, str) or not role:
             continue
@@ -677,9 +672,9 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
     镜像的 plms 段（顶层数组，条目 {model, file, class}）在这里装载进 core.plms，
     与内建 PLM_REGISTRY 并列；没有该段时行为与从前一致。
     """
-    if core._conv_by_cid:
+    if core.conversations:
         raise ImageError(
-            f"load_image 需要一个空核心（当前已有 {len(core._conv_by_cid)} 个对话）："
+            f"load_image 需要一个空核心（当前已有 {len(core.conversations)} 个对话）："
             f"先用 Core() 建空核心，再往里装载"
         )
     if not os.path.isfile(image_path):
@@ -821,55 +816,13 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="AVM 系统镜像启动器")
-    parser.add_argument("image", help="系统镜像 JSON 文件路径")
-    parser.add_argument("--checkpoint-in", metavar="PATH",
-                        help="调试用：启动时加载单对话检查点（跳过 init，恢复为就绪对话）")
-    from .boot import add_core_dump_args, add_mode_arg, add_restore_arg
-    add_core_dump_args(parser)
-    add_restore_arg(parser)
-    add_mode_arg(parser)
-    args = parser.parse_args(argv)
-    # 局部导入：boot 依赖本模块的 load_image，模块级导入会成环
-    from .boot import boot, dump_on_death, write_snapshot
-    from .journal import JournalError
-    try:
-        core = boot(
-            args.image, mode=args.mode,
-            checkpoint_in=args.checkpoint_in, restore=args.restore,
-        )
-    except (ImageError, JournalError, VMMemoryError, OSError, json.JSONDecodeError) as e:
-        print(f"[AVM] 镜像错误: {e}", file=sys.stderr)
-        return 1
-    if args.no_core_dump:
-        core.core_dump_enabled = False
-    status = 0
-    snapshot_ok = True  # 只有安全点退出才写重启快照
-    try:
-        core.run()
-    except RunnerStop as e:
-        print(f"[AVM] {e}", file=sys.stderr)
-    except KeyboardInterrupt:
-        print("[AVM] 收到中断，写回后退出", file=sys.stderr)
-        status = 130
-        snapshot_ok = False
-    except BaseException as e:
-        # 内核死亡：先落现场快照，再保留原始 traceback 往上抛
-        dump_on_death(core, e, args.core_dump)
-        snapshot_ok = False
-        raise
-    finally:
-        if snapshot_ok:
-            write_snapshot(core)
-        persist_to = getattr(core, "persist_to", None)
-        if persist_to:
-            try:
-                os.makedirs(os.path.dirname(persist_to) or ".", exist_ok=True)
-                core.mem.save(persist_to)
-                print(f"[AVM] 内存已写回 {persist_to}")
-            except OSError as e:
-                print(f"[AVM] 写回失败: {e}", file=sys.stderr)
-    return status
+    """CLI 入口：`python -m avm.image <image.json>`。
+
+    实现在 avm.launcher：本模块只负责把镜像解析进空内核，启动与收尾属于宿主。
+    这样 image 不必反向依赖 boot（boot 依赖本模块的 load_image）。
+    """
+    from .launcher import main as _launcher_main
+    return _launcher_main(argv)
 
 
 if __name__ == "__main__":

@@ -73,8 +73,8 @@ def snapshot(core) -> dict:
             "roots": {name: list(target) for name, target in core.root_registry.items()},
         },
         "conversations": [
-            core._conv_by_cid[cid].to_snapshot()
-            for cid in sorted(core._conv_by_cid) if cid >= 0
+            core.get_conversation(cid).to_snapshot()
+            for cid in sorted(core.conversations) if cid >= 0
         ],
         "listeners": [listener_to_snapshot(listener) for listener in core.events.listeners],
         "devices": [
@@ -306,7 +306,7 @@ def _rebuild_modules(core, doc: dict) -> None:
 def _rebuild_conversations(core, doc: dict) -> None:
     from .types import Conversation
 
-    core._conv_by_cid = {}
+    core.clear_conversations()
     core._ready_cids = []
     core._dormant_cids = []
     core._active_cid = None
@@ -318,7 +318,7 @@ def _rebuild_conversations(core, doc: dict) -> None:
     for brief in briefs:
         if not isinstance(brief, dict) or not isinstance(brief.get("cid"), int):
             raise SnapshotError(f"快照里的对话条目形状不合法：{brief!r}")
-        if brief["cid"] in core._conv_by_cid:
+        if brief["cid"] in core.conversations:
             raise SnapshotError(f"快照里对话 cid 重复：{brief['cid']}")
         conv = Conversation.from_snapshot(brief)
         core._register(conv, cid=brief["cid"])
@@ -327,8 +327,8 @@ def _rebuild_conversations(core, doc: dict) -> None:
         parent_cid = brief.get("parent_cid")
         if parent_cid is None:
             continue
-        conv = core._conv_by_cid[brief["cid"]]
-        parent = core._conv_by_cid.get(parent_cid)
+        conv = core.get_conversation(brief["cid"])
+        parent = core.get_conversation(parent_cid)
         if parent is None:
             raise SnapshotError(
                 f"对话 {brief['cid']} 的父对话 cid={parent_cid} 不在快照里"
@@ -365,5 +365,5 @@ def _restore_security_and_pointer(core, doc: dict) -> None:
         core.para_ref = para_ref
     next_cid = doc.get("next_cid")
     if not isinstance(next_cid, int):
-        next_cid = (max(core._conv_by_cid) + 1) if core._conv_by_cid else 0
+        next_cid = (max(core.conversations) + 1) if core.conversations else 0
     core._next_cid = next_cid

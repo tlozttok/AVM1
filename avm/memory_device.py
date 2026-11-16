@@ -451,7 +451,7 @@ class InputsListDevice(MetaListDevice):
         if self._core is not None:
             cid = self._core._active_cid
             if cid is not None:
-                convs = getattr(self._core, "_conv_by_cid", {})
+                convs = getattr(self._core, "conversations", {})
                 conv = convs.get(cid)
                 who = f"{conv.identity}（cid={cid}）" if conv is not None else f"cid={cid}"
         return f"[{who} 等待输入，/save 保存检查点] "

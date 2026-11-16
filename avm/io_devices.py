@@ -49,7 +49,7 @@ class IOInputDevice(MetaListDevice):
         """当前对话的可寻址身份：cid、名字、identity。"""
         if self._core is None or getattr(self._core, "_active_cid", None) is None:
             return []
-        conv = self._core._conv_by_cid.get(self._core._active_cid)
+        conv = self._core.get_conversation(self._core._active_cid)
         if conv is None:
             return []
         return [str(self._core._active_cid), getattr(conv, "name", None),

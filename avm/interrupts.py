@@ -104,7 +104,7 @@ class InterruptTable:
         if cid is None:
             return self._drop(itype, f"没有为 {itype!r} 注册向量")
 
-        target = core._conv_by_cid.get(cid)
+        target = core.get_conversation(cid)
         if target is None or cid in core._finished:
             return self._drop(itype, f"目标对话 {cid} 不存在或已关闭")
 

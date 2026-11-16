@@ -110,7 +110,7 @@ class Monitor:
         }
 
         conversations = {}
-        for cid, conv in core._conv_by_cid.items():
+        for cid, conv in core.conversations.items():
             if core._active_cid == cid:
                 state = "active"
             elif cid in core._dormant_cids:

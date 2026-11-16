@@ -316,7 +316,7 @@ def _restore_snapshot(core: Core, path: str) -> dict:
         raise ImageError(f"重启快照恢复失败：{e}") from e
     print(
         f"[AVM] 已从重启快照恢复（seq={doc.get('seq', 0)}，"
-        f"{len(core._conv_by_cid)} 个对话）",
+        f"{len(core.conversations)} 个对话）",
         file=sys.stderr,
     )
     return doc
@@ -515,7 +515,7 @@ def _restored_counts(core: Core) -> dict:
     except TypeError:
         listener_count = 0
     return {
-        "conversations": len(core._conv_by_cid),
+        "conversations": len(core.conversations),
         "listeners": listener_count,
         "devices": len(core.mem.mounted_devices()),
     }

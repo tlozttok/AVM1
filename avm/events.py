@@ -38,9 +38,6 @@ EVENT_TYPES = [
     "listen_event",
 ]
 
-# 批次二：10 条指令全部有 before 事件
-INTERCEPTABLE_TYPES = set(EVENT_TYPES)
-
 # 生命周期事件：通配监听与创建/关闭/监听注册的权限规则与内存事件不同
 LIFECYCLE_TYPES = {
     "create_cmd",
@@ -630,7 +627,7 @@ class EventSystem:
     def _conversation_snapshot(self, cid) -> Optional[dict]:
         if not isinstance(cid, int):
             return None
-        conv = self._core._conv_by_cid.get(cid)
+        conv = self._core.get_conversation(cid)
         if conv is None:
             return None
         if cid in self._core._finished:
@@ -829,7 +826,7 @@ class EventSystem:
             return info
         if tag == "cid":
             cid = target_ref[1]
-            conv = self._core._conv_by_cid.get(cid)
+            conv = self._core.get_conversation(cid)
             info.update({"kind": "conversation", "type": "conversation",
                          "conversation": self._conversation_snapshot(cid)})
             info["exists"] = conv is not None
@@ -898,7 +895,7 @@ class EventSystem:
         """kernel 级来源对话上下文（消息列表，截断旧消息并标注）。"""
         if not isinstance(cid, int):
             return None
-        conv = self._core._conv_by_cid.get(cid)
+        conv = self._core.get_conversation(cid)
         if conv is None:
             return None
         messages = []
@@ -960,28 +957,6 @@ class EventSystem:
         return {k: v for k, v in event.items() if k != "_kernel_payload"}
 
     # ------------------------------------------------------------------
-    # 设备前缀检查
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _has_device_prefix(core: 'Core', path: str) -> bool:
-        """路径的任意前缀是否命中已挂载设备。
-
-        权限检查不能触发设备 resolve_path（如 $MEM.inputs.next 会阻塞等待输入），
-        因此先做纯注册表检查。
-        """
-        if not isinstance(path, str) or not path.startswith("$MEM."):
-            return False
-        parts = path[1:].split(".")
-        if not parts or parts[0] != "MEM":
-            return False
-        rest = parts[1:]
-        for i in range(1, len(rest) + 1):
-            if ".".join(rest[:i]) in core.mem._devices:
-                return True
-        return False
-
-    # ------------------------------------------------------------------
     # 处理器解析与执行
     # ------------------------------------------------------------------
 
@@ -1008,7 +983,7 @@ class EventSystem:
         注册监听器时抄进记录（与 handler_code 同一种「注册时快照」语义）；owner 对话
         关闭/恢复后处理器仍按注册时的白名单运行。
         """
-        conv = self._core._conv_by_cid.get(owner_cid)
+        conv = self._core.get_conversation(owner_cid)
         granted = conv.caps.imports if conv is not None else frozenset()
         return sorted(set(BASE_MODULES) | set(granted))
 
@@ -1160,7 +1135,7 @@ class EventSystem:
     # ------------------------------------------------------------------
 
     def _listener_owner_kernel(self, listener: dict) -> bool:
-        conv = self._core._conv_by_cid.get(listener.get("owner_cid"))
+        conv = self._core.get_conversation(listener.get("owner_cid"))
         return conv is not None and conv.caps.mode == "kernel"
 
 
@@ -1337,7 +1312,7 @@ class EventSystem:
     def _actor_conv(self, event: dict):
         source = event.get("source") or {}
         cid = source.get("initiator_cid") or (event.get("payload") or {}).get("actor_cid")
-        return self._core._conv_by_cid.get(cid) if isinstance(cid, int) else None
+        return self._core.get_conversation(cid) if isinstance(cid, int) else None
 
     def _condition_target_matches(self, target: dict, event: dict) -> bool:
         kind = target.get("kind")
@@ -1522,7 +1497,7 @@ class EventSystem:
         for item in event.get("notify") or []:
             cid = item["cid"]
             content = item["content"]
-            target = core._conv_by_cid.get(cid)
+            target = core.get_conversation(cid)
             if target is None or cid in core._finished:
                 print(
                     f"[AVM] 事件通知投递失败：对话 {cid} 不存在或已关闭",

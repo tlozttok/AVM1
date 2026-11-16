@@ -419,7 +419,7 @@ class Console:
             "schedule": self.schedule(),
             "conversations": [
                 self._conversation_brief(cid, conv)
-                for cid, conv in sorted(core._conv_by_cid.items())
+                for cid, conv in sorted(core.conversations.items())
             ],
             "panel": {
                 "cid": self.panel.cid,
@@ -493,7 +493,7 @@ class Console:
         }
 
     def conversation(self, cid: int) -> dict:
-        conv = self.core._conv_by_cid.get(cid)
+        conv = self.core.get_conversation(cid)
         if conv is None:
             raise KeyError(f"对话 {cid} 不存在")
         brief = self._conversation_brief(cid, conv)

@@ -55,6 +55,16 @@ class VMResourceError(VMError):
     pass
 
 
+class ImageError(ValueError):
+    """镜像格式错误：面向运行者，应修复镜像而不是吞掉。
+
+    放在契约层而非 avm.image：启动器（avm.launcher）要捕获它，但启动器不该
+    为了一个异常类型反向依赖装载模块（boot 依赖 image，反过来就成了环）。
+    avm.image 仍重新导出该名字，`from avm.image import ImageError` 保持不变。
+    """
+    pass
+
+
 class APIError(VMError):
     """外部 API 调用失败：网络、鉴权、超时、协议错误、余额不足、上下文超限。
 

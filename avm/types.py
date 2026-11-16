@@ -6,6 +6,17 @@ from .capabilities import Capability, caps_from_dict, caps_to_dict, default_kern
 
 CHECKPOINT_VERSION = 2
 
+# 保留对话 cid（作者规定）：宿主侧操作员对话的身份，不参与正常分配，也不会撞上
+# `_next_cid` 的正数。它对普通对话隐藏：不出现在 $MEM.conversations / $MEM.scheduler
+# 里，也不可用 send_instruction / close_conversation 或 $conv.<cid> / $batch.<cid>
+# 寻址。隐藏只是显示/寻址策略：对话本身随快照/日志正常恢复，日志里它的回合按普通
+# 回合重放。
+#
+# 定义在类型层而非 avm.core：日志重放要判断「保留对话可能需要补建」，而 avm.core
+# 模块级依赖 journal，journal 反过来依赖 core 就成了环。avm.core 仍重新导出该名字，
+# `from avm.core import PANEL_CID` 保持不变。
+PANEL_CID = -1
+
 
 def _tool_call_to_dict(tc) -> dict:
     """工具调用无损转 dict（兼容 ToolCall 对象与已转好的 dict，检查点序列化用）"""

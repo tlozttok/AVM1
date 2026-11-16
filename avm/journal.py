@@ -52,7 +52,7 @@ from .capabilities import AddressSpace
 from .exceptions import VMMemoryError, IllegalOperationError
 from .memory import Memory
 from .types import (
-    Conversation, MetaDict, MetaList,
+    Conversation, MetaDict, MetaList, PANEL_CID,
     batch_from_dict, batch_to_dict, message_from_dict, message_to_dict,
 )
 
@@ -276,9 +276,8 @@ def apply(core, record: dict) -> None:
     if record.get("v") != JOURNAL_RECORD_VERSION:
         raise JournalError(_version_error(seq, record.get("v")))
     cid = record.get("cid")
-    conv = core._conv_by_cid.get(cid)
+    conv = core.get_conversation(cid)
     if conv is None:
-        from .core import PANEL_CID
         if cid == PANEL_CID:
             # 保留对话是世界的固定成员，身份固定且可恢复：日志里先出现、快照里
             # 还没有它时（只靠日志恢复），在这里补建。
@@ -304,7 +303,7 @@ def _apply_change(core, change, cid: int, seq) -> None:
         raise JournalError(f"日志 seq={seq}: 变化条目形状不合法：{change!r}")
     kind = change["kind"]
     if kind == "message":
-        conv = core._conv_by_cid.get(cid)
+        conv = core.get_conversation(cid)
         if conv is None:
             raise JournalError(f"日志 seq={seq}: 消息的目标对话 cid={cid} 不存在")
         message = change.get("message")
@@ -317,7 +316,7 @@ def _apply_change(core, change, cid: int, seq) -> None:
         return
     if kind == "batch":
         target_cid = change.get("cid", cid)
-        conv = core._conv_by_cid.get(target_cid)
+        conv = core.get_conversation(target_cid)
         if conv is not None:
             conv.user_batch = batch_from_dict(change.get("batch"))
         return
@@ -331,7 +330,7 @@ def _apply_scheduler_delta(core, change, seq) -> None:
     """应用一条调度增量；引用不存在对话时警告并跳过（与快照恢复同一策略）。"""
 
     def _known(cid):
-        if cid in core._conv_by_cid:
+        if cid in core.conversations:
             return True
         print(
             f"[AVM] 日志 seq={seq}: 调度增量引用不存在的对话 cid={cid}，跳过",
@@ -381,7 +380,7 @@ def apply_scheduler(core, scheduler, source: str = "日志") -> None:
         return
 
     def _known(cid):
-        if cid in core._conv_by_cid:
+        if cid in core.conversations:
             return True
         print(
             f"[AVM] {source}: 调度状态引用不存在的对话 cid={cid}（宿主侧对话不随恢复）",
@@ -496,7 +495,7 @@ def _effect_conversation_create(core, effect) -> None:
     conv = Conversation.from_snapshot(payload)
     parent_cid = payload.get("parent_cid")
     if parent_cid is not None:
-        parent = core._conv_by_cid.get(parent_cid)
+        parent = core.get_conversation(parent_cid)
         if parent is None:
             raise VMMemoryError(f"conversation_create 的父对话 cid={parent_cid} 不存在")
         conv.parent = parent
@@ -508,7 +507,7 @@ def _effect_conversation_create(core, effect) -> None:
 def _effect_conversation_roots(core, effect) -> None:
     """还原一次动态授予根：整体替换对话的非 core 根表（core 自述根保留）。"""
     cid = effect.get("cid")
-    conv = core._conv_by_cid.get(cid)
+    conv = core.get_conversation(cid)
     if conv is None:
         print(
             f"[AVM] 日志 conversation_roots 效果：对话 {cid} 不存在（可能已关闭），跳过",
@@ -526,7 +525,7 @@ def _effect_conversation_roots(core, effect) -> None:
 
 def _effect_conversation_close(core, effect) -> None:
     cid = effect["cid"]
-    conv = core._conv_by_cid.get(cid)
+    conv = core.get_conversation(cid)
     if conv is None:
         return
     core._finished.add(cid)
@@ -540,10 +539,10 @@ def _effect_conversation_delete(core, effect) -> None:
     cid = effect["cid"]
 
     def _delete(target_cid):
-        for child in list(core._conv_by_cid.values()):
+        for child in list(core.conversations.values()):
             if child.is_sub and child.parent is not None and child.parent.cid == target_cid:
                 _delete(child.cid)
-        conv = core._conv_by_cid.pop(target_cid, None)
+        conv = core.remove_conversation(target_cid)
         if conv is None:
             return
         for queue in (core._ready_cids, core._dormant_cids):
@@ -557,7 +556,7 @@ def _effect_conversation_delete(core, effect) -> None:
 
 def _effect_delivery(core, effect) -> None:
     cid = effect.get("to_cid")
-    target = core._conv_by_cid.get(cid)
+    target = core.get_conversation(cid)
     if target is None or cid in core._finished:
         print(f"[AVM] 日志投递效果：对话 {cid} 不存在或已关闭，跳过", file=sys.stderr)
         return
