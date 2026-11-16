@@ -730,7 +730,7 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
         if parsed is None:
             continue
         root[key] = parsed
-    core.mem._data = root
+    core.mem.replace_root(root)
     # Core 的内建设备在 __init__ 里挂载，早于这次整树替换；按设备表把挂载点链接重新物化
     core.mem.materialize_mount_links()
     # 镜像声明的 PLM 必须在安装模型目录之前装载：$MEM.model_catalog.plm 是它的可见面，

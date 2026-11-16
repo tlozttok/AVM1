@@ -219,8 +219,8 @@ def _rebuild_memory_and_devices(core, doc: dict) -> None:
     memory_doc = doc.get("memory")
     if not isinstance(memory_doc, dict):
         raise SnapshotError("快照 memory 段必须是对象")
-    core.mem._data = Memory.deserialize_node(memory_doc)
-    if not isinstance(core.mem._data, MetaDict):
+    core.mem.replace_root(Memory.deserialize_node(memory_doc))
+    if not isinstance(core.mem.root, MetaDict):
         raise SnapshotError("快照 memory 段的根必须是 dict 节点")
     for mount, spec in specs.items():
         if not isinstance(spec, dict):
@@ -264,7 +264,7 @@ def _rebuild_memory_and_devices(core, doc: dict) -> None:
         core.device_specs[mount] = dict(spec)
     # 设备挂载点重新物化（mount 已建链接；这里兜底快照树里没带的挂载点）
     for mount in list(core.mem._devices):
-        node = core.mem._data
+        node = core.mem.root
         for segment in mount.split(".")[:-1]:
             if not isinstance(node, (dict, MetaDict)):
                 break

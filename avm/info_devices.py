@@ -356,7 +356,7 @@ class MemorySummaryDevice(MemoryDevice):
     def to_llm_string(self):
         from .types import MetaDict, MetaList, LinkNode
 
-        root = self._core.mem._data
+        root = self._core.mem.root
         counts = {"dict": 0, "list": 0, "str": 0, "link": 0}
 
         def walk(v):

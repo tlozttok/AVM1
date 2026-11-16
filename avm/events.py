@@ -717,7 +717,7 @@ class EventSystem:
         """解析节点但不跟随最终段的链接（删链接时看链接节点本身）。"""
         segments = list(segments)
         if not segments:
-            return self._core.mem._data
+            return self._core.mem.root
         try:
             parent = self._core.mem.resolve_path(["MEM"] + segments[:-1], for_llm=False)
         except Exception:

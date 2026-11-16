@@ -1265,7 +1265,7 @@ def _check_model_namespace(core: 'Core', program_type: str, para: MetaDict, para
     python 程序 → model 必须是 PLM 注册名；settingup 程序 → model 必须是上游 LLM 模型名。
     上游清单没取到时只警告不拦：`/models` 只是参考，取不到不该让镜像起不来（讨论案第五节）。
     """
-    catalog = core.mem._data.get(MODEL_CATALOG_KEY)
+    catalog = core.mem.get(MODEL_CATALOG_KEY)
     if not isinstance(catalog, MetaDict):
         return
     model = para.get("model")
@@ -3013,7 +3013,7 @@ class Core:
         mounted_ids = set()
         for address, device in list(self.mem._devices.items()):
             mounted_ids.add(getattr(device, "device_id", None) or address)
-            node = self.mem._data
+            node = self.mem.root
             for seg in address.split("."):
                 node = node.get(seg) if isinstance(node, (dict, MetaDict)) else None
                 if node is None:
@@ -3034,7 +3034,7 @@ class Core:
         整树替换（load_image）之后必须重装一次，否则镜像会把启动节点冲掉。
         静态部分不依赖网络：PLM 注册表、para 能用的 API 参数、必填字段。
         """
-        root = self.mem._data
+        root = self.mem.root
         catalog = root.get(MODEL_CATALOG_KEY)
         if not isinstance(catalog, MetaDict):
             catalog = MetaDict(data={}, metadata=_CATALOG_META)
@@ -3085,7 +3085,7 @@ class Core:
         清单只当参考——取不到不拦启动，也不拦模型名（后者见 _check_model_namespace）。
         """
         self.install_model_catalog()
-        llm = self.mem._data[MODEL_CATALOG_KEY]["llm"]
+        llm = self.mem[MODEL_CATALOG_KEY]["llm"]
 
         def _unavailable(reason: str) -> dict:
             llm["source"] = "unavailable"

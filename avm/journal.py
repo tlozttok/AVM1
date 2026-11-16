@@ -431,7 +431,7 @@ def _effect_memory_attach(core, effect) -> None:
     if not isinstance(path, list) or not path:
         raise VMMemoryError("memory_attach 的 path 必须是非空段列表")
     node = Memory.deserialize_node(effect.get("node"))
-    parent = core.mem._data
+    parent = core.mem.root
     for key in path[:-1]:
         if isinstance(parent, (dict, MetaDict)):
             child = parent.get(key)
@@ -459,7 +459,7 @@ def _effect_memory_detach(core, effect) -> None:
     path = effect.get("path")
     if not isinstance(path, list) or not path:
         raise VMMemoryError("memory_detach 的 path 必须是非空段列表")
-    parent = core.mem._data
+    parent = core.mem.root
     for key in path[:-1]:
         if not isinstance(parent, (dict, MetaDict)) or key not in parent:
             raise VMMemoryError(f"memory_detach 的路径不存在：{'/'.join(str(x) for x in path)}")

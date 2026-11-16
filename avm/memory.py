@@ -134,6 +134,26 @@ class Memory:
             return self._devices[key]
         return self._data.setdefault(key, default)
 
+    # -- 整树访问（只给"明知自己在操作整棵树"的代码用）------------------
+
+    @property
+    def root(self) -> MetaDict:
+        """内存树的根节点本体。
+
+        给需要"沿真实段路径逐段走树"的调用方：装模型目录、遍历设备挂载点、
+        日志重放按段路径挂载/摘除子树。改内容优先走 set / setdefault / delete，
+        它们会维护设备边界与包装；只有整树操作才该拿本体。
+        """
+        return self._data
+
+    def replace_root(self, node: MetaDict) -> None:
+        """整体替换根节点（镜像装载、快照重建用）。
+
+        旧根整棵丢弃，设备表与设备标识不受影响——挂载点链接由调用方
+        `materialize_mount_links()` 重新物化。
+        """
+        self._data = node
+
     def _expand_ref_parts(self, parts: list, space: Optional[AddressSpace] = None):
         """根展开：返回 ("memory", 真实段, 显示段) 或 ("device", 请求段, 请求段)。
 
@@ -945,7 +965,7 @@ class Memory:
         """按设备表重建全部挂载点的链接节点（幂等）。
 
         用途：整树替换之后把已挂载设备重新物化进树。镜像装载会在
-        `core.mem._data = root` 之后调用——Core 的内建设备在 `Core.__init__`
+        `replace_root` 之后调用——Core 的内建设备在 `Core.__init__`
         里挂载，早于整树替换，不重建就只剩设备表、树里看不到挂载点。
         """
         for path, device in list(self._devices.items()):
@@ -1216,7 +1236,7 @@ class Memory:
 
         with open(filepath, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        mem._data = cls._deserialize_node(raw)
+        mem.replace_root(cls._deserialize_node(raw))
         return mem
 
     @classmethod
@@ -1265,5 +1285,5 @@ class Memory:
         from .types import MetaDict
 
         mem = cls()
-        mem._data = MetaDict(data={k: cls._deserialize_node(v) for k, v in tree.items()})
+        mem.replace_root(MetaDict(data={k: cls._deserialize_node(v) for k, v in tree.items()}))
         return mem
