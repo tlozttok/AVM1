@@ -159,8 +159,8 @@ def restore(core, doc: dict) -> None:
     core.journal_generation = _generation_of(doc)
     apply_scheduler(core, doc.get("scheduler"), source="重启快照")
     core.restore_journal_seq(doc.get("seq", 0))
-    core._refresh_journal_batch()
-    core._check_invariants()
+    core.refresh_journal_batch()
+    core.check_invariants()
 
 
 def restore_world(core, doc: dict) -> None:
@@ -267,7 +267,7 @@ def _rebuild_memory_and_devices(core, doc: dict) -> None:
                 break
             node = node.get(segment)
         if isinstance(node, (dict, MetaDict)) and mount.split(".")[-1] not in node:
-            core.mem._plant_link(
+            core.mem.plant_mount_link(
                 mount, getattr(core.mem.devices[mount], "device_id", None) or mount,
                 type(core.mem.devices[mount]).__name__,
             )

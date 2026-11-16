@@ -123,13 +123,13 @@ class ConversationsDevice(MemoryDevice):
         except (TypeError, ValueError):
             raise VMMemoryError(f"cid 必须是数字: {raw}")
 
-    def _core_roots(self, conv):
+    def core_roots(self, conv):
         """Core 拥有的根（目前只有能力自述根 caps）：控制面不可覆盖。"""
         target = conv.caps.roots.get("caps")
         return {"caps": tuple(target)} if target is not None else {}
 
     def _read_roots_json(self, conv) -> str:
-        core_roots = self._core_roots(conv)
+        core_roots = self.core_roots(conv)
         data = {}
         for name, target in conv.caps.roots.items():
             if name == "MEM":

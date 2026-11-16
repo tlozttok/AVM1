@@ -566,7 +566,7 @@ def _boot_reboot(image_path: str, snapshot_path: str, journal_path: Optional[str
     new_generation, _archived = _start_new_generation(
         core, journal_path, generation, bump_when_absent=True,
     )
-    core._check_invariants()
+    core.check_invariants()
     recovery = _new_recovery("reboot", last_exit)
     recovery["source"] = "snapshot"
     recovery["world_source"] = "snapshot+journal" if replayed else "snapshot"

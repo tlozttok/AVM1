@@ -521,7 +521,7 @@ def _effect_conversation_roots(core, effect) -> None:
     roots = effect.get("roots")
     if not isinstance(roots, dict):
         raise VMMemoryError("conversation_roots 缺少 roots 映射")
-    new_roots = core._core_roots(conv)
+    new_roots = core.core_roots(conv)
     for name, segments in roots.items():
         new_roots[name] = tuple(segments)
     conv.caps = conv.caps.copy(roots=new_roots)

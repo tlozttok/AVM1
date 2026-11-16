@@ -132,7 +132,7 @@ class InterruptTable:
         # 上一条链的计数进入被中断的对话）。中断夺取执行权改变的就是"下一个执行
         # 谁"，不摘队列会让目标在本轮结束时被当成"自己让出"而立刻交出执行权。
         core.drop_from_schedule(cid)
-        if not core._same_chain(current, cid):
+        if not core.same_chain(current, cid):
             core.set_activation_instructions(0)  # 断链：重新给满预算
 
         core.set_active(cid)

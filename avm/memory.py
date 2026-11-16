@@ -227,9 +227,14 @@ class Memory:
             path = list(value)
         return self.resolve_path(path, for_llm=for_llm, space=space)
 
-    def resolve_path(self, path: list, for_llm: bool = False, space: Optional[AddressSpace] = None) -> Any:
-        """公开入口：带空链接栈解析路径。"""
-        return self._resolve_path(path, for_llm=for_llm, seen_links=None, space=space)
+    def resolve_path(self, path: list, for_llm: bool = False, space: Optional[AddressSpace] = None,
+                     seen_links: Optional[list] = None) -> Any:
+        """公开入口：解析路径。
+
+        seen_links：已经过的挂载点列表。普通调用传 None（等于空栈）；只有
+        "自己就是链上一环"的链接设备才需要把它接着传下去，否则跨设备成环检测不出来。
+        """
+        return self._resolve_path(path, for_llm=for_llm, seen_links=seen_links, space=space)
 
     def _resolve_path(self, path: list, for_llm: bool = False, seen_links: Optional[list] = None,
                       space: Optional[AddressSpace] = None) -> Any:
@@ -398,7 +403,7 @@ class Memory:
                     remainder = list(current[index:])
                     if getattr(device, "is_link", False):
                         # 设备层别名：交给它自己跟随，seen_links 继续累积（跨设备成环在此断掉）
-                        sub = device._follow_real(remainder, seen_links)
+                        sub = device.follow_links(remainder, seen_links)
                         if sub[0] == "device":
                             real = self._devices.get(sub[1])
                             if real is None:
@@ -444,7 +449,7 @@ class Memory:
             walked.append(key)
             index += 1
 
-    def _follow_real(self, segments: list, seen_links: Optional[list] = None) -> tuple:
+    def follow_links(self, segments: list, seen_links: Optional[list] = None) -> tuple:
         """把 MEM 段（不含根）跟随链接，返回 ("memory", segments) 或 ("device", address, remainder)。
 
         不做数据访问副作用；只按内存树与挂载注册表决定最终目标。
@@ -473,7 +478,7 @@ class Memory:
         if device is None:
             raise VMMemoryError(f"设备未登记挂载地址：{mount}")
         if getattr(device, "is_link", False):
-            return device._follow_real(remainder, seen_links=[mount])
+            return device.follow_links(remainder, seen_links=[mount])
         return ("device", mount, remainder)
 
     @staticmethod
@@ -728,7 +733,7 @@ class Memory:
             raise IllegalOperationError(f"{ref} 落在设备上：不能在设备空间删除节点（设备内容由设备自己管理）")
 
         # 中间段跟随链接；最终段不跟随（删链接本身，不删目标）
-        followed = self._follow_real(list(segments[:-1]))
+        followed = self.follow_links(list(segments[:-1]))
         if followed[0] == "device":
             raise IllegalOperationError(f"{ref} 落在设备上：不能在设备空间删除节点（设备内容由设备自己管理）")
         resolved = list(followed[1])
@@ -816,7 +821,7 @@ class Memory:
         segments = ref[1:].split(".")[1:]  # 去掉 $MEM
         if not segments:
             raise VMMemoryError("不能摘除 $MEM 根节点")
-        target = self._follow_real(segments)
+        target = self.follow_links(segments)
         if target[0] != "memory":
             raise VMMemoryError(
                 f"{ref} 落在设备上：调试原语只作用于数据节点，设备请用 unmount/mount"
@@ -926,7 +931,7 @@ class Memory:
         if mounted is not None and mounted is not device:
             raise VMMemoryError(f"挂载路径已被另一台设备占用：{path}")
 
-        self._plant_link(path, device_id, type(device).__name__)
+        self.plant_mount_link(path, device_id, type(device).__name__)
         self._devices[path] = device
         self._device_ids[device_id] = device
 
@@ -943,7 +948,7 @@ class Memory:
             del self._device_ids[device_id]
         self._remove_link(path)
 
-    def _plant_link(self, path: str, device_id: str, metadata: str) -> None:
+    def plant_mount_link(self, path: str, device_id: str, metadata: str) -> None:
         """在挂载点物化链接节点；父段不存在则自动建空 MetaDict。
 
         挂载点已有普通数据节点、或父段是链接节点时拒绝——挂载点与数据节点不能同名，
@@ -991,7 +996,7 @@ class Memory:
         """
         for path, device in list(self._devices.items()):
             device_id = getattr(device, "device_id", None) or path
-            self._plant_link(path, device_id, type(device).__name__)
+            self.plant_mount_link(path, device_id, type(device).__name__)
 
     def is_device_path(self, path: list) -> bool:
         """检查路径是否对应设备"""

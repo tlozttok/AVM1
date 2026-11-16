@@ -387,7 +387,7 @@ class TestRestoredInvariants:
         mine.snapshot_to(snap)
         restored = load_core(image)
         restored.restore_from(snap)
-        restored._check_invariants()  # 不抛即通过
+        restored.check_invariants()  # 不抛即通过
 
 
 class TestSnapshotFormatVersion:

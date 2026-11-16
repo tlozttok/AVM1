@@ -53,7 +53,7 @@ def _note_memory_write(core: 'Core', conv: Conversation, ref: str, content: str)
     `$MEM` 里，重放不访问设备。LinkDevice 把写委托进内存树的路径因此不会被重放——
     它是"不要用于新设计"的兼容设备，日志不承诺覆盖（见 docs/runtime.md）。
     """
-    if not core._journaling():
+    if not core.is_journaling():
         return
     try:
         split = core.mem.split_path(ref, space=conv.caps.space())
@@ -508,7 +508,7 @@ class MemoryMakeInstruction(Instruction):
         except _INSTRUCTION_ERRORS as e:
             _respond_error(conv, self.call_id, e)
             return
-        if core._journaling():
+        if core.is_journaling():
             core.note_effect(
                 "memory_make", ref=self.ref, key=self.key, mem_type=self.mem_type,
                 space=_effect_space(conv),
@@ -581,7 +581,7 @@ class MemoryDeleteInstruction(Instruction):
         except _INSTRUCTION_ERRORS as e:
             _respond_error(conv, self.call_id, e)
             return
-        if core._journaling():
+        if core.is_journaling():
             core.note_effect("memory_delete", ref=self.ref, space=_effect_space(conv))
         conv.user_batch.add_tool_response(f"Success deleted {deleted_type} at {address}", self.call_id)
         _publish_core_after_safely(
@@ -668,7 +668,7 @@ class EditMetadataInstruction(Instruction):
                 return
             ctrl[key] = value
             node.set_ctrl(ctrl)
-            if core._journaling():
+            if core.is_journaling():
                 core.note_effect(
                     "edit_metadata", ref=self.ref, type="set", key=key, value=value,
                     space=_effect_space(conv),
@@ -718,7 +718,7 @@ class EditMetadataInstruction(Instruction):
                 return
             del ctrl[key]
             node.set_ctrl(ctrl)
-            if core._journaling():
+            if core.is_journaling():
                 core.note_effect(
                     "edit_metadata", ref=self.ref, type="del", key=key,
                     space=_effect_space(conv),
@@ -779,7 +779,7 @@ class CreateInstruction(Instruction):
         # 子对话创建后进入休眠，等待 send_instruction 投递指令
         if child.cid not in core._dormant_cids:
             core._dormant_cids.append(child.cid)
-        if core._journaling():
+        if core.is_journaling():
             core.note_effect("conversation_create", **conversation_create_payload(core, child))
         _publish_core_after_safely(core,
             "create_cmd",
@@ -842,7 +842,7 @@ class CreateSubInstruction(Instruction):
         core._ready_cids.insert(0, sub.cid)
         if conv.cid not in core._dormant_cids:
             core._dormant_cids.append(conv.cid)
-        if core._journaling():
+        if core.is_journaling():
             core.note_effect("conversation_create", **conversation_create_payload(core, sub))
         _publish_core_after_safely(core,
             "create_sub",
@@ -952,7 +952,7 @@ class SendInstruction(Instruction):
                 source_kind="core",
                 target_ref=("cid", target.cid),
             )
-            if core._is_waiting_for_return(target):
+            if core.is_waiting_for_return(target):
                 # 等亚对话返回的对话：消息只入批次，不唤醒；亚对话结束后父对话先跑。
                 continue
             if target.cid in core._dormant_cids:
@@ -1922,7 +1922,7 @@ class Core:
         checked = self._validate_root_specs(roots_spec, check_live=True)
         self.root_registry = checked
 
-    def _core_roots(self, conv) -> dict:
+    def core_roots(self, conv) -> dict:
         """Core 拥有的根（目前只有能力自述根 caps）：控制面不可覆盖、重放时保留。"""
         target = conv.caps.roots.get("caps")
         return {"caps": tuple(target)} if target is not None else {}
@@ -1993,7 +1993,7 @@ class Core:
             )
         if not isinstance(roots_map, dict):
             raise IllegalOperationError("roots 必须是映射（根名 -> 目标段序列）")
-        core_roots = self._core_roots(conv)
+        core_roots = self.core_roots(conv)
         grants: Dict[str, tuple] = {}
         for name, segments in roots_map.items():
             if not isinstance(name, str) or not name:
@@ -2275,14 +2275,14 @@ class Core:
         self.journal = Journal(path)
         # 调度增量的基线：从装载后的状态开始记，第一条记录覆盖 run 前的选择与回合内迁移。
         self._scheduler_committed = self._scheduler_state()
-        self._refresh_journal_batch()
+        self.refresh_journal_batch()
         return self.journal
 
     def detach_journal(self) -> None:
         """摘掉日志（之后的回合不再记录；已提交的记录留在文件里）。"""
         self.journal = None
 
-    def _journaling(self) -> bool:
+    def is_journaling(self) -> bool:
         """当前是否正在为回合日志记录（无日志/重放/非回合执行期都是假）。
 
         记录点先问这一句再构造载荷：无日志镜像不该为日志做序列化工作。
@@ -2291,13 +2291,13 @@ class Core:
 
     def note_effect(self, kind: str, **payload) -> None:
         """记一条语义效果：无日志、重放期间、非回合执行期都是空操作。"""
-        if not self._journaling():
+        if not self.is_journaling():
             return
         self._turn_effects.append({"kind": kind, **payload})
 
     def note_effects(self, effects: List[dict]) -> None:
         """批量记效果（一步产生多条状态变化的操作用）。"""
-        if not self._journaling():
+        if not self.is_journaling():
             return
         self._turn_effects.extend(effects)
 
@@ -2343,7 +2343,7 @@ class Core:
             return None
         return {"kind": "scheduler", **delta}
 
-    def _refresh_journal_batch(self) -> None:
+    def refresh_journal_batch(self) -> None:
         """重放/恢复完成后，把"上次提交的批次"对齐到当前对话状态。"""
         self._journal_batch = {
             cid: batch_to_dict(conv.user_batch) for cid, conv in self._conv_by_cid.items()
@@ -2424,7 +2424,7 @@ class Core:
             self._journal_seq = seq
             applied += 1
         if applied:
-            self._refresh_journal_batch()
+            self.refresh_journal_batch()
             self._refresh_journal_scheduler()
         return applied
 
@@ -2527,7 +2527,7 @@ class Core:
                     conv.metadata["returned"] = True
                 # 用完即删：返回通道只用一次，个体不再保留
                 self._delete_conversation(conv.cid)
-                if not self._is_waiting_for_return(parent):
+                if not self.is_waiting_for_return(parent):
                     # 同一轮可能声明多个 create_sub：全部返回后才唤醒父
                     self._resume(parent.cid)
                 else:
@@ -2626,7 +2626,7 @@ class Core:
         )
         sub.metadata["returned"] = True
         # 同一轮多个 create_sub：父还有别的待答调用时只补响应，等全部返回后再唤醒
-        if parent.cid != self._active_cid and not self._is_waiting_for_return(parent):
+        if parent.cid != self._active_cid and not self.is_waiting_for_return(parent):
             if parent.cid in self._dormant_cids:
                 self._dormant_cids.remove(parent.cid)
             if parent.cid not in self._ready_cids:
@@ -2637,7 +2637,7 @@ class Core:
         while self._ready_cids:
             picked = self._ready_cids.pop(0)
             conv = self._conv_by_cid.get(picked)
-            if conv is not None and self._is_waiting_for_return(conv):
+            if conv is not None and self.is_waiting_for_return(conv):
                 # 等亚对话返回的对话不能先跑：退回休眠，响应到了再由 _resume 唤醒。
                 # 它批次里的内容保留，等被唤醒时一起处理。
                 if picked not in self._dormant_cids:
@@ -2645,13 +2645,13 @@ class Core:
                 continue
             if picked in self._dormant_cids:
                 self._dormant_cids.remove(picked)
-            if not self._same_chain(self._active_cid, picked):
+            if not self.same_chain(self._active_cid, picked):
                 self._activation_instructions = 0  # 调用链断开：新链重新给满预算
             self._active_cid = picked
             return
         self._active_cid = None
 
-    def _same_chain(self, prev_cid, new_cid) -> bool:
+    def same_chain(self, prev_cid, new_cid) -> bool:
         """亚对话与父对话是同一调用链（预算共享）：
         亚对话激活时续用父的剩余预算；亚对话完成、父恢复时也续用。
         create_cmd 子对话（is_sub=False）独立预算，不在此列。"""
@@ -2986,10 +2986,12 @@ class Core:
     # 安全点自检（六条具名不变量）
     # ------------------------------------------------------------------
 
-    def _check_invariants(self) -> None:
+    def check_invariants(self) -> None:
         """六条具名不变量的结构自检。违反即 KernelPanic：出现说明某条边界少了一条判定。
 
-        只在安全点调用（run 的每轮推理之前）。成本是常数级遍历，加上活跃对话的一小段历史。
+        只在安全点调用：run 的每轮推理之前，以及装载/快照恢复把内核重建完之后
+        （那时外部刚批量改过对话表、调度与设备表，最需要自检）。
+        成本是常数级遍历，加上活跃对话的一小段历史。
         """
         # 1 调度互斥：就绪与休眠不相交，就绪队列无重复
         both = set(self._ready_cids) & set(self._dormant_cids)
@@ -3036,7 +3038,7 @@ class Core:
         got |= {r.tool_call_id for r in conv.user_batch.tool_responses}
         return [call_id for call_id in wanted if call_id not in got]
 
-    def _is_waiting_for_return(self, conv: Conversation) -> bool:
+    def is_waiting_for_return(self, conv: Conversation) -> bool:
         """对话是否在等工具返回（亚对话）。等返回的对话不能被外部消息唤醒运行。"""
         return bool(self._pending_call_ids(conv))
 
@@ -3544,7 +3546,7 @@ class Core:
             # 日志与内存的提交位置必须追平（恢复路径由 boot 保证）。
             self._check_journal_seq()
             try:
-                self._check_invariants()
+                self.check_invariants()
             except KernelPanic as e:
                 self.monitor.record(self, error=e)
                 raise

@@ -277,9 +277,9 @@ class EventSystem:
     # 注册 / 修改 / 取消
     # ------------------------------------------------------------------
 
-    def _journaling(self) -> bool:
+    def is_journaling(self) -> bool:
         """当前是否正在为回合日志记录（无日志/重放/非回合执行期为假）。"""
-        check = getattr(self._core, "_journaling", None)
+        check = getattr(self._core, "is_journaling", None)
         return bool(check()) if callable(check) else False
 
     def _note(self, kind: str, **payload) -> None:
@@ -360,7 +360,7 @@ class EventSystem:
             "priority": priority,
             "space": space,
         })
-        if self._journaling():
+        if self.is_journaling():
             self._note("listener_register", listener=listener_to_snapshot(self.listeners[-1]))
         return listener_id
 
@@ -387,7 +387,7 @@ class EventSystem:
             if priority > 0 and listener.get("tier") != KERNEL_TIER:
                 raise IllegalOperationError("priority>0 只有内核级监听器可以设置")
             listener["priority"] = priority
-        if self._journaling():
+        if self.is_journaling():
             self._note("listener_modify", listener_id=listener_id,
                        listener=listener_to_snapshot(listener))
 
@@ -395,7 +395,7 @@ class EventSystem:
         listener = self._get_listener(listener_id)
         self._check_owner(listener, owner_cid)
         self.listeners.remove(listener)
-        if self._journaling():
+        if self.is_journaling():
             self._note("listener_cancel", listener_id=listener_id)
 
     @staticmethod
@@ -406,7 +406,7 @@ class EventSystem:
 
     def cancel_all_for_owner(self, owner_cid: int) -> None:
         self.listeners = [l for l in self.listeners if l.get("owner_cid") != owner_cid]
-        if self._journaling():
+        if self.is_journaling():
             self._note("listener_cancel_all", owner_cid=owner_cid)
 
     # ------------------------------------------------------------------
@@ -1322,7 +1322,7 @@ class EventSystem:
             "space": space,
             "condition": condition,
         })
-        if self._journaling():
+        if self.is_journaling():
             self._note("listener_register", listener=listener_to_snapshot(self.listeners[-1]))
         return listener_id
 
@@ -1522,7 +1522,7 @@ class EventSystem:
                 )
                 continue
             target.user_batch.add_user_content(content)
-            if core._is_waiting_for_return(target):
+            if core.is_waiting_for_return(target):
                 # 等亚对话返回的对话：notify 只入批次，不唤醒；亚对话结束后父对话先跑
                 continue
             core.wake(cid)

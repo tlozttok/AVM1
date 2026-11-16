@@ -276,7 +276,7 @@ class TestCoreLifecycle:
         core._pick_next_active = lambda: setattr(core, "_active_cid", 1)
         core.advance_conversation = lambda: advanced.append(1)
         core.interrupts.dispatch = lambda: None
-        core._check_invariants = lambda: None
+        core.check_invariants = lambda: None
         core.monitor.record_baseline = lambda _core: None
         core.run()
         assert advanced == [], "停止标志命中后不该再推进一轮"

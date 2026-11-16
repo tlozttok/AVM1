@@ -928,7 +928,7 @@ class TestMemoryGrammarAndCreateOnly:
         _call(core, conv, "memory_make", {"ref": "$MEM", "key": "a", "mem_type": "str"})
         assert "已存在" in _responses(conv)[0][0]
         assert core.unwrap("$MEM.a") == "dev"
-        core._check_invariants()  # 不抛：设备表一致
+        core.check_invariants()  # 不抛：设备表一致
 
     def test_write_path_still_rejects_empty_segment(self):
         core, conv = _core()
@@ -1021,19 +1021,19 @@ class TestInvariants:
         core, conv = _core()
         core._ready_cids.extend([conv.cid, conv.cid])
         with pytest.raises(KernelPanic):
-            core._check_invariants()
+            core.check_invariants()
 
     def test_budget_counter(self):
         core, _conv = _core()
         core._activation_instructions = -1
         with pytest.raises(KernelPanic):
-            core._check_invariants()
+            core.check_invariants()
 
     def test_active_has_a_source(self):
         core, _conv = _core()
         core._active_cid = 999
         with pytest.raises(KernelPanic):
-            core._check_invariants()
+            core.check_invariants()
 
     def test_history_pairing(self):
         core, conv = _core()
@@ -1044,7 +1044,7 @@ class TestInvariants:
             )
         )
         with pytest.raises(KernelPanic):
-            core._check_invariants()
+            core.check_invariants()
 
     def test_pairing_counts_pending_batch(self):
         """工具响应先在 batch 里、下一轮才写进历史：待发内容也算配对。"""
@@ -1056,14 +1056,14 @@ class TestInvariants:
             )
         )
         conv.user_batch.add_tool_response("v", "x1")
-        core._check_invariants()  # 不报
+        core.check_invariants()  # 不报
 
     def test_value_domain(self):
         core, conv = _core()
         # 绕过入队时的类型检查，直接放一个坏值：不变量要能自己认出来
         conv.user_batch.tool_responses.append(ToolMessage(content=123, tool_call_id="x1"))
         with pytest.raises(KernelPanic):
-            core._check_invariants()
+            core.check_invariants()
 
     def test_tool_response_rejects_non_string(self):
         core, conv = _core()
@@ -1074,8 +1074,8 @@ class TestInvariants:
         core, _conv = _core()
         core.mem._device_ids["ghost"] = object()
         with pytest.raises(KernelPanic):
-            core._check_invariants()
+            core.check_invariants()
 
     def test_normal_state_passes(self):
         core, _conv = _core()
-        core._check_invariants()
+        core.check_invariants()

@@ -90,17 +90,17 @@ class LinkDevice(MemoryDevice):
     # 内部跟随
     # ------------------------------------------------------------------
 
-    def _follow_real(self, remainder, seen_links=None):
+    def follow_links(self, remainder, seen_links=None):
         """跟随目标（含链式链接），返回 ("memory", segments) 或 ("device", mount, remainder)。"""
         if self._core is None:
             from .exceptions import VMMemoryError
             raise VMMemoryError("LinkDevice 未接入 Core")
         segments = self._target_segments + list(remainder or [])
-        return self._core.mem._follow_real(segments, seen_links or [])
+        return self._core.mem.follow_links(segments, seen_links or [])
 
     def _real_mem_segments(self, suffix, seen_links=None):
         """把别名后的剩余路径换算成真实 MEM 段（不含 MEM 根），供 set_by_path 委托。"""
-        follow = self._follow_real(suffix or [], seen_links=seen_links)
+        follow = self.follow_links(suffix or [], seen_links=seen_links)
         if follow[0] == "memory":
             return follow[1]
         _, mount, remainder = follow
@@ -111,7 +111,7 @@ class LinkDevice(MemoryDevice):
         if self._core is None:
             from .exceptions import VMMemoryError
             raise VMMemoryError("LinkDevice 未接入 Core")
-        self._core.mem._resolve_path(
+        self._core.mem.resolve_path(
             ["MEM"] + self._target_segments,
             for_llm=False,
             seen_links=[self.mount_path] if self.mount_path else [],
@@ -129,7 +129,7 @@ class LinkDevice(MemoryDevice):
         if self._core is None:
             raise VMMemoryError("LinkDevice 未接入 Core")
         try:
-            return self._core.mem._resolve_path(
+            return self._core.mem.resolve_path(
                 ["MEM"] + self._target_segments,
                 for_llm=True,
                 seen_links=[self.mount_path] if self.mount_path else [],
@@ -146,7 +146,7 @@ class LinkDevice(MemoryDevice):
             raise VMMemoryError("LinkDevice 未接入 Core")
         target_segments = self._target_segments + list(path or [])
         try:
-            return self._core.mem._resolve_path(
+            return self._core.mem.resolve_path(
                 ["MEM"] + target_segments,
                 for_llm=False,
                 seen_links=seen_links or ([self.mount_path] if self.mount_path else []),
@@ -169,7 +169,7 @@ class LinkDevice(MemoryDevice):
     def authorize_listener(self, event_type: str, remainder: list, owner_cid: int) -> bool:
         from .exceptions import MemoryCircularReferenceError
         try:
-            follow = self._follow_real(
+            follow = self.follow_links(
                 list(remainder or []),
                 seen_links=[self.mount_path] if self.mount_path else [],
             )

@@ -1302,7 +1302,7 @@ class TestEventContractFixes20261024:
         CreateSubInstruction("cs", parent.cid, {
             "system_ref": "$MEM.prog", "user_ref": "$MEM.u", "para_ref": "$MEM.para",
         }).execute(core, parent)
-        assert core._is_waiting_for_return(parent)
+        assert core.is_waiting_for_return(parent)
         seen = []
         core.events.add_observer(seen.append)
         core._active_cid = other.cid
