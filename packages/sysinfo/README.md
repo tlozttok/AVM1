@@ -8,14 +8,14 @@
 |---|---|
 | `manifest.json` | OS 包清单：`name` / `package_version` / `device` 条目 |
 | `data.json` | 显式节点格式的包数据（安装程序把它搬进 `$MEM`） |
-| `install.py` | 安装程序：`plm.command` 程序正文，读 `$MEM.pkgrepo`、搬数据、请求挂载设备 |
+| `install.py` | 安装程序：`plm.command` 程序正文，读 `$MEM.pkgrepo`、搬数据、提交装载申请、批准后完成挂载 |
 | `devices/sysinfo.py` | 设备代码（宿主 Python，`SysInfoDevice`）；只读，不 import 包内其他代码 |
 
 ## 前置
 
 - base 镜像启动的运行实例（`python -m avm.console images/base/base.json`）；
 - `$MEM.pkgrepo` 已挂载（base 自带），默认 `root` 是仓库根，所以本例的包路径是 `packages/sysinfo`；
-- 设备代码经 `$MEM.device_loader` 挂载，必须带 `approved_sha256`（本例安装程序从包文件清单里取哈希；真实系统里应先由操作员核对）。
+- 设备代码经 `$MEM.device_loader` 挂载：申请写 `$MEM.device_loader.request.<名字>`，操作员在面板设备动作里批准，再写 `$MEM.device_loader.resume.<名字>` 完成挂载。审批值由设备在批准时生成，安装程序不提供。
 
 ## 手动安装流程
 
@@ -63,9 +63,9 @@ create_cmd $MEM.workshop.programs.pkg_installer $MEM.workshop.paras.pkg_install
 
 得到 `cid=N`。
 
-**4. 投递安装命令**
+**4. 投递安装命令（提交挂载申请）**
 
-`device_file` 是相对 base 镜像目录（`images/base`）的宿主路径：
+`device_file` 是相对 base 镜像目录（`images/base`）的宿主路径；`mount` 是单段设备名：
 
 ```json
 {"action": "install",
@@ -81,9 +81,23 @@ create_cmd $MEM.workshop.programs.pkg_installer $MEM.workshop.paras.pkg_install
 send_instruction <cid> '<上面的 JSON>'
 ```
 
-安装程序会依次：读 `$MEM.pkgrepo.data` 把字段搬进 `$MEM.workshop.installed.sysinfo`（`memory_make`/`memory_write`）→ 从 `$MEM.pkgrepo.files` 取 `devices/sysinfo.py` 的 sha256 → 写 `$MEM.device_loader` 请求 `load_device`。返回 JSON 摘要，`ok=true` 表示数据已搬入、设备已挂载。
+安装程序会依次：读 `$MEM.pkgrepo.data` 把字段搬进 `$MEM.workshop.installed.sysinfo`（`memory_make`/`memory_write`）→ 写 `$MEM.device_loader.request.sysinfo` 提交挂载申请。返回 JSON 摘要，`pending=true` 表示数据已搬入、设备**尚未挂载**，等操作员批准。
 
-**5. 验证**
+**5. 在面板批准装载**
+
+打开面板，选中 `$MEM.device_loader` 设备节点，在「设备声明的调试动作」里点「批准装载 sysinfo」。批准动作校验设备文件自申请以来没有变化，并记录 `approved_sha256` / `approved_at` / `approved_via`；它不挂载。
+
+**6. 完成挂载**
+
+再向安装程序投递：
+
+```json
+{"action": "resume", "mount": "sysinfo"}
+```
+
+安装程序写 `$MEM.device_loader.resume.sysinfo`，设备在这一条指令里 import 设备代码、挂载并记 `device_mount`；重启时按记录重放，不重新审批。
+
+**7. 验证**
 
 ```text
 $MEM.sysinfo                 # 说明书 + 一行摘要
@@ -102,7 +116,7 @@ $MEM.sysinfo.json            # 以上合成的 JSON
 ## 安全与审批
 
 - `devices/sysinfo.py` 是宿主 Python 代码，能读平台/进程/环境/磁盘信息，代码里用 `subprocess`/`shutil` 做探测；挂载前应人工审查。
-- 挂载要求 `approved_sha256`；本例安装程序从包自身文件清单填这个值，等于"包自己批准自己"。真实部署应让操作员先核对设备文件哈希，再由 OS 安装程序带着人工批准的哈希去挂载。
+- 审批走 `$MEM.device_loader` 的申请/批准/挂载三步：申请只登记，设备文件哈希由设备在批准动作里复核并记录；请求方（安装程序或 AI）无法携带审批值。文件在批准后变化时 `resume` 会失败并要求重新申请。
 - 设备只读：根地址写入、子路径写入都会得到 `MemoryTypeError`。
 
 ## 清理

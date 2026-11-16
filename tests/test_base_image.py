@@ -289,12 +289,7 @@ def test_device_loader_mounts_device_and_replay_keeps_it(tmp_path):
     core = load_core(image, journal=True)
     boot_cold(core)
 
-    with open(device_source, "rb") as f:
-        approved = hashlib.sha256(f.read()).hexdigest()
-    command = json.dumps({
-        "action": "load_device",
-        "approved_sha256": approved,
-        "path": "echo",
+    request = json.dumps({
         "file": str(device_source),
         "class": "EchoDevice",
         "args": {"value": "初始"},
@@ -303,10 +298,28 @@ def test_device_loader_mounts_device_and_replay_keeps_it(tmp_path):
     panel = core.bind_console_conversation(channel, para_ref="$MEM.para.python")
     _panel_actions(core, channel, panel, [
         {"tool": "memory_write",
-         "arguments": {"ref": "$MEM.device_loader", "content": command}},
+         "arguments": {"ref": "$MEM.device_loader.request.echo", "content": request}},
+        {"end": True},
+    ])
+    assert "echo" not in core.mem._devices, "申请阶段不应挂载"
+
+    loader = core.mem.mounted_devices()["device_loader"]
+    approve = [a for a in loader.debug_actions()
+               if a.get("name") == "批准装载 echo"][0]
+    approve["run"]({})
+    assert "echo" not in core.mem._devices, "批准阶段不应挂载"
+
+    _panel_actions(core, channel, panel, [
+        {"tool": "memory_write",
+         "arguments": {"ref": "$MEM.device_loader.resume.echo", "content": ""}},
         {"end": True},
     ])
     assert "echo" in core.mem._devices
+    with open(device_source, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    assert core.device_specs["echo"]["sha256"] == digest
+    assert core.device_specs["echo"]["approved_sha256"] == digest
+    assert core.device_specs["echo"]["approved_via"] == "panel-device-action"
 
     restored = load_image(Core(), image)
     restored.attach_journal(restored.journal_path)

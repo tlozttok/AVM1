@@ -1,4 +1,9 @@
-"""sysinfo 包的 OS 层安装程序（plm.command）：读 pkgrepo、把数据搬进 $MEM、请求挂载设备代码。"""
+"""sysinfo 包的 OS 层安装程序（plm.command）：读 pkgrepo、把数据搬进 $MEM、提交设备挂载申请。
+
+设备代码的审批归面板：`install` 只写 `$MEM.device_loader.request.<mount>` 登记申请
+（不挂载）；操作员在面板 `$MEM.device_loader` 设备上批准后，执行本程序的 `resume`
+动作写 `$MEM.device_loader.resume.<mount>` 完成挂载。
+"""
 
 def _err(msg):
     return "错误: installer: " + str(msg)
@@ -8,20 +13,11 @@ def _is_error(text):
     return isinstance(text, str) and text.startswith(("Error:", "Illegal:"))
 
 
-def _file_sha(files_text, rel):
-    for line in files_text.splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[0] == rel:
-            return parts[2]
-    return None
-
-
-def _make_node(dest, node):
-    kind = node.get("kind")
-    if kind != "str":
-        return _err("data.json 只支持 str 叶子（示例安装程序）")
-    response = yield from memory_make(dest, "x", "str")  # 占位，不会执行到：见 _install
-    return response
+def _mount_name(spec):
+    mount = spec.get("mount", "sysinfo")
+    if not isinstance(mount, str) or not mount or "." in mount:
+        return None
+    return mount
 
 
 def _install(spec):
@@ -38,12 +34,9 @@ def _install(spec):
     if not isinstance(value, dict):
         return _err("data.json 的 value 必须是对象")
 
-    files_text = yield from memory_read("$MEM.pkgrepo.files")
-    if _is_error(files_text):
-        return _err("读 files 失败：" + str(files_text))
-    sha = _file_sha(str(files_text), "devices/sysinfo.py")
-    if sha is None:
-        return _err("包内没有 devices/sysinfo.py")
+    mount = _mount_name(spec)
+    if mount is None:
+        return _err("mount 必须是单段设备名（不含点号）")
 
     parent = spec.get("dest_parent", "$MEM.workshop.installed")
     name = spec.get("dest_name", "sysinfo")
@@ -68,25 +61,35 @@ def _install(spec):
         written.append(key)
 
     request = {
-        "action": "load_device",
-        "path": spec.get("mount", "sysinfo"),
         "file": spec["device_file"],
         "class": spec.get("device_class", "SysInfoDevice"),
         "args": spec.get("device_args", {}),
-        "approved_sha256": sha,
-        "approved_at": "2026-11-14T21:40:00+0800",
-        "approved_via": "pkg-install-trial",
     }
-    response = yield from memory_write("$MEM.device_loader", json.dumps(request, ensure_ascii=False))
+    response = yield from memory_write(
+        "$MEM.device_loader.request." + mount,
+        json.dumps(request, ensure_ascii=False),
+    )
     if _is_error(response):
-        return _err("挂载设备失败：" + str(response))
+        return _err("提交装载申请失败：" + str(response))
     return json.dumps({
         "ok": True,
         "installed_at": dest,
         "fields": written,
-        "mount": spec.get("mount", "sysinfo"),
-        "device_sha256": sha,
+        "mount": mount,
+        "pending": True,
+        "next": "操作员在面板 $MEM.device_loader 设备上批准后，执行本程序的 resume 动作完成挂载",
     }, ensure_ascii=False)
+
+
+def _resume(spec):
+    mount = _mount_name(spec)
+    if mount is None:
+        return _err("mount 必须是单段设备名（不含点号）")
+    response = yield from memory_write("$MEM.device_loader.resume." + mount, "")
+    if _is_error(response):
+        return _err("完成挂载失败：" + str(response))
+    return json.dumps({"ok": True, "mount": mount, "mounted": True},
+                      ensure_ascii=False)
 
 
 def handle(cmd):
@@ -98,7 +101,11 @@ def handle(cmd):
         return _err("命令必须是 JSON 对象")
     action = spec.get("action")
     if action == "help":
-        return "sysinfo 包安装程序：命令 {\"action\": \"install\", \"device_file\": ..., \"mount\": ...}"
-    if action != "install":
-        return _err("未知 action： " + repr(action))
-    return (yield from _install(spec))
+        return ("sysinfo 包安装程序：{\"action\": \"install\", \"device_file\": ..., "
+                "\"mount\": ...} 提交挂载申请；操作员批准后执行 "
+                "{\"action\": \"resume\", \"mount\": ...} 完成挂载。")
+    if action == "install":
+        return (yield from _install(spec))
+    if action == "resume":
+        return (yield from _resume(spec))
+    return _err("未知 action： " + repr(action))

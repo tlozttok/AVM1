@@ -9,9 +9,11 @@ python images/base/build_image.py          # 重新生成 base.json（首次生�
 python -m avm.console images/base/base.json
 ```
 
-运行期装载设备代码不再使用密码：`load_device` 命令必须带操作员审批得到的
-`approved_sha256`（设备文件内容哈希）。软件包怎么分发、安装到哪由 OS 决定，VM 不提供
-包机制（见 [docs/porting-contract.md](../../docs/porting-contract.md)）。
+运行期装载设备代码走 `$MEM.device_loader` 的申请/批准/挂载三步：写
+`$MEM.device_loader.request.<名字>` 登记申请，操作员在面板设备动作里批准，再写
+`$MEM.device_loader.resume.<名字>` 完成挂载；审批值由设备在批准时生成，请求方不提供。
+软件包怎么分发、安装到哪由 OS 决定，VM 不提供包机制（见
+[docs/porting-contract.md](../../docs/porting-contract.md)）。
 
 ## 镜像里有什么
 
@@ -28,7 +30,7 @@ python -m avm.console images/base/base.json
 | `$MEM.sys.handbook` | 分区与自举约定 |
 | `$MEM.para.python` / `.command` / `.builder` / `.shell` / `.assistant` | 内建 PLM 的参数档（`.builder` / `.shell` 用 `plm.command`；`.assistant` 是示例 settingup 的模型档，`model` 改成上游模型名后才能建对话） |
 | `$MEM.workshop` / `$MEM.home` | 试验区 / 个人数据区（空） |
-| `$MEM.device_loader` | 设备装载入口：宿主/操作员审批后把一段宿主 Python 挂成设备，命令只保留 `load_device` |
+| `$MEM.device_loader` | 设备装载入口：写 `.request.<名字>` 登记申请、面板设备动作批准、写 `.resume.<名字>` 完成挂载；请求方不提供审批值 |
 | `$MEM.AVMRepo` | 仓库只读设备（查文档用） |
 | `$MEM.pkgrepo` | OS 包仓库设备（只读）：向根地址写入一行相对路径装载；验证后读 `.manifest` / `.data` / `.files` / `.read."<相对路径>"`。设备不 import 设备代码、不写安装事务，装载/安装归 OS |
 | `$MEM.inputs` / `$MEM.outputs` | 标准 IO 设备；操作面板宿主会替换成总线设备 |
@@ -269,7 +271,7 @@ IO 总线，是不进日志的调试通道。base 不预置 inbox/面板输入�
 
 - boot-check 的业务报告（作者写个人系统时完善）；base 只保留 `boot.report` 约定。
 - 配置层/前端对关机中、超时次数的展示。
-- 设备审批的强制力是人的仪式：内核不检查发起者（任何能写 `$MEM.device_loader` 的对话知道哈希即可装载）。
+- 设备审批由面板设备动作执行：内核仍不检查发起者，但申请只登记，挂载要等一次面板批准；审批值由设备在批准时生成。
 
 ## 测试
 

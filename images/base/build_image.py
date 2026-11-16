@@ -14,8 +14,9 @@ OS 程序节点（boot/shutdown 两个 guest 角色程序 + clock_a/clock_b 服�
 supervisor。其余基础由作者在系统内手动搭建，见 README.md。
 
 设备文件按相对路径引用（`../devices/*`），因此镜像可以直接放在仓库里运行；
-运行期装载设备代码必须带面板审批得到的 `approved_sha256`（设备装载入口只做这一件事，
-软件包怎么分发与安装是 OS 的事，见 docs/porting-contract.md）。
+运行期装载设备走 `$MEM.device_loader` 的申请/批准/挂载三步：写
+`.request.<名字>` 登记申请、面板设备动作批准、写 `.resume.<名字>` 完成挂载，
+请求方不提供审批值（软件包怎么分发与安装是 OS 的事，见 docs/porting-contract.md）。
 
 base.json 由本脚本首次生成后就是种子：仓库里的 base.json 已提交，作者在系统内
 改它；只有需要从程序源重建镜像时才重新运行本脚本。

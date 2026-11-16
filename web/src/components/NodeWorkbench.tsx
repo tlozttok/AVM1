@@ -246,7 +246,7 @@ export default function NodeWorkbench({
     void run(memoryWrite(target, value))
   }
 
-  const runDeviceAction = async (index: number) => {
+  const runDeviceAction = async (index: number, actionName: string | null) => {
     if (!device) return
     let args: Record<string, unknown> = {}
     const raw = (deviceArgs[index] ?? '').trim()
@@ -268,7 +268,8 @@ export default function NodeWorkbench({
       const record = await apiSend<{ result?: unknown; error?: string | null }>(
         '/api/device-action',
         'POST',
-        { mount: device.mount, index, arguments: args },
+        // 动作名优先（动态动作表在两次请求之间会变化）；没有名字时退回 index。
+        { mount: device.mount, name: actionName ?? undefined, index, arguments: args },
       )
       const text = record.error
         ?? (record.result === undefined ? '已调用（没有返回值）' : JSON.stringify(record.result))
@@ -656,7 +657,7 @@ export default function NodeWorkbench({
                     type="button"
                     data-testid={`node-device-run-${action.index}`}
                     disabled={busy || !action.callable}
-                    onClick={() => void runDeviceAction(action.index)}
+                    onClick={() => void runDeviceAction(action.index, action.name)}
                   >
                     运行
                   </button>

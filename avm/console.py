@@ -28,7 +28,6 @@
 """
 
 import argparse
-import ast
 import json
 import os
 import queue
@@ -75,41 +74,6 @@ _MIME = {
 # ----------------------------------------------------------------------
 # JSON 化
 # ----------------------------------------------------------------------
-
-# ----------------------------------------------------------------------
-# 设备文件检查（审批弹窗的只读数据源）
-# ----------------------------------------------------------------------
-
-def _device_classes_in_file(path: str) -> List[str]:
-    """从源码里找继承 MemoryDevice 的类名；只做 AST 解析，不 import（不执行设备代码）。"""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            tree = ast.parse(f.read(), filename=path)
-    except (OSError, UnicodeDecodeError, SyntaxError) as e:
-        raise ValueError(f"设备文件无法作为 Python 源码解析：{path}: {e}") from e
-    classes = []
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef):
-            continue
-        for base in node.bases:
-            name = base.id if isinstance(base, ast.Name) else (
-                base.attr if isinstance(base, ast.Attribute) else None
-            )
-            if isinstance(name, str) and name.endswith("MemoryDevice"):
-                classes.append(node.name)
-                break
-    return classes
-
-
-def _path_within(path: str, roots: List[str]) -> bool:
-    for root in roots:
-        try:
-            if os.path.commonpath([root, path]) == root:
-                return True
-        except ValueError:
-            continue  # 不同盘符：不是同一棵树
-    return False
-
 
 def _describe_device(device: MemoryDevice) -> dict:
     """设备的运行者视图：类型、挂载键、LLM 表示。取不到就报错，不抛。"""
@@ -597,105 +561,6 @@ class Console:
             })
         return {"devices": out, "action_log": list(self._action_log[-50:])}
 
-    # -- 设备审批：只读检查 -------------------------------------------
-
-    def _inspect_roots(self) -> List[str]:
-        """允许检查的目录：只认镜像目录。
-
-        审批弹窗只能检查宿主世界里的设备文件；任意路径（/etc/passwd、用户 home）
-        一律拒绝。镜像之外的目录由 OS 自己在镜像里组织，不进审批可见范围。
-        """
-        roots = []
-        image_dir = getattr(self.core, "image_dir", None)
-        if isinstance(image_dir, str) and image_dir:
-            roots.append(os.path.realpath(image_dir))
-        return sorted(set(roots))
-
-    def _existing_device_spec(self, path: str, mount: Optional[str] = None) -> Optional[dict]:
-        """同一设备文件已挂在哪些路径；优先返回请求里给出的挂载点。"""
-        matches = []
-        for spec_mount, spec in sorted(self.core.device_specs.items()):
-            if not isinstance(spec, dict) or spec.get("builtin"):
-                continue
-            spec_path = spec.get("path")
-            if isinstance(spec_path, str) and os.path.realpath(spec_path) == path:
-                matches.append((spec_mount, spec))
-        if not matches:
-            return None
-        chosen = matches[0]
-        if mount is not None:
-            for item in matches:
-                if item[0] == mount:
-                    chosen = item
-                    break
-        spec_mount, spec = chosen
-        return {
-            "mount": spec_mount,
-            "class": spec.get("class"),
-            "args": spec.get("args") or {},
-            "sha256": spec.get("sha256"),
-            "approved_at": spec.get("approved_at"),
-            "approved_via": spec.get("approved_via"),
-        }
-
-    def inspect_device(self, path, class_name: Optional[str] = None,
-                       mount: Optional[str] = None,
-                       args: Optional[dict] = None) -> dict:
-        """只读检查一台设备文件：路径、大小、哈希、类名、挂载信息与现有来源表条目。
-
-        不 import 设备代码（类名从 AST 取），不挂载、不写内存。路径必须落在
-        镜像目录内；拒绝只读探测宿主任意文件。
-        """
-        from .image import _sha256_file
-
-        if not isinstance(path, str) or not path.strip():
-            raise ValueError("path 必须是非空字符串")
-        if mount is not None and (not isinstance(mount, str) or not mount):
-            raise ValueError("mount 必须是非空字符串")
-        if args is not None and not isinstance(args, dict):
-            raise ValueError("args 必须是对象")
-        roots = self._inspect_roots()
-        if not roots:
-            raise ValueError("当前内核没有镜像目录，拒绝检查任意路径")
-        base = roots[0]
-        target = os.path.realpath(
-            path if os.path.isabs(path) else os.path.join(base, path)
-        )
-        if not _path_within(target, roots):
-            raise ValueError(f"设备文件路径必须落在镜像目录内：{path}")
-        if not os.path.isfile(target):
-            raise ValueError(f"设备文件不存在：{path}")
-        classes = _device_classes_in_file(target)
-        if class_name is not None:
-            if not isinstance(class_name, str) or not class_name:
-                raise ValueError("class 必须是非空字符串")
-            if classes and class_name not in classes:
-                raise ValueError(
-                    f"文件里没有继承 MemoryDevice 的类 {class_name}"
-                    f"（发现：{', '.join(classes) or '无'}）"
-                )
-        elif len(classes) == 1:
-            class_name = classes[0]
-        existing = self._existing_device_spec(target, mount)
-        if mount is None and existing is not None:
-            mount = existing["mount"]
-        if args is None and existing is not None:
-            args = existing["args"]
-        try:
-            size = os.path.getsize(target)
-            digest = _sha256_file(target)
-        except OSError as e:
-            raise ValueError(f"设备文件不可读：{path}: {e}") from e
-        return {
-            "path": target,
-            "size": size,
-            "sha256": digest,
-            "class": class_name,
-            "mount": mount,
-            "args": args,
-            "existing": existing,
-        }
-
     # -- 快照与 diff ---------------------------------------------------
 
     def snapshot(self) -> int:
@@ -793,18 +658,40 @@ class Console:
         self._api_resume_event.wait()
         self._api_resume_event.clear()
 
-    def invoke_device_action(self, mount: str, index: int,
-                             arguments: Optional[dict] = None) -> dict:
-        """调用设备自己声明的调试动作。不入核心、不产生事件。"""
+    def invoke_device_action(self, mount: str, index: Optional[int] = None,
+                             arguments: Optional[dict] = None,
+                             name: Optional[str] = None) -> dict:
+        """调用设备自己声明的调试动作。不入核心、不产生事件。
+
+        优先按动作名 `name` 查找（动态动作表的稳定性由名字保证）；没给名字时沿用
+        index。名字在该设备的动作清单里必须唯一。
+        """
         device = self.core.mem.mounted_devices().get(mount)
         if device is None:
             raise KeyError(f"设备 {mount} 未挂载（可能被屏蔽了）")
         actions = device.debug_actions() or []
-        if index < 0 or index >= len(actions):
-            raise KeyError(f"设备 {mount} 没有编号 {index} 的调试动作")
-        action = actions[index]
+        if name is not None:
+            if not isinstance(name, str) or not name:
+                raise ValueError("动作 name 必须是非空字符串")
+            matches = [
+                (i, action) for i, action in enumerate(actions)
+                if isinstance(action, dict) and action.get("name") == name
+                and callable(action.get("run"))
+            ]
+            if not matches:
+                raise KeyError(f"设备 {mount} 没有名为 {name!r} 的可调用调试动作")
+            if len(matches) > 1:
+                raise ValueError(
+                    f"设备 {mount} 有多个名为 {name!r} 的调试动作；请用 index 指定")
+            resolved_index, action = matches[0]
+        else:
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise ValueError("调用设备动作需要 name 或整数 index")
+            if index < 0 or index >= len(actions):
+                raise KeyError(f"设备 {mount} 没有编号 {index} 的调试动作")
+            resolved_index, action = index, actions[index]
         if not isinstance(action, dict) or not callable(action.get("run")):
-            raise ValueError(f"设备 {mount} 的调试动作 {index} 没有可调用的 run")
+            raise ValueError(f"设备 {mount} 的调试动作 {resolved_index} 没有可调用的 run")
         args = arguments if isinstance(arguments, dict) else {}
         started = time.time()
         try:
@@ -814,7 +701,7 @@ class Console:
             result, error = None, f"{type(e).__name__}: {e}"
         record = {
             "mount": mount,
-            "index": index,
+            "index": resolved_index,
             "name": action.get("name"),
             "arguments": args,
             "result": _jsonable(result) if error is None else None,
@@ -978,7 +865,7 @@ _INDEX_HTML = """<!doctype html>
 <li><code>GET /api/memory/diff?from=0&amp;to=1</code></li>
 <li><code>POST /api/memory/snapshot</code></li>
 <li><code>GET /api/listeners</code> · <code>PATCH /api/listeners/&lt;id&gt;</code></li>
-<li><code>GET /api/devices</code> · <code>POST /api/device-action</code> · <code>POST /api/device/inspect</code></li>
+<li><code>GET /api/devices</code> · <code>POST /api/device-action</code></li>
 <li><code>GET /api/events</code> · <code>GET /api/io/stream?after=&lt;seq&gt;</code>（SSE）</li>
 <li><code>POST /api/interrupt</code> · <code>POST /api/resume</code> · <code>POST /api/action</code></li>
 <li><code>POST /api/io/input</code>（调试输入：只进宿主 IO 总线，不进日志、不重放）</li>
@@ -1190,11 +1077,8 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
                     body.get("tool"), body.get("arguments")))
             elif path == "/api/device-action":
                 self._send_json(200, console.invoke_device_action(
-                    body.get("mount"), int(body.get("index", 0)), body.get("arguments")))
-            elif path == "/api/device/inspect":
-                self._send_json(200, console.inspect_device(
-                    body.get("path"), class_name=body.get("class"),
-                    mount=body.get("mount"), args=body.get("args")))
+                    body.get("mount"), index=body.get("index"),
+                    arguments=body.get("arguments"), name=body.get("name")))
             elif path == "/api/memory/snapshot":
                 self._send_json(200, {"snapshot": console.snapshot()})
             elif path == "/api/mask/memory":

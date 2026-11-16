@@ -8,7 +8,6 @@ import ActionCard from './ActionCard'
 import ActionForm from './ActionForm'
 import ConversationView from './ConversationView'
 import DebugInput from './DebugInput'
-import DeviceApprovalPanel from './DeviceApprovalPanel'
 import EventLog from './EventLog'
 import InputFeed from './InputFeed'
 import ListenerEditor from './ListenerEditor'
@@ -22,7 +21,6 @@ export type DrawerTab =
   | 'listeners'
   | 'io'
   | 'tray'
-  | 'approvals'
   | 'conversation'
   | 'system'
 
@@ -33,7 +31,6 @@ const TAB_LABEL: Record<DrawerTab, string> = {
   listeners: '监听器编辑',
   io: 'IO 调试输入',
   tray: '值暂存区',
-  approvals: '设备审批',
   conversation: '对话原始详情',
   system: '系统信息',
 }
@@ -45,7 +42,6 @@ const TAB_ORDER: DrawerTab[] = [
   'listeners',
   'io',
   'tray',
-  'approvals',
   'conversation',
   'system',
 ]
@@ -78,7 +74,7 @@ interface Props {
 
 /**
  * 底部调试抽屉：原始动作（保留「直接作为 cid -1 对话执行指令」的通道）、事件流、
- * 监听器编辑、IO 调试输入、值暂存区、设备审批、对话原始详情、系统信息。
+ * 监听器编辑、IO 调试输入、值暂存区、对话原始详情、系统信息。
  * 默认收起，主界面不放调试能力。
  */
 export default function DebugDrawer({
@@ -130,7 +126,7 @@ export default function DebugDrawer({
       <div className="drawer-bar" data-testid="debug-toggle" onClick={onToggle}>
         <span className="drawer-label">调试抽屉</span>
         <span className="drawer-desc">
-          原始动作（以 cid -1 直接执行） · 事件流 · 监听器编辑 · IO 调试输入 · 值暂存区 · 设备审批 ·
+          原始动作（以 cid -1 直接执行） · 事件流 · 监听器编辑 · IO 调试输入 · 值暂存区 ·
           对话原始详情 · 系统信息
         </span>
         <span className="drawer-toggle">{open ? '收起' : '展开'}</span>
@@ -213,12 +209,6 @@ export default function DebugDrawer({
             {tab === 'tray' ? (
               <div className="drawer-pane" data-testid="drawer-pane-tray">
                 <ValueTray values={tray} selected={traySelected} onSelect={onSelectTray} note={copyNote} />
-              </div>
-            ) : null}
-
-            {tab === 'approvals' ? (
-              <div className="drawer-pane" data-testid="drawer-pane-approvals">
-                <DeviceApprovalPanel onRefresh={onRefreshState} />
               </div>
             ) : null}
 
