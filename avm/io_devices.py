@@ -47,12 +47,15 @@ class IOInputDevice(MetaListDevice):
 
     def _identities(self) -> list:
         """当前对话的可寻址身份：cid、名字、identity。"""
-        if self._core is None or getattr(self._core, "_active_cid", None) is None:
+        if self._core is None:
             return []
-        conv = self._core.get_conversation(self._core._active_cid)
+        cid = self._core.active_conversation_id()
+        if cid is None:
+            return []
+        conv = self._core.get_conversation(cid)
         if conv is None:
             return []
-        return [str(self._core._active_cid), getattr(conv, "name", None),
+        return [str(cid), getattr(conv, "name", None),
                 getattr(conv, "identity", None)]
 
     # -- 调试动作（与标准输入设备同名同形）----------------------------
@@ -184,7 +187,7 @@ class IOOutputDevice(MetaListDevice):
         if bus is None:
             return
         bus.publish_output(
-            source=getattr(self._core, "_active_cid", None),
+            source=self._core.active_conversation_id(),
             text=value,
             kind="notify" if notify else "text",
             meta={"notify": True} if notify else None,

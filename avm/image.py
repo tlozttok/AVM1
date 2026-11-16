@@ -448,7 +448,7 @@ def _start_init(core: Core, init: dict):
         conv.append_user_message(user)
         conv.is_root = True
         conv.name = name
-        core._ready_cids.append(conv.cid)
+        core.wake(conv.cid)  # 首次入队（摘掉残留 + 排到就绪末尾）
         return
     conv = core.start(system, user, para_ref)
     if node is not None:
@@ -571,9 +571,9 @@ def start_guest_programs(core: Core, decl: Optional[dict] = None) -> dict:
         entry = _guest_entry(role, node_type)
         if role == "boot":
             conv.append_user_message(entry)
-            core._ready_cids.append(conv.cid)
+            core.wake(conv.cid)  # boot 角色开局即排入就绪
         else:
-            core._dormant_cids.append(conv.cid)
+            core.sleep(conv.cid)
         core.interrupts.register(role, conv.cid)
         created[role] = {"cid": conv.cid, "entry": entry, "kind": node_type}
     core.guest_roles = created

@@ -211,10 +211,11 @@ def archive_file(path: Optional[str], generation: int):
 
 def scheduler_to_snapshot(core) -> dict:
     """回合结束时的调度状态（日志记录与重启快照共用同一形状）。"""
+    sched = core.schedule_state()
     return {
-        "active": core._active_cid,
-        "ready": list(core._ready_cids),
-        "dormant": list(core._dormant_cids),
+        "active": sched["active"],
+        "ready": sched["ready"],
+        "dormant": sched["dormant"],
         "finished": sorted(core._finished),
         "activation_instructions": core._activation_instructions,
         "next_cid": core._next_cid,
@@ -340,15 +341,16 @@ def _apply_scheduler_delta(core, change, seq) -> None:
 
     if "active" in change:
         active = change.get("active")
-        core._active_cid = active if active is not None and _known(active) else None
-    for key, attr in (("ready", "_ready_cids"), ("dormant", "_dormant_cids")):
-        target = getattr(core, attr)
+        core.set_active(active if active is not None and _known(active) else None)
+    for key, add, remove in (
+        ("ready", core.add_ready, core.remove_ready),
+        ("dormant", core.add_dormant, core.remove_dormant),
+    ):
         for cid in change.get(key + "_remove") or []:
-            if cid in target:
-                target.remove(cid)
+            remove(cid)
         for cid in change.get(key + "_add") or []:
-            if _known(cid) and cid not in target:
-                target.append(cid)
+            if _known(cid):
+                add(cid)
     for cid in change.get("finished_remove") or []:
         core._finished.discard(cid)
     for cid in change.get("finished_add") or []:
@@ -389,9 +391,11 @@ def apply_scheduler(core, scheduler, source: str = "日志") -> None:
         return False
 
     active = scheduler.get("active")
-    core._active_cid = active if active is not None and _known(active) else None
-    core._ready_cids = [cid for cid in scheduler.get("ready") or [] if _known(cid)]
-    core._dormant_cids = [cid for cid in scheduler.get("dormant") or [] if _known(cid)]
+    core.restore_schedule(
+        active if active is not None and _known(active) else None,
+        [cid for cid in scheduler.get("ready") or [] if _known(cid)],
+        [cid for cid in scheduler.get("dormant") or [] if _known(cid)],
+    )
     core._finished = {cid for cid in scheduler.get("finished") or [] if _known(cid)}
     if isinstance(scheduler.get("activation_instructions"), int):
         core._activation_instructions = scheduler["activation_instructions"]
@@ -529,9 +533,7 @@ def _effect_conversation_close(core, effect) -> None:
     if conv is None:
         return
     core._finished.add(cid)
-    for queue in (core._ready_cids, core._dormant_cids):
-        while cid in queue:
-            queue.remove(cid)
+    core.drop_from_schedule(cid)
     core._executors.pop(cid, None)
 
 
@@ -545,9 +547,7 @@ def _effect_conversation_delete(core, effect) -> None:
         conv = core.remove_conversation(target_cid)
         if conv is None:
             return
-        for queue in (core._ready_cids, core._dormant_cids):
-            while target_cid in queue:
-                queue.remove(target_cid)
+        core.drop_from_schedule(target_cid)
         core._finished.discard(target_cid)
         core._executors.pop(target_cid, None)
 

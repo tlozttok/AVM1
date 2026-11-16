@@ -449,7 +449,7 @@ class InputsListDevice(MetaListDevice):
         """调试用：输入提示，标明正在等待哪个对话输入（及 /save 调试命令）"""
         who = "对话"
         if self._core is not None:
-            cid = self._core._active_cid
+            cid = self._core.active_conversation_id()
             if cid is not None:
                 convs = getattr(self._core, "conversations", {})
                 conv = convs.get(cid)
@@ -470,7 +470,7 @@ class InputsListDevice(MetaListDevice):
         if self._core is None:
             print("[检查点] 设备未接入 Core，无法保存", flush=True)
             return
-        cid = self._core._active_cid
+        cid = self._core.active_conversation_id()
         if cid is None:
             print("[检查点] 无活跃对话，无法保存", flush=True)
             return

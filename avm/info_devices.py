@@ -33,11 +33,11 @@ def _parse_json_field(value, field: str):
 
 
 def _state_of(core, cid):
-    if core._active_cid == cid:
+    if core.active_conversation_id() == cid:
         return "active"
-    if cid in core._dormant_cids:
+    if core.is_dormant(cid):
         return "dormant"
-    if cid in core._ready_cids:
+    if core.is_ready(cid):
         return "ready"
     return "finished"
 
@@ -326,9 +326,9 @@ class SchedulerDevice(MemoryDevice):
 
     def to_llm_string(self):
         return (
-            f"active={self._visible(self._core._active_cid)}\n"
-            f"ready={self._visible_list(self._core._ready_cids)}\n"
-            f"dormant={self._visible_list(self._core._dormant_cids)}\n"
+            f"active={self._visible(self._core.active_conversation_id())}\n"
+            f"ready={self._visible_list(self._core.ready_ids())}\n"
+            f"dormant={self._visible_list(self._core.dormant_ids())}\n"
             f"instruction_budget={self._core._instruction_budget} "
             f"(当前链计数={self._core._activation_instructions})"
         )
@@ -337,9 +337,9 @@ class SchedulerDevice(MemoryDevice):
         if len(path) != 1 or path[0] not in ("active", "ready", "dormant", "budget"):
             raise VMMemoryError("$MEM.scheduler 支持 active/ready/dormant/budget")
         return {
-            "active": self._visible(self._core._active_cid),
-            "ready": self._visible_list(self._core._ready_cids),
-            "dormant": self._visible_list(self._core._dormant_cids),
+            "active": self._visible(self._core.active_conversation_id()),
+            "ready": self._visible_list(self._core.ready_ids()),
+            "dormant": self._visible_list(self._core.dormant_ids()),
             "budget": f"{self._core._activation_instructions}/{self._core._instruction_budget}",
         }[path[0]]
 

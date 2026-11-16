@@ -632,11 +632,11 @@ class EventSystem:
             return None
         if cid in self._core._finished:
             state = "finished"
-        elif cid == self._core._active_cid:
+        elif cid == self._core.active_conversation_id():
             state = "active"
-        elif cid in self._core._ready_cids:
+        elif self._core.is_ready(cid):
             state = "ready"
-        elif cid in self._core._dormant_cids:
+        elif self._core.is_dormant(cid):
             state = "dormant"
         else:
             state = "unknown"
@@ -1508,8 +1508,4 @@ class EventSystem:
             if core._is_waiting_for_return(target):
                 # 等亚对话返回的对话：notify 只入批次，不唤醒；亚对话结束后父对话先跑
                 continue
-            if cid in core._dormant_cids:
-                core._dormant_cids.remove(cid)
-            if cid in core._ready_cids:
-                core._ready_cids.remove(cid)
-            core._ready_cids.append(cid)
+            core.wake(cid)

@@ -102,20 +102,23 @@ class Monitor:
                 "error": str(error) if error else None,
             }
 
+        sched_state = core.schedule_state()
         sched = {
-            "active_cid": core._active_cid,
-            "ready_cids": list(core._ready_cids),
-            "dormant_cids": list(core._dormant_cids),
+            "active_cid": sched_state["active"],
+            "ready_cids": sched_state["ready"],
+            "dormant_cids": sched_state["dormant"],
             "next_cid": core._next_cid,
         }
 
+        ready_set = set(sched_state["ready"])
+        dormant_set = set(sched_state["dormant"])
         conversations = {}
         for cid, conv in core.conversations.items():
-            if core._active_cid == cid:
+            if sched_state["active"] == cid:
                 state = "active"
-            elif cid in core._dormant_cids:
+            elif cid in dormant_set:
                 state = "dormant"
-            elif cid in core._ready_cids:
+            elif cid in ready_set:
                 state = "ready"
             else:
                 state = "finished"

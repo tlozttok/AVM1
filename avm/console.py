@@ -402,10 +402,11 @@ class Console:
 
     def schedule(self) -> dict:
         core = self.core
+        sched = core.schedule_state()
         return {
-            "active_cid": core._active_cid,
-            "ready": list(core._ready_cids),
-            "dormant": list(core._dormant_cids),
+            "active_cid": sched["active"],
+            "ready": sched["ready"],
+            "dormant": sched["dormant"],
             "finished": sorted(core._finished),
             "instruction_budget": core._instruction_budget,
             "activation_instructions": core._activation_instructions,
@@ -423,7 +424,7 @@ class Console:
             ],
             "panel": {
                 "cid": self.panel.cid,
-                "active": core._active_cid == self.panel.cid,
+                "active": core.active_conversation_id() == self.panel.cid,
                 "messages": len(self.panel.messages),
                 "channel": self.channel.status(),
             },
@@ -465,11 +466,11 @@ class Console:
         core = self.core
         if cid in core._finished:
             status = "finished"
-        elif core._active_cid == cid:
+        elif core.active_conversation_id() == cid:
             status = "active"
-        elif cid in core._ready_cids:
+        elif core.is_ready(cid):
             status = "ready"
-        elif cid in core._dormant_cids:
+        elif core.is_dormant(cid):
             status = "dormant"
         else:
             status = "unknown"
@@ -595,7 +596,7 @@ class Console:
             "requested": True,
             "pending": self.core.interrupts.pending_types(),
             "panel_cid": self.panel.cid,
-            "already_active": self.core._active_cid == self.panel.cid,
+            "already_active": self.core.active_conversation_id() == self.panel.cid,
         }
 
     def submit_action(self, tool: str, arguments: Optional[dict] = None) -> dict:
@@ -625,7 +626,7 @@ class Console:
         动作批一次入队（`OperatorChannel.submit_actions`），避免其它端点的
         `end` 动作插到批中间。未暂停时先请求中断，和单动作提交同一语义。
         """
-        paused = self.core._active_cid == self.panel.cid
+        paused = self.core.active_conversation_id() == self.panel.cid
         if not paused:
             self.core.interrupts.raise_("operator", payload=interrupt_payload)
         self.channel.submit_actions(actions)
@@ -765,7 +766,7 @@ class Console:
             )
         else:
             self.core.interrupts.raise_("shutdown", payload=info.get("entry"))
-            if self.core._active_cid == self.panel.cid:
+            if self.core.active_conversation_id() == self.panel.cid:
                 # 面板关机按钮同时向操作员通道提交一次：结束面板这一轮，Core 回到
                 # 安全点才能派发 shutdown 中断（作者 2026-11-11 定）。
                 self.channel.submit_action({"end": True})

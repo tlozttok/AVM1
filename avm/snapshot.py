@@ -307,9 +307,7 @@ def _rebuild_conversations(core, doc: dict) -> None:
     from .types import Conversation
 
     core.clear_conversations()
-    core._ready_cids = []
-    core._dormant_cids = []
-    core._active_cid = None
+    core.restore_schedule(None, [], [])
     core._finished = set()
     core._executors = {}
     briefs = doc.get("conversations") or []

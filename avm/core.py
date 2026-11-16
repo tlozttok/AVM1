@@ -2049,6 +2049,97 @@ class Core:
         """清空对话表（快照恢复重建时用）。原地清空，保留字典对象本身。"""
         self._conv_by_cid.clear()
 
+    # ------------------------------------------------------------------
+    # 调度状态：就绪队列 / 休眠集合 / 活跃对话
+    #
+    # 这三样原先被 9 个模块直接读写私有字段（events / interrupts / journal /
+    # info_devices / console / monitor / image / snapshot / io_devices）。
+    # 队列的插入顺序本身就是语义（谁先跑），所以外部不该自己 append/remove。
+    # 下面这组方法是唯一的操作入口；本类内部仍直接操作字段。
+    # ------------------------------------------------------------------
+
+    def schedule_state(self) -> dict:
+        """调度状态快照：{active, ready, dormant}。两个队列是副本，改了不影响内核。"""
+        return {
+            "active": self._active_cid,
+            "ready": list(self._ready_cids),
+            "dormant": list(self._dormant_cids),
+        }
+
+    def active_conversation_id(self) -> Optional[int]:
+        """当前活跃对话 cid；没有则为 None。"""
+        return self._active_cid
+
+    def is_ready(self, cid) -> bool:
+        return cid in self._ready_cids
+
+    def is_dormant(self, cid) -> bool:
+        return cid in self._dormant_cids
+
+    def ready_ids(self) -> List[int]:
+        """就绪队列的副本（按执行顺序）。"""
+        return list(self._ready_cids)
+
+    def dormant_ids(self) -> List[int]:
+        """休眠集合的副本。"""
+        return list(self._dormant_cids)
+
+    def wake(self, cid) -> None:
+        """唤醒：从休眠/就绪中摘掉后，排到就绪队列末尾（排队执行）。"""
+        if cid in self._dormant_cids:
+            self._dormant_cids.remove(cid)
+        if cid in self._ready_cids:
+            self._ready_cids.remove(cid)
+        self._ready_cids.append(cid)
+
+    def prioritize(self, cid) -> None:
+        """插队：从休眠摘掉后放到就绪队列最前（亚对话结束唤醒父对话、中断抢占）。"""
+        if cid in self._dormant_cids:
+            self._dormant_cids.remove(cid)
+        if cid not in self._ready_cids:
+            self._ready_cids.insert(0, cid)
+
+    def sleep(self, cid) -> None:
+        """置为休眠：不再参与就绪排队。"""
+        if cid not in self._dormant_cids:
+            self._dormant_cids.append(cid)
+
+    def add_ready(self, cid) -> None:
+        """只往就绪队列末尾补一个（不动休眠集合）。日志重放按增量追加时用。"""
+        if cid not in self._ready_cids:
+            self._ready_cids.append(cid)
+
+    def remove_ready(self, cid) -> None:
+        """只从就绪队列摘掉（不动休眠集合）。日志重放按增量撤销时用。"""
+        if cid in self._ready_cids:
+            self._ready_cids.remove(cid)
+
+    def add_dormant(self, cid) -> None:
+        """只往休眠集合补一个（不动就绪队列）。"""
+        if cid not in self._dormant_cids:
+            self._dormant_cids.append(cid)
+
+    def remove_dormant(self, cid) -> None:
+        """只从休眠集合摘掉（不动就绪队列）。"""
+        if cid in self._dormant_cids:
+            self._dormant_cids.remove(cid)
+
+    def drop_from_schedule(self, cid) -> None:
+        """从两个队列里彻底摘掉（对话关闭/删除时）。不改活跃位。"""
+        for queue in (self._ready_cids, self._dormant_cids):
+            while cid in queue:
+                queue.remove(cid)
+
+    def set_active(self, cid) -> None:
+        """指定活跃对话；None 表示无活跃。"""
+        self._active_cid = cid
+
+    def restore_schedule(self, active, ready, dormant) -> None:
+        """整体恢复调度状态（日志重放 / 快照恢复用）。三个参数都是完整状态。"""
+        self._active_cid = active
+        self._ready_cids = list(ready)
+        self._dormant_cids = list(dormant)
+
     def checkpoint_path(self, cid: int) -> str:
         """调试用：单对话检查点的默认路径（镜像目录/out/<镜像名>.conv.json；无镜像上下文时用 checkpoints/conv-<cid>.json）"""
         if self.image_dir and self.image_name:
