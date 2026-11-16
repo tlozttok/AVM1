@@ -408,8 +408,8 @@ class Console:
             "ready": sched["ready"],
             "dormant": sched["dormant"],
             "finished": core.finished_ids(),
-            "instruction_budget": core._instruction_budget,
-            "activation_instructions": core._activation_instructions,
+            "instruction_budget": core.instruction_budget,
+            "activation_instructions": core.activation_instructions,
             "panel_cid": self.panel.cid,
         }
 

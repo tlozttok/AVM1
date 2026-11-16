@@ -60,14 +60,14 @@ def snapshot(core) -> dict:
         "format": SNAPSHOT_FORMAT,
         "version": SNAPSHOT_VERSION,
         "when": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "seq": int(getattr(core, "_journal_seq", 0) or 0),
+        "seq": int(getattr(core, "journal_seq", 0) or 0),
         "generation": int(getattr(core, "journal_generation", 1) or 1),
         "image": os.path.join(core.image_dir or "", core.image_name or "") or None,
         "host_flags": dict(core.host_flags or {}),
         "para_ref": core.para_ref,
         "note": "重启快照（加速缓存）；memory 段与 persist_to 同格式",
         "scheduler": scheduler,
-        "next_cid": core._next_cid,
+        "next_cid": core.next_cid,
         "memory": core.mem.to_image_dict(),
         "security": {
             "roots": {name: list(target) for name, target in core.root_registry.items()},
@@ -158,8 +158,7 @@ def restore(core, doc: dict) -> None:
     _restore_security_and_pointer(core, doc)
     core.journal_generation = _generation_of(doc)
     apply_scheduler(core, doc.get("scheduler"), source="重启快照")
-    core._journal_seq = int(doc.get("seq", 0) or 0)
-    core._last_snapshot_seq = core._journal_seq
+    core.restore_journal_seq(doc.get("seq", 0))
     core._refresh_journal_batch()
     core._check_invariants()
 
@@ -176,8 +175,7 @@ def restore_world(core, doc: dict) -> None:
     _rebuild_modules(core, doc)
     _restore_security_and_pointer(core, doc)
     core.journal_generation = _generation_of(doc)
-    core._journal_seq = int(doc.get("seq", 0) or 0)
-    core._last_snapshot_seq = core._journal_seq
+    core.restore_journal_seq(doc.get("seq", 0))
 
 
 def _generation_of(doc: dict) -> int:
@@ -318,7 +316,7 @@ def _rebuild_conversations(core, doc: dict) -> None:
         if brief["cid"] in core.conversations:
             raise SnapshotError(f"快照里对话 cid 重复：{brief['cid']}")
         conv = Conversation.from_snapshot(brief)
-        core._register(conv, cid=brief["cid"])
+        core.register(conv, cid=brief["cid"])
         core._warmup_needed.add(conv.cid)  # 恢复出来的对话：Python 执行器首次创建时预热
     for brief in briefs:
         parent_cid = brief.get("parent_cid")
@@ -338,8 +336,8 @@ def _rebuild_listeners(core, doc: dict) -> None:
     if not isinstance(listeners, list):
         raise SnapshotError("快照 listeners 段必须是数组")
     core.events.listeners = []
-    core.events._next_listener_id = 1
-    core.events._next_event_id = 1
+    core.events.reset_listener_ids()
+    core.events.reset_event_ids()
     for data in listeners:
         try:
             listener = listener_from_snapshot(data)
@@ -347,8 +345,7 @@ def _rebuild_listeners(core, doc: dict) -> None:
             raise SnapshotError(f"快照里的监听器记录不合法：{e}") from e
         core.events.listeners.append(listener)
         listener_id = listener.get("listener_id")
-        if isinstance(listener_id, int) and listener_id >= core.events._next_listener_id:
-            core.events._next_listener_id = listener_id + 1
+        core.events.reserve_listener_id(listener_id)
 
 
 def _restore_security_and_pointer(core, doc: dict) -> None:
@@ -363,4 +360,4 @@ def _restore_security_and_pointer(core, doc: dict) -> None:
     next_cid = doc.get("next_cid")
     if not isinstance(next_cid, int):
         next_cid = (max(core.conversations) + 1) if core.conversations else 0
-    core._next_cid = next_cid
+    core.restore_next_cid(next_cid)

@@ -133,7 +133,7 @@ class InterruptTable:
         # 谁"，不摘队列会让目标在本轮结束时被当成"自己让出"而立刻交出执行权。
         core.drop_from_schedule(cid)
         if not core._same_chain(current, cid):
-            core._activation_instructions = 0
+            core.set_activation_instructions(0)  # 断链：重新给满预算
 
         core.set_active(cid)
         return {"type": itype, "target": cid, "action": "switch",

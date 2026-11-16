@@ -288,6 +288,23 @@ class EventSystem:
         if callable(note):
             note(kind, **payload)
 
+    def reserve_listener_id(self, listener_id) -> None:
+        """重放/恢复用：保证下一个分配号大于已用过的 id。
+
+        日志里记录的是当时的 id，号段可能有跳号（注册后又撤销、或来自旧代际），
+        所以不能按"条数"推，只能按"见过的最大号"抬分配器。
+        """
+        if isinstance(listener_id, int) and listener_id >= self._next_listener_id:
+            self._next_listener_id = listener_id + 1
+
+    def reset_listener_ids(self) -> None:
+        """监听器 id 分配器归零（快照重建：监听器表整体替换后从 1 重发）。"""
+        self._next_listener_id = 1
+
+    def reset_event_ids(self) -> None:
+        """事件 id 分配器归零（快照重建：事件流水不跨重启，id 从 1 重发）。"""
+        self._next_event_id = 1
+
     def register(self, owner_cid: int, event_type: str, target: str, handler_ref: str, phase: str = "all",
                  space=None, tier: str = NORMAL_TIER, priority: int = 0,
                  kernel_mode: bool = False) -> int:

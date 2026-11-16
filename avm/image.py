@@ -706,7 +706,7 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
     core.image_name = os.path.splitext(os.path.basename(image_path))[0]
     budget = meta.get("instruction_budget")
     if isinstance(budget, int) and budget > 0:
-        core._instruction_budget = budget
+        core.set_instruction_budget(budget)
     snapshot_every = meta.get("snapshot_every")
     if snapshot_every is not None:
         if (not isinstance(snapshot_every, int) or isinstance(snapshot_every, bool)

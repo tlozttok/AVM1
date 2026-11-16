@@ -329,8 +329,8 @@ class SchedulerDevice(MemoryDevice):
             f"active={self._visible(self._core.active_conversation_id())}\n"
             f"ready={self._visible_list(self._core.ready_ids())}\n"
             f"dormant={self._visible_list(self._core.dormant_ids())}\n"
-            f"instruction_budget={self._core._instruction_budget} "
-            f"(当前链计数={self._core._activation_instructions})"
+            f"instruction_budget={self._core.instruction_budget} "
+            f"(当前链计数={self._core.activation_instructions})"
         )
 
     def resolve_path(self, path):
@@ -340,7 +340,7 @@ class SchedulerDevice(MemoryDevice):
             "active": self._visible(self._core.active_conversation_id()),
             "ready": self._visible_list(self._core.ready_ids()),
             "dormant": self._visible_list(self._core.dormant_ids()),
-            "budget": f"{self._core._activation_instructions}/{self._core._instruction_budget}",
+            "budget": f"{self._core.activation_instructions}/{self._core.instruction_budget}",
         }[path[0]]
 
 

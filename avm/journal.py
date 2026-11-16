@@ -217,8 +217,8 @@ def scheduler_to_snapshot(core) -> dict:
         "ready": sched["ready"],
         "dormant": sched["dormant"],
         "finished": core.finished_ids(),
-        "activation_instructions": core._activation_instructions,
-        "next_cid": core._next_cid,
+        "activation_instructions": core.activation_instructions,
+        "next_cid": core.next_cid,
     }
 
 
@@ -357,9 +357,9 @@ def _apply_scheduler_delta(core, change, seq) -> None:
         if _known(cid):
             core.add_finished(cid)
     if isinstance(change.get("activation_instructions"), int):
-        core._activation_instructions = change["activation_instructions"]
+        core.set_activation_instructions(change["activation_instructions"])
     if isinstance(change.get("next_cid"), int):
-        core._next_cid = change["next_cid"]
+        core.restore_next_cid(change["next_cid"])
 
 
 def _apply_effect(core, effect, seq) -> None:
@@ -398,9 +398,9 @@ def apply_scheduler(core, scheduler, source: str = "日志") -> None:
     )
     core.restore_finished({cid for cid in scheduler.get("finished") or [] if _known(cid)})
     if isinstance(scheduler.get("activation_instructions"), int):
-        core._activation_instructions = scheduler["activation_instructions"]
+        core.set_activation_instructions(scheduler["activation_instructions"])
     if isinstance(scheduler.get("next_cid"), int):
-        core._next_cid = scheduler["next_cid"]
+        core.restore_next_cid(scheduler["next_cid"])
 
 
 # ----------------------------------------------------------------------
@@ -503,7 +503,7 @@ def _effect_conversation_create(core, effect) -> None:
         if parent is None:
             raise VMMemoryError(f"conversation_create 的父对话 cid={parent_cid} 不存在")
         conv.parent = parent
-    core._register(conv, cid=payload["cid"])
+    core.register(conv, cid=payload["cid"])
     # 日志里创建出来的对话在续跑时同样需要 Python 执行器预热
     core._warmup_needed.add(conv.cid)
 
@@ -575,8 +575,7 @@ def _effect_listener_register(core, effect) -> None:
     listener = listener_from_snapshot(data)
     core.events.listeners.append(listener)
     listener_id = listener.get("listener_id")
-    if isinstance(listener_id, int) and listener_id >= core.events._next_listener_id:
-        core.events._next_listener_id = listener_id + 1
+    core.events.reserve_listener_id(listener_id)
 
 
 def _effect_listener_modify(core, effect) -> None:

@@ -1500,7 +1500,7 @@ def _build_conversation(core: 'Core', system_ref: str, para_ref: str, parent: Co
         is_root=False,
         caps=caps,
     )
-    core._register(conv)
+    core.register(conv)
     if conv.caps.mode == MODE_USER:
         # 能力自述：保留根 caps 绑定到 $MEM.caps.<cid>，由 Core 拥有，不参与授予
         roots = dict(conv.caps.roots)
@@ -2020,7 +2020,7 @@ class Core:
         )
         conv.caps = conv.caps.copy(roots=new_roots)
 
-    def _register(self, conv: Conversation, cid: Optional[int] = None) -> Conversation:
+    def register(self, conv: Conversation, cid: Optional[int] = None) -> Conversation:
         conv.cid = self._next_cid if cid is None else cid
         assert conv.cid not in self._conv_by_cid, f"cid {conv.cid} 已存在"
         self._conv_by_cid[conv.cid] = conv
@@ -2163,6 +2163,64 @@ class Core:
         """整体恢复终结集合（日志重放 / 快照恢复用）。"""
         self._finished = set(cids)
 
+    # ------------------------------------------------------------------
+    # 记账数字：cid 分配器 / 日志位置 / 指令预算
+    #
+    # 这几个都是内核自己维护的计数器，外部（boot / snapshot / journal /
+    # monitor / console / interrupts / info_devices）以前直接读写字段。
+    # 它们的不变量只在写入点成立：cid 只能增、"已提交位置"只能由提交推进、
+    # 预算只能由本链消费。所以读取用属性，写入各给一个具名方法。
+    # ------------------------------------------------------------------
+
+    @property
+    def next_cid(self) -> int:
+        """下一个可分配的对话 cid。"""
+        return self._next_cid
+
+    def restore_next_cid(self, cid: int) -> None:
+        """恢复 cid 分配器（快照 / 日志重放用），保证重启后继续增长、不撞号。"""
+        self._next_cid = int(cid)
+
+    @property
+    def journal_seq(self) -> int:
+        """已提交的日志位置（不是文件长度：文件里可能有尚未重放的尾巴）。"""
+        return self._journal_seq
+
+    def restore_journal_seq(self, seq) -> None:
+        """把已提交位置恢复到 seq，并把"上次快照位置"对齐到同一点。
+
+        恢复基线就是"快照 + 日志尾部"：两者必须重合，否则增量会重复应用。
+        """
+        self._journal_seq = int(seq or 0)
+        self._last_snapshot_seq = self._journal_seq
+
+    def mark_snapshot_taken(self) -> None:
+        """记录"快照已覆盖到当前已提交位置"（写快照后、建立恢复基线时）。"""
+        self._last_snapshot_seq = self._journal_seq
+
+    def reset_journal_seq(self) -> None:
+        """新代际：已提交位置与上次快照位置一起归零。"""
+        self._journal_seq = 0
+        self._last_snapshot_seq = 0
+
+    @property
+    def instruction_budget(self) -> int:
+        """单条调用链的指令预算上限。"""
+        return self._instruction_budget
+
+    def set_instruction_budget(self, budget: int) -> None:
+        """设定预算上限（镜像声明 / 恢复）。"""
+        self._instruction_budget = int(budget)
+
+    @property
+    def activation_instructions(self) -> int:
+        """当前调用链已消耗的指令数。"""
+        return self._activation_instructions
+
+    def set_activation_instructions(self, count: int) -> None:
+        """设定链内计数：断链时归零（重新给满预算），重放时按记录恢复。"""
+        self._activation_instructions = int(count)
+
     def checkpoint_path(self, cid: int) -> str:
         """调试用：单对话检查点的默认路径（镜像目录/out/<镜像名>.conv.json；无镜像上下文时用 checkpoints/conv-<cid>.json）"""
         if self.image_dir and self.image_name:
@@ -2200,7 +2258,7 @@ class Core:
         conv = Conversation.from_checkpoint(cp)
         if conv.is_python:
             raise ValueError("v1 检查点不支持 Python 对话")
-        self._register(conv)
+        self.register(conv)
         if schedule == "ready":
             self._ready_cids.append(conv.cid)
         else:
@@ -2879,7 +2937,7 @@ class Core:
             parent=None,
             is_root=True,
         )
-        self._register(conv)
+        self.register(conv)
         conv.para_ref = para_ref
         self._ready_cids.append(conv.cid)
         return conv
@@ -2907,7 +2965,7 @@ class Core:
             # 宿主标记：控制台持有的保留对话对普通对话隐藏。判定只读 attrs。
             attrs={"host": "console", "hidden": "1"},
         )
-        self._register(conv, cid=PANEL_CID)
+        self.register(conv, cid=PANEL_CID)
         conv.para_ref = para_ref or self.para_ref
         conv.is_python = True
         self._dormant_cids.append(conv.cid)

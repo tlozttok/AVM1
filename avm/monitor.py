@@ -107,7 +107,7 @@ class Monitor:
             "active_cid": sched_state["active"],
             "ready_cids": sched_state["ready"],
             "dormant_cids": sched_state["dormant"],
-            "next_cid": core._next_cid,
+            "next_cid": core.next_cid,
         }
 
         ready_set = set(sched_state["ready"])
