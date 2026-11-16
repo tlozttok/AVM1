@@ -1162,7 +1162,11 @@ class EventSystem:
 
     def _resolve_condition(self, node, owner_cid: int, owner_kernel: bool,
                            space=None) -> dict:
-        """把 handler 节点的 condition 数据解析成内部条件（canonical 目标）。"""
+        """把 handler 节点的 condition 数据解析成内部条件（canonical 目标）。
+
+        五个字段各自一段校验，顺序就是下面字典的书写顺序 —— 字典字面量按插入顺序
+        求值，同时有多处非法时报哪一条也属于可观测行为，别重排。
+        """
         raw = _condition_leaf(node)
         if raw is None:
             raise IllegalOperationError(
@@ -1173,32 +1177,49 @@ class EventSystem:
         unknown = sorted(set(raw) - CONDITION_KEYS)
         if unknown:
             raise IllegalOperationError(f"handler 节点 condition 含未知字段：{unknown}")
-        if "preset" in raw:
-            preset = raw["preset"]
-            if preset == "own_work.memory":
-                raise IllegalOperationError(
-                    "条件 preset 'own_work.memory' 已移除：工作空间不再由内核分配。"
-                    "改用 self.lifecycle，或由软件动态加根后自定义条件"
-                )
-            if preset == "own_nodes.memory":
-                raise IllegalOperationError(
-                    "条件 preset 'own_nodes.memory' 已移除：节点所有权 cid 不再写进 MEM。"
-                    "改用 self.lifecycle，或改用自定义 target（内核态）"
-                )
-            if preset not in USER_CONDITION_PRESETS:
-                raise IllegalOperationError(
-                    f"未知的用户态条件子集 {preset!r}（可用：{sorted(USER_CONDITION_PRESETS)}）"
-                )
-            raw = dict(USER_CONDITION_PRESETS[preset])
-            raw["target"] = dict(raw.get("target") or {})
-            raw["preset"] = preset
-        elif not owner_kernel:
+        raw = self._expand_condition_preset(raw, owner_kernel)
+        return {
+            "preset": raw.get("preset"),
+            "events": self._condition_events(raw),
+            "phases": self._condition_phases(raw),
+            "target": self._condition_target(raw, owner_cid, space),
+            "source": self._condition_source(raw),
+        }
+
+    def _expand_condition_preset(self, raw: dict, owner_kernel: bool) -> dict:
+        """preset 展开成完整条件；用户态只能走 preset，不能自定义 condition。"""
+        if "preset" not in raw:
+            if owner_kernel:
+                return raw
             # TODO(issue): owner 授权删除后用户态仍只能用 preset，无法给出 memory target；
             # Guard 的 caps/roots 策略因此只能观察到内核态注册的 memory 监听。是否放开
             # 用户自定义条件属于事件子集策略，留给作者决定（本计划未包含）。
             raise IllegalOperationError(
                 "用户态对话只能使用命名条件子集（preset），不能自定义 condition"
             )
+        preset = raw["preset"]
+        if preset == "own_work.memory":
+            raise IllegalOperationError(
+                "条件 preset 'own_work.memory' 已移除：工作空间不再由内核分配。"
+                "改用 self.lifecycle，或由软件动态加根后自定义条件"
+            )
+        if preset == "own_nodes.memory":
+            raise IllegalOperationError(
+                "条件 preset 'own_nodes.memory' 已移除：节点所有权 cid 不再写进 MEM。"
+                "改用 self.lifecycle，或改用自定义 target（内核态）"
+            )
+        if preset not in USER_CONDITION_PRESETS:
+            raise IllegalOperationError(
+                f"未知的用户态条件子集 {preset!r}（可用：{sorted(USER_CONDITION_PRESETS)}）"
+            )
+        expanded = dict(USER_CONDITION_PRESETS[preset])
+        expanded["target"] = dict(expanded.get("target") or {})
+        expanded["preset"] = preset
+        return expanded
+
+    @staticmethod
+    def _condition_events(raw: dict) -> list:
+        """events：缺省监听全部事件类型。"""
         events = raw.get("events")
         if events is None:
             events = list(EVENT_TYPES)
@@ -1207,64 +1228,73 @@ class EventSystem:
         unknown_events = [x for x in events if x not in EVENT_TYPES]
         if unknown_events:
             raise IllegalOperationError(f"condition.events 含未知事件类型：{unknown_events}")
+        return list(events)
+
+    @staticmethod
+    def _condition_phases(raw: dict) -> list:
+        """phases：缺省 before+after，"all" 是它的别名。"""
         phases = raw.get("phase", ["before", "after"])
         if phases == "all":
             phases = ["before", "after"]
         if not isinstance(phases, list) or not all(x in ("before", "after") for x in phases):
             raise IllegalOperationError("condition.phase 必须是 before/after 列表")
+        return list(phases)
+
+    def _condition_target(self, raw: dict, owner_cid: int, space=None):
+        """target：换成 canonical 引用。exact/subtree 要"正常跟随"与"删除视角"两套引用，
+        后者不跟随最终段的链接（删的是链接节点本身）。"""
         target = raw.get("target")
-        resolved_target = None
-        if target is not None:
-            if not isinstance(target, dict):
-                raise IllegalOperationError("condition.target 必须是对象")
-            kind = target.get("kind")
-            if kind == "owned_by_owner":
-                raise IllegalOperationError(
-                    "condition.target.kind 'owned_by_owner' 已移除：节点所有权 cid 不再写进 MEM"
-                )
-            if kind not in ("exact", "subtree", "cid_owner", "self_lifecycle"):
-                raise IllegalOperationError(f"condition.target.kind 不支持：{kind!r}")
-            resolved = {"kind": kind}
-            if kind in ("exact", "subtree"):
-                ref = target.get("ref")
-                if not isinstance(ref, str) or not ref.startswith("$"):
-                    raise IllegalOperationError("condition.target.ref 必须是 $ 引用")
-                normal = self._core.canonical_ref(ref, space=space)
-                delete = self._core.canonical_ref(ref, space=space, follow_final=False)
-                if normal is None:
-                    raise IllegalOperationError(f"condition.target.ref 无法解析：{ref}")
-                resolved["refs"] = {"normal": normal, "delete": delete}
-            else:
-                resolved["cid"] = owner_cid
-            resolved_target = resolved
+        if target is None:
+            return None
+        if not isinstance(target, dict):
+            raise IllegalOperationError("condition.target 必须是对象")
+        kind = target.get("kind")
+        if kind == "owned_by_owner":
+            raise IllegalOperationError(
+                "condition.target.kind 'owned_by_owner' 已移除：节点所有权 cid 不再写进 MEM"
+            )
+        if kind not in ("exact", "subtree", "cid_owner", "self_lifecycle"):
+            raise IllegalOperationError(f"condition.target.kind 不支持：{kind!r}")
+        resolved = {"kind": kind}
+        if kind in ("exact", "subtree"):
+            ref = target.get("ref")
+            if not isinstance(ref, str) or not ref.startswith("$"):
+                raise IllegalOperationError("condition.target.ref 必须是 $ 引用")
+            normal = self._core.canonical_ref(ref, space=space)
+            delete = self._core.canonical_ref(ref, space=space, follow_final=False)
+            if normal is None:
+                raise IllegalOperationError(f"condition.target.ref 无法解析：{ref}")
+            resolved["refs"] = {"normal": normal, "delete": delete}
+        else:
+            resolved["cid"] = owner_cid
+        return resolved
+
+    @staticmethod
+    def _condition_source(raw: dict):
+        """source：按发起者的 mode/groups 过滤事件来源。"""
         source = raw.get("source")
-        resolved_source = None
-        if source is not None:
-            if not isinstance(source, dict):
-                raise IllegalOperationError("condition.source 必须是对象")
-            unknown_source = sorted(set(source) - {"mode", "groups"})
-            if unknown_source:
-                if "cid" in unknown_source:
-                    raise IllegalOperationError(
-                        "condition.source.cid 已移除：不能按来源 cid 过滤事件"
-                    )
+        if source is None:
+            return None
+        if not isinstance(source, dict):
+            raise IllegalOperationError("condition.source 必须是对象")
+        unknown_source = sorted(set(source) - {"mode", "groups"})
+        if unknown_source:
+            if "cid" in unknown_source:
                 raise IllegalOperationError(
-                    f"condition.source 含未知字段：{unknown_source}（允许：mode/groups）"
+                    "condition.source.cid 已移除：不能按来源 cid 过滤事件"
                 )
-            resolved_source = {}
-            for key in ("mode", "groups"):
-                if key in source:
-                    value = source[key]
-                    if not isinstance(value, list):
-                        raise IllegalOperationError(f"condition.source.{key} 必须是列表")
-                    resolved_source[key] = value
-        return {
-            "preset": raw.get("preset"),
-            "events": list(events),
-            "phases": list(phases),
-            "target": resolved_target,
-            "source": resolved_source,
-        }
+            raise IllegalOperationError(
+                f"condition.source 含未知字段：{unknown_source}（允许：mode/groups）"
+            )
+        resolved_source = {}
+        for key in ("mode", "groups"):
+            if key in source:
+                value = source[key]
+                if not isinstance(value, list):
+                    raise IllegalOperationError(f"condition.source.{key} 必须是列表")
+                resolved_source[key] = value
+        return resolved_source
+
 
     def parse_condition(self, owner_cid: int, handler_ref: str, space=None,
                         kernel_mode: bool = False) -> dict:
