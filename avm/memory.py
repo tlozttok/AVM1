@@ -285,12 +285,7 @@ class Memory:
         index = 0
         while True:
             if isinstance(node, LinkNode):
-                address = ".".join(walked)
-                if address in seen_links:
-                    chain = " -> ".join(seen_links + [address])
-                    raise MemoryCircularReferenceError(f"链接成环: {chain}")
-                seen_links.append(address)
-                kind, payload = nodes.link_target(node, address)
+                address, kind, payload = self._enter_link(node, walked, seen_links)
                 if kind == "device":
                     device = self._require_device(payload, address)
                     remainder = list(path[index:])
@@ -313,6 +308,25 @@ class Memory:
             node = node[nodes.index_key(node, key)]
             walked.append(key)
             index += 1
+
+    @staticmethod
+    def _enter_link(node: LinkNode, walked: list, seen_links: list) -> tuple:
+        """进入一个链接节点：记进访问集合、判成环、解出 target。
+
+        返回 (address, kind, payload)：address 是链接所在路径（报错与成环链都用它），
+        kind 是 "memory" 或 "device"，payload 是目标段序列或设备标识符。
+
+        只有这一步收在一起：拿到结果之后两处调用点分道扬镳——解析要真取值，目标缺失
+        就报错；探测只回答"走到哪一段为止"，缺段不算错。成环判定必须只有一处：链接
+        可以指向设备、设备又转发回内存树，漏掉一条边的症状是解析卡死而不是报错。
+        """
+        address = ".".join(walked)
+        if address in seen_links:
+            chain = " -> ".join(seen_links + [address])
+            raise MemoryCircularReferenceError(f"链接成环: {chain}")
+        seen_links.append(address)
+        kind, payload = nodes.link_target(node, address)
+        return address, kind, payload
 
     def _require_device(self, identifier: str, address: str = "") -> MemoryDevice:
         device = self._device_ids.get(identifier)
@@ -360,12 +374,7 @@ class Memory:
         index = 0
         while True:
             if isinstance(node, LinkNode):
-                address = ".".join(walked)
-                if address in seen_links:
-                    chain = " -> ".join(seen_links + [address])
-                    raise MemoryCircularReferenceError(f"链接成环: {chain}")
-                seen_links.append(address)
-                kind, payload = nodes.link_target(node, address)
+                address, kind, payload = self._enter_link(node, walked, seen_links)
                 if kind == "device":
                     device = self._require_device(payload, address)
                     remainder = list(current[index:])
