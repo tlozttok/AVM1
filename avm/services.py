@@ -5,7 +5,7 @@
 `avm/llm.py` 与 `avm/plm.py` 互不 import。
 """
 
-from .llm import LMU
+from .llm import LLMService
 from .plm import PLMService
 
 
@@ -13,7 +13,7 @@ class Services:
     """服务层容器。测试可注入假实现（`Core(services=...)`）。"""
 
     def __init__(self, llm=None, plm=None):
-        self.llm = llm if llm is not None else LMU()
+        self.llm = llm if llm is not None else LLMService()
         self.plm = plm if plm is not None else PLMService()
 
 

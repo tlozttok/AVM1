@@ -1,141 +1,108 @@
-"""LLM 服务（L4）：客户端生命周期、API 参数表、工具调用解析、模型清单原始拉取。
+"""LLM 服务入口（L4）：适配器选择、流式事件汇合与 last_call 维护。
 
-从 core.py 抽出（计划 plan-service-layer-2026-11-17 批次 S3）。本模块是 Core 之外
-唯一 import openai/dotenv 的地方；多协议适配器（Responses/Anthropic/Gemini）将落在
-这里，Core 不感知协议细节。
+计划 plan-ir-multiprotocol-2026-11-17 批次 I2：本模块不再实现具体协议。
+- 非流式路径（observer 未装）：直接调用适配器的 `exec`，行为与拆分前一致；
+- 流式路径（observer 已装）：迭代适配器 `stream()` 的统一事件，交给
+  `executor.assistant_from_events` 组装 assistant IR 消息并提交。
+
+Core 通过 `services.llm` 使用本服务（`core.lmu` 是它的兼容属性）。
 """
 
-import json
 import time
 from typing import Optional
 
-from openai import OpenAI
-from dotenv import load_dotenv
-
 from .api_errors import classify_api_error
 from .exceptions import APIError
-from .executor import assemble_messages, commit_round
-from .instructions import build_tools
+from .executor import (
+    assistant_from_events, return_calls_from_assistant,
+)
+from .llm_chat import LMU
 from .types import Conversation, MetaDict
 
 
-class LMU:
-    """一次 LLM 推理的调用侧实现（chat completions 投影）。"""
+class LLMService:
+    """LLM 服务：把「一次推理」分派给某个协议适配器。"""
 
-    _client: Optional[OpenAI] = None
+    def __init__(self, adapters: Optional[dict] = None, observer=None):
+        if adapters is None:
+            adapters = {"chat": LMU()}
+        self.adapters = dict(adapters)
+        self.observer = observer
+        self.last_call: Optional[dict] = None
 
-    def __init__(self):
-        self._client = None
-        self.last_call: Optional[dict] = None  # 最近一次 API 调用全文（供监测器写全文文件）
+    # ------------------------------------------------------------------
+    # 兼容面（chat 适配器 = 拆分前的 LMU）
+    # ------------------------------------------------------------------
+
+    @property
+    def chat(self):
+        return self.adapters.get("chat")
+
+    @property
+    def _client(self):
+        """兼容：测试与旧代码通过 core.lmu._client 注入假客户端。"""
+        return self.chat._client
+
+    @_client.setter
+    def _client(self, value):
+        self.chat._client = value
 
     @property
     def client(self):
-        if self._client is None:
-            load_dotenv()
-            self._client = OpenAI()
-        return self._client
+        return self.chat.client
 
     def reset_client(self) -> None:
-        """丢弃缓存的客户端，按当前环境重建。
-
-        运行者选"更新环境"后调用：光重建客户端不够——load_dotenv 默认不覆盖已存在的
-        环境变量，第二次读 .env 不会生效，这里显式 override。
-        """
-        self._client = None
-        load_dotenv(override=True)
-
-    _API_PARAM_KEYS: set = {
-        "temperature", "max_tokens", "top_p", "frequency_penalty",
-        "presence_penalty", "stop", "stream", "extra_body",
-        "seed", "logit_bias", "logprobs", "top_logprobs",
-        "n", "response_format", "timeout", "reasoning_effort",
-    }
-    _NUMERIC_API_PARAMS: set = {
-        "temperature", "max_tokens", "top_p", "frequency_penalty",
-        "presence_penalty", "n", "seed", "timeout", "logprobs", "top_logprobs",
-    }
+        if self.chat is not None:
+            self.chat.reset_client()
 
     def api_param_names(self) -> tuple:
-        """para 白名单里允许出现的 API 参数名（模型目录用）。"""
-        return tuple(sorted(self._API_PARAM_KEYS))
+        return self.chat.api_param_names()
 
     def numeric_param_names(self) -> tuple:
-        """其中以数值型存储、调用前需要还原的参数名（模型目录用）。"""
-        return tuple(sorted(self._NUMERIC_API_PARAMS))
+        return self.chat.numeric_param_names()
 
-    def _filter_api_params(self, para: dict) -> dict:
-        out = {}
-        for k, v in para.items():
-            if k not in self._API_PARAM_KEYS:
-                continue
-            # para 以 str 存储在内存中，数值型参数需要还原为数值
-            if k in self._NUMERIC_API_PARAMS and isinstance(v, str):
-                try:
-                    v = float(v) if ("." in v or "e" in v.lower()) else int(v)
-                except ValueError:
-                    pass
-            out[k] = v
-        return out
+    def fetch_models_raw(self, timeout: float = 10.0) -> dict:
+        return self.chat.fetch_models_raw(timeout)
 
-    def _parse_tool_args(self, tool_call, return_calls: list):
-        call_id = tool_call.id
-        try:
-            return json.loads(tool_call.function.arguments)
-        except json.JSONDecodeError as e:
-            return_calls.append({
-                "call_id": call_id,
-                "cmd_type": "json_error",
-                "args": {"error": str(e), "name": tool_call.function.name, "raw": tool_call.function.arguments},
-            })
-            return None
+    # ------------------------------------------------------------------
+    # 执行
+    # ------------------------------------------------------------------
 
-    def _return_calls_from_message(self, message) -> list:
-        return_calls = []
-        if not message.tool_calls:
-            return return_calls
-
-        for tool_call in message.tool_calls:
-            call_id = tool_call.id
-            name = tool_call.function.name
-            args = self._parse_tool_args(tool_call, return_calls)
-            if args is None:
-                continue
-
-            # 解析器不查指令集：名字原样进 cmd_type。认不认识这个名字由
-            # _process_return_calls 在处理指令时判断一次——查表只在一处发生，
-            # 解析器因此不必知道指令集，也不会把未知名字改写掉。
-            return_calls.append({"call_id": call_id, "cmd_type": name, "args": args})
-
-        return return_calls
+    def adapter_for(self, para: MetaDict):
+        api = (para.get("api") or "chat") if hasattr(para, "get") else "chat"
+        adapter = self.adapters.get(api)
+        if adapter is None:
+            raise APIError(
+                f"LLM 接口 {api!r} 未配置（可用: {sorted(self.adapters)}）",
+                category="other",
+                detail={"category": "other", "message": f"接口 {api!r} 未配置",
+                        "status_code": None, "context_limit": None},
+            )
+        return adapter
 
     def exec(self, conversation: Conversation, para: MetaDict):
-        messages = assemble_messages(conversation)
+        adapter = self.adapter_for(para)
+        if self.observer is None:
+            result = adapter.exec(conversation, para)
+            self.last_call = adapter.last_call
+            return result
+        return self._exec_stream(conversation, para, adapter)
 
-        extra_para = self._filter_api_params(para.to_dict())
-        use_tool = para.get("use_tool")
-        tools = build_tools(conversation)
-        model = para.get("model", "gpt-4")
-
+    def _exec_stream(self, conversation: Conversation, para: MetaDict, adapter):
+        events = []
         start = time.time()
         try:
-            response = self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=tools,
-                tool_choice=use_tool,
-                **extra_para
-            )
+            for event in adapter.stream(conversation, para):
+                events.append(event)
+                self.observer(event)
+            assistant, usage, stop_reason = assistant_from_events(events)
+            return_calls = return_calls_from_assistant(assistant)
+            from .executor import commit_round
+            commit_round(conversation, assistant=assistant)
         except Exception as e:
-            self.last_call = {
-                "model": model,
-                "messages": messages,
-                "result": None,
-                "tool_calls": [],
-                "elapsed_ms": (time.time() - start) * 1000,
-                "error": f"{type(e).__name__}: {e}",
-            }
-            # 失败时历史与输入批次都没动过（追加在下面、clear 在 exec 返回之后），
-            # 所以从这里重试同一轮是干净的，不需要检查点或回退。
+            self._record_failure(adapter, para, e, start)
+            if isinstance(e, APIError):
+                raise
             category, detail = classify_api_error(e)
             raise APIError(
                 f"{type(e).__name__}: {e}",
@@ -144,62 +111,35 @@ class LMU:
                 detail=detail,
             ) from e
 
-        choice = response.choices[0]
-        message = choice.message
-        result = message.content
-        # 思维链内容：防御性读取（openai SDK 对非标准响应字段的支持依赖版本）
-        reasoning_content = getattr(message, "reasoning_content", None)
-        return_calls = self._return_calls_from_message(message)
-
-        tc_list = None
-        if message.tool_calls:
-            tc_list = [{"id": tc.id, "type": tc.type, "function": {"name": tc.function.name, "arguments": tc.function.arguments}} for tc in message.tool_calls]
-        commit_round(conversation, result, tool_calls=tc_list,
-                     reasoning_content=reasoning_content)
-
+        request = getattr(adapter, "last_request", None) or {}
         self.last_call = {
-            "model": model,
-            "messages": messages,
-            "result": result,
-            "reasoning": reasoning_content,
+            "model": request.get("model", para.get("model")),
+            "messages": request.get("messages", []),
+            "result": assistant.content,
+            "reasoning": assistant.reasoning_content,
             "tool_calls": return_calls,
             "elapsed_ms": (time.time() - start) * 1000,
             "error": None,
+            "usage": usage,
+            "stop_reason": stop_reason,
         }
-        return result, return_calls, conversation
+        return assistant.content, return_calls, conversation
 
-    def fetch_models_raw(self, timeout: float = 10.0) -> dict:
-        """拉一次上游 `/models` 并返回原始 JSON 对象（信封校验留给 Core）。
+    def _record_failure(self, adapter, para, error, start: float) -> None:
+        request = getattr(adapter, "last_request", None) or {}
+        self.last_call = {
+            "model": request.get("model", para.get("model")),
+            "messages": request.get("messages", []),
+            "result": None,
+            "tool_calls": [],
+            "elapsed_ms": (time.time() - start) * 1000,
+            "error": f"{type(error).__name__}: {error}",
+        }
 
-        任何异常直接抛给调用方；`Core.refresh_model_catalog` 负责收敛成
-        source="unavailable" 并打一行 stderr。
-        """
-        raw = self.client.models.with_raw_response.list(timeout=timeout)
-        return _raw_response_json(raw)
+
+def _raw_response_json(raw):  # pragma: no cover - 兼容旧导入路径
+    from .llm_chat import _raw_response_json as impl
+    return impl(raw)
 
 
-def _raw_response_json(raw):
-    """从 SDK 的"原始响应"对象里取回 JSON 对象，兼容 openai 各版本。
-
-    - openai 2.x 的 `LegacyAPIResponse`：没有 `.json()`，有 `.http_response`（httpx 响应）与 `.text`；
-    - openai 1.x：有 `.json()`；
-    - 未来主版本把 `.text`/`.content` 改成方法——两者都按可调用或属性处理。
-    """
-    http = getattr(raw, "http_response", None)
-    json_fn = getattr(http, "json", None) if http is not None else None
-    if callable(json_fn):
-        return json_fn()
-    json_fn = getattr(raw, "json", None)
-    if callable(json_fn):
-        return json_fn()
-    text = getattr(raw, "text", None)
-    if callable(text):
-        text = text()
-    if isinstance(text, str) and text:
-        return json.loads(text)
-    content = getattr(raw, "content", None)
-    if callable(content):
-        content = content()
-    if isinstance(content, (bytes, bytearray)):
-        return json.loads(bytes(content).decode("utf-8"))
-    raise TypeError(f"无法从 {type(raw).__name__} 取原始 JSON 响应体")
+__all__ = ["LLMService", "LMU"]

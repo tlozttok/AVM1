@@ -2287,7 +2287,7 @@ class Core:
 def __getattr__(name):
     """兼容旧导入路径：LMU/PLMExecutor 已迁到服务模块（计划 S5）。"""
     if name == "LMU":
-        from .llm import LMU
+        from .llm_chat import LMU
         return LMU
     if name == "PLMExecutor":
         from .plm import PLMExecutor
