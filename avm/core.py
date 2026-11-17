@@ -772,8 +772,7 @@ class CreateInstruction(Instruction):
             if isinstance(name, str) and name:
                 child.name = name
         # 子对话创建后进入休眠，等待 send_instruction 投递指令
-        if child.cid not in core._dormant_cids:
-            core._dormant_cids.append(child.cid)
+        core.sleep(child.cid)
         if core.is_journaling():
             core.note_effect("conversation_create", **conversation_create_payload(core, child))
         _publish_core_after_safely(core,
@@ -834,9 +833,8 @@ class CreateSubInstruction(Instruction):
         sub.append_user_message(user_content)  # 亚对话的任务在创建时直接给出
         sub.metadata["call_id"] = self.call_id
         # 父进入休眠等待亚对话完成，完成时由 core 唤醒（_on_conversation_finished）
-        core._ready_cids.insert(0, sub.cid)
-        if conv.cid not in core._dormant_cids:
-            core._dormant_cids.append(conv.cid)
+        core.prioritize(sub.cid)  # 亚对话插队：它的任务在创建时就已给定，先跑
+        core.sleep(conv.cid)
         if core.is_journaling():
             core.note_effect("conversation_create", **conversation_create_payload(core, sub))
         _publish_core_after_safely(core,
@@ -1022,11 +1020,11 @@ class CloseInstruction(Instruction):
                     conv.user_batch.add_tool_response(f"Illegal: {msg}", self.call_id)
                     return
                 ancestor = ancestor.parent
-        target = core._conv_by_cid.get(self.cid)
+        target = core.get_conversation(self.cid)
         if target is None or core.is_hidden_cid(self.cid):
             conv.user_batch.add_tool_response(f"Error: 对话 {self.cid} 不存在", self.call_id)
             return
-        if self.cid in core._finished:
+        if core.is_finished(self.cid):
             conv.user_batch.add_tool_response(f"Error: 对话 {self.cid} 已关闭", self.call_id)
             return
         if conv.caps.mode != MODE_KERNEL and target.caps.mode == MODE_KERNEL:
@@ -1043,7 +1041,7 @@ class CloseInstruction(Instruction):
             conv.user_batch.add_tool_response(before["response"], self.call_id)
             return
         dropped = bool(target.user_batch.tool_responses or target.user_batch.user_contents)
-        dropped = dropped or self.cid in core._ready_cids
+        dropped = dropped or core.is_ready(self.cid)
         core._close_conversation(self.cid)
         _publish_core_after_safely(core,
             "close_conversation",
