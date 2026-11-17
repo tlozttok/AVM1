@@ -2626,35 +2626,33 @@ class Core:
             instr = instr_cls(call_id, conv.cid, args)
             instr.execute(self, conv)
 
-    def _on_conversation_finished(self, conv: Conversation, result: str):
-        if conv.is_sub:
-            parent = conv.parent
-            if parent is not None and parent.cid not in self._finished:
-                if conv.metadata.get("returned"):
-                    _report_tool_error(conv, "亚对话已完成过一次，本次完成不再写回父对话")
-                else:
-                    # 亚对话紧耦合：完成即自动写回并唤醒父
-                    call_id = conv.metadata.get("call_id", "direct_output")
-                    parent.user_batch.add_tool_response(result, call_id)
-                    self.note_effect(
-                        "delivery", to_cid=parent.cid,
-                        tool_responses=[{"content": result, "tool_call_id": call_id}],
-                    )
-                    conv.metadata["returned"] = True
-                # 用完即删：返回通道只用一次，个体不再保留
-                self._delete_conversation(conv.cid)
-                if not self.is_waiting_for_return(parent):
-                    # 同一轮可能声明多个 create_sub：全部返回后才唤醒父
-                    self._resume(parent.cid)
-                else:
-                    # 父还在等别的亚对话：让出活跃权，继续调度（活跃指针不能留在已删个体上）
-                    self._active_cid = None
-                    self._pick_next_active()
-                return
-            # 父已关闭或不存在：没有返回通道，亚对话用完即删
-            self._delete_conversation(conv.cid)
+    def _after_tool_returns(self, conv: Conversation, return_calls) -> None:
+        """工具调用已返回、响应已进批次之后：记账，再定这个对话接下来算活跃还是让出。
+
+        三条去向互斥，顺序不能换：先看个体还在不在（工具可能顺手把它关了或删了），
+        再看它是不是自己让出的（等亚对话返回），最后才轮到指令预算用尽——预算用尽
+        是"打断"，前两条是"结束/暂停"，判反了会把一条已经消失的对话放进就绪队列。
+        """
+        self._process_return_calls(return_calls, conv)
+        self._activation_instructions += len(return_calls)
+        if conv.cid in self._finished or conv.cid not in self._conv_by_cid:
+            # 内核级关闭或亚对话用完即删：本轮结束后选择下一个活跃对话
             self._active_cid = None
             self._pick_next_active()
+        elif conv.cid in self._dormant_cids:
+            # 对话自己让出（等待返回/子完成）
+            self._pick_next_active()
+        elif self._activation_instructions >= self._instruction_budget:
+            # 核心中断：工具返回已加入 batch、状态完整；让出执行权，进就绪队列末尾
+            self._activation_instructions = 0  # 链被中断，重新计数
+            if conv.cid not in self._ready_cids:
+                self._ready_cids.append(conv.cid)
+            self._pick_next_active()
+
+    def _on_conversation_finished(self, conv: Conversation, result: str):
+        """一轮交互结束：亚对话写完返回就消失，交互对话退回休眠等事件。"""
+        if conv.is_sub:
+            self._finish_sub_conversation(conv, result)
             return
         # 交互结束：对话进入休眠（个体保留，等待事件/再次被调用）。
         # "finished" 是概念态（被内核级关闭指令关闭的对话），Core 调度状态只有活跃/休眠/就绪。
@@ -2662,6 +2660,40 @@ class Core:
             self._dormant_cids.append(conv.cid)
         self._active_cid = None
         self._pick_next_active()
+
+    def _finish_sub_conversation(self, conv: Conversation, result: str) -> None:
+        """亚对话完成：有活着的父就写回并唤醒它，没有返回通道就直接删。
+
+        亚对话紧耦合——返回通道只用一次，个体不保留。唤醒父之前要看它还等不等别的
+        亚对话：同一轮可能声明了多个 create_sub，只有最后一个返回才该唤醒它。
+        """
+        parent = conv.parent
+        if parent is None or parent.cid in self._finished:
+            # 父已关闭或不存在：没有返回通道，亚对话用完即删
+            self._delete_conversation(conv.cid)
+            self._active_cid = None
+            self._pick_next_active()
+            return
+        if conv.metadata.get("returned"):
+            _report_tool_error(conv, "亚对话已完成过一次，本次完成不再写回父对话")
+        else:
+            # 亚对话紧耦合：完成即自动写回并唤醒父
+            call_id = conv.metadata.get("call_id", "direct_output")
+            parent.user_batch.add_tool_response(result, call_id)
+            self.note_effect(
+                "delivery", to_cid=parent.cid,
+                tool_responses=[{"content": result, "tool_call_id": call_id}],
+            )
+            conv.metadata["returned"] = True
+        # 用完即删：返回通道只用一次，个体不再保留
+        self._delete_conversation(conv.cid)
+        if not self.is_waiting_for_return(parent):
+            # 同一轮可能声明多个 create_sub：全部返回后才唤醒父
+            self._resume(parent.cid)
+        else:
+            # 父还在等别的亚对话：让出活跃权，继续调度（活跃指针不能留在已删个体上）
+            self._active_cid = None
+            self._pick_next_active()
 
     def _resume(self, cid: int):
         """将等待中的对话唤醒为活跃对话（亚对话完成唤醒父：同一调用链，延续预算不重置）。"""
@@ -2809,21 +2841,7 @@ class Core:
                 self._recording = True
                 try:
                     if return_calls:
-                        self._process_return_calls(return_calls, conv)
-                        self._activation_instructions += len(return_calls)
-                        if conv.cid in self._finished or conv.cid not in self._conv_by_cid:
-                            # 内核级关闭或亚对话用完即删：本轮结束后选择下一个活跃对话
-                            self._active_cid = None
-                            self._pick_next_active()
-                        elif conv.cid in self._dormant_cids:
-                            # 对话自己让出（等待返回/子完成）
-                            self._pick_next_active()
-                        elif self._activation_instructions >= self._instruction_budget:
-                            # 核心中断：工具返回已加入 batch、状态完整；让出执行权，进就绪队列末尾
-                            self._activation_instructions = 0  # 链被中断，重新计数
-                            if conv.cid not in self._ready_cids:
-                                self._ready_cids.append(conv.cid)
-                            self._pick_next_active()
+                        self._after_tool_returns(conv, return_calls)
                     else:
                         self._on_conversation_finished(conv, result)
                 finally:
