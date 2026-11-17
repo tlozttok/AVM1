@@ -1594,7 +1594,7 @@ class EventSystem:
             summary["error"] = event["error"]
         if event.get("handler_errors"):
             summary["handler_errors"] = event["handler_errors"]
-        self._core._turn_events.append(summary)
+        self._core.note_turn_event(summary)
         for observer in list(self._observers):
             try:
                 observer(event)

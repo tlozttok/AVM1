@@ -306,7 +306,7 @@ def _rebuild_conversations(core, doc: dict) -> None:
     core.clear_conversations()
     core.restore_schedule(None, [], [])
     core.restore_finished(set())
-    core._executors = {}
+    core.clear_executors()
     briefs = doc.get("conversations") or []
     if not isinstance(briefs, list):
         raise SnapshotError("快照 conversations 段必须是数组")
@@ -317,7 +317,7 @@ def _rebuild_conversations(core, doc: dict) -> None:
             raise SnapshotError(f"快照里对话 cid 重复：{brief['cid']}")
         conv = Conversation.from_snapshot(brief)
         core.register(conv, cid=brief["cid"])
-        core._warmup_needed.add(conv.cid)  # 恢复出来的对话：Python 执行器首次创建时预热
+        core.mark_warmup_needed(conv.cid)  # 恢复出来的对话：Python 执行器首次创建时预热
     for brief in briefs:
         parent_cid = brief.get("parent_cid")
         if parent_cid is None:

@@ -288,15 +288,11 @@ def apply(core, record: dict) -> None:
     changes = record.get("changes")
     if not isinstance(changes, list):
         raise JournalError(f"日志 seq={seq}: changes 必须是数组")
-    was_replaying = core._replaying
-    core._replaying = True
-    try:
+    with core.replaying():
         for change in changes:
             _apply_change(core, change, cid, seq)
         # 这段历史来自日志（不是本进程跑出来的）：Python 对话的执行器需要预热
-        core._warmup_needed.add(cid)
-    finally:
-        core._replaying = was_replaying
+        core.mark_warmup_needed(cid)
 
 
 def _apply_change(core, change, cid: int, seq) -> None:
@@ -505,7 +501,7 @@ def _effect_conversation_create(core, effect) -> None:
         conv.parent = parent
     core.register(conv, cid=payload["cid"])
     # 日志里创建出来的对话在续跑时同样需要 Python 执行器预热
-    core._warmup_needed.add(conv.cid)
+    core.mark_warmup_needed(conv.cid)
 
 
 def _effect_conversation_roots(core, effect) -> None:
@@ -534,7 +530,7 @@ def _effect_conversation_close(core, effect) -> None:
         return
     core.add_finished(cid)
     core.drop_from_schedule(cid)
-    core._executors.pop(cid, None)
+    core.drop_executor(cid)
 
 
 def _effect_conversation_delete(core, effect) -> None:
@@ -549,7 +545,7 @@ def _effect_conversation_delete(core, effect) -> None:
             return
         core.drop_from_schedule(target_cid)
         core.remove_finished(target_cid)
-        core._executors.pop(target_cid, None)
+        core.drop_executor(target_cid)
 
     _delete(cid)
 
@@ -735,11 +731,7 @@ def apply_world_record(core, record: dict) -> int:
     if record.get("v") != JOURNAL_RECORD_VERSION:
         raise JournalError(_version_error(seq, record.get("v")))
     effects = world_effects_of(record)
-    was_replaying = core._replaying
-    core._replaying = True
-    try:
+    with core.replaying():
         for effect in effects:
             _apply_effect(core, effect, seq)
-    finally:
-        core._replaying = was_replaying
     return len(effects)

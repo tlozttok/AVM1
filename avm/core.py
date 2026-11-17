@@ -1,5 +1,6 @@
 import dataclasses
 import traceback
+from contextlib import contextmanager
 from types import MappingProxyType
 from typing import Optional, List, Dict, Type, Any
 
@@ -2364,6 +2365,35 @@ class Core:
         if not self.is_journaling():
             return
         self._turn_effects.extend(effects)
+
+    @contextmanager
+    def replaying(self):
+        """进入"按日志重放"态，退出时恢复原值（重放里可能嵌套调用）。
+
+        重放期间 is_journaling 为假：应用历史变化不该再产生新日志。
+        """
+        was = self._replaying
+        self._replaying = True
+        try:
+            yield
+        finally:
+            self._replaying = was
+
+    def mark_warmup_needed(self, cid) -> None:
+        """标记该对话的 Python 执行器需要预热（日志/快照恢复出来的对话）。"""
+        self._warmup_needed.add(cid)
+
+    def drop_executor(self, cid) -> None:
+        """丢掉该对话的执行器（对话关闭/删除时释放 PLM 状态）。"""
+        self._executors.pop(cid, None)
+
+    def clear_executors(self) -> None:
+        """清空全部执行器（快照重建时）。"""
+        self._executors = {}
+
+    def note_turn_event(self, summary: dict) -> None:
+        """记一条本回合的事件摘要（监测帧用）。事件系统每派发完一条就调一次。"""
+        self._turn_events.append(summary)
 
     def _scheduler_state(self) -> dict:
         """当前调度状态的只读快照（回合开始/提交时各取一次，做增量用）。"""
