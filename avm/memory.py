@@ -1072,50 +1072,62 @@ class Memory:
 
         `-1` 只表示追加位置，不是下标：`-2` 及以下一律报错。
         """
-        if mem_type not in ('str', 'dict', 'list'):
-            raise IllegalOperationError(f"不支持的类型：{mem_type}，必须是 'str', 'dict', 'list' 之一")
-
-        check_new_key(key)
+        self._check_make_args(mem_type, key)
         parts = self._parse_ref(ref)
         kind, real_ref, display = self._expand_ref_parts(parts, space)
+        self._check_root_alias(space, kind, parts)
 
-        # 根别名：目标本身必须存在（根无效），不通过别名补建根目标
+        # 先按引用解析（链接与设备别名透明）：能解析就直接当落点用
+        node = self._resolve_make_target(real_ref, kind, display, space)
+        address_parts = list(display)
+        if node is None:
+            node, address_parts = self._build_make_path(kind, ref, parts, display, space)
+        return self._create_in_container(node, key, mem_type, address_parts, ref)
+
+    @staticmethod
+    def _check_make_args(mem_type: str, key: str) -> None:
+        """建节点前先挡掉类型名写错与非法键。"""
+        if mem_type not in ('str', 'dict', 'list'):
+            raise IllegalOperationError(f"不支持的类型：{mem_type}，必须是 'str', 'dict', 'list' 之一")
+        check_new_key(key)
+
+    def _check_root_alias(self, space, kind: str, parts: list) -> None:
+        """根别名：目标本身必须存在（根无效），不通过别名补建根目标。"""
         if space is not None and kind == "memory" and parts[0] != MEM_ROOT_NAME:
             target = space.root(parts[0])
             if target is not None and not self._root_target_complete(list(target)):
                 raise MemoryLinkBrokenError(f"引用根无效：{parts[0]!r}（目标不存在）")
 
-        # 先按引用解析（链接与设备别名透明）：能解析就直接当落点用
-        node = None
-        if kind == "memory":
-            try:
-                node = self._resolve_mem_path(list(real_ref), for_llm=False, display=list(display))
-            except MemoryCircularReferenceError:
-                raise
-            except VMMemoryError:
-                node = None
-        else:
-            try:
-                node = self._resolve_path(list(real_ref), for_llm=False, space=space)
-            except MemoryCircularReferenceError:
-                raise
-            except VMMemoryError:
-                node = None
+    def _resolve_make_target(self, real_ref, kind: str, display: list, space):
+        """按引用解析落点；解析不出来返回 None（交给 _build_make_path 补建）。
 
-        address_parts = list(display)
-        if node is None:
-            if kind == "device":
-                raise VMMemoryError(f"不支持在设备路径下创建新键：{ref}")
-            split = self.split_path(ref, space=space)
-            if split[0] != "memory":
-                raise VMMemoryError(f"不支持在设备路径下创建新键：{ref}")
-            real_segments = list(split[1])
-            request_rest = list(parts[1:])
-            offset = len(real_segments) - len(request_rest)
-            node, address_parts = self._walk_make_path(
-                real_segments, list(display), offset, ref
-            )
+        成环必须原样抛出：它不是"路径不存在"，当不存在处理会悄悄改坏结构。
+        """
+        try:
+            if kind == "memory":
+                return self._resolve_mem_path(list(real_ref), for_llm=False, display=list(display))
+            return self._resolve_path(list(real_ref), for_llm=False, space=space)
+        except MemoryCircularReferenceError:
+            raise
+        except VMMemoryError:
+            return None
 
+    def _build_make_path(self, kind: str, ref: str, parts: list,
+                         display: list, space) -> tuple:
+        """落点不存在：先拒绝设备路径，再沿路径把缺的段建出来。返回 (父容器, 地址段)。"""
+        if kind == "device":
+            raise VMMemoryError(f"不支持在设备路径下创建新键：{ref}")
+        split = self.split_path(ref, space=space)
+        if split[0] != "memory":
+            raise VMMemoryError(f"不支持在设备路径下创建新键：{ref}")
+        real_segments = list(split[1])
+        request_rest = list(parts[1:])
+        offset = len(real_segments) - len(request_rest)
+        return self._walk_make_path(real_segments, list(display), offset, ref)
+
+    def _create_in_container(self, node, key: str, mem_type: str,
+                             address_parts: list, ref: str) -> str:
+        """在父容器里建节点：字典按名字建（已存在报错），列表只能 -1 追加。"""
         if isinstance(node, (dict, MetaDict)):
             if key == "-1":
                 raise IllegalOperationError(f"字典里不能用 -1（-1 只表示列表追加位置）：{ref}")
