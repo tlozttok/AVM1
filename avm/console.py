@@ -410,6 +410,134 @@ class MemorySnapshots:
         }
 
 
+class ConsoleView:
+    """控制台的只读投影：把内核状态整理成面板要看的形状。
+
+    这一层只读——它不调用任何写接口，也不改任何状态；"改世界"的动作全在
+    Console 的介入方法里。单独成类就是为了让这条界限看得出来。
+    """
+
+    def __init__(self, core, panel, action_log: List[dict]):
+        self.core = core
+        self.panel = panel
+        self._action_log = action_log  # 与 Console 共用同一个列表，这里只读切片
+
+    def schedule(self) -> dict:
+        core = self.core
+        sched = core.schedule_state()
+        return {
+            "active_cid": sched["active"],
+            "ready": sched["ready"],
+            "dormant": sched["dormant"],
+            "finished": core.finished_ids(),
+            "instruction_budget": core.instruction_budget,
+            "activation_instructions": core.activation_instructions,
+            "panel_cid": self.panel.cid,
+        }
+
+    def brief(self, cid: int, conv) -> dict:
+        """列表用的对话摘要：身份 + 状态 + 能力摘要。"""
+        core = self.core
+        if core.is_finished(cid):
+            status = "finished"
+        elif core.active_conversation_id() == cid:
+            status = "active"
+        elif core.is_ready(cid):
+            status = "ready"
+        elif core.is_dormant(cid):
+            status = "dormant"
+        else:
+            status = "unknown"
+        return {
+            "cid": cid,
+            "identity": conv.identity,
+            "name": conv.name,
+            "status": status,
+            "is_python": conv.is_python,
+            "is_sub": conv.is_sub,
+            "is_root": conv.is_root,
+            "parent": conv.parent.cid if conv.parent is not None else None,
+            "messages": len(conv.messages),
+            # 宿主观测面：只展示能力摘要（根名/工具名），不展开根目标的真实地址
+            "caps": {
+                "mode": conv.caps.mode,
+                "groups": list(conv.caps.groups),
+                "roots": sorted(conv.caps.roots),
+                "tools": sorted(conv.caps.tools),
+            },
+        }
+
+    def conversation(self, cid: int) -> dict:
+        """单个对话的完整视图：摘要 + 历史 + 待发批次 + 元信息。"""
+        conv = self.core.get_conversation(cid)
+        if conv is None:
+            raise KeyError(f"对话 {cid} 不存在")
+        brief = self.brief(cid, conv)
+        brief["history"] = [
+            {
+                "role": m.role,
+                "content": m.content,
+                "tool_calls": getattr(m, "tool_calls", None),
+                "tool_call_id": getattr(m, "tool_call_id", None),
+            }
+            for m in conv.messages
+        ]
+        brief["user_batch"] = {
+            "user_contents": list(conv.user_batch.user_contents),
+            "tool_responses": [
+                {"content": r.content, "tool_call_id": r.tool_call_id}
+                for r in conv.user_batch.tool_responses
+            ],
+        }
+        brief["metadata"] = dict(conv.metadata)
+        brief["para_ref"] = conv.para_ref
+        return brief
+
+    def memory(self, ref: Optional[str] = None) -> dict:
+        # 这里走的是普通读取路径，如果 ref 落在设备上，设备的读会被真的执行。
+        # 对 InputsListDevice 来说 `$MEM.inputs.next` 就是"请求一次操作员输入"：控制台托管下
+        # （host_flags["console"]）这一读等在面板输入队列上，所以这个端点会挂起，
+        # 直到有人在面板里喂一行（POST /api/device-action）——不再是挂起在终端上等敲键盘。
+        target = ref if ref else "$MEM"
+        return {"ref": target, "node": _jsonable(self.core.unwrap(target, for_llm=False), node_view=True)}
+
+    def listeners(self) -> dict:
+        from .events import EventSystem
+        return {
+            "listeners": [dict(l) for l in self.core.events.listeners],
+            "editable_fields": list(EventSystem.EDITABLE_FIELDS),
+        }
+
+    def devices(self) -> dict:
+        """已挂载设备，现取一次各自的调试动作。"""
+        out = []
+        for mount, device in sorted(self.core.mem.mounted_devices().items()):
+            actions = []
+            error = None
+            try:
+                raw = device.debug_actions() or []
+            except Exception as e:
+                raw, error = [], f"debug_actions: {type(e).__name__}: {e}"
+            for index, action in enumerate(raw):
+                if not isinstance(action, dict):
+                    continue
+                actions.append({
+                    "index": index,
+                    "name": action.get("name"),
+                    "description": action.get("description"),
+                    "parameters": action.get("parameters"),
+                    "callable": callable(action.get("run")),
+                })
+            out.append({
+                "mount": mount,
+                "type": type(device).__name__,
+                "description": _describe_device(device),
+                "actions": actions,
+                "error": error,
+            })
+        return {"devices": out, "action_log": list(self._action_log[-50:])}
+
+
 class Console:
     """调试控制台：面板对话 + 观测 + 介入 + 屏蔽账本。"""
 
@@ -461,6 +589,8 @@ class Console:
         self.masks = MaskLedger(core)              # 屏蔽账本（摘下来的节点/设备）
         self.snapshots = MemorySnapshots(core)     # 内存快照（diff 用）
         self._action_log: List[dict] = []          # 设备调试动作的调用记录
+        # 只读投影（对话/内存/监听器/设备的展示形状），与 _action_log 共用同一个列表
+        self.view = ConsoleView(core, self.panel, self._action_log)
         core.events.add_observer(self._on_event)
 
     # -- 操作面板 IO 设备挂载 ------------------------------------------
@@ -528,17 +658,8 @@ class Console:
     # -- 观测 ----------------------------------------------------------
 
     def schedule(self) -> dict:
-        core = self.core
-        sched = core.schedule_state()
-        return {
-            "active_cid": sched["active"],
-            "ready": sched["ready"],
-            "dormant": sched["dormant"],
-            "finished": core.finished_ids(),
-            "instruction_budget": core.instruction_budget,
-            "activation_instructions": core.activation_instructions,
-            "panel_cid": self.panel.cid,
-        }
+        """就绪 / 休眠 / 已结束队列与步数账本；实现在 ConsoleView。"""
+        return self.view.schedule()
 
     def state(self) -> dict:
         core = self.core
@@ -546,7 +667,7 @@ class Console:
             "running": self.running,
             "schedule": self.schedule(),
             "conversations": [
-                self._conversation_brief(cid, conv)
+                self.view.brief(cid, conv)
                 for cid, conv in sorted(core.conversations.items())
             ],
             "panel": {
@@ -586,105 +707,17 @@ class Console:
             return self.force_stop_delay
         return max(0.0, self.force_stop_delay - (time.time() - since))
 
-    def _conversation_brief(self, cid: int, conv) -> dict:
-        core = self.core
-        if core.is_finished(cid):
-            status = "finished"
-        elif core.active_conversation_id() == cid:
-            status = "active"
-        elif core.is_ready(cid):
-            status = "ready"
-        elif core.is_dormant(cid):
-            status = "dormant"
-        else:
-            status = "unknown"
-        return {
-            "cid": cid,
-            "identity": conv.identity,
-            "name": conv.name,
-            "status": status,
-            "is_python": conv.is_python,
-            "is_sub": conv.is_sub,
-            "is_root": conv.is_root,
-            "parent": conv.parent.cid if conv.parent is not None else None,
-            "messages": len(conv.messages),
-            # 宿主观测面：只展示能力摘要（根名/工具名），不展开根目标的真实地址
-            "caps": {
-                "mode": conv.caps.mode,
-                "groups": list(conv.caps.groups),
-                "roots": sorted(conv.caps.roots),
-                "tools": sorted(conv.caps.tools),
-            },
-        }
-
     def conversation(self, cid: int) -> dict:
-        conv = self.core.get_conversation(cid)
-        if conv is None:
-            raise KeyError(f"对话 {cid} 不存在")
-        brief = self._conversation_brief(cid, conv)
-        brief["history"] = [
-            {
-                "role": m.role,
-                "content": m.content,
-                "tool_calls": getattr(m, "tool_calls", None),
-                "tool_call_id": getattr(m, "tool_call_id", None),
-            }
-            for m in conv.messages
-        ]
-        brief["user_batch"] = {
-            "user_contents": list(conv.user_batch.user_contents),
-            "tool_responses": [
-                {"content": r.content, "tool_call_id": r.tool_call_id}
-                for r in conv.user_batch.tool_responses
-            ],
-        }
-        brief["metadata"] = dict(conv.metadata)
-        brief["para_ref"] = conv.para_ref
-        return brief
+        return self.view.conversation(cid)
 
     def memory(self, ref: Optional[str] = None) -> dict:
-        # 这里走的是普通读取路径，如果 ref 落在设备上，设备的读会被真的执行。
-        # 对 InputsListDevice 来说 `$MEM.inputs.next` 就是"请求一次操作员输入"：控制台托管下
-        # （host_flags["console"]）这一读等在面板输入队列上，所以这个端点会挂起，
-        # 直到有人在面板里喂一行（POST /api/device-action）——不再是挂起在终端上等敲键盘。
-        target = ref if ref else "$MEM"
-        return {"ref": target, "node": _jsonable(self.core.unwrap(target, for_llm=False), node_view=True)}
+        return self.view.memory(ref)
 
     def listeners(self) -> dict:
-        from .events import EventSystem
-        return {
-            "listeners": [dict(l) for l in self.core.events.listeners],
-            "editable_fields": list(EventSystem.EDITABLE_FIELDS),
-        }
+        return self.view.listeners()
 
     def devices(self) -> dict:
-        """已挂载设备，现取一次各自的调试动作。"""
-        out = []
-        for mount, device in sorted(self.core.mem.mounted_devices().items()):
-            actions = []
-            error = None
-            try:
-                raw = device.debug_actions() or []
-            except Exception as e:
-                raw, error = [], f"debug_actions: {type(e).__name__}: {e}"
-            for index, action in enumerate(raw):
-                if not isinstance(action, dict):
-                    continue
-                actions.append({
-                    "index": index,
-                    "name": action.get("name"),
-                    "description": action.get("description"),
-                    "parameters": action.get("parameters"),
-                    "callable": callable(action.get("run")),
-                })
-            out.append({
-                "mount": mount,
-                "type": type(device).__name__,
-                "description": _describe_device(device),
-                "actions": actions,
-                "error": error,
-            })
-        return {"devices": out, "action_log": list(self._action_log[-50:])}
+        return self.view.devices()
 
     # -- 快照与 diff ---------------------------------------------------
     #
