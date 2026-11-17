@@ -32,8 +32,8 @@ def _imports(path: Path):
 
 
 def test_R1_service_modules_do_not_import_core():
-    for name in ("llm", "llm_chat", "llm_responses", "llm_anthropic", "plm",
-                 "executor", "services"):
+    for name in ("llm", "llm_chat", "llm_responses", "llm_anthropic",
+                 "llm_gemini", "plm", "executor", "services"):
         relative, _ = _imports(AVM / f"{name}.py")
         assert "core" not in relative, f"avm/{name}.py 不得 import core（含函数内）"
 
