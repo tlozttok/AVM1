@@ -64,7 +64,8 @@ def tool_result_part(call_id: str, content: str, is_error=None) -> dict:
     return part
 
 
-def reasoning_part(interface: str, *, text=None, opaque=None, summary=None) -> dict:
+def reasoning_part(interface: str, *, text=None, opaque=None, summary=None,
+                   **extra) -> dict:
     part = {"type": "reasoning", "interface": interface}
     if text is not None:
         part["text"] = text
@@ -72,6 +73,7 @@ def reasoning_part(interface: str, *, text=None, opaque=None, summary=None) -> d
         part["opaque"] = opaque
     if summary is not None:
         part["summary"] = summary
+    part.update(extra)  # 协议作用域的额外字段（如 Responses 的 reasoning item id）
     return part
 
 

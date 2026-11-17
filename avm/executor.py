@@ -114,6 +114,11 @@ def assistant_from_events(events) -> tuple:
                 opaque = event.get("opaque")
                 if opaque is not None:
                     parts[index]["opaque"] = opaque
+                extra = event.get("extra")
+                if isinstance(extra, dict):
+                    for key, value in extra.items():
+                        if key not in parts[index]:
+                            parts[index][key] = value
         elif etype == "tool_call_start":
             if index not in parts:
                 parts[index] = tool_call_part(

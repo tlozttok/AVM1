@@ -82,7 +82,7 @@ class LLMService:
 
     def exec(self, conversation: Conversation, para: MetaDict):
         adapter = self.adapter_for(para)
-        if self.observer is None:
+        if self.observer is None and hasattr(adapter, "exec"):
             result = adapter.exec(conversation, para)
             self.last_call = adapter.last_call
             return result
@@ -94,7 +94,8 @@ class LLMService:
         try:
             for event in adapter.stream(conversation, para):
                 events.append(event)
-                self.observer(event)
+                if self.observer is not None:
+                    self.observer(event)
             assistant, usage, stop_reason = assistant_from_events(events)
             return_calls = return_calls_from_assistant(assistant)
             from .executor import commit_round
@@ -122,6 +123,7 @@ class LLMService:
             "error": None,
             "usage": usage,
             "stop_reason": stop_reason,
+            "dropped_parts": list(getattr(adapter, "last_dropped", [])),
         }
         return assistant.content, return_calls, conversation
 
