@@ -90,7 +90,7 @@ def _wait_for_api_resume(core) -> str:
     return "resume"
 
 
-def main(argv=None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AVM 调试入口")
     parser.add_argument("image", nargs="?", help="系统镜像 JSON 文件路径（缺省时从 --debug-config 读取）")
     parser.add_argument("--frames", action="store_true", help="运行结束后打印监测帧摘要（stderr）")
@@ -102,8 +102,22 @@ def main(argv=None) -> int:
     add_core_dump_args(parser)
     add_restore_arg(parser)
     add_mode_arg(parser)
-    args = parser.parse_args(argv)
+    return parser
 
+
+def _as_path(path, base_dir: str):
+    """相对路径按配置文件所在目录展开；绝对路径与空值原样返回。"""
+    if path and not os.path.isabs(path):
+        return os.path.join(base_dir, path)
+    return path
+
+
+def _resolve_options(args) -> dict:
+    """命令行与 debug.json 合并成一组生效配置；命令行优先，配置不成立时返回 None。
+
+    只有没给 image 时才读 debug.json：那时所有路径都相对配置文件所在目录解析，
+    而不是相对当前工作目录——否则从别的目录起 main.py 就找不到镜像。
+    """
     frames = args.frames
     transcript = args.transcript
     checkpoint_in = args.checkpoint_in
@@ -117,11 +131,11 @@ def main(argv=None) -> int:
             cfg = _load_config(cfg_path)
         except (OSError, ValueError) as e:
             print(f"[AVM] 调试配置错误: {e}", file=sys.stderr)
-            return 1
+            return None
         image = cfg.get("image")
         if not isinstance(image, str) or not image:
             print(f"[AVM] {cfg_path} 中缺少 image 字段，且未提供命令行参数", file=sys.stderr)
-            return 1
+            return None
         config_dir = os.path.dirname(os.path.abspath(cfg_path))
         image = image if os.path.isabs(image) else os.path.join(config_dir, image)
         frames = frames or bool(cfg.get("frames"))
@@ -130,27 +144,36 @@ def main(argv=None) -> int:
         restore = restore or cfg.get("restore")
         # debug.json 里的 mode 与命令行同义；缺省 auto。
         mode = mode or cfg.get("mode") or "auto"
-    if transcript and not os.path.isabs(transcript):
-        transcript = os.path.join(config_dir, transcript)
-    if checkpoint_in and not os.path.isabs(checkpoint_in):
-        checkpoint_in = os.path.join(config_dir, checkpoint_in)
-    if restore and not os.path.isabs(restore):
-        restore = os.path.join(config_dir, restore)
-    mode = mode or "auto"
+    return {
+        "image": image,
+        "frames": frames,
+        "transcript": _as_path(transcript, config_dir),
+        "checkpoint_in": _as_path(checkpoint_in, config_dir),
+        "restore": _as_path(restore, config_dir),
+        "mode": mode or "auto",
+        "core_dump": args.core_dump,
+        "no_core_dump": args.no_core_dump,
+    }
 
+
+def _boot(opts: dict):
+    """加载镜像并返回内核；镜像有问题时打印原因返回 None（由 main 转成退出码 1）。"""
     try:
-        core = boot(image, mode=mode, checkpoint_in=checkpoint_in, restore=restore)
+        return boot(opts["image"], mode=opts["mode"],
+                    checkpoint_in=opts["checkpoint_in"], restore=opts["restore"])
     except (ImageError, VMMemoryError, OSError, ValueError) as e:
         print(f"[AVM] 镜像错误: {e}", file=sys.stderr)
-        return 1
+        return None
 
-    if transcript:
-        core.monitor = Monitor(max_frames=2000, transcript_path=transcript)
-    if args.no_core_dump:
-        core.core_dump_enabled = False
 
+def _run_until_stop(core) -> tuple:
+    """跑到内核停下：API 暂停就等宿主恢复。返回 (退出码, 是否允许写快照)。
+
+    只有"正常跑完"和"宿主按回车恢复后跑完"算安全点；中断退出不写快照，
+    否则恢复出来的状态会和调用方的预期不一致。
+    """
     status = 0
-    snapshot_ok = True  # 只有安全点退出才写重启快照
+    snapshot_ok = True
     try:
         while True:
             core.run()
@@ -169,24 +192,50 @@ def main(argv=None) -> int:
         print("[AVM] 收到中断，写回后退出", file=sys.stderr)
         status = 130
         snapshot_ok = False
+    return status, snapshot_ok
+
+
+def _finish(core, snapshot_ok: bool, opts: dict) -> None:
+    """收尾三件事：安全点写重启快照 → 内存写回 → 帧摘要。互不阻断，前一步失败不影响后一步。"""
+    if snapshot_ok:
+        write_snapshot(core)
+    persist_to = getattr(core, "persist_to", None)
+    if persist_to:
+        try:
+            os.makedirs(os.path.dirname(persist_to) or ".", exist_ok=True)
+            core.mem.save(persist_to)
+            print(f"[AVM] 内存已写回 {persist_to}", file=sys.stderr)
+        except OSError as e:
+            print(f"[AVM] 写回失败: {e}", file=sys.stderr)
+    if opts["frames"]:
+        _print_frames(core)
+
+
+def main(argv=None) -> int:
+    args = _build_parser().parse_args(argv)
+    opts = _resolve_options(args)
+    if opts is None:
+        return 1
+
+    core = _boot(opts)
+    if core is None:
+        return 1
+    if opts["transcript"]:
+        core.monitor = Monitor(max_frames=2000, transcript_path=opts["transcript"])
+    if opts["no_core_dump"]:
+        core.core_dump_enabled = False
+
+    status = 0
+    snapshot_ok = True  # 只有安全点退出才写重启快照
+    try:
+        status, snapshot_ok = _run_until_stop(core)
     except BaseException as e:
         # 内核死亡（不变量被破坏或未捕获缺陷）：先落现场快照，再保留原始 traceback 往上抛
-        dump_on_death(core, e, args.core_dump)
+        dump_on_death(core, e, opts["core_dump"])
         snapshot_ok = False
         raise
     finally:
-        if snapshot_ok:
-            write_snapshot(core)
-        persist_to = getattr(core, "persist_to", None)
-        if persist_to:
-            try:
-                os.makedirs(os.path.dirname(persist_to) or ".", exist_ok=True)
-                core.mem.save(persist_to)
-                print(f"[AVM] 内存已写回 {persist_to}", file=sys.stderr)
-            except OSError as e:
-                print(f"[AVM] 写回失败: {e}", file=sys.stderr)
-        if frames:
-            _print_frames(core)
+        _finish(core, snapshot_ok, opts)
     return status
 
 
