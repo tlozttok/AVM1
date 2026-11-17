@@ -14,10 +14,9 @@ import time
 from .types import MetaList, MetaDict, PANEL_CID
 from .capabilities import (
     CONTROL_DEVICE_ROOTS, MEM_ROOT_NAME, MODE_KERNEL, MODE_USER, Capability, caps_to_dict,
-    check_root_name, default_kernel_caps, grant_target_segments, path_is_prefix,
-    targets_prefix_free,
+    check_root_name, default_kernel_caps, path_is_prefix, targets_prefix_free,
 )
-from .exceptions import IllegalOperationError, VMSyntaxError, VMMemoryError, APIError, RunnerStop, KernelPanic
+from .exceptions import IllegalOperationError, VMMemoryError, APIError, RunnerStop, KernelPanic
 from .api_errors import (
     CONTEXT_LIMIT,
     INSUFFICIENT_BALANCE,
@@ -27,23 +26,22 @@ from .api_errors import (
     resolve_action,
     retry_limit,
 )
-from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, message_to_api_dict, LinkNode
+from .types import SystemMessage, UserMessage, Conversation, LinkNode
 from .types import message_to_dict, batch_to_dict, tool_exchange
 from .memory import Memory
 from .memory_nodes import check_new_key
 from .model_catalog import MODEL_CATALOG_KEY, ModelCatalog
-from .memory_device import MemoryDevice
 from .monitor import Monitor
 from .modules import (
-    BASE_MODULES, MODULE_CATALOG, ModuleCatalogDevice, ModuleLoaderDevice,
+    BASE_MODULES, ModuleCatalogDevice, ModuleLoaderDevice,
     grantable_module_names, module_descriptor, register_module_from_source,
-    register_module as register_catalog_module, registered_module_descriptors,
+    register_module as register_catalog_module,
 )
 from .python_server import HOST_ONLY_PLMS, PLM_REGISTRY, create_plm
-from .events import EventSystem, build_event, EVENT_TYPES
+from .events import EventSystem, build_event
 from .journal import (
     JOURNAL_RECORD_VERSION, Journal, JournalError, apply as apply_journal_record,
-    conversation_create_payload, scheduler_delta, scheduler_to_snapshot,
+    conversation_create_payload, scheduler_delta,
 )
 from .info_devices import (
     CapsDevice, ConversationsDevice, RootsDevice, SchedulerDevice,

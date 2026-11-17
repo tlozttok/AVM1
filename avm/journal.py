@@ -53,7 +53,7 @@ from .exceptions import VMMemoryError, IllegalOperationError
 from .memory import Memory
 from .types import (
     Conversation, MetaDict, MetaList, PANEL_CID,
-    batch_from_dict, batch_to_dict, message_from_dict, message_to_dict,
+    batch_from_dict, message_from_dict,
 )
 
 

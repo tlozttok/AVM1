@@ -10,8 +10,7 @@ from abc import ABC, abstractmethod
 
 from .machine_dsl import MachineParser
 from .types import (
-    Conversation, MetaDict, MetaList, Role, message_to_api_dict, Message,
-    SystemMessage, UserMessage, AssistantMessage, ToolMessage,
+    Message, SystemMessage, UserMessage, AssistantMessage, ToolMessage,
 )
 from .modules import BASE_MODULES, catalog_exports, sandbox_globals
 from .sandbox import SecurityError, check_code

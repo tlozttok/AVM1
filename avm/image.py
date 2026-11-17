@@ -25,7 +25,6 @@ from .capabilities import grant_target_segments
 from .exceptions import IllegalOperationError, ImageError, VMMemoryError
 from .memory_device import MemoryDevice, BUILTIN_DEVICE_CLASSES
 from .python_server import PLM_REGISTRY, PLMServer
-from .runner_prompt import prompt_api_error
 from .types import MetaDict, MetaList, LinkNode, StrNode
 
 IMAGE_VERSION = 1

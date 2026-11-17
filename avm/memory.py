@@ -7,7 +7,7 @@ from .types import MetaList, MetaDict, LinkNode, StrNode
 from .exceptions import (VMMemoryError, IllegalOperationError, MemoryKeyNotFoundError, MemoryIndexOutOfRangeError,
                           MemoryTypeError, MemoryCircularReferenceError, MemoryLinkBrokenError)
 from .capabilities import AddressSpace, MEM_ROOT_NAME
-from .memory_device import MemoryDevice, StringDevice
+from .memory_device import MemoryDevice
 
 
 _MAX_PATH_SEGMENTS = 64  # 单条引用的段数上限（戊4）

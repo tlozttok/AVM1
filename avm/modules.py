@@ -31,7 +31,7 @@ import importlib.util
 import json
 import os
 import types
-from typing import Dict, List, Mapping, Optional
+from typing import Dict, Mapping, Optional
 
 from .exceptions import VMMemoryError
 from .memory_device import MemoryDevice

@@ -24,7 +24,6 @@ seq 之后的日志。快照缺失或损坏时没有可恢复的对话状态：�
 import json
 import os
 import time
-from typing import Optional
 
 from .events import listener_from_snapshot, listener_to_snapshot
 from .journal import apply_scheduler, scheduler_to_snapshot
