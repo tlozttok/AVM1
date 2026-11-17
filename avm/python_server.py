@@ -755,84 +755,11 @@ class StateMachinePLM(PLMServer):
         if not dest:
             raise _MachineParseError(f"第 {lineno} 行: 转移行缺少目标状态")
 
-        # 解析目标状态与可选 response JSON
-        next_state = dest
-        content = ""
-        tools = []
-        if "|" in dest:
-            left, _, resp_text = dest.partition("|")
-            next_state = left.strip()
-            resp_text = resp_text.strip()
-            try:
-                response = json.loads(resp_text)
-            except Exception as e:
-                raise _MachineParseError(f"第 {lineno} 行: response JSON 解析失败: {e}")
-            if not isinstance(response, dict):
-                raise _MachineParseError(f"第 {lineno} 行: response 必须是 JSON 对象")
-            content = response.get("content", "")
-            if content is None:
-                content = ""
-            if not isinstance(content, str):
-                raise _MachineParseError(f"第 {lineno} 行: response.content 必须是字符串")
-            tools = response.get("tools") or []
-            if not isinstance(tools, list):
-                raise _MachineParseError(f"第 {lineno} 行: response.tools 必须是数组")
-            checked = []
-            for tool in tools:
-                if not isinstance(tool, dict):
-                    raise _MachineParseError(f"第 {lineno} 行: response.tools 每项必须是对象")
-                name = tool.get("name")
-                arguments = tool.get("arguments", {})
-                if not isinstance(name, str) or not name:
-                    raise _MachineParseError(f"第 {lineno} 行: tool.name 必须是非空字符串")
-                if not isinstance(arguments, dict):
-                    raise _MachineParseError(f"第 {lineno} 行: tool.arguments 必须是对象")
-                checked.append({"name": name, "arguments": arguments})
-            tools = checked
-
-        # 解析 set 块
-        sets = []
-        brace = src.find("{")
-        if brace != -1:
-            end = src.rfind("}")
-            if end < brace:
-                raise _MachineParseError(f"第 {lineno} 行: set 块缺少 }}")
-            block = src[brace + 1:end]
-            src = (src[:brace] + " " + src[end + 1:]).strip()
-            for raw_stmt in block.split(";"):
-                stmt = raw_stmt.strip()
-                if not stmt:
-                    continue
-                if not stmt.startswith("set "):
-                    raise _MachineParseError(f"第 {lineno} 行: set 块语句必须以 set 开头")
-                assignment = stmt[4:].strip()
-                var, sep, expr = assignment.partition("=")
-                var = var.strip()
-                expr = expr.strip()
-                if not sep or not var or not expr:
-                    raise _MachineParseError(f"第 {lineno} 行: set 语句格式应为 set <var> = <expr>")
-                if not self._VAR_NAME_RE.match(var):
-                    raise _MachineParseError(f"第 {lineno} 行: 非法变量名 {var!r}")
-                sets.append((var, expr))
-
-        # 解析事件与可选 guard
-        event, _, rest = src.partition(" ")
-        rest = rest.strip()
-        guard = None
-        if rest:
-            if not rest.startswith("if "):
-                raise _MachineParseError(f"第 {lineno} 行: 事件后只能是 if guard 或 set 块")
-            guard = rest[3:].strip()
-            if not guard:
-                raise _MachineParseError(f"第 {lineno} 行: if 后缺少 guard 表达式")
-
-        if self._tools_declared:
-            for tool in tools:
-                if not self._tool_allowed(tool["name"]):
-                    raise _MachineParseError(
-                        f"第 {lineno} 行: 未知工具 {tool['name']}（可用: {sorted(self._tools)}）"
-                    )
-
+        # 顺序即语义：先 dest（含 response JSON），再 src（set 块、事件与 guard），
+        # 最后才对照工具声明。同一行有多处错误时报哪一条取决于这个顺序，别重排。
+        next_state, content, tools = self._parse_dest(dest, lineno)
+        sets, event, guard = self._parse_src(src, lineno)
+        self._check_tools_declared(tools, lineno)
         return {
             "event": event,
             "guard": guard,
@@ -842,6 +769,98 @@ class StateMachinePLM(PLMServer):
             "tools": tools,
             "line": lineno,
         }
+
+    def _parse_dest(self, dest: str, lineno: int) -> tuple:
+        """目标状态与可选 response JSON（`状态 | {"content": ...}`）。"""
+        if "|" not in dest:
+            return dest, "", []
+        next_state, _, resp_text = dest.partition("|")
+        content, tools = self._parse_response(resp_text.strip(), lineno)
+        return next_state.strip(), content, tools
+
+    def _parse_response(self, resp_text: str, lineno: int) -> tuple:
+        """response 对象 → (content, tools)。content 缺省为空串，None 也当空串。"""
+        try:
+            response = json.loads(resp_text)
+        except Exception as e:
+            raise _MachineParseError(f"第 {lineno} 行: response JSON 解析失败: {e}")
+        if not isinstance(response, dict):
+            raise _MachineParseError(f"第 {lineno} 行: response 必须是 JSON 对象")
+        content = response.get("content", "")
+        if content is None:
+            content = ""
+        if not isinstance(content, str):
+            raise _MachineParseError(f"第 {lineno} 行: response.content 必须是字符串")
+        return content, self._parse_response_tools(response.get("tools") or [], lineno)
+
+    def _parse_response_tools(self, tools: list, lineno: int) -> list:
+        """response.tools 每项规范成 {name, arguments}，其余键丢弃。"""
+        if not isinstance(tools, list):
+            raise _MachineParseError(f"第 {lineno} 行: response.tools 必须是数组")
+        checked = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                raise _MachineParseError(f"第 {lineno} 行: response.tools 每项必须是对象")
+            name = tool.get("name")
+            arguments = tool.get("arguments", {})
+            if not isinstance(name, str) or not name:
+                raise _MachineParseError(f"第 {lineno} 行: tool.name 必须是非空字符串")
+            if not isinstance(arguments, dict):
+                raise _MachineParseError(f"第 {lineno} 行: tool.arguments 必须是对象")
+            checked.append({"name": name, "arguments": arguments})
+        return checked
+
+    def _parse_src(self, src: str, lineno: int) -> tuple:
+        """来源侧：`事件 { set ... } if guard` → (sets, 事件名, guard)。"""
+        src, sets = self._parse_set_block(src, lineno)
+        event, _, rest = src.partition(" ")
+        rest = rest.strip()
+        guard = None
+        if rest:
+            if not rest.startswith("if "):
+                raise _MachineParseError(f"第 {lineno} 行: 事件后只能是 if guard 或 set 块")
+            guard = rest[3:].strip()
+            if not guard:
+                raise _MachineParseError(f"第 {lineno} 行: if 后缺少 guard 表达式")
+        return sets, event, guard
+
+    def _parse_set_block(self, src: str, lineno: int) -> tuple:
+        """摘出 `{ set a = 1; set b = 2 }` 块，返回 (去掉块的 src, [(var, expr)])。"""
+        brace = src.find("{")
+        if brace == -1:
+            return src, []
+        end = src.rfind("}")
+        if end < brace:
+            raise _MachineParseError(f"第 {lineno} 行: set 块缺少 }}")
+        block = src[brace + 1:end]
+        src = (src[:brace] + " " + src[end + 1:]).strip()
+        sets = []
+        for raw_stmt in block.split(";"):
+            stmt = raw_stmt.strip()
+            if not stmt:
+                continue
+            if not stmt.startswith("set "):
+                raise _MachineParseError(f"第 {lineno} 行: set 块语句必须以 set 开头")
+            assignment = stmt[4:].strip()
+            var, sep, expr = assignment.partition("=")
+            var = var.strip()
+            expr = expr.strip()
+            if not sep or not var or not expr:
+                raise _MachineParseError(f"第 {lineno} 行: set 语句格式应为 set <var> = <expr>")
+            if not self._VAR_NAME_RE.match(var):
+                raise _MachineParseError(f"第 {lineno} 行: 非法变量名 {var!r}")
+            sets.append((var, expr))
+        return src, sets
+
+    def _check_tools_declared(self, tools: list, lineno: int) -> None:
+        """声明过 tools 后，转移里只能引用已声明的工具。"""
+        if not self._tools_declared:
+            return
+        for tool in tools:
+            if not self._tool_allowed(tool["name"]):
+                raise _MachineParseError(
+                    f"第 {lineno} 行: 未知工具 {tool['name']}（可用: {sorted(self._tools)}）"
+                )
 
     # ------------------------------------------------------------------
     # user / tool 消息
