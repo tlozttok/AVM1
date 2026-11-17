@@ -555,73 +555,94 @@ class Memory:
         if display is None:
             display = [MEM_ROOT_NAME] + list(path)
         if not path:
-            if isinstance(self._data, MetaDict):
-                self._data.set_metadata(str(value))
-                return
-            self._data = _wrap_value(value)
-            return
+            self._set_root(value)
+            return None
 
         # 列表追加：-1 只表示"末尾的下一个位置"，不是下标。
         # 追加是显式位置语法，不是隐式建路径：父容器必须已存在。
-        if path and path[-1] == "-1" and not self.is_device_path(path[:-1]):
-            parent = self.resolve_path(["MEM"] + list(path[:-1]), for_llm=False)
-            if isinstance(parent, MemoryDevice):
-                _device_put(parent, "-1", value)  # 设备层本轮保持旧语义
-                return None
-            if isinstance(parent, (list, MetaList)):
-                self._check_append_same_type(parent, "str")
-                parent.append(_wrap_value(value))
-                return _show(list(display[:-1]) + [str(len(parent) - 1)])
-            if isinstance(parent, (dict, MetaDict)):
-                raise IllegalOperationError("字典里不能用 -1（-1 只表示列表追加位置）")
-            if isinstance(parent, str):
-                raise VMMemoryError("字符串没有子节点：不能用 -1 追加")
-            raise VMMemoryError(f"不支持在类型 {type(parent).__name__} 下追加")
+        if path[-1] == "-1" and not self.is_device_path(path[:-1]):
+            return self._append_at_end(path, value, display)
 
         # 链接透明：先沿树展开链接（含成环检测），得到真实落点
         followed = self._walk_links(path)
         if followed[0] == "device":
             _, device, _address, remainder = followed
-            if not remainder:
-                if hasattr(device, 'set_value'):
-                    device.set_value(value)
-                    return
-                raise VMMemoryError(f"设备 {type(device).__name__} 不支持直接写入")
-            current = device
-            for key in remainder[:-1]:
-                current = _device_child(current, key)
-            _device_put(current, remainder[-1], value)
-            return
+            self._write_followed_device(device, remainder, value)
+            return None
         path = followed[1]
 
-        # 检查是否是设备路径
         if self.is_device_path(path):
-            device = self.get_device(path)
-            if getattr(device, "is_link", False):
-                device.set_value(value)
-            elif hasattr(device, 'set_value'):
-                device.set_value(value)
-            else:
-                raise VMMemoryError(f"设备 {type(device).__name__} 不支持直接写入")
-            return
+            self._write_mounted_device(path, value)
+            return None
+        if self._write_into_device_prefix(path, value):
+            return None
+        self._write_existing_path(path, value, display)
+        return None
 
-        # 检查路径前缀是否命中设备：如 outputs.out 中 outputs 是设备
+    def _set_root(self, value: Any) -> None:
+        """空路径写根：根是 MetaDict 时按改元数据解释，否则整体换成包装后的值。"""
+        if isinstance(self._data, MetaDict):
+            self._data.set_metadata(str(value))
+            return
+        self._data = _wrap_value(value)
+
+    def _append_at_end(self, path: list, value: Any, display: list) -> Optional[str]:
+        """`-1` 追加到列表末尾，返回新元素地址；父容器不是列表时按类型拒绝。"""
+        parent = self.resolve_path(["MEM"] + list(path[:-1]), for_llm=False)
+        if isinstance(parent, MemoryDevice):
+            _device_put(parent, "-1", value)  # 设备层本轮保持旧语义
+            return None
+        if isinstance(parent, (list, MetaList)):
+            self._check_append_same_type(parent, "str")
+            parent.append(_wrap_value(value))
+            return _show(list(display[:-1]) + [str(len(parent) - 1)])
+        if isinstance(parent, (dict, MetaDict)):
+            raise IllegalOperationError("字典里不能用 -1（-1 只表示列表追加位置）")
+        if isinstance(parent, str):
+            raise VMMemoryError("字符串没有子节点：不能用 -1 追加")
+        raise VMMemoryError(f"不支持在类型 {type(parent).__name__} 下追加")
+
+    def _write_followed_device(self, device: Any, remainder: list, value: Any) -> None:
+        """链接展开后落在设备上：没有剩余段就写设备本体，否则逐段下钻到父节点再写。"""
+        if not remainder:
+            if hasattr(device, 'set_value'):
+                device.set_value(value)
+                return
+            raise VMMemoryError(f"设备 {type(device).__name__} 不支持直接写入")
+        current = device
+        for key in remainder[:-1]:
+            current = _device_child(current, key)
+        _device_put(current, remainder[-1], value)
+
+    def _write_mounted_device(self, path: list, value: Any) -> None:
+        """整条路径就是一个挂载点：直接写设备本体。"""
+        device = self.get_device(path)
+        if getattr(device, "is_link", False) or hasattr(device, 'set_value'):
+            device.set_value(value)
+            return
+        raise VMMemoryError(f"设备 {type(device).__name__} 不支持直接写入")
+
+    def _write_into_device_prefix(self, path: list, value: Any) -> bool:
+        """路径的某个前缀命中设备（如 outputs.out 里 outputs 是设备）。命中并写完返回 True。"""
         for i in range(len(path) - 1, 0, -1):
             prefix = path[:i]
-            if self.is_device_path(prefix):
-                device = self.get_device(prefix)
-                if getattr(device, "is_link", False):
-                    # 链接子路径写：委托到真实目标路径（含环检测）
-                    real_segments = device._real_mem_segments(path[i:])
-                    self.set_by_path(real_segments, value)
-                    return
-                current = device
-                for key in path[i:-1]:
-                    current = _device_child(current, key)
-                _device_put(current, path[-1], value)
-                return
+            if not self.is_device_path(prefix):
+                continue
+            device = self.get_device(prefix)
+            if getattr(device, "is_link", False):
+                # 链接子路径写：委托到真实目标路径（含环检测）
+                real_segments = device._real_mem_segments(path[i:])
+                self.set_by_path(real_segments, value)
+                return True
+            current = device
+            for key in path[i:-1]:
+                current = _device_child(current, key)
+            _device_put(current, path[-1], value)
+            return True
+        return False
 
-        # 普通路径处理：只改已存在的地址（创建归 memory_make）。
+    def _write_existing_path(self, path: list, value: Any, display: list) -> None:
+        """普通路径处理：只改已存在的地址（创建归 memory_make）。"""
         node = self._data
         for i, key in enumerate(path[:-1]):
             child, exists = self._child(node, key, display, i)
