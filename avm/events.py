@@ -8,6 +8,10 @@
 
 监听注册的 memory 目标授权不在 Core：Core 只提供机制，策略由软件层的 Guard
 监听器（监听 listen_event before）按 caps/roots 实现。设备目标仍由设备授权。
+
+"这个目标指的是什么"这类只读读法（别名 → 节点/对话/监听器状态、normal 与
+kernel 两级的载荷形状）在 event_targets.TargetProbe 里：判权和拼载荷问的是
+同一组问题，写在两处就会漂移。
 """
 
 # TODO(issue-2026-11-01): 用户态事件子集（named presets）的名单与粒度是临时方案，待作者
@@ -20,10 +24,17 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from .capabilities import AddressSpace
+from .event_contracts import (  # noqa: F401  (对外转出，见下方说明)
+    KERNEL_TIER,
+    LISTENER_TIERS,
+    MAX_ANCESTORS_DEPTH,
+    NORMAL_TIER,
+)
 from .exceptions import IllegalOperationError, VMMemoryError
+from .event_targets import TargetProbe
 from .modules import BASE_MODULES, catalog_exports, import_function, shared_view
 from .sandbox import check_code, safe_globals
-from .types import MetaDict, MetaList
+from .types import MetaDict
 
 EVENT_TYPES = [
     "memory_read",
@@ -55,15 +66,12 @@ MEMORY_EVENT_TYPES = {
     "edit_metadata",
 }
 
-NORMAL_TIER = "normal"
-KERNEL_TIER = "kernel"
-LISTENER_TIERS = (NORMAL_TIER, KERNEL_TIER)
+# 层级名与祖先深度上限住在 event_contracts（事件系统与目标探针共用）；这里重新
+# 导出，`from .events import NORMAL_TIER` 这类外部写法不用改。
 
 # kernel 级 source_context 的截断上限（消息条数）；超出的旧消息不放进载荷
 SOURCE_CONTEXT_MAX_MESSAGES = 20
 
-# normal 载荷祖先链的深度上限（只保留最近 MAX_ANCESTORS_DEPTH 个祖先）
-MAX_ANCESTORS_DEPTH = 32
 
 # 各事件类型中处理器可以修改的 payload 字段。
 # 未列出的字段（身份字段等）一律不可由处理器修改。
@@ -320,6 +328,9 @@ def _merge_notify(event: dict, out: dict, listener_id: Optional[int],
 class EventSystem:
     def __init__(self, core: 'Core'):
         self._core = core
+        # 目标读数（别名 → 节点/对话/监听器的真实状态）交给 TargetProbe。传的是
+        # "取法"而不是列表本身：cancel_all_for_owner 会整个重建 self.listeners。
+        self.targets = TargetProbe(core, lambda: self.listeners)
         # 注册顺序即优先级：先注册者先执行。
         self.listeners: List[dict] = []
         self._next_listener_id = 1
@@ -471,7 +482,7 @@ class EventSystem:
             "owner_cid": owner_cid,
             "event_type": event_type,
             "target": target,
-            "target_ref": self._canonical_target_ref(
+            "target_ref": self.targets.canonical_ref(
                 target, space=space, follow_final=(event_type != "memory_delete")
             ),
             "handler_ref": handler_ref,
@@ -592,7 +603,7 @@ class EventSystem:
 
         listener["event_type"] = event_type
         listener["target"] = target
-        listener["target_ref"] = self._canonical_target_ref(
+        listener["target_ref"] = self.targets.canonical_ref(
             target, space=listener.get("space"),
             follow_final=(event_type != "memory_delete"),
         )
@@ -760,301 +771,6 @@ class EventSystem:
         if split[0] != "memory":
             raise ValueError(f"不能监听设备上的程序节点：{target}")
 
-    # ------------------------------------------------------------------
-    # 目标规范化与载荷分层
-    # ------------------------------------------------------------------
-
-    def _canonical_target_ref(self, target: str, space=None, follow_final: bool = True):
-        """把请求别名转成内部 canonical target_ref；无法解析返回 None。
-
-        格式：("memory", 段序列) / ("device", 挂载键, 剩余段) / ("cid", id) /
-        ("listener", id) / ("*",)。canonical 只用于匹配与权限判定，不进 normal 载荷。
-        """
-        if not isinstance(target, str) or not target:
-            return None
-        if target == "*":
-            return ("*",)
-        if target.startswith("cid:"):
-            try:
-                return ("cid", int(target[4:]))
-            except ValueError:
-                return None
-        if target.startswith("listener:"):
-            try:
-                return ("listener", int(target[9:]))
-            except ValueError:
-                return None
-        if not target.startswith("$"):
-            return None
-        return self._core.canonical_ref(target, space=space, follow_final=follow_final)
-
-    def _conversation_snapshot(self, cid) -> Optional[dict]:
-        if not isinstance(cid, int):
-            return None
-        conv = self._core.get_conversation(cid)
-        if conv is None:
-            return None
-        if self._core.is_finished(cid):
-            state = "finished"
-        elif cid == self._core.active_conversation_id():
-            state = "active"
-        elif self._core.is_ready(cid):
-            state = "ready"
-        elif self._core.is_dormant(cid):
-            state = "dormant"
-        else:
-            state = "unknown"
-        return {
-            "cid": cid,
-            "identity": conv.identity,
-            "name": getattr(conv, "name", None),
-            "mode": conv.caps.mode,
-            "groups": list(conv.caps.groups),
-            "is_sub": conv.is_sub,
-            "is_python": conv.is_python,
-            "parent_cid": conv.parent.cid if conv.parent is not None else None,
-            "state": state,
-            "para_ref": conv.para_ref,
-        }
-
-    def _actor_cid(self, event: dict):
-        source = event.get("source") or {}
-        for cid in (source.get("initiator_cid"), (event.get("payload") or {}).get("actor_cid")):
-            if isinstance(cid, int):
-                return cid
-        return None
-
-    @staticmethod
-    def _node_kind(node) -> str:
-        from .types import LinkNode
-        if isinstance(node, MetaDict):
-            return "dict"
-        if isinstance(node, MetaList):
-            return "list"
-        if isinstance(node, LinkNode):
-            return "link"
-        if isinstance(node, str):
-            return "str"
-        return type(node).__name__
-
-    @staticmethod
-    def _node_meta(node):
-        if hasattr(node, "get_metadata"):
-            return node.get_metadata()
-        return None
-
-    def _node_ancestors(self, segments) -> List[dict]:
-        """祖先链简单信息（type/meta/ctrl + depth）。
-
-        normal 载荷不暴露真实路径；祖先从根到父排列，超过 MAX_ANCESTORS_DEPTH
-        时只保留离目标最近的若干层（带 depth 便于判断截断）。
-        """
-        total = len(segments) - 1
-        if total <= 0:
-            return []
-        first = max(1, total - MAX_ANCESTORS_DEPTH + 1)
-        ancestors = []
-        for depth in range(first, total + 1):
-            prefix = list(segments[:depth])
-            try:
-                node = self._core.mem.resolve_path(["MEM"] + prefix, for_llm=False)
-            except Exception:
-                break
-            ctrl = dict(node.get_ctrl()) if hasattr(node, "get_ctrl") and node.get_ctrl() else None
-            ancestors.append({
-                "depth": depth,
-                "type": self._node_kind(node),
-                "meta": self._node_meta(node),
-                "ctrl": ctrl,
-            })
-        return ancestors
-
-    @staticmethod
-    def _alias_parent(alias):
-        if isinstance(alias, str) and alias.startswith("$") and "." in alias:
-            return alias.rsplit(".", 1)[0]
-        return None
-
-    _MISSING = object()
-
-    def _resolve_node_no_follow(self, segments):
-        """解析节点但不跟随最终段的链接（删链接时看链接节点本身）。"""
-        segments = list(segments)
-        if not segments:
-            return self._core.mem.root
-        try:
-            parent = self._core.mem.resolve_path(["MEM"] + segments[:-1], for_llm=False)
-        except Exception:
-            return self._MISSING
-        key = segments[-1]
-        try:
-            if isinstance(parent, (MetaDict, dict)):
-                return parent[key] if key in parent else self._MISSING
-        except Exception:
-            return self._MISSING
-        return self._MISSING
-
-    def _node_simple(self, segments, follow_final: bool = True):
-        """一个祖先节点的简单信息；节点不存在时返回 None。"""
-        if follow_final:
-            try:
-                node = self._core.mem.resolve_path(["MEM"] + list(segments), for_llm=False)
-            except Exception:
-                return None
-        else:
-            node = self._resolve_node_no_follow(segments)
-            if node is self._MISSING:
-                return None
-        return {
-            "type": self._node_kind(node),
-            "meta": self._node_meta(node),
-            "ctrl": dict(node.get_ctrl()) if hasattr(node, "get_ctrl") and node.get_ctrl() else None,
-            "ancestors": self._node_ancestors(list(segments)),
-        }
-
-    def _memory_context(self, segments, alias: str) -> dict:
-        """目标不存在时的上下文：最近存在前缀 + 直接父节点（用于 make/追加裁决）。"""
-        context = {}
-        existing_index = None
-        for i in range(len(segments) - 1, -1, -1):
-            if self._node_simple(segments[:i]) is not None:
-                existing_index = i
-                break
-            if i == 0:
-                existing_index = 0
-        if existing_index is not None:
-            prefix = self._node_simple(segments[:existing_index]) or {}
-            new_count = len(segments) - existing_index
-            prefix_alias = None
-            if isinstance(alias, str) and alias.startswith("$"):
-                parts = alias[1:].split(".")
-                keep = len(parts) - new_count
-                if keep > 0:
-                    prefix_alias = "$" + ".".join(parts[:keep])
-                elif keep == 0:
-                    prefix_alias = "$MEM"
-            prefix.update({
-                "alias": prefix_alias,
-                "depth": existing_index,
-                "ancestors": self._node_ancestors(segments[:existing_index]),
-            })
-            context["longest_existing_prefix"] = prefix
-        parent_segments = list(segments[:-1])
-        parent = self._node_simple(parent_segments) if parent_segments else None
-        if parent is not None:
-            parent["alias"] = self._alias_parent(alias)
-        context["parent"] = parent
-        return context
-
-    def _target_info(self, target_ref, alias: str, follow_final: bool = True) -> dict:
-        """normal 级目标信息：种类、别名、是否存在、类型、描述、ctrl、祖先链。"""
-        info = {"kind": "unknown", "ref": alias, "exists": False, "type": None,
-                "meta": None, "ctrl": None, "ancestors": []}
-        if not target_ref:
-            return info
-        tag = target_ref[0]
-        if tag == "memory":
-            segments = list(target_ref[1])
-            info.update({"kind": "memory"})
-            if follow_final:
-                try:
-                    node = self._core.mem.resolve_path(["MEM"] + segments, for_llm=False)
-                except Exception:
-                    info.update(self._memory_context(segments, alias))
-                    return info
-            else:
-                node = self._resolve_node_no_follow(segments)
-                if node is self._MISSING:
-                    info.update(self._memory_context(segments, alias))
-                    return info
-            info["exists"] = True
-            info["type"] = self._node_kind(node)
-            info["meta"] = self._node_meta(node)
-            info["ctrl"] = dict(node.get_ctrl()) if hasattr(node, "get_ctrl") and node.get_ctrl() else None
-            info["ancestors"] = self._node_ancestors(segments)
-            parent = self._node_simple(segments[:-1]) if segments else None
-            if parent is not None:
-                parent["alias"] = self._alias_parent(alias)
-            info["parent"] = parent
-            return info
-        if tag == "device":
-            mount_key, remainder = target_ref[1], list(target_ref[2])
-            device = self._core.mem.devices.get(mount_key)
-            info.update({"kind": "device", "mount": mount_key, "remainder": remainder})
-            if device is not None:
-                info["exists"] = True
-                try:
-                    info["device"] = device.to_llm_string()
-                except Exception:
-                    info["device"] = None
-            return info
-        if tag == "cid":
-            cid = target_ref[1]
-            conv = self._core.get_conversation(cid)
-            info.update({"kind": "conversation", "type": "conversation",
-                         "conversation": self._conversation_snapshot(cid)})
-            info["exists"] = conv is not None
-            return info
-        if tag == "listener":
-            lid = target_ref[1]
-            record = next((x for x in self.listeners if x["listener_id"] == lid), None)
-            info.update({"kind": "listener", "type": "listener",
-                         "listener": self._listener_summary(record) if record else None})
-            info["exists"] = record is not None
-            return info
-        if tag == "*":
-            info.update({"kind": "wildcard", "exists": True})
-        return info
-
-    def _listener_summary(self, listener: dict) -> dict:
-        """监听器记录摘要（不含 handler_code，避免把安全代码交给其他处理器）。"""
-        return {
-            "listener_id": listener["listener_id"],
-            "owner_cid": listener.get("owner_cid"),
-            "event_type": listener.get("event_type"),
-            "target": listener.get("target"),
-            "phase": listener.get("phase"),
-            "priority": listener.get("priority", 0),
-            "tier": listener.get("tier", NORMAL_TIER),
-            "enabled": listener.get("enabled", True),
-            "imports": sorted(listener.get("imports") or BASE_MODULES),
-        }
-
-    def _target_full(self, target_ref, follow_final: bool = True):
-        """kernel 级目标完整数据（JSON 安全结构）。"""
-        if not target_ref or target_ref[0] != "memory":
-            return None
-        segments = list(target_ref[1])
-        if follow_final:
-            try:
-                node = self._core.mem.resolve_path(["MEM"] + segments, for_llm=False)
-            except Exception:
-                return None
-        else:
-            node = self._resolve_node_no_follow(segments)
-            if node is self._MISSING:
-                return None
-        return self._json_safe_node(node)
-
-    def _json_safe_node(self, node):
-        from .types import LinkNode, StrNode
-        if isinstance(node, MetaDict):
-            return {"kind": "dict", "meta": node.get_metadata(),
-                    "ctrl": dict(node.get_ctrl()) if node.get_ctrl() else None,
-                    "value": {str(k): self._json_safe_node(v) for k, v in node.items()}}
-        if isinstance(node, MetaList):
-            return {"kind": "list", "meta": node.get_metadata(),
-                    "ctrl": dict(node.get_ctrl()) if node.get_ctrl() else None,
-                    "value": [self._json_safe_node(v) for v in node]}
-        if isinstance(node, LinkNode):
-            return {"kind": "link", "target": node.target}
-        if isinstance(node, StrNode):
-            return {"kind": "str", "ctrl": dict(node.get_ctrl()) if node.get_ctrl() else None,
-                    "value": str(node)}
-        if isinstance(node, str):
-            return {"kind": "str", "value": str(node)}
-        return {"kind": type(node).__name__, "value": str(node)}
-
     def _source_context(self, cid) -> Optional[dict]:
         """kernel 级来源对话上下文（消息列表，截断旧消息并标注）。"""
         if not isinstance(cid, int):
@@ -1080,15 +796,15 @@ class EventSystem:
     def _enrich_event(self, event: dict, matched: List[dict]) -> None:
         """构造 normal 载荷；有 kernel 监听器时把重块放进内部 _kernel_payload。"""
         source = event.setdefault("source", {})
-        actor = self._actor_cid(event)
+        actor = self.targets.actor_cid(event)
         if actor is not None and "conversation" not in source:
             try:
-                source["conversation"] = self._conversation_snapshot(actor)
+                source["conversation"] = self.targets.conversation_snapshot(actor)
             except Exception:
                 source["conversation"] = None
         follow_final = event.get("event_type") != "memory_delete"
         try:
-            event["target_info"] = self._target_info(
+            event["target_info"] = self.targets.target_info(
                 event.get("target_ref"), event.get("target", ""), follow_final=follow_final,
             )
         except Exception as e:
@@ -1099,7 +815,7 @@ class EventSystem:
             try:
                 ref = event.get("target_ref")
                 if ref and ref[0] == "memory":
-                    kernel["target_full"] = self._target_full(ref, follow_final=follow_final)
+                    kernel["target_full"] = self.targets.target_full(ref, follow_final=follow_final)
             except Exception as e:
                 kernel["target_full"] = None
                 kernel["target_full_error"] = f"{type(e).__name__}: {e}"

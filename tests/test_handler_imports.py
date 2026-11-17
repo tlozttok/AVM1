@@ -56,7 +56,7 @@ class TestRegistrationSnapshot:
             conv.cid, ref, space=conv.caps.space(), kernel_mode=True)
         record = next(l for l in core.events.listeners if l["listener_id"] == listener_id)
         assert record["imports"] == sorted({"math", "json", "re", "itertools"})
-        assert core.events._listener_summary(record)["imports"] == record["imports"]
+        assert core.events.targets.listener_summary(record)["imports"] == record["imports"]
 
     def test_legacy_register_also_snapshots(self):
         core = _core()
