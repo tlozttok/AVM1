@@ -9,6 +9,38 @@ import threading
 from typing import Any, Optional, List
 
 
+def input_queue_tools(feed, pending, feed_description: str) -> List[dict]:
+    """两个「输入队列」调试动作的定义（面板设备与总线设备共用这一份 schema）。
+
+    两边取队列的方式不同——面板设备读自己的队列，总线设备还要问宿主待取的行数——
+    但对外暴露的动作名、参数与顺序必须一样：同一个对话换个设备就得换调用方式，这
+    是设备该吸收掉的事，不该漏给对话看。schema 只写在这里，改 required 不会漏掉
+    另一半。
+
+    两个回调都是 `args -> dict`，原样挂在 `run` 上。
+    """
+    return [
+        {
+            "name": "投喂一行输入",
+            "description": feed_description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "要交给对话的一行文本"},
+                },
+                "required": ["content"],
+            },
+            "run": feed,
+        },
+        {
+            "name": "查询队列",
+            "description": "看队列里还有几行、设备当前是否正等着输入。",
+            "parameters": {"type": "object", "properties": {}},
+            "run": pending,
+        },
+    ]
+
+
 class MemoryDevice:
     """设备基类"""
 
@@ -354,26 +386,10 @@ class InputsListDevice(MetaListDevice):
             return {"queued": len(self._panel_inputs),
                     "waiting": self._pending_input}
 
-        return [
-            {
-                "name": "投喂一行输入",
-                "description": "把一行文本排进输入队列；下一次 $MEM.inputs.next 直接取走它，不碰终端。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "content": {"type": "string", "description": "要交给对话的一行文本"},
-                    },
-                    "required": ["content"],
-                },
-                "run": feed,
-            },
-            {
-                "name": "查询队列",
-                "description": "看队列里还有几行、设备当前是否正等着输入。",
-                "parameters": {"type": "object", "properties": {}},
-                "run": pending,
-            },
-        ]
+        return input_queue_tools(
+            feed, pending,
+            "把一行文本排进输入队列；下一次 $MEM.inputs.next 直接取走它，不碰终端。",
+        )
 
     def __getitem__(self, index):
         if index == "next":

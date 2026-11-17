@@ -17,7 +17,7 @@ import threading
 from typing import Any
 
 from .exceptions import MemoryIndexOutOfRangeError, MemoryTypeError, VMMemoryError
-from .memory_device import MetaListDevice
+from .memory_device import MetaListDevice, input_queue_tools
 
 
 class IOInputDevice(MetaListDevice):
@@ -78,26 +78,10 @@ class IOInputDevice(MetaListDevice):
                            if bus is not None else 0)
             return {"queued": queued + bus_pending, "waiting": self._waiting}
 
-        return [
-            {
-                "name": "投喂一行输入",
-                "description": "把一行文本排进输入队列；下一次 $MEM.inputs.next 直接取走它。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "content": {"type": "string", "description": "要交给对话的一行文本"},
-                    },
-                    "required": ["content"],
-                },
-                "run": feed,
-            },
-            {
-                "name": "查询队列",
-                "description": "看队列里还有几行、设备当前是否正等着输入。",
-                "parameters": {"type": "object", "properties": {}},
-                "run": pending,
-            },
-        ]
+        return input_queue_tools(
+            feed, pending,
+            "把一行文本排进输入队列；下一次 $MEM.inputs.next 直接取走它。",
+        )
 
     def notify_input(self) -> None:
         """宿主总线来了输入：唤醒可能正等在 `next` 上的读。"""
