@@ -1818,6 +1818,15 @@ class Core:
         self.events: EventSystem = EventSystem(self)
         self.interrupts: InterruptTable = InterruptTable(self)  # 中断向量表：外部（控制台）发起的控制权转移
         self._turn_events: List[dict] = []
+        self._init_persistence()
+
+    def _init_persistence(self) -> None:
+        """持久运行的状态：日志、快照、重放/记录标记，以及末尾的两步安装。
+
+        单独成法只为让 __init__ 读得下去：这些字段都属于「这台内核怎么活过下一次
+        重启」，与上面的执行状体不混在一起。宿主设备与模型目录放在最后装，因为它们
+        要枚举前面那些字段（设备来源表、镜像声明的 PLM 等）。
+        """
         # 持久运行：回合级效果日志（journal）与重启快照（snapshot）。
         # journal 为 None 时所有记录点是空操作——无日志镜像行为不变。
         self.journal: Optional[Journal] = None
