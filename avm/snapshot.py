@@ -36,7 +36,7 @@ from .memory import Memory
 from .types import MetaDict
 
 SNAPSHOT_FORMAT = "avm.snapshot"
-SNAPSHOT_VERSION = 2
+SNAPSHOT_VERSION = 3
 
 
 class SnapshotError(ValueError):

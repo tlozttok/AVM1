@@ -249,7 +249,7 @@ def _space_from_roots(roots: Optional[dict]):
 # 重放
 # ----------------------------------------------------------------------
 
-JOURNAL_RECORD_VERSION = 3
+JOURNAL_RECORD_VERSION = 4
 
 
 def _version_error(seq, version) -> str:
@@ -267,7 +267,7 @@ def apply(core, record: dict) -> None:
     JournalError——日志与镜像/快照不一致时继续跑只会把状态带得更歪。
     幂等由 `Core.replay_journal` 的 seq 游标保证（已应用过的记录不再进入这里）。
 
-    记录形状（v3）：`{"v": 3, "generation", "seq", "cid", "at", "changes": [...]}`，
+    记录形状（v4）：`{"v": 3, "generation", "seq", "cid", "at", "changes": [...]}`，
     逐个应用 changes 里的变化：消息追加、效果、待发批次、调度增量。顺序就是执行顺序。
     """
     if not isinstance(record, dict):

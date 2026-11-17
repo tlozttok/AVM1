@@ -452,7 +452,7 @@ class TestRecordShape:
             "activation_instructions", "next_cid",
         }
         for record in records:
-            assert record["v"] == 3
+            assert record["v"] == 4
             for legacy in ("history", "call", "batch", "scheduler", "effects"):
                 assert legacy not in record
             assert isinstance(record["changes"], list)
@@ -487,7 +487,7 @@ class TestDeviceMountReplay:
         core = load_core(image)
         core.start("sys", "user", para_ref="$MEM.model_params")
         record = {
-            "v": 3, "generation": 1, "seq": 1, "cid": 0,
+            "v": 4, "generation": 1, "seq": 1, "cid": 0,
             "changes": [{"kind": "effect", "effect": {
                 "kind": "device_mount", "mount": "echo",
                 "spec": {"path": "echo.py", "class": "EchoDevice", "args": {}},

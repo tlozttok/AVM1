@@ -666,7 +666,7 @@ Guard 是软件层（镜像/OS 程序）注册的一个普通内核态监听器�
 
 ### 重启快照（snapshot，缓存）
 
-`avm/snapshot.py`；`format="avm.snapshot"`、`version=2`（显式版本化，旧版本拒绝恢复并提示 `reset`），`generation` 必须存在且为正整数。形状与内核转储同源（调度、内存、安全段、对话、监听器、设备表），差别：不截断、带 `seq`（已提交的日志位置）与 `generation`（日志代际）、带 `device_specs`（设备来源表）、对话额外带 cid/parent_cid/待发批次。它是加速重启的缓存；没有快照就没有可恢复的对话态。
+`avm/snapshot.py`；`format="avm.snapshot"`、`version=3`（显式版本化，旧版本拒绝恢复并提示 `reset`），`generation` 必须存在且为正整数。形状与内核转储同源（调度、内存、安全段、对话、监听器、设备表），差别：不截断、带 `seq`（已提交的日志位置）与 `generation`（日志代际）、带 `device_specs`（设备来源表）、对话额外带 cid/parent_cid/待发批次。它是加速重启的缓存；没有快照就没有可恢复的对话态。
 
 `Core.snapshot_to(path)` 只在安全点调用（宿主正常退出路径，以及定时快照触发）。`Core.restore_from(path)` 顺序：清空调度/对话/监听器 → 换内存树 → 按来源表重建设备并重新物化挂载点 → 按 cid 重建对话与父子引用 → 恢复监听器 → 安全配置/para_ref/下一个 cid → 跑安全点自检。对话身份与历史按硬承诺保留；设备内部状态不序列化，按 spec 重建实例。
 

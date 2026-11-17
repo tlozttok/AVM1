@@ -793,7 +793,9 @@ class Core:
             raise ValueError("v1 检查点不支持 Python 对话")
         cp = conv.to_checkpoint()
         msgs = cp["messages"]
-        if msgs and msgs[-1].get("role") == "assistant" and "tool_calls" in msgs[-1]:
+        last_parts = (msgs[-1].get("parts") or []) if msgs else []
+        if (msgs and msgs[-1].get("role") == "assistant"
+                and any(part.get("type") == "tool_call" for part in last_parts)):
             msgs = msgs[:-1]  # 末尾未配对工具调用：截断到最后一个完整交换
             cp["messages"] = msgs
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
