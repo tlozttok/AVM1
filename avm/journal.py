@@ -323,6 +323,46 @@ def _apply_change(core, change, cid: int, seq) -> None:
     raise JournalError(f"日志 seq={seq}: 未知变化种类 {kind!r}")
 
 
+def scheduler_delta(before: dict, after: dict):
+    """把回合前后的调度状态压成一条增量变化；没有变化返回 None。
+
+    产出的是日志里 `kind=scheduler` 的 change，字段名与下面 _apply_scheduler_delta
+    一一对应：两份必须一起改。放在同一个文件里，就是为了让这件事一眼看得见——
+    以前产出端在 core.py、消费端在这里，改一个字段名靠记忆。
+
+    before / after 都是 _scheduler_state() 的形状：active / ready / dormant /
+    finished / activation_instructions / next_cid。
+    """
+    delta = {}
+    if before["active"] != after["active"]:
+        delta["active"] = after["active"]
+    for key in ("ready", "dormant"):
+        before_list = before[key]
+        after_list = after[key]
+        before_set = set(before_list)
+        after_set = set(after_list)
+        added = [cid for cid in after_list if cid not in before_set]
+        removed = [cid for cid in before_list if cid not in after_set]
+        if added:
+            delta[key + "_add"] = added
+        if removed:
+            delta[key + "_remove"] = removed
+    added_finished = sorted(after["finished"] - before["finished"])
+    removed_finished = sorted(before["finished"] - after["finished"])
+    if added_finished:
+        delta["finished_add"] = added_finished
+    if removed_finished:
+        delta["finished_remove"] = removed_finished
+    if before["activation_instructions"] != after["activation_instructions"]:
+        delta["activation_instructions"] = after["activation_instructions"]
+    if before["next_cid"] != after["next_cid"]:
+        delta["next_cid"] = after["next_cid"]
+    if not delta:
+        return None
+    return {"kind": "scheduler", **delta}
+
+
+
 def _apply_scheduler_delta(core, change, seq) -> None:
     """应用一条调度增量；引用不存在对话时警告并跳过（与快照恢复同一策略）。"""
 

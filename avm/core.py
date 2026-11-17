@@ -42,7 +42,7 @@ from .python_server import HOST_ONLY_PLMS, PLM_REGISTRY, create_plm
 from .events import EventSystem, build_event, EVENT_TYPES
 from .journal import (
     JOURNAL_RECORD_VERSION, Journal, JournalError, apply as apply_journal_record,
-    conversation_create_payload, scheduler_to_snapshot,
+    conversation_create_payload, scheduler_delta, scheduler_to_snapshot,
 )
 from .info_devices import (
     CapsDevice, ConversationsDevice, RootsDevice, SchedulerDevice,
@@ -2428,37 +2428,6 @@ class Core:
             "next_cid": int(self._next_cid),
         }
 
-    @staticmethod
-    def _scheduler_delta(before: dict, after: dict):
-        """把回合前后的调度状态压成一条增量变化；没有变化返回 None。"""
-        delta = {}
-        if before["active"] != after["active"]:
-            delta["active"] = after["active"]
-        for key in ("ready", "dormant"):
-            before_list = before[key]
-            after_list = after[key]
-            before_set = set(before_list)
-            after_set = set(after_list)
-            added = [cid for cid in after_list if cid not in before_set]
-            removed = [cid for cid in before_list if cid not in after_set]
-            if added:
-                delta[key + "_add"] = added
-            if removed:
-                delta[key + "_remove"] = removed
-        added_finished = sorted(after["finished"] - before["finished"])
-        removed_finished = sorted(before["finished"] - after["finished"])
-        if added_finished:
-            delta["finished_add"] = added_finished
-        if removed_finished:
-            delta["finished_remove"] = removed_finished
-        if before["activation_instructions"] != after["activation_instructions"]:
-            delta["activation_instructions"] = after["activation_instructions"]
-        if before["next_cid"] != after["next_cid"]:
-            delta["next_cid"] = after["next_cid"]
-        if not delta:
-            return None
-        return {"kind": "scheduler", **delta}
-
     def refresh_journal_batch(self) -> None:
         """重放/恢复完成后，把"上次提交的批次"对齐到当前对话状态。"""
         self._journal_batch = {
@@ -2499,7 +2468,7 @@ class Core:
         scheduler_before = self._scheduler_committed
         if scheduler_before is None:
             scheduler_before = self._scheduler_state()
-        delta = self._scheduler_delta(scheduler_before, self._scheduler_state())
+        delta = scheduler_delta(scheduler_before, self._scheduler_state())
         if delta is not None:
             changes.append(delta)
         self._scheduler_committed = self._scheduler_state()
