@@ -684,6 +684,39 @@ class UserMessageBatch:
 
 
 
+def tool_exchange(conv: 'Conversation'):
+    """最近一次"带工具调用"的 assistant 消息，与它已经拿到的响应。
+
+    返回 (wanted, got)：
+
+    - wanted：那条消息声明的 call id，按声明顺序，只留非空字符串（没有 id 的工具
+      调用两边都配不上，不参与配对）；
+    - got：已经能对上这些声明的响应 id，**按出现顺序、重复保留**——历史里排在它
+      之后的每条 tool 消息算一个，待发批次里的响应也算（工具响应先进批次，下一轮
+      推理才写进历史）。同一个 id 收到两次响应属于要判错的情形，去重会把它藏起来，
+      所以这里返回列表而不是集合；只做包含判断的调用方自己转 set。
+
+    从后往前找第一条带 tool_calls 的 assistant 消息：tool 响应总是紧跟它的那条，
+    再往后没有别的声明，所以找到第一条就够了。
+    """
+    messages = conv.messages
+    last = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].role == "assistant" and getattr(messages[i], "tool_calls", None):
+            last = i
+            break
+    if last is None:
+        return [], []
+    wanted = []
+    for tc in messages[last].tool_calls or []:
+        call_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+        if isinstance(call_id, str) and call_id:
+            wanted.append(call_id)
+    got = [m.tool_call_id for m in messages[last + 1:] if m.role == "tool"]
+    got += [r.tool_call_id for r in conv.user_batch.tool_responses]
+    return wanted, got
+
+
 __all__ = [
     'MetaList',
     'MetaDict',
@@ -700,6 +733,7 @@ __all__ = [
     'message_from_dict',
     'batch_to_dict',
     'batch_from_dict',
+    'tool_exchange',
     'Conversation',
     'UserMessageBatch',
 ]

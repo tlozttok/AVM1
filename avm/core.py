@@ -20,7 +20,7 @@ from .capabilities import (
 from .exceptions import IllegalOperationError, VMSyntaxError, VMMemoryError, APIError, RunnerStop, KernelPanic
 from .api_errors import CONTEXT_LIMIT, INSUFFICIENT_BALANCE, CATEGORIES, classify_api_error
 from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, message_to_api_dict, LinkNode
-from .types import message_to_dict, batch_to_dict
+from .types import message_to_dict, batch_to_dict, tool_exchange
 from .memory import Memory, check_new_key
 from .model_catalog import MODEL_CATALOG_KEY, ModelCatalog
 from .memory_device import MemoryDevice
@@ -3129,22 +3129,11 @@ class Core:
 
         目前只有 `create_sub` 会留下待答调用：父对话在等亚对话返回。
         """
-        messages = conv.messages
-        last = None
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].role == "assistant" and getattr(messages[i], "tool_calls", None):
-                last = i
-                break
-        if last is None:
+        wanted, got = tool_exchange(conv)
+        if not wanted:
             return []
-        wanted = []
-        for tc in messages[last].tool_calls or []:
-            call_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
-            if isinstance(call_id, str) and call_id:
-                wanted.append(call_id)
-        got = {m.tool_call_id for m in messages[last + 1:] if m.role == "tool"}
-        got |= {r.tool_call_id for r in conv.user_batch.tool_responses}
-        return [call_id for call_id in wanted if call_id not in got]
+        answered = set(got)
+        return [call_id for call_id in wanted if call_id not in answered]
 
     def is_waiting_for_return(self, conv: Conversation) -> bool:
         """对话是否在等工具返回（亚对话）。等返回的对话不能被外部消息唤醒运行。"""
@@ -3155,25 +3144,12 @@ class Core:
         """调用 API 前，带 tool_calls 的 assistant 消息要与 tool 消息一一配对。
 
         待发批次（user_batch）也算数：工具响应先入批次，下一轮推理才写进历史。
-        没有 id 的工具调用两边都配不上，不在这里判定。
+        没有 id 的工具调用两边都配不上，不在这里判定。排序后再比：同一 id 收到两次
+        响应会让两边长度不等，照样判错。
         """
-        messages = conv.messages
-        last = None
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].role == "assistant" and getattr(messages[i], "tool_calls", None):
-                last = i
-                break
-        if last is None:
-            return
-        wanted = []
-        for tc in messages[last].tool_calls or []:
-            call_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
-            if isinstance(call_id, str) and call_id:
-                wanted.append(call_id)
+        wanted, got = tool_exchange(conv)
         if not wanted:
             return
-        got = [m.tool_call_id for m in messages[last + 1:] if m.role == "tool"]
-        got += [r.tool_call_id for r in conv.user_batch.tool_responses]
         if sorted(wanted) != sorted(got):
             raise KernelPanic(
                 f"对话 {conv.cid} 的历史配对被破坏：assistant 声明 {sorted(wanted)}，"
