@@ -234,13 +234,6 @@ def conversation_create_payload(core, conv) -> dict:
     return {"conversation": doc}
 
 
-def _space_roots(space) -> Optional[dict]:
-    """AddressSpace → 根表 dict（JSON 安全）；None 保持 None。"""
-    if space is None:
-        return None
-    return {name: list(segments) for name, segments in space.as_roots().items()}
-
-
 def _space_from_roots(roots: Optional[dict]):
     if roots is None:
         return None

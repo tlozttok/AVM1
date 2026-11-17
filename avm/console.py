@@ -1013,10 +1013,6 @@ class Console:
     def submit_action(self, tool: str, arguments: Optional[dict] = None) -> dict:
         return self.actions.submit_action(tool, arguments)
 
-    def _enqueue_actions(self, actions: List[dict],
-                         interrupt_payload: Optional[str] = "已暂停") -> bool:
-        return self.actions.enqueue(actions, interrupt_payload)
-
     def resume(self) -> dict:
         return self.actions.resume()
 
