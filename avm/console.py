@@ -538,6 +538,81 @@ class ConsoleView:
         return {"devices": out, "action_log": list(self._action_log[-50:])}
 
 
+class DeviceActions:
+    """设备调试动作：调用设备自己声明的动作，并记一条调用记录。
+
+    不入内核、不产生事件——这是宿主侧的调试通道，动作写什么、返回什么都由设备决定。
+    记录里保留异常（不往外抛）：面板要能看到"这一次失败了"而不是整个请求挂掉。
+    """
+
+    def __init__(self, core):
+        self.core = core
+        self.log: List[dict] = []   # 调用记录（面板只展示最近 50 条）
+
+    def invoke(self, mount: str, index: Optional[int] = None,
+               arguments: Optional[dict] = None,
+               name: Optional[str] = None) -> dict:
+        """优先按动作名查找（动态动作表的稳定性由名字保证）；没给名字时按 index。"""
+        device = self.core.mem.mounted_devices().get(mount)
+        if device is None:
+            raise KeyError(f"设备 {mount} 未挂载（可能被屏蔽了）")
+        actions = device.debug_actions() or []
+        if name is not None:
+            resolved_index, action = self._pick_by_name(mount, name, actions)
+        else:
+            resolved_index, action = self._pick_by_index(mount, index, actions)
+        if not isinstance(action, dict) or not callable(action.get("run")):
+            raise ValueError(f"设备 {mount} 的调试动作 {resolved_index} 没有可调用的 run")
+        return self._run(mount, resolved_index, action, arguments)
+
+    @staticmethod
+    def _pick_by_name(mount: str, name: str, actions: list) -> tuple:
+        """按名字找唯一一个可调用动作；没有、或有多个同名都报错。"""
+        if not isinstance(name, str) or not name:
+            raise ValueError("动作 name 必须是非空字符串")
+        matches = [
+            (i, action) for i, action in enumerate(actions)
+            if isinstance(action, dict) and action.get("name") == name
+            and callable(action.get("run"))
+        ]
+        if not matches:
+            raise KeyError(f"设备 {mount} 没有名为 {name!r} 的可调用调试动作")
+        if len(matches) > 1:
+            raise ValueError(
+                f"设备 {mount} 有多个名为 {name!r} 的调试动作；请用 index 指定")
+        return matches[0]
+
+    @staticmethod
+    def _pick_by_index(mount: str, index, actions: list) -> tuple:
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise ValueError("调用设备动作需要 name 或整数 index")
+        if index < 0 or index >= len(actions):
+            raise KeyError(f"设备 {mount} 没有编号 {index} 的调试动作")
+        return index, actions[index]
+
+    def _run(self, mount: str, resolved_index: int, action: dict,
+             arguments: Optional[dict]) -> dict:
+        """执行一次并记账。动作自己抛的异常记进记录，不往外传。"""
+        args = arguments if isinstance(arguments, dict) else {}
+        started = time.time()
+        try:
+            result = action["run"](args)
+            error = None
+        except Exception as e:
+            result, error = None, f"{type(e).__name__}: {e}"
+        record = {
+            "mount": mount,
+            "index": resolved_index,
+            "name": action.get("name"),
+            "arguments": args,
+            "result": _jsonable(result) if error is None else None,
+            "error": error,
+            "time": started,
+        }
+        self.log.append(record)
+        return record
+
+
 class Console:
     """调试控制台：面板对话 + 观测 + 介入 + 屏蔽账本。"""
 
@@ -588,9 +663,9 @@ class Console:
         self.running = False                       # Core.run 是否在跑，由 runner 设置
         self.masks = MaskLedger(core)              # 屏蔽账本（摘下来的节点/设备）
         self.snapshots = MemorySnapshots(core)     # 内存快照（diff 用）
-        self._action_log: List[dict] = []          # 设备调试动作的调用记录
-        # 只读投影（对话/内存/监听器/设备的展示形状），与 _action_log 共用同一个列表
-        self.view = ConsoleView(core, self.panel, self._action_log)
+        self.device_actions = DeviceActions(core)   # 设备调试动作 + 调用记录
+        # 只读投影（对话/内存/监听器/设备的展示形状），与动作记录共用同一个列表
+        self.view = ConsoleView(core, self.panel, self.device_actions.log)
         core.events.add_observer(self._on_event)
 
     # -- 操作面板 IO 设备挂载 ------------------------------------------
@@ -807,55 +882,9 @@ class Console:
     def invoke_device_action(self, mount: str, index: Optional[int] = None,
                              arguments: Optional[dict] = None,
                              name: Optional[str] = None) -> dict:
-        """调用设备自己声明的调试动作。不入核心、不产生事件。
-
-        优先按动作名 `name` 查找（动态动作表的稳定性由名字保证）；没给名字时沿用
-        index。名字在该设备的动作清单里必须唯一。
-        """
-        device = self.core.mem.mounted_devices().get(mount)
-        if device is None:
-            raise KeyError(f"设备 {mount} 未挂载（可能被屏蔽了）")
-        actions = device.debug_actions() or []
-        if name is not None:
-            if not isinstance(name, str) or not name:
-                raise ValueError("动作 name 必须是非空字符串")
-            matches = [
-                (i, action) for i, action in enumerate(actions)
-                if isinstance(action, dict) and action.get("name") == name
-                and callable(action.get("run"))
-            ]
-            if not matches:
-                raise KeyError(f"设备 {mount} 没有名为 {name!r} 的可调用调试动作")
-            if len(matches) > 1:
-                raise ValueError(
-                    f"设备 {mount} 有多个名为 {name!r} 的调试动作；请用 index 指定")
-            resolved_index, action = matches[0]
-        else:
-            if isinstance(index, bool) or not isinstance(index, int):
-                raise ValueError("调用设备动作需要 name 或整数 index")
-            if index < 0 or index >= len(actions):
-                raise KeyError(f"设备 {mount} 没有编号 {index} 的调试动作")
-            resolved_index, action = index, actions[index]
-        if not isinstance(action, dict) or not callable(action.get("run")):
-            raise ValueError(f"设备 {mount} 的调试动作 {resolved_index} 没有可调用的 run")
-        args = arguments if isinstance(arguments, dict) else {}
-        started = time.time()
-        try:
-            result = action["run"](args)
-            error = None
-        except Exception as e:
-            result, error = None, f"{type(e).__name__}: {e}"
-        record = {
-            "mount": mount,
-            "index": resolved_index,
-            "name": action.get("name"),
-            "arguments": args,
-            "result": _jsonable(result) if error is None else None,
-            "error": error,
-            "time": started,
-        }
-        self._action_log.append(record)
-        return record
+        """调用设备自己声明的调试动作（实现见 DeviceActions）。"""
+        return self.device_actions.invoke(mount, index=index,
+                                         arguments=arguments, name=name)
 
     # -- 操作面板：IO 与生命周期 ---------------------------------------
 
