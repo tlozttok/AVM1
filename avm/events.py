@@ -46,6 +46,15 @@ LIFECYCLE_TYPES = {
     "listen_event",
 }
 
+# 地址类事件：target 是内存路径，权限判定落在"这段地址归谁"上（设备问设备，内存交给 Guard）
+MEMORY_EVENT_TYPES = {
+    "memory_read",
+    "memory_write",
+    "memory_make",
+    "memory_delete",
+    "edit_metadata",
+}
+
 NORMAL_TIER = "normal"
 KERNEL_TIER = "kernel"
 LISTENER_TIERS = (NORMAL_TIER, KERNEL_TIER)
@@ -76,6 +85,20 @@ def _to_tuple_ref(value):
     if isinstance(value, (list, tuple)):
         return tuple(_to_tuple_ref(item) for item in value)
     return value
+
+
+def _cid_from_ref(target: str, type_error: str, number_error: str) -> int:
+    """从 `cid:<n>` 形态的 target 里取出数字。
+
+    两条错误消息由调用方给：不同事件类型对同一个错误有各自的措辞，
+    放进本函数就会变成一句谁都不像的话。
+    """
+    if not target.startswith("cid:"):
+        raise IllegalOperationError(type_error)
+    try:
+        return int(target[4:])
+    except ValueError:
+        raise IllegalOperationError(number_error)
 
 
 def listener_to_snapshot(listener: dict) -> dict:
@@ -624,94 +647,118 @@ class EventSystem:
         send/close：普通对话只能监听发往自己/关闭自己的事件；
         lifecycle：通配只有内核态可注册，其余按“自己相关”判定。
         """
-        if event_type in ("memory_read", "memory_write", "edit_metadata", "memory_make", "memory_delete"):
-            if kernel_mode:
-                return
-            split = self._core.mem.split_path(target, space=space)
-            if split[0] == "device":
-                _, mount_key, remainder = split
-                device = self._core.mem.devices[mount_key]
-                if not device.authorize_listener(event_type, remainder, owner_cid):
-                    raise ValueError(f"设备 {mount_key} 未授权对话 {owner_cid} 监听 {target}")
+        if event_type in MEMORY_EVENT_TYPES:
+            self._check_memory_target(event_type, target, owner_cid, space, kernel_mode)
             return
-
         if event_type == "send_instruction":
-            if not target.startswith("cid:"):
-                raise IllegalOperationError("send_instruction 事件的 target 必须是 cid:<cid>")
+            self._check_send_target(target, owner_cid, kernel_mode)
+            return
+        if event_type in LIFECYCLE_TYPES:
+            self._check_lifecycle_target(event_type, target, owner_cid, space, kernel_mode)
+            return
+        raise ValueError(f"不支持的事件注册类型：{event_type}")
+
+    def _check_memory_target(self, event_type: str, target: str, owner_cid: int,
+                             space, kernel_mode: bool) -> None:
+        """地址类事件：内核态直接放行；普通对话由设备裁决，内存节点交给软件层 Guard。"""
+        if kernel_mode:
+            return
+        self._check_device_target(event_type, target, owner_cid, space)
+
+    def _check_device_target(self, event_type: str, target: str, owner_cid: int, space) -> None:
+        """目标落在设备上就问设备的 authorize_listener；内存节点不做所有者判定。"""
+        split = self._core.mem.split_path(target, space=space)
+        if split[0] != "device":
+            return
+        _, mount_key, remainder = split
+        device = self._core.mem.devices[mount_key]
+        if not device.authorize_listener(event_type, remainder, owner_cid):
+            raise ValueError(f"设备 {mount_key} 未授权对话 {owner_cid} 监听 {target}")
+
+    @staticmethod
+    def _check_send_target(target: str, owner_cid: int, kernel_mode: bool) -> None:
+        """send_instruction：target 必须是 cid:<cid>，普通对话只能监听发往自己的。"""
+        cid = _cid_from_ref(
+            target,
+            "send_instruction 事件的 target 必须是 cid:<cid>",
+            f"send_instruction 事件的 target cid 必须是数字：{target}",
+        )
+        if kernel_mode or cid == owner_cid:
+            return
+        raise ValueError(f"对话只能监听发往自己的消息，不能监听 {target}")
+
+    def _check_lifecycle_target(self, event_type: str, target: str, owner_cid: int,
+                                space, kernel_mode: bool) -> None:
+        """生命周期事件：通配先判，其余按事件类型分流。"""
+        if target == "*":
+            if not kernel_mode:
+                raise ValueError("通配监听只有内核态对话可以注册")
+            return
+        if event_type == "close_conversation":
+            self._check_close_target(target, owner_cid, kernel_mode)
+            return
+        if event_type == "listen_event":
+            self._check_listen_target(target, owner_cid, space, kernel_mode)
+            return
+        self._check_program_target(event_type, target, space, kernel_mode)
+
+    @staticmethod
+    def _check_close_target(target: str, owner_cid: int, kernel_mode: bool) -> None:
+        """close_conversation：普通对话只能监听关闭自己的事件。"""
+        cid = _cid_from_ref(
+            target,
+            "close_conversation 事件的 target 必须是 cid:<cid>",
+            f"cid 必须是数字：{target}",
+        )
+        if kernel_mode or cid == owner_cid:
+            return
+        raise ValueError("普通对话只能监听关闭自己的事件")
+
+    def _check_listen_target(self, target: str, owner_cid: int, space, kernel_mode: bool) -> None:
+        """listen_event 的三种 target 形态：listener:<id>、cid:<id>、$<内存路径>。"""
+        if target.startswith("listener:"):
+            self._check_listener_target(target, owner_cid, kernel_mode)
+            return
+        if target.startswith("cid:"):
             try:
                 cid = int(target[4:])
             except ValueError:
-                raise IllegalOperationError(f"send_instruction 事件的 target cid 必须是数字：{target}")
-            if kernel_mode:
+                raise IllegalOperationError(f"cid 必须是数字：{target}")
+            if kernel_mode or cid == owner_cid:
                 return
-            if cid != owner_cid:
-                raise ValueError(f"对话只能监听发往自己的消息，不能监听 {target}")
+            raise ValueError("普通对话只能监听自己相关的事件")
+        if target.startswith("$"):
+            # action=listen 的 before target 是准备注册的目标（condition 的 canonical
+            # ref）：memory 目标不做所有者判定（交给 Guard），设备照旧询问设备。
+            self._check_device_target("listen_event", target, owner_cid, space)
             return
+        raise IllegalOperationError(
+            f"listen_event 事件的 target 不是可识别的形式：{target}"
+        )
 
-        if event_type in LIFECYCLE_TYPES:
-            if target == "*":
-                if not kernel_mode:
-                    raise ValueError("通配监听只有内核态对话可以注册")
-                return
-            if event_type == "close_conversation":
-                if not target.startswith("cid:"):
-                    raise IllegalOperationError("close_conversation 事件的 target 必须是 cid:<cid>")
-                try:
-                    cid = int(target[4:])
-                except ValueError:
-                    raise IllegalOperationError(f"cid 必须是数字：{target}")
-                if kernel_mode:
-                    return
-                if cid != owner_cid:
-                    raise ValueError("普通对话只能监听关闭自己的事件")
-                return
-            if event_type == "listen_event":
-                if target.startswith("listener:"):
-                    try:
-                        lid = int(target[9:])
-                    except ValueError:
-                        raise IllegalOperationError(f"listener 事件的 target 必须是 listener:<id>：{target}")
-                    record = next((x for x in self.listeners if x["listener_id"] == lid), None)
-                    if record is None:
-                        raise ValueError(f"监听器 {lid} 不存在")
-                    if kernel_mode:
-                        return
-                    if record.get("owner_cid") != owner_cid:
-                        raise ValueError("普通对话只能监听自己的监听器")
-                    return
-                if target.startswith("cid:"):
-                    try:
-                        cid = int(target[4:])
-                    except ValueError:
-                        raise IllegalOperationError(f"cid 必须是数字：{target}")
-                    if kernel_mode or cid == owner_cid:
-                        return
-                    raise ValueError("普通对话只能监听自己相关的事件")
-                if target.startswith("$"):
-                    # action=listen 的 before target 是准备注册的目标（condition 的 canonical
-                    # ref）：memory 目标不做所有者判定（交给 Guard），设备照旧询问设备。
-                    split = self._core.mem.split_path(target, space=space)
-                    if split[0] == "device":
-                        _, mount_key, remainder = split
-                        device = self._core.mem.devices[mount_key]
-                        if not device.authorize_listener(event_type, remainder, owner_cid):
-                            raise ValueError(f"设备 {mount_key} 未授权对话 {owner_cid} 监听 {target}")
-                        return
-                    return
-                raise IllegalOperationError(
-                    f"listen_event 事件的 target 不是可识别的形式：{target}"
-                )
-            # create_cmd / create_sub：target 是程序节点引用（内存节点；不做所有者判定）
-            if kernel_mode:
-                return
-            if not isinstance(target, str) or not target.startswith("$"):
-                raise IllegalOperationError(f"{event_type} 事件的 target 必须是程序节点引用")
-            split = self._core.mem.split_path(target, space=space)
-            if split[0] != "memory":
-                raise ValueError(f"不能监听设备上的程序节点：{target}")
+    def _check_listener_target(self, target: str, owner_cid: int, kernel_mode: bool) -> None:
+        """listener:<id>：监听器必须存在，普通对话只能监听自己的监听器。"""
+        try:
+            lid = int(target[9:])
+        except ValueError:
+            raise IllegalOperationError(f"listener 事件的 target 必须是 listener:<id>：{target}")
+        record = next((x for x in self.listeners if x["listener_id"] == lid), None)
+        if record is None:
+            raise ValueError(f"监听器 {lid} 不存在")
+        if kernel_mode:
             return
+        if record.get("owner_cid") != owner_cid:
+            raise ValueError("普通对话只能监听自己的监听器")
 
-        raise ValueError(f"不支持的事件注册类型：{event_type}")
+    def _check_program_target(self, event_type: str, target: str, space, kernel_mode: bool) -> None:
+        """create_cmd / create_sub：target 是程序节点引用（内存节点；不做所有者判定）。"""
+        if kernel_mode:
+            return
+        if not isinstance(target, str) or not target.startswith("$"):
+            raise IllegalOperationError(f"{event_type} 事件的 target 必须是程序节点引用")
+        split = self._core.mem.split_path(target, space=space)
+        if split[0] != "memory":
+            raise ValueError(f"不能监听设备上的程序节点：{target}")
 
     # ------------------------------------------------------------------
     # 目标规范化与载荷分层
