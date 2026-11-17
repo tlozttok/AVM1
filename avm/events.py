@@ -194,6 +194,106 @@ def _condition_leaf(node):
     except ValueError as e:
         raise IllegalOperationError(f"handler 节点的 condition 不是合法 JSON：{e}")
 
+def _merge_action(event: dict, out: dict, listener: Optional[dict]) -> None:
+    """action 只在 before 阶段生效；allow 是内核级特权（normal 级返回视为错误）。"""
+    if "action" not in out:
+        return
+    action = out["action"]
+    if event["phase"] != "before":
+        return  # after 阶段忽略 action
+    if action not in ("execute", "replace", "allow"):
+        raise EventHandlerError(
+            0,  # 调用方随后用真实 listener_id 包装
+            f"before 阶段 action 必须是 execute/replace/allow，得到 {action!r}",
+        )
+    if action == "allow" and (listener or {}).get("tier") != KERNEL_TIER:
+        raise EventHandlerError(0, "只有内核级监听器可以返回 allow")
+    event["action"] = action
+
+
+def _merge_replace_response(event: dict, out: dict) -> None:
+    """replace 的拒答文本：统一加 Interrupted 前缀，让调用者能分辨"被拦截"与"成功"。"""
+    if event.get("action") != "replace":
+        return
+    response = out.get("response", "")
+    if response is None:
+        response = ""
+    if not isinstance(response, str):
+        raise EventHandlerError(
+            0,
+            f"response 必须是字符串，得到 {type(response).__name__}",
+        )
+    # 处理器自定义文本也加前缀：调用者只看这一句，不能有一类漏掉标记。
+    event["response"] = f"Interrupted: {response or DEFAULT_REPLACE_RESPONSE}"
+
+
+def _merge_payload(event: dict, out: dict) -> None:
+    """载荷里只有该事件类型声明为可变的键能改；类型按事件类型校验。"""
+    mutable = MUTABLE_PAYLOAD_KEYS.get(event["event_type"], set())
+    payload_out = out.get("payload")
+    if not isinstance(payload_out, dict):
+        return
+    for key in mutable:
+        if key not in payload_out:
+            continue
+        # edit_metadata 的 value 只有原操作是 set 时才可变
+        if event["event_type"] == "edit_metadata" and event["payload"].get("type") != "set":
+            continue
+        val = payload_out[key]
+        if event["event_type"] in ("memory_write", "send_instruction") and not isinstance(val, str):
+            raise EventHandlerError(0, f"payload.{key} 必须是字符串，得到 {type(val).__name__}")
+        if event["event_type"] == "edit_metadata" and not isinstance(val, str):
+            raise EventHandlerError(0, f"payload.value 必须是字符串，得到 {type(val).__name__}")
+        event["payload"][key] = val
+
+
+def _reject_notify(event: dict, listener_id: Optional[int], error: str) -> None:
+    """notify 违规：before 阶段当处理器错误抛出；after 阶段记账、丢弃这一条、继续。"""
+    if event["phase"] == "before":
+        raise EventHandlerError(0, error)
+    event.setdefault("handler_errors", []).append({
+        "listener_id": listener_id,
+        "error": error,
+    })
+    print(f"[AVM] 事件监听器 {listener_id} 处理失败: {error}", file=sys.stderr)
+
+
+def _merge_notify(event: dict, out: dict, listener_id: Optional[int],
+                  listener: Optional[dict], owner_kernel: bool) -> None:
+    """notify 投递列表：形状校验 + 两条"不许投给谁"，通过后并进事件。"""
+    if "notify" not in out:
+        return
+    notifies = out["notify"]
+    if not isinstance(notifies, list):
+        raise EventHandlerError(0, "notify 必须是 list")
+    # 谁在发起这次投递：before 看事件来源，after 看载荷里的执行者
+    source_cid = None
+    if event["phase"] == "before":
+        source = event.get("source") or {}
+        if source.get("kind") == "core":
+            source_cid = source.get("initiator_cid")
+    else:
+        source_cid = (event.get("payload") or {}).get("actor_cid")
+    owner_cid = (listener or {}).get("owner_cid")
+    for item in notifies:
+        if not isinstance(item, dict) or not isinstance(item.get("cid"), int) or not isinstance(item.get("content"), str):
+            raise EventHandlerError(
+                0,
+                f"notify 每项必须是 {{\"cid\": int, \"content\": str}}，得到 {item!r}",
+            )
+        if source_cid is not None and item["cid"] == source_cid:
+            _reject_notify(event, listener_id, f"notify 不允许自我投递（cid={source_cid} 是当前对话）")
+            continue
+        if not owner_kernel and item["cid"] != owner_cid:
+            _reject_notify(
+                event, listener_id,
+                f"用户态监听器只能把 notify 投递给注册者自己"
+                f"（owner cid={owner_cid}，请求 cid={item['cid']}）",
+            )
+            continue
+        event["notify"].append({"cid": item["cid"], "content": item["content"]})
+
+
 class EventSystem:
     def __init__(self, core: 'Core'):
         self._core = core
@@ -1062,90 +1162,14 @@ class EventSystem:
         allow 只有 kernel 级监听器可以返回（normal 级返回按处理器错误 fail closed）。
         after 阶段遇到 notify 自我投递时丢弃该条并记入 handler_errors；
         before 阶段遇到 notify 自我投递视为处理器错误。
+
+        四类字段各一个 _merge_xxx：动作、拒答文本、载荷、通知。它们只在"哪个阶段
+        抛错、哪个阶段记账"上不同，混在一起会看不出这个差别。
         """
-        if "action" in out:
-            action = out["action"]
-            if event["phase"] == "before":
-                if action not in ("execute", "replace", "allow"):
-                    raise EventHandlerError(
-                        0,  # 调用方随后用真实 listener_id 包装
-                        f"before 阶段 action 必须是 execute/replace/allow，得到 {action!r}",
-                    )
-                if action == "allow" and (listener or {}).get("tier") != KERNEL_TIER:
-                    raise EventHandlerError(0, "只有内核级监听器可以返回 allow")
-                event["action"] = action
-            # after 阶段忽略 action
-
-        if event.get("action") == "replace":
-            response = out.get("response", "")
-            if response is None:
-                response = ""
-            if not isinstance(response, str):
-                raise EventHandlerError(
-                    0,
-                    f"response 必须是字符串，得到 {type(response).__name__}",
-                )
-            # 调用者要能分辨"被拦截"与"成功"：统一加前缀；处理器自定义文本也加。
-            event["response"] = f"Interrupted: {response or DEFAULT_REPLACE_RESPONSE}"
-
-        mutable = MUTABLE_PAYLOAD_KEYS.get(event["event_type"], set())
-        payload_out = out.get("payload")
-        if isinstance(payload_out, dict):
-            for key in mutable:
-                if key not in payload_out:
-                    continue
-                # edit_metadata 的 value 只有原操作是 set 时才可变
-                if event["event_type"] == "edit_metadata" and event["payload"].get("type") != "set":
-                    continue
-                val = payload_out[key]
-                if event["event_type"] in ("memory_write", "send_instruction") and not isinstance(val, str):
-                    raise EventHandlerError(0, f"payload.{key} 必须是字符串，得到 {type(val).__name__}")
-                if event["event_type"] == "edit_metadata" and not isinstance(val, str):
-                    raise EventHandlerError(0, f"payload.value 必须是字符串，得到 {type(val).__name__}")
-                event["payload"][key] = val
-
-        if "notify" in out:
-            notifies = out["notify"]
-            if not isinstance(notifies, list):
-                raise EventHandlerError(0, "notify 必须是 list")
-            source_cid = None
-            if event["phase"] == "before":
-                source = event.get("source") or {}
-                if source.get("kind") == "core":
-                    source_cid = source.get("initiator_cid")
-            else:
-                source_cid = (event.get("payload") or {}).get("actor_cid")
-            for item in notifies:
-                if not isinstance(item, dict) or not isinstance(item.get("cid"), int) or not isinstance(item.get("content"), str):
-                    raise EventHandlerError(
-                        0,
-                        f"notify 每项必须是 {{\"cid\": int, \"content\": str}}，得到 {item!r}",
-                    )
-                if source_cid is not None and item["cid"] == source_cid:
-                    error = f"notify 不允许自我投递（cid={source_cid} 是当前对话）"
-                    if event["phase"] == "before":
-                        raise EventHandlerError(0, error)
-                    event.setdefault("handler_errors", []).append({
-                        "listener_id": listener_id,
-                        "error": error,
-                    })
-                    print(f"[AVM] 事件监听器 {listener_id} 处理失败: {error}", file=sys.stderr)
-                    continue
-                owner_cid = (listener or {}).get("owner_cid")
-                if not owner_kernel and item["cid"] != owner_cid:
-                    error = (
-                        f"用户态监听器只能把 notify 投递给注册者自己"
-                        f"（owner cid={owner_cid}，请求 cid={item['cid']}）"
-                    )
-                    if event["phase"] == "before":
-                        raise EventHandlerError(0, error)
-                    event.setdefault("handler_errors", []).append({
-                        "listener_id": listener_id,
-                        "error": error,
-                    })
-                    print(f"[AVM] 事件监听器 {listener_id} 处理失败: {error}", file=sys.stderr)
-                    continue
-                event["notify"].append({"cid": item["cid"], "content": item["content"]})
+        _merge_action(event, out, listener)
+        _merge_replace_response(event, out)
+        _merge_payload(event, out)
+        _merge_notify(event, out, listener_id, listener, owner_kernel)
 
     # ------------------------------------------------------------------
     # 分发
