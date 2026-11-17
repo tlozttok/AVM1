@@ -79,11 +79,16 @@ class Journal:
         self._last_seq = 0
         self._rescan()
 
-    def _rescan(self) -> None:
-        """扫描已有文件确定 last_seq；坏行/半行之后的内容忽略。"""
-        last = 0
+    def _read_records(self):
+        """逐行解析已有记录；坏行/半行处停下，不再往后看。
+
+        这是日志文件的读取契约，`_rescan`（找 last_seq）与 `iter_records`（重放）
+        都要遵守：一条解析不了的行意味着"上一代留下的内容或崩溃时的半行"，它后面
+        的东西不属于本次恢复。两处各写一遍时，改一处的停止条件很容易漏掉另一处。
+
+        文件不存在时什么都不产出。
+        """
         if not os.path.isfile(self.path):
-            self._last_seq = 0
             return
         with open(self.path, "r", encoding="utf-8") as f:
             for line in f:
@@ -93,11 +98,17 @@ class Journal:
                 try:
                     record = json.loads(line)
                 except ValueError:
-                    break
-                seq = record.get("seq") if isinstance(record, dict) else None
-                if not isinstance(seq, int) or seq != last + 1:
-                    break
-                last = seq
+                    return
+                yield record
+
+    def _rescan(self) -> None:
+        """扫描已有文件确定 last_seq；坏行/半行之后的内容忽略。"""
+        last = 0
+        for record in self._read_records():
+            seq = record.get("seq") if isinstance(record, dict) else None
+            if not isinstance(seq, int) or seq != last + 1:
+                break
+            last = seq
         self._last_seq = last
 
     def append(self, record: dict) -> int:
@@ -122,23 +133,13 @@ class Journal:
 
         重放用这个接口：内存里只留一条记录，不把整段尾部读成列表。
         """
-        if not os.path.isfile(self.path):
-            return
-        with open(self.path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    break
-                seq = record.get("seq") if isinstance(record, dict) else None
-                if not isinstance(seq, int) or seq <= after_seq:
-                    if isinstance(seq, int) and seq <= after_seq:
-                        continue
-                    break
-                yield record
+        for record in self._read_records():
+            seq = record.get("seq") if isinstance(record, dict) else None
+            if not isinstance(seq, int):
+                break
+            if seq <= after_seq:
+                continue
+            yield record
 
     def generation(self) -> Optional[int]:
         """日志所属的代际 id（首条记录的 `generation` 字段）；空日志返回 None。"""
