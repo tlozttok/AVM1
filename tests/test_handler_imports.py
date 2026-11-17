@@ -9,7 +9,7 @@ import pytest
 
 from avm.core import Core
 from avm.events import EventHandlerError
-from avm.types import MetaDict, MetaList, StrNode
+from avm.types import MetaDict, StrNode
 
 
 def _core():

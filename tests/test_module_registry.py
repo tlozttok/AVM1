@@ -11,7 +11,7 @@ from avm.capabilities import default_kernel_caps
 from avm.core import Core, _build_conversation, _build_imports, _derive_child_caps
 from avm.exceptions import VMMemoryError
 from avm.modules import (
-    BASE_MODULES,
+    
     MODULE_CATALOG,
     grantable_module_names,
     register_module,

@@ -190,7 +190,7 @@ class TestChildCaps:
         parent = _user_conv(core)
         core.mem["user_text"] = "hi"
         _program(core, caps={"tools": ["memory_read"]})
-        text = _call_maybe(core, parent, "create_sub", {
+        _call_maybe(core, parent, "create_sub", {
             "system_ref": "$prog", "user_ref": "$utext", "para_ref": "$para",
         })
         # create_sub 成功没有成功响应（父进入休眠）；亚对话应存在且继承根

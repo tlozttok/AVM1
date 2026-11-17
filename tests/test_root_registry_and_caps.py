@@ -2,7 +2,6 @@
 
 import json
 
-import pytest
 
 from avm.capabilities import ALL_TOOL_NAMES
 from avm.core import Core, CreateInstruction, MemoryReadInstruction, MemoryWriteInstruction

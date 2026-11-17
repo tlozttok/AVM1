@@ -19,11 +19,11 @@ from avm.core import (
     _instruction_registry,
     _build_conversation,
 )
-from avm.events import EventHandlerError, EVENT_TYPES
+from avm.events import EVENT_TYPES
 from avm.exceptions import VMMemoryError, MemoryKeyNotFoundError
 from avm.memory import Memory
 from avm.memory_device import MemoryDevice
-from avm.types import MetaDict, MetaList, StrNode
+from avm.types import MetaDict, StrNode
 
 
 def _seed(mem, ref, value):
@@ -577,7 +577,7 @@ class _DummyDevice(MemoryDevice):
 class TestEmitDeviceEvent:
     def test_source_and_target_validation_and_replace(self):
         core = Core()
-        root = _new_root(core)
+        _new_root(core)
         core.mem.make("$MEM", "box", "dict")
         core.mem.mount("box.dev", _DummyDevice())
         core.mem["h"] = _python_node("def handle(event):\n    return {'action': 'replace', 'response': 'blocked'}")
@@ -609,7 +609,7 @@ class TestEmitDeviceEvent:
 class TestInfoAndMonitor:
     def test_listeners_device(self):
         core = Core()
-        root = _new_root(core)
+        _new_root(core)
         core.mem.make("$MEM", "box", "dict")
         _seed(core.mem, "$MEM.box.msg", "v")
         core.mem["h"] = _python_node("def handle(event):\n    return {}")
@@ -635,7 +635,7 @@ class TestInfoAndMonitor:
 
         core = Core()
         core.lmu = MockLMU()
-        root = _new_root(core)
+        _new_root(core)
         core.mem.make("$MEM", "box", "dict")
         _seed(core.mem, "$MEM.box.msg", "v")
         core._active_cid = core._ready_cids.pop(0)
@@ -779,7 +779,7 @@ class TestBeforeHandlerErrorEventResult:
 
         core = Core()
         core.lmu = MockLMU()
-        root = _new_root(core)
+        _new_root(core)
         core.mem.make("$MEM", "box", "dict")
         _seed(core.mem, "$MEM.box.msg", "v")
         core.mem["h"] = _python_node("def handle(event):\n    raise RuntimeError('boom')")
@@ -1324,7 +1324,7 @@ class TestEventContractFixes20261024:
 
     def test_listen_argument_errors_are_illegal(self):
         core = Core()
-        root = _new_root(core)
+        _new_root(core)
         core.mem.make("$MEM", "box", "dict")
         _seed(core.mem, "$MEM.box.x", "v")
     def test_listen_permission_errors_stay_error(self):

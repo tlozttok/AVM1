@@ -8,7 +8,6 @@ import json
 import pytest
 
 from avm.core import Core, CreateInstruction, MemoryReadInstruction, MemoryWriteInstruction
-from avm.exceptions import VMMemoryError
 from avm.memory_device import StringDevice
 from avm.types import MetaDict, MetaList, StrNode
 

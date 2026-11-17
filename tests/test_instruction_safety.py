@@ -611,7 +611,7 @@ class TestPanelConversationHidden:
         summary = core.unwrap("$MEM.monitor")
         assert "frames." not in summary, "设备自述不宣传单帧读取路径"
         detail = core.unwrap(f"$MEM.monitor.frames.{seq}")
-        assert f"[-1" not in detail and " -1," not in detail and "=-1" not in detail
+        assert "[-1" not in detail and " -1," not in detail and "=-1" not in detail
         with pytest.raises(VMMemoryError):
             core.unwrap(f"$MEM.monitor.{seq}")
 

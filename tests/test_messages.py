@@ -3,10 +3,10 @@
 import pytest
 from avm.types import (
     MetaList, MetaDict,
-    Message, SystemMessage, UserMessage, AssistantMessage, ToolMessage,
+    SystemMessage, UserMessage, AssistantMessage, ToolMessage,
     message_to_api_dict,
     Conversation, UserMessageBatch,
-    Role,
+    
 )
 
 

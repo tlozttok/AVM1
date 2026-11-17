@@ -13,9 +13,9 @@ import pytest
 
 from avm.boot import boot
 from avm.image import ImageError
-from avm.snapshot import SnapshotError, read_snapshot, snapshot, write_atomic
+from avm.snapshot import SnapshotError, read_snapshot, write_atomic
 from persist_helpers import (
-    ScriptedLMU, assert_same_state, load_core, out_path, run_core, run_turns,
+    assert_same_state, load_core, out_path, run_core, run_turns,
     write_image,
 )
 

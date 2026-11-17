@@ -83,8 +83,8 @@ def _make_checkpoint(tmp_path):
 
 
 def test_main_checkpoint_in_debug_config(tmp_path, capsys, monkeypatch):
-    path = _write(tmp_path, _no_init_image())
-    cp = _make_checkpoint(tmp_path)
+    _write(tmp_path, _no_init_image())
+    _make_checkpoint(tmp_path)
     cfg_path = tmp_path / "debug.json"
     cfg_path.write_text(json.dumps({"image": "image.json", "checkpoint_in": "cp.json", "frames": True}), encoding="utf-8")
     monkeypatch.setattr("avm.core.LMU.exec", lambda self, conv, para: ("ok", [], conv))

@@ -3,7 +3,6 @@ from avm.exceptions import MemoryKeyNotFoundError
 
 import json
 
-import pytest
 
 from avm.core import Core
 from avm.python_server import create_plm, PLM_REGISTRY

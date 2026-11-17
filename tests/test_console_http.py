@@ -505,7 +505,7 @@ class TestInterventionFlow:
         first = core.start("sys", "one")
         second = core.start("sys", "two")
         _seed(core.mem, "$MEM.from_panel", "")
-        third = core.start("sys", "three")
+        core.start("sys", "three")
         _seed(core.mem, "$MEM.auto", "")
         release = threading.Event()
 

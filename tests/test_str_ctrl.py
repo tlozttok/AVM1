@@ -8,7 +8,6 @@ import json
 
 import pytest
 
-from avm.capabilities import ALL_TOOL_NAMES, Capability
 from avm.core import Core
 from avm.image import ImageError, load_image
 from avm.memory import Memory

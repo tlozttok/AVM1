@@ -2,7 +2,7 @@
 
 import pytest
 from avm.memory import Memory, _wrap_value
-from avm.memory_device import StringDevice, MetaListDevice, MetaDictDevice, InputsListDevice, OutputsListDevice, MemoryDevice
+from avm.memory_device import StringDevice, InputsListDevice, OutputsListDevice, MemoryDevice
 from avm.types import MetaDict, MetaList, LinkNode
 from avm.exceptions import (VMMemoryError, IllegalOperationError, MemoryKeyNotFoundError,
                                   MemoryIndexOutOfRangeError, MemoryTypeError)

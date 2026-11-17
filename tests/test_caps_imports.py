@@ -14,10 +14,9 @@ from avm.capabilities import (
     caps_to_dict,
     default_kernel_caps,
 )
-from avm.core import Core, PLMExecutor, _build_conversation, _build_imports, _derive_child_caps
+from avm.core import Core, _build_conversation, _build_imports, _derive_child_caps
 from avm.exceptions import IllegalOperationError, VMMemoryError
 from avm.modules import BASE_MODULES, grantable_module_names
-from avm.python_server import create_plm
 from avm.types import (
     Conversation, MetaDict, MetaList, StrNode, SystemMessage, UserMessage,
 )

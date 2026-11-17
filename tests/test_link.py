@@ -5,7 +5,6 @@ import json
 import pytest
 
 from avm.core import Core, MemoryReadInstruction, EditMetadataInstruction, _build_conversation
-from avm.events import EVENT_TYPES
 from avm.exceptions import MemoryCircularReferenceError, VMMemoryError, MemoryKeyNotFoundError
 from avm.image import ImageError, load_image
 from avm.memory import Memory
@@ -76,7 +75,7 @@ class TestBasicTransparency:
 class TestMakeAndEdit:
     def test_memory_make_via_alias_creates_plain_nodes(self):
         core = Core()
-        root = _new_root(core)
+        _new_root(core)
         core.mem["deep"] = {}
         _mount(core, "alias", "$MEM.deep")
 
