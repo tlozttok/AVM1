@@ -711,6 +711,22 @@ class Memory:
         """
         parts = self._parse_ref(ref)
         kind, real, display = self._expand_ref_parts(parts, space)
+        self._check_delete_target(ref, kind, display)
+        segments = list(real)
+        resolved = self._resolve_delete_path(ref, segments, space)
+        container = self._walk_to_container(ref, resolved)
+        last = segments[-1]
+        node, real_address, idx = self._locate_delete_child(ref, container, last, resolved)
+        deleted_type = self._classify_deletable(ref, node, real_address)
+        if idx is None:
+            del container[last]
+        else:
+            del container[idx]  # 列表元素删除后，后续元素下标前移
+        return deleted_type, ref
+
+    @staticmethod
+    def _check_delete_target(ref: str, kind: str, display) -> None:
+        """删除目标的静态拒绝：设备空间、根名本身、负下标。"""
         if kind == "device":
             raise IllegalOperationError(
                 f"{ref} 落在设备上：不能在设备空间删除节点（设备内容由设备自己管理）"
@@ -723,7 +739,8 @@ class Memory:
         if any(seg == "-1" or (seg.startswith("-") and seg[1:].isdigit()) for seg in display[1:]):
             raise IllegalOperationError(f"负下标不支持：{ref}（-1 只表示追加位置）")
 
-        segments = list(real)
+    def _resolve_delete_path(self, ref: str, segments: list, space) -> list:
+        """定位父容器的路径段：中间段跟随链接，最终段不跟随。设备空间一律拒绝。"""
         split = self.split_path(ref, space=space)
         if split[0] == "device":
             if not split[2]:
@@ -731,65 +748,59 @@ class Memory:
                     f"{ref} 是设备挂载点，不能删除（挂载点请用 unmount/mount）"
                 )
             raise IllegalOperationError(f"{ref} 落在设备上：不能在设备空间删除节点（设备内容由设备自己管理）")
-
-        # 中间段跟随链接；最终段不跟随（删链接本身，不删目标）
         followed = self.follow_links(list(segments[:-1]))
         if followed[0] == "device":
             raise IllegalOperationError(f"{ref} 落在设备上：不能在设备空间删除节点（设备内容由设备自己管理）")
-        resolved = list(followed[1])
+        return list(followed[1])
 
+    def _walk_to_container(self, ref: str, resolved: list):
+        """沿 resolved 走到父容器（每段都过访问检查）。"""
         container = self._data
         for key in resolved:
             if isinstance(container, LinkNode):
                 raise VMMemoryError(f"{ref} 的中间段落在链接上，无法删除")
             self._check_access(container, key, [], shown=ref)
             container = container[self._index_key(container, key)]
+        return container
 
-        last = segments[-1]
+    def _locate_delete_child(self, ref: str, container, last, resolved: list) -> tuple:
+        """在父容器里定位子节点，返回 (节点, 真实地址, 列表下标或 None)。"""
         if isinstance(container, (dict, MetaDict)):
             if last not in container:
                 raise MemoryKeyNotFoundError(f"键 {last!r} 不存在：{ref}")
-            node = container[last]
-            real_address = ".".join(resolved + [last])
-        elif isinstance(container, (list, MetaList)):
+            return container[last], ".".join(resolved + [last]), None
+        if isinstance(container, (list, MetaList)):
             idx = self._index_of(container, last)
             if idx < 0:
                 raise IllegalOperationError("负下标不支持（-1 只表示追加位置）")
             if idx >= len(container):
                 raise MemoryIndexOutOfRangeError(f"索引越界：{idx}，列表长度：{len(container)}")
-            node = container[idx]
-            real_address = ".".join(resolved + [str(idx)])
-        elif isinstance(container, str):
+            return container[idx], ".".join(resolved + [str(idx)]), idx
+        if isinstance(container, str):
             raise MemoryTypeError(f"字符串没有子节点：{ref}")
-        else:
-            raise VMMemoryError(f"不支持在类型 {type(container).__name__} 下删除节点：{ref}")
+        raise VMMemoryError(f"不支持在类型 {type(container).__name__} 下删除节点：{ref}")
 
+    def _classify_deletable(self, ref: str, node, real_address: str) -> str:
+        """判定节点可删并返回类型名；设备链接与非空容器在这里拒绝。"""
         if isinstance(node, LinkNode):
             if real_address in self._devices or not node.target.startswith("$MEM"):
                 raise IllegalOperationError(f"{ref} 是设备挂载点或指向设备的链接，不能删除（挂载点请用 unmount/mount）")
-            deleted_type = "link"
-        elif isinstance(node, (dict, MetaDict)):
+            return "link"
+        if isinstance(node, (dict, MetaDict)):
             size = len(node.to_dict()) if isinstance(node, MetaDict) else len(node)
             if size > 0:
                 raise VMMemoryError(
                     f"非空容器不能删除：{ref}（整棵子树删除保留给内核态对话，尚未实现）"
                 )
-            deleted_type = "dict"
-        elif isinstance(node, (list, MetaList)):
+            return "dict"
+        if isinstance(node, (list, MetaList)):
             size = len(node.to_list()) if isinstance(node, MetaList) else len(node)
             if size > 0:
                 raise VMMemoryError(
                     f"非空容器不能删除：{ref}（整棵子树删除保留给内核态对话，尚未实现）"
                 )
-            deleted_type = "list"
-        else:
-            deleted_type = "str"
-
-        if isinstance(container, (dict, MetaDict)):
-            del container[last]
-        else:
-            del container[idx]  # 列表元素删除后，后续元素下标前移
-        return deleted_type, ref
+            return "list"
+        return "str"
 
     def set(self, ref: str, value: Any,
             space: Optional[AddressSpace] = None) -> Optional[str]:
