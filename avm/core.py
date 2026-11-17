@@ -18,7 +18,15 @@ from .capabilities import (
     targets_prefix_free,
 )
 from .exceptions import IllegalOperationError, VMSyntaxError, VMMemoryError, APIError, RunnerStop, KernelPanic
-from .api_errors import CONTEXT_LIMIT, INSUFFICIENT_BALANCE, CATEGORIES, classify_api_error
+from .api_errors import (
+    CONTEXT_LIMIT,
+    INSUFFICIENT_BALANCE,
+    category_and_detail,
+    classify_api_error,
+    remember_failure,
+    resolve_action,
+    retry_limit,
+)
 from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, message_to_api_dict, LinkNode
 from .types import message_to_dict, batch_to_dict, tool_exchange
 from .memory import Memory, check_new_key
@@ -2825,11 +2833,12 @@ class Core:
                 # 同一轮是干净的。宿主装了 api_error_policy 时走宿主策略（旧语义）；
                 # 没装时走内置策略：余额不足暂停、上下文超限跳过对话、其余重试。
                 attempt += 1
-                category, detail = self._classify_api_error(e)
-                self._remember_api_error(conv, detail)
+                category, detail = category_and_detail(e)
+                remember_failure(conv, detail)
                 self.monitor.record(self, error=e, last_call=self._last_call_for(executor))
                 if self.api_error_policy is not None:
-                    if self._resolve_api_error(e, conv, attempt, executor) == "exit":
+                    # 宿主装了覆盖策略：走向由它定，内核只负责把失败记帧（上面两行）。
+                    if resolve_action(self.api_error_policy, e, attempt, executor) == "exit":
                         raise RunnerStop(f"API 调用失败，运行者选择退出：{e}") from e
                     continue
                 if category == INSUFFICIENT_BALANCE:
@@ -2869,76 +2878,17 @@ class Core:
             last_call = {**last_call, "events": list(self._turn_events)}
         return last_call
 
-    def _resolve_api_error(self, error: APIError, conv: Conversation, attempt: int, executor) -> str:
-        """问运行者 API 失败怎么办，返回 retry / reload / exit。
-
-        没装回调、回调自己出错、返回未知动作，一律按退出处理：停下等一个不会来的
-        选择比退出更糟。策略的落点是宿主（终端提示见 avm/runner_prompt.py）。
-        """
-        policy = self.api_error_policy
-        if policy is None:
-            print(f"[AVM] API 调用失败且没有安装 api_error_policy，按退出处理：{error}", file=sys.stderr)
-            return "exit"
-        try:
-            action = policy(error, attempt)
-        except Exception as e:
-            print(
-                f"[AVM] api_error_policy 自身异常（{type(e).__name__}: {e}），按退出处理",
-                file=sys.stderr,
-            )
-            return "exit"
-        if action not in ("retry", "reload", "exit"):
-            print(f"[AVM] api_error_policy 返回未知动作 {action!r}，按退出处理", file=sys.stderr)
-            return "exit"
-        if action == "reload":
-            reset = getattr(executor, "reset_client", None)
-            if callable(reset):
-                reset()
-        return action
-
     # ------------------------------------------------------------------
     # 内置 API 失败策略
+    #
+    # 分类、处置、失败记录与重试上限都在 api_errors 里（见那边的"处置"一节）；
+    # 这里只剩"配置从哪儿读"：Core.api_error_max_retries 是宿主可改的字段，缺省
+    # 与合法性判断跟着字段走，所以留在本类。
     # ------------------------------------------------------------------
-
-    def _classify_api_error(self, error: APIError):
-        """取 (category, detail)：外部执行器已经分类的直接用，否则在这里补分类。
-
-        LMU 在抛错前把分类放进 APIError；其它执行器（镜像自定义 PLM、测试替身）
-        可能只抛一个普通 APIError，这里按同样的纯函数再判一次。
-        """
-        category = getattr(error, "category", None)
-        detail = getattr(error, "detail", None)
-        if category in CATEGORIES:
-            detail = dict(detail or {})
-            detail.setdefault("category", category)
-            detail.setdefault("message", str(error))
-            detail.setdefault("status_code", getattr(error, "status_code", None))
-            detail.setdefault("context_limit", None)
-            return category, detail
-        return classify_api_error(
-            error, status_code=getattr(error, "status_code", None)
-        )
-
-    def _remember_api_error(self, conv: Conversation, detail: dict) -> None:
-        """把分类信息挂到对话运行态（不写内存树）；成功一轮后由调用方清掉。
-
-        只保留设备契约里的五个字段：外部执行器给的 detail 可能带额外键，设备面
-        不因此漂移。
-        """
-        conv.last_api_error = {
-            "category": detail.get("category"),
-            "message": detail.get("message", ""),
-            "status_code": detail.get("status_code"),
-            "context_limit": detail.get("context_limit"),
-            "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        }
 
     def _api_error_retry_limit(self) -> int:
         """连续失败达到这个次数就暂停；运行期改 Core.api_error_max_retries 立即生效。"""
-        limit = getattr(self, "api_error_max_retries", 5)
-        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
-            return 5
-        return limit
+        return retry_limit(getattr(self, "api_error_max_retries", 5))
 
     def _pause_for_api_error(self, category: str, reason: str,
                              cid: Optional[int] = None) -> None:

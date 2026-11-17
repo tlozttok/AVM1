@@ -11,6 +11,8 @@
 """
 
 import re
+import sys
+import time
 
 
 INSUFFICIENT_BALANCE = "insufficient_balance"
@@ -124,3 +126,88 @@ def classify_api_error(exc, status_code=None):
         "context_limit": context_limit,
     }
     return category, detail
+
+
+# ---------------------------------------------------------------------------
+# 处置：宿主策略、失败记录、重试上限
+#
+# 分类（上面那个函数）只回答"这是哪种失败"，纯函数、同样的异常永远得到同样的
+# 类别。这里回答"接下来怎么办"——要看宿主装没装策略、这个对话已经连着失败几次、
+# 要不要重置执行器的连接。两者分开，是因为内核在同一个 except 分支里既要记帧
+# 又要决定走向，混在一起读不出哪句是判断、哪句是副作用。
+# ---------------------------------------------------------------------------
+
+
+def category_and_detail(error):
+    """取 ``(category, detail)``：外部执行器已经分类的直接用，否则在这里补分类。
+
+    执行器在抛错前就该把分类放进 APIError；镜像自定义的 PLM 与测试替身可能只抛
+    一个普通 APIError，这里按同一套规则再判一次——所以这个函数对"分类过一次"和
+    "完全没分类"的异常都成立，不要求调用方先做什么。
+    """
+    category = getattr(error, "category", None)
+    detail = getattr(error, "detail", None)
+    if category in CATEGORIES:
+        detail = dict(detail or {})
+        detail.setdefault("category", category)
+        detail.setdefault("message", str(error))
+        detail.setdefault("status_code", getattr(error, "status_code", None))
+        detail.setdefault("context_limit", None)
+        return category, detail
+    return classify_api_error(error, status_code=getattr(error, "status_code", None))
+
+
+def resolve_action(policy, error, attempt, executor) -> str:
+    """问宿主 API 失败怎么办，返回 retry / reload / exit。
+
+    没装策略、策略自己出错、返回未知动作，一律按退出处理：停下等一个不会来的
+    选择比退出更糟。终端三选项策略在 avm/runner_prompt.py。
+
+    ``policy`` 为 None 也走退出（调用方已先判空，这里兜底让函数自洽，免得别的
+    调用点忘了判空就静默继续）。
+    """
+    if policy is None:
+        print(f"[AVM] API 调用失败且没有安装 api_error_policy，按退出处理：{error}",
+              file=sys.stderr)
+        return "exit"
+    try:
+        action = policy(error, attempt)
+    except Exception as e:
+        print(
+            f"[AVM] api_error_policy 自身异常（{type(e).__name__}: {e}），按退出处理",
+            file=sys.stderr,
+        )
+        return "exit"
+    if action not in ("retry", "reload", "exit"):
+        print(f"[AVM] api_error_policy 返回未知动作 {action!r}，按退出处理", file=sys.stderr)
+        return "exit"
+    if action == "reload":
+        reset = getattr(executor, "reset_client", None)
+        if callable(reset):
+            reset()
+    return action
+
+
+def remember_failure(conv, detail: dict) -> None:
+    """把分类信息挂到对话运行态（不写内存树）；成功一轮后由调用方清掉。
+
+    只保留设备契约里的五个字段：外部执行器给的 detail 可能带额外键，设备面不
+    因此漂移。时间戳让面板能看出"这次失败发生在什么时候"。
+    """
+    conv.last_api_error = {
+        "category": detail.get("category"),
+        "message": detail.get("message", ""),
+        "status_code": detail.get("status_code"),
+        "context_limit": detail.get("context_limit"),
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+
+
+def retry_limit(configured) -> int:
+    """连续失败到几次暂停：非负整数照用，其余（含没配）一律 5。
+
+    bool 是 int 的子类，``True`` 会悄悄变成"只重试 1 次"，所以单独排掉。
+    """
+    if not isinstance(configured, int) or isinstance(configured, bool) or configured < 0:
+        return 5
+    return configured
