@@ -321,6 +321,95 @@ class ClientLease:
             return True
 
 
+class MaskLedger:
+    """屏蔽账本：把内存节点/设备从内核里摘下来寄存，随时能原样装回去。
+
+    与内核的交互只有四件事：mem.detach / attach / unmount / mount。账本只负责
+    记着"摘了什么"——所以摘/装失败时账本一律不动，否则会出现"记录说还屏蔽着、
+    实际已经装回去了"的假象。
+    """
+
+    def __init__(self, core):
+        self.core = core
+        self._memory: Dict[str, Any] = {}   # ref → 摘下来的节点
+        self._devices: Dict[str, Any] = {}  # 挂载键 → 设备实例
+
+    def masked(self) -> dict:
+        """当前被屏蔽的地址与设备（state 里给面板看）。"""
+        return {"memory": sorted(self._memory), "devices": sorted(self._devices)}
+
+    def mask_memory(self, ref: str) -> dict:
+        if ref in self._memory:
+            raise ValueError(f"{ref} 已经被屏蔽")
+        node = self.core.mem.detach(ref)  # 失败时抛 VMMemoryError，不改账本
+        self._memory[ref] = node
+        return {"masked": ref, "kind": type(node).__name__}
+
+    def unmask_memory(self, ref: str) -> dict:
+        if ref not in self._memory:
+            raise KeyError(f"{ref} 没有被屏蔽")
+        self.core.mem.attach(ref, self._memory[ref])  # 冲突时抛 VMMemoryError，账本保持不变
+        del self._memory[ref]
+        return {"unmasked": ref}
+
+    def mask_device(self, mount: str) -> dict:
+        if mount in self._devices:
+            raise ValueError(f"设备 {mount} 已经被屏蔽")
+        devices = self.core.mem.mounted_devices()
+        if mount not in devices:
+            raise KeyError(f"路径 {mount} 没有挂载设备")
+        device = devices[mount]
+        self.core.mem.unmount(mount)
+        self._devices[mount] = device
+        return {"masked": mount, "type": type(device).__name__}
+
+    def unmask_device(self, mount: str) -> dict:
+        if mount not in self._devices:
+            raise KeyError(f"设备 {mount} 没有被屏蔽")
+        self.core.mem.mount(mount, self._devices[mount])
+        del self._devices[mount]
+        return {"unmasked": mount}
+
+
+class MemorySnapshots:
+    """内存快照：把当前 $MEM 摊平成 {地址: 值} 存一份，用来做前后比对。
+
+    只读内核、不改任何东西。构造时先取一份——相当于"刚装载完的初始态"，
+    所以第一个编号 0 总是可用的。
+    """
+
+    def __init__(self, core):
+        self.core = core
+        self._frames: List[Dict[str, Any]] = [self._current()]
+
+    def _current(self) -> Dict[str, Any]:
+        return _walk(self.core.unwrap("$MEM", for_llm=False))
+
+    def count(self) -> int:
+        return len(self._frames)
+
+    def take(self) -> int:
+        """存一份当前状态，返回它的编号。"""
+        self._frames.append(self._current())
+        return len(self._frames) - 1
+
+    def diff(self, frm: int, to: Optional[int] = None) -> dict:
+        """两个快照之间新增/删除/改动过的地址；to 缺省表示"现在"。"""
+        if frm < 0 or frm >= len(self._frames):
+            raise KeyError(f"快照 {frm} 不存在（现有 0..{len(self._frames) - 1}）")
+        before = self._frames[frm]
+        after = self._frames[to] if to is not None else self._current()
+        return {
+            "from": frm,
+            "to": to,
+            "added": sorted(set(after) - set(before)),
+            "removed": sorted(set(before) - set(after)),
+            "changed": sorted(
+                p for p in set(before) & set(after) if before[p] != after[p]
+            ),
+        }
+
+
 class Console:
     """调试控制台：面板对话 + 观测 + 介入 + 屏蔽账本。"""
 
@@ -369,10 +458,9 @@ class Console:
         self._state_lock = threading.Lock()
 
         self.running = False                       # Core.run 是否在跑，由 runner 设置
-        self._memory_mask: Dict[str, Any] = {}     # ref → 摘下来的节点
-        self._device_mask: Dict[str, Any] = {}     # 挂载键 → 设备实例
+        self.masks = MaskLedger(core)              # 屏蔽账本（摘下来的节点/设备）
+        self.snapshots = MemorySnapshots(core)     # 内存快照（diff 用）
         self._action_log: List[dict] = []          # 设备调试动作的调用记录
-        self._snapshots: List[Dict[str, Any]] = [_walk(core.unwrap("$MEM", for_llm=False))]
         core.events.add_observer(self._on_event)
 
     # -- 操作面板 IO 设备挂载 ------------------------------------------
@@ -472,11 +560,8 @@ class Console:
                 "pending": core.interrupts.pending_types(),
                 "last_dispatch": core.interrupts.last_dispatch,
             },
-            "mask": {
-                "memory": sorted(self._memory_mask),
-                "devices": sorted(self._device_mask),
-            },
-            "snapshots": len(self._snapshots),
+            "mask": self.masks.masked(),
+            "snapshots": self.snapshots.count(),
             # 操作面板首屏：生命周期、本次恢复摘要、IO 两条流的 seq 与丢弃计数
             "lifecycle": self.lifecycle,
             # API 暂停是内核状态（core.paused），生命周期是宿主视角，两者一起给面板。
@@ -602,26 +687,14 @@ class Console:
         return {"devices": out, "action_log": list(self._action_log[-50:])}
 
     # -- 快照与 diff ---------------------------------------------------
+    #
+    # 帧的存法与比对在 MemorySnapshots 里，这里只保留对外方法名。
 
     def snapshot(self) -> int:
-        self._snapshots.append(_walk(self.core.unwrap("$MEM", for_llm=False)))
-        return len(self._snapshots) - 1
+        return self.snapshots.take()
 
     def diff(self, frm: int, to: Optional[int] = None) -> dict:
-        if frm < 0 or frm >= len(self._snapshots):
-            raise KeyError(f"快照 {frm} 不存在（现有 0..{len(self._snapshots) - 1}）")
-        before = self._snapshots[frm]
-        after = self._snapshots[to] if to is not None else _walk(
-            self.core.unwrap("$MEM", for_llm=False))
-        return {
-            "from": frm,
-            "to": to,
-            "added": sorted(set(after) - set(before)),
-            "removed": sorted(set(before) - set(after)),
-            "changed": sorted(
-                p for p in set(before) & set(after) if before[p] != after[p]
-            ),
-        }
+        return self.snapshots.diff(frm, to)
 
     # -- 介入：中断与动作 ----------------------------------------------
 
@@ -841,42 +914,20 @@ class Console:
         return {"status": "force-stopped", "snapshot_written": False}
 
     # -- 屏蔽与还原 ----------------------------------------------------
+    #
+    # 账本逻辑在 MaskLedger 里，这里只保留对外方法名（HTTP 层与测试用这几个）。
 
     def mask_memory(self, ref: str) -> dict:
-        if ref in self._memory_mask:
-            raise ValueError(f"{ref} 已经被屏蔽")
-        node = self.core.mem.detach(ref)  # 失败时抛 VMMemoryError，不改账本
-        self._memory_mask[ref] = node
-        return {"masked": ref, "kind": type(node).__name__}
+        return self.masks.mask_memory(ref)
 
     def unmask_memory(self, ref: str) -> dict:
-        if ref not in self._memory_mask:
-            raise KeyError(f"{ref} 没有被屏蔽")
-        node = self._memory_mask[ref]
-        try:
-            self.core.mem.attach(ref, node)  # 冲突时抛 VMMemoryError，账本保持不变
-        except Exception:
-            raise
-        del self._memory_mask[ref]
-        return {"unmasked": ref}
+        return self.masks.unmask_memory(ref)
 
     def mask_device(self, mount: str) -> dict:
-        if mount in self._device_mask:
-            raise ValueError(f"设备 {mount} 已经被屏蔽")
-        devices = self.core.mem.mounted_devices()
-        if mount not in devices:
-            raise KeyError(f"路径 {mount} 没有挂载设备")
-        device = devices[mount]
-        self.core.mem.unmount(mount)
-        self._device_mask[mount] = device
-        return {"masked": mount, "type": type(device).__name__}
+        return self.masks.mask_device(mount)
 
     def unmask_device(self, mount: str) -> dict:
-        if mount not in self._device_mask:
-            raise KeyError(f"设备 {mount} 没有被屏蔽")
-        self.core.mem.mount(mount, self._device_mask[mount])
-        del self._device_mask[mount]
-        return {"unmasked": mount}
+        return self.masks.unmask_device(mount)
 
     # -- 监听器管线 ----------------------------------------------------
 
