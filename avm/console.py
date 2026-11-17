@@ -1306,7 +1306,6 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        query = self._query()
         console = self.console
         if self._guard(path):
             return

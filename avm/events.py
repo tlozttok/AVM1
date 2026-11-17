@@ -20,7 +20,7 @@ kernel 两级的载荷形状）在 event_targets.TargetProbe 里：判权和拼�
 # docs/private/Agents/implemented/design-unified-event-bus-2026-10-31.md §2.3、§8。
 import copy
 import sys
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 from .capabilities import AddressSpace
 from .event_conditions import EventConditions, condition_leaf
@@ -36,6 +36,9 @@ from .exceptions import IllegalOperationError, VMMemoryError
 from .modules import BASE_MODULES, catalog_exports, import_function, shared_view
 from .sandbox import check_code, safe_globals
 from .types import MetaDict
+
+if TYPE_CHECKING:  # 只为静态检查：core 反向依赖本模块，运行期导入会成环
+    from .core import Core
 
 # 生命周期事件：通配监听与创建/关闭/监听注册的权限规则与内存事件不同
 LIFECYCLE_TYPES = {

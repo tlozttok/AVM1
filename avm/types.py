@@ -1,6 +1,9 @@
 """AVM 类型系统：带元数据的集合类"""
-import json
-from typing import Dict, Optional
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional, Tuple, Union
+
+from openai.types.chat import ChatCompletionMessageToolCallUnion
 
 from .capabilities import Capability, caps_from_dict, caps_to_dict, default_kernel_caps
 
@@ -338,11 +341,9 @@ class LinkNode:
     def __repr__(self):
         return f"LinkNode(target={self.target!r}, metadata={self._metadata!r}, ctrl={self._ctrl!r})"
 
-"""AVM 消息类型定义"""
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Tuple, Union
-from enum import Enum
-from openai.types.chat import ChatCompletionMessageToolCallUnion
+# ---------------------------------------------------------------------------
+# 消息类型（原为独立模块，追加到本文件末尾；导入已并入顶部模块头）
+# ---------------------------------------------------------------------------
 
 type ToolCall=ChatCompletionMessageToolCallUnion
 
