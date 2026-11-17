@@ -871,91 +871,108 @@ class SendInstruction(Instruction):
 
     def execute(self, core: 'Core', conv: Conversation):
         targets = self.cid if isinstance(self.cid, list) else [self.cid]
-        if not targets:
-            msg = "send_instruction 失败：cid 列表为空"
-            _report_tool_error(conv, msg)
-            conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
+        if not self._check_legal(conv, targets):
             return
+        # 先解析目标，任一不存在或已关闭即整体失败
+        resolved = self._resolve_targets(core, conv, targets)
+        if resolved is None:
+            return
+        delivered_cids, blocked, failed = self._deliver_all(core, conv, resolved)
+        self._report(conv, resolved, delivered_cids, blocked, failed)
+
+    def _reject(self, conv: Conversation, msg: str, kind: str = "Error") -> None:
+        """整次投递不成立：记终端提示并回一条工具响应。kind=Illegal 表示越权/非法用法。"""
+        _report_tool_error(conv, msg)
+        conv.user_batch.add_tool_response(f"{kind}: {msg}", self.call_id)
+
+    def _check_legal(self, conv: Conversation, targets: list) -> bool:
+        """投递前置校验（空列表 / 亚对话发往主对话 / 自我投递）。False 表示已回复、不再继续。"""
+        if not targets:
+            self._reject(conv, "send_instruction 失败：cid 列表为空")
+            return False
         if conv.is_sub:
             ancestor = conv.parent
             while ancestor is not None:
                 if ancestor.cid in targets:
-                    msg = ("send_instruction 失败：亚对话不能向主对话发送消息，"
-                           "只能用 create_sub 的返回通道")
-                    _report_tool_error(conv, msg)
-                    conv.user_batch.add_tool_response(f"Illegal: {msg}", self.call_id)
-                    return
+                    self._reject(conv, "send_instruction 失败：亚对话不能向主对话发送消息，"
+                                       "只能用 create_sub 的返回通道", "Illegal")
+                    return False
                 ancestor = ancestor.parent
         for cid in targets:
             if cid == conv.cid:
-                msg = f"send_instruction 不允许自我投递（cid={cid} 是当前对话）"
-                _report_tool_error(conv, msg)
-                conv.user_batch.add_tool_response(f"Illegal: {msg}", self.call_id)
-                return
-        # 先解析目标，任一不存在或已关闭即整体失败
+                self._reject(conv, f"send_instruction 不允许自我投递（cid={cid} 是当前对话）",
+                             "Illegal")
+                return False
+        return True
+
+    def _resolve_targets(self, core: 'Core', conv: Conversation, targets: list) -> Optional[list]:
+        """把 cid 列表解析成对话对象。任一不存在或已关闭即整体失败（多播的原子性）。"""
         resolved = []
         for cid in targets:
-            target = core._conv_by_cid.get(cid)
+            target = core.get_conversation(cid)
             if target is None or core.is_hidden_cid(cid):
-                msg = f"send_instruction 失败：对话 {cid} 不存在"
-                _report_tool_error(conv, msg)
-                conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
-                return
-            if cid in core._finished:
-                msg = f"send_instruction 失败：对话 {cid} 已关闭"
-                _report_tool_error(conv, msg)
-                conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
-                return
+                self._reject(conv, f"send_instruction 失败：对话 {cid} 不存在")
+                return None
+            if core.is_finished(cid):
+                self._reject(conv, f"send_instruction 失败：对话 {cid} 已关闭")
+                return None
             resolved.append(target)
+        return resolved
 
-        delivered = 0
-        delivered_cids = []
-        blocked = []
-        failed = []
+    def _deliver_all(self, core: 'Core', conv: Conversation, resolved: list) -> tuple:
+        """逐个投递。单个目标被拦截/处理失败不阻断其他目标，结果分三堆收着。"""
+        delivered_cids, blocked, failed = [], [], []
         for target in resolved:
-            event = build_event(
-                core,
-                "send_instruction",
-                "before",
-                conv=conv,
-                target=f"cid:{target.cid}",
-                payload={"cid": target.cid, "content": self.content},
-                target_ref=("cid", target.cid),
-            )
-            event = core.events.dispatch(event)
-            core.events.deliver_notifies(event)
-            if event["action"] == "handler_error":
-                failed.append(event["response"])
-                _report_tool_error(conv, event["response"])
-                continue
-            if event["action"] == "replace":
-                blocked.append(event["response"])
-                continue
-            content = event["payload"]["content"]
-            # 简单投递：内容原样放入目标对话的输入批次，不包装 JSON 信封
-            target.user_batch.add_user_content(content)
-            core.note_effect("delivery", to_cid=target.cid, user_contents=[content])
-            delivered_cids.append(target.cid)
-            delivered += 1
-            # 事实事件按"消息已被接受"发布：等待返回的目标只入批次、也照样有 after。
-            # TODO(issue): send_instruction 事实事件的语义需进一步研究
-            _publish_core_after_safely(core,
-                "send_instruction",
-                conv,
-                f"cid:{target.cid}",
-                {"cid": target.cid, "content": content, "actor_cid": conv.cid},
-                source_kind="core",
-                target_ref=("cid", target.cid),
-            )
-            if core.is_waiting_for_return(target):
-                # 等亚对话返回的对话：消息只入批次，不唤醒；亚对话结束后父对话先跑。
-                continue
-            if target.cid in core._dormant_cids:
-                core._dormant_cids.remove(target.cid)
-            if target.cid in core._ready_cids:
-                core._ready_cids.remove(target.cid)
-            core._ready_cids.append(target.cid)  # 排队调度：被唤醒者进队列末尾
+            outcome, text = self._deliver_one(core, conv, target)
+            if outcome == "delivered":
+                delivered_cids.append(target.cid)
+            elif outcome == "blocked":
+                blocked.append(text)
+            else:
+                failed.append(text)
+        return delivered_cids, blocked, failed
 
+    def _deliver_one(self, core: 'Core', conv: Conversation, target: Conversation) -> tuple:
+        """向单个目标投递一条内容，返回 (delivered / blocked / failed, 说明文本)。"""
+        event = build_event(
+            core,
+            "send_instruction",
+            "before",
+            conv=conv,
+            target=f"cid:{target.cid}",
+            payload={"cid": target.cid, "content": self.content},
+            target_ref=("cid", target.cid),
+        )
+        event = core.events.dispatch(event)
+        core.events.deliver_notifies(event)
+        if event["action"] == "handler_error":
+            _report_tool_error(conv, event["response"])
+            return "failed", event["response"]
+        if event["action"] == "replace":
+            return "blocked", event["response"]
+        content = event["payload"]["content"]
+        # 简单投递：内容原样放入目标对话的输入批次，不包装 JSON 信封
+        target.user_batch.add_user_content(content)
+        core.note_effect("delivery", to_cid=target.cid, user_contents=[content])
+        # 事实事件按"消息已被接受"发布：等待返回的目标只入批次、也照样有 after。
+        # TODO(issue): send_instruction 事实事件的语义需进一步研究
+        _publish_core_after_safely(core,
+            "send_instruction",
+            conv,
+            f"cid:{target.cid}",
+            {"cid": target.cid, "content": content, "actor_cid": conv.cid},
+            source_kind="core",
+            target_ref=("cid", target.cid),
+        )
+        # 等亚对话返回的对话：消息只入批次，不唤醒；亚对话结束后父对话先跑。
+        if not core.is_waiting_for_return(target):
+            core.wake(target.cid)  # 排队调度：被唤醒者进队列末尾
+        return "delivered", None
+
+    def _report(self, conv: Conversation, resolved: list,
+                delivered_cids: list, blocked: list, failed: list) -> None:
+        """回报投递结果：部分成功要说明拦截/失败数量，全失败时把第一条原因原样带回去。"""
+        delivered = len(delivered_cids)
         if delivered > 0 and (blocked or failed):
             conv.user_batch.add_tool_response(
                 f"已投递到 cid={delivered_cids}（{len(blocked)} 个被拦截，{len(failed)} 个处理失败）",
