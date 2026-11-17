@@ -8,8 +8,11 @@ class FakeLLMExecutor:
     def __init__(self):
         self.last_call = None
         self.calls = []
-        self.api_param_names = lambda: ("model", "temperature")
+        self.api_param_names = lambda: ("temperature",)
         self.numeric_param_names = lambda: ("temperature",)
+
+    def interfaces(self):
+        return {"chat": self}
 
     def exec(self, conversation, para):
         self.calls.append((conversation.cid, para.get("model")))
@@ -32,6 +35,9 @@ class FakePLMExecutor:
 
     def warm_restore(self, messages, params=None):
         self.warm_calls.append((messages, params))
+
+    def interfaces(self):
+        return {"chat": self}
 
     def exec(self, conversation, para):
         return "", [], conversation
@@ -90,7 +96,7 @@ def test_core_lmu_property_delegates_to_services():
 
 def test_model_catalog_uses_injected_service_param_names():
     core = _core()
-    params = core.mem._data["model_catalog"]["llm"]["params"]
+    params = core.mem._data["model_catalog"]["llm"]["interfaces"]["chat"]["params"]
     assert "temperature" in params and params["temperature"] == "数值型"
     assert "top_p" not in params  # 假服务没有声明
 
@@ -129,3 +135,50 @@ def test_bind_console_conversation_uses_plm_service():
     conv = core.bind_console_conversation(channel=object())
     assert conv.cid == -1
     assert core.services.plm.created[-1].model == "plm.operator"
+
+
+# ----------------------------------------------------------------------
+# 多接口装配（I6）：环境变量 → Services；boot 注入
+# ----------------------------------------------------------------------
+
+def test_llm_service_from_env_assembles_only_configured_interfaces():
+    from avm.llm import LLMService
+
+    service = LLMService.from_env(env={"OPENAI_API_KEY": "k"}, load_env=False)
+    assert sorted(service.interfaces().keys()) == ["chat", "responses"]
+
+    service = LLMService.from_env(env={}, load_env=False)
+    assert sorted(service.interfaces().keys()) == ["chat"]
+
+    service = LLMService.from_env(
+        env={"OPENAI_API_KEY": "k", "ANTHROPIC_API_KEY": "a",
+             "GEMINI_API_KEY": "g"}, load_env=False)
+    assert sorted(service.interfaces().keys()) == ["anthropic", "chat", "gemini",
+                                                   "responses"]
+
+
+def test_services_from_env_reads_process_environment(monkeypatch):
+    from avm.services import services_from_env
+
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    services = services_from_env(load_env=False)
+    assert sorted(services.llm.interfaces().keys()) == ["chat", "responses"]
+
+
+def test_boot_accepts_injected_services(tmp_path):
+    import json as _json
+    from avm.boot import boot
+
+    image = {
+        "meta": {"version": 1},
+        "mem": {"model_params": {"kind": "dict", "ctrl": {"type": "para"},
+                                 "value": {"model": {"kind": "str", "value": "m"}}}},
+    }
+    path = tmp_path / "image.json"
+    path.write_text(_json.dumps(image), encoding="utf-8")
+    fake = FakeServices()
+    core = boot(str(path), refresh_models=False, services=fake)
+    assert core.services is fake
+    assert sorted(core.mem._data["model_catalog"]["llm"]["interfaces"].keys()) == ["chat"]

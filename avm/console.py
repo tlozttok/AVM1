@@ -1245,13 +1245,15 @@ def main(argv=None) -> int:
         return 1
 
     from .boot import boot, dump_on_death, write_snapshot
+    from .services import services_from_env
     from .exceptions import VMMemoryError
     from .image import ImageError
 
     try:
         core = boot(args.image, mode=args.mode,
                     checkpoint_in=args.checkpoint_in,
-                    host_flags={"console": True})
+                    host_flags={"console": True},
+                    services=services_from_env())
     except (ImageError, VMMemoryError, OSError, ValueError) as e:
         print(f"[console] 镜像错误: {e}", file=sys.stderr)
         return 1

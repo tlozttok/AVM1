@@ -81,7 +81,8 @@ python -m avm.image <image.json>
 ## para（模型调用参数）
 
 - mem 中必须存在一个 `ctrl.type="para"` 的 dict 节点（默认路径 `$MEM.model_params`），否则加载报错。
-- 其 `value` 是 LLM API 参数（`model`、`temperature`、`use_tool` 等），均以 str 存储；数值型参数（temperature、max_tokens、top_p 等）在每次调用 API 前由 LLM 服务模块转回数值，镜像加载本身不做转换。
+- 其 `value` 是 LLM API 参数（`model`、`api`、`temperature`、`use_tool` 等），均以 str 存储；数值型参数（temperature、max_tokens、top_p 等）在每次调用 API 前由 LLM 服务模块转回数值，镜像加载本身不做转换。
+- `api`（可选，LLM 对话）：接口声明，取 `chat`（缺省）/ `responses` / `anthropic` / `gemini`；`model` 按该接口在 `$MEM.model_catalog.llm.interfaces.<api>` 的清单校验。python 程序忽略该字段。
 - `para_ref` 顶层声明 para 路径，覆盖默认值。
 
 ## devices（设备插件）

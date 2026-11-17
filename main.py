@@ -26,6 +26,7 @@ from avm.boot import (
 from avm.exceptions import VMMemoryError, RunnerStop
 from avm.image import ImageError
 from avm.monitor import Monitor
+from avm.services import services_from_env
 
 
 def _load_config(path: str) -> dict:
@@ -139,7 +140,8 @@ def main(argv=None) -> int:
     mode = mode or "auto"
 
     try:
-        core = boot(image, mode=mode, checkpoint_in=checkpoint_in, restore=restore)
+        core = boot(image, mode=mode, checkpoint_in=checkpoint_in, restore=restore,
+                    services=services_from_env())
     except (ImageError, VMMemoryError, OSError, ValueError) as e:
         print(f"[AVM] 镜像错误: {e}", file=sys.stderr)
         return 1

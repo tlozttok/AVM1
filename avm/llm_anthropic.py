@@ -88,6 +88,30 @@ class AnthropicAdapter:
     def api_param_names(self) -> tuple:
         return tuple(sorted(_API_PARAM_KEYS))
 
+    def numeric_param_names(self) -> tuple:
+        return ("max_tokens",)
+
+    def parse_models(self, payload) -> list:
+        items = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise ValueError("Anthropic /models 信封不是 {data: [...]}")
+        entries = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            model_id = item.get("id")
+            if not isinstance(model_id, str) or not model_id:
+                continue
+            entry = {"id": model_id}
+            for source, target in (("display_name", "name"),
+                                   ("max_input_tokens", "context_window"),
+                                   ("max_tokens", "max_output_tokens")):
+                value = item.get(source)
+                if value is not None:
+                    entry[target] = str(value)
+            entries.append(entry)
+        return entries
+
     def fetch_models_raw(self, timeout: float = 10.0) -> dict:
         response = self.client.get("/v1/models", timeout=timeout)
         if response.status_code >= 400:

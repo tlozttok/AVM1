@@ -51,6 +51,10 @@ class LLMService:
     def client(self):
         return self.chat.client
 
+    def interfaces(self) -> dict:
+        """当前已装配的接口（api → 适配器）副本；目录与校验用它枚举。"""
+        return dict(self.adapters)
+
     def reset_client(self) -> None:
         if self.chat is not None:
             self.chat.reset_client()
@@ -137,6 +141,35 @@ class LLMService:
             "elapsed_ms": (time.time() - start) * 1000,
             "error": f"{type(error).__name__}: {error}",
         }
+
+
+    @classmethod
+    def from_env(cls, env=None, load_env: bool = True) -> "LLMService":
+        """按宿主环境变量装配适配器（只装配有凭据的接口）。
+
+        chat 永远装配（保持旧行为）；responses 复用 OPENAI_*，anthropic/gemini
+        各自需要 ANTHROPIC_API_KEY / GEMINI_API_KEY。配置读取在宿主层完成，
+        镜像与 $MEM 里不出现凭据。
+        """
+        import os
+        if load_env:
+            try:
+                from dotenv import load_dotenv
+                load_dotenv()
+            except Exception:
+                pass
+        env = os.environ if env is None else env
+        adapters = {"chat": LMU()}
+        if env.get("OPENAI_API_KEY"):
+            from .llm_responses import ResponsesAdapter
+            adapters["responses"] = ResponsesAdapter()
+        if env.get("ANTHROPIC_API_KEY"):
+            from .llm_anthropic import AnthropicAdapter
+            adapters["anthropic"] = AnthropicAdapter()
+        if env.get("GEMINI_API_KEY"):
+            from .llm_gemini import GeminiAdapter
+            adapters["gemini"] = GeminiAdapter()
+        return cls(adapters=adapters)
 
 
 def _raw_response_json(raw):  # pragma: no cover - 兼容旧导入路径

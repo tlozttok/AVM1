@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from .api_errors import classify_api_error
 from .exceptions import APIError
 from .instructions import build_tools
+from .llm_chat import parse_openai_models
 from .types import Conversation, MetaDict
 
 _API_PARAM_KEYS = {
@@ -81,6 +82,13 @@ class ResponsesAdapter:
         from .llm_chat import _raw_response_json
         raw = self.client.models.with_raw_response.list(timeout=timeout)
         return _raw_response_json(raw)
+
+    @staticmethod
+    def parse_models(payload) -> list:
+        return parse_openai_models(payload)
+
+    def numeric_param_names(self) -> tuple:
+        return ("max_output_tokens", "temperature", "top_p")
 
     # ------------------------------------------------------------------
     # 请求渲染

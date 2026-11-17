@@ -170,13 +170,13 @@ class LMU:
         return result, return_calls, conversation
 
     def fetch_models_raw(self, timeout: float = 10.0) -> dict:
-        """拉一次上游 `/models` 并返回原始 JSON 对象（信封校验留给 Core）。
-
-        任何异常直接抛给调用方；`Core.refresh_model_catalog` 负责收敛成
-        source="unavailable" 并打一行 stderr。
-        """
+        """拉一次上游 `/models` 并返回原始 JSON 对象（信封校验由 parse_models 做）。"""
         raw = self.client.models.with_raw_response.list(timeout=timeout)
         return _raw_response_json(raw)
+
+    @staticmethod
+    def parse_models(payload) -> list:
+        return parse_openai_models(payload)
 
     # ------------------------------------------------------------------
     # 流式路径（计划 I2）：产出统一事件；组装与提交由 LLMService 负责
@@ -341,3 +341,38 @@ def _raw_response_json(raw):
     if isinstance(content, (bytes, bytearray)):
         return json.loads(bytes(content).decode("utf-8"))
     raise TypeError(f"无法从 {type(raw).__name__} 取原始 JSON 响应体")
+
+
+def parse_openai_models(payload) -> list:
+    """OpenAI 风格 `/models` 信封 → 目录条目列表（除 id 外全部可选、忽略未知字段）。
+
+    Core 只负责把它写进 $MEM.model_catalog；信封校验与字段归一化在这里。
+    """
+    if (not isinstance(payload, dict) or payload.get("object") != "list"
+            or not isinstance(payload.get("data"), list)):
+        raise ValueError("上游 /models 的信封不是 OpenAI 形状（object=list 且 data 是数组）")
+    entries = []
+    for item in payload["data"]:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        entry = {"id": model_id}
+        for key in ("name", "owned_by", "context_window", "max_output_tokens",
+                    "input_modalities", "output_modalities"):
+            value = item.get(key)
+            if value is None:
+                continue
+            entry[key] = (", ".join(str(v) for v in value)
+                          if isinstance(value, list) else str(value))
+        effort = item.get("effort")
+        if isinstance(effort, dict):
+            levels = effort.get("supported_levels")
+            if isinstance(levels, list):
+                entry["reasoning_effort_levels"] = ", ".join(str(v) for v in levels)
+            default_level = effort.get("default_level")
+            if isinstance(default_level, str) and default_level:
+                entry["default_effort_level"] = default_level
+        entries.append(entry)
+    return entries

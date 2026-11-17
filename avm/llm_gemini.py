@@ -110,6 +110,27 @@ class GeminiAdapter:
     def numeric_param_names(self) -> tuple:
         return ("max_output_tokens", "temperature", "top_p")
 
+    def parse_models(self, payload) -> list:
+        items = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise ValueError("Gemini /models 信封不是 {models: [...]}")
+        entries = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            entry = {"id": name.split("/", 1)[-1]}
+            for source, target in (("displayName", "name"),
+                                   ("inputTokenLimit", "context_window"),
+                                   ("outputTokenLimit", "max_output_tokens")):
+                value = item.get(source)
+                if value is not None:
+                    entry[target] = str(value)
+            entries.append(entry)
+        return entries
+
     def fetch_models_raw(self, timeout: float = 10.0) -> dict:
         version = self._version or os.environ.get("GEMINI_API_VERSION") or _DEFAULT_VERSION
         response = self.client.get(f"/{version}/models",

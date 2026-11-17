@@ -210,18 +210,27 @@ def _check_model_namespace(core: 'Core', program_type: str, para: MetaDict, para
             f"{para_ref} 缺少 model：settingup 程序的 model 必须是 LLM 模型名"
         )
     llm = catalog.get("llm")
-    if not isinstance(llm, MetaDict) or llm.get("source") != "api":
+    interfaces = llm.get("interfaces") if isinstance(llm, MetaDict) else None
+    api = para.get("api") or (llm.get("default") if isinstance(llm, MetaDict) else None) or "chat"
+    available_apis = sorted(interfaces.keys()) if isinstance(interfaces, MetaDict) else []
+    if not isinstance(interfaces, MetaDict) or api not in interfaces:
+        raise IllegalOperationError(
+            f"{para_ref} 的 api {api!r} 未配置（可用：{available_apis}）"
+        )
+    interface = interfaces[api]
+    if not isinstance(interface, MetaDict) or interface.get("source") != "api":
         print(
-            f"[AVM] 模型目录未取到上游清单，跳过 LLM 模型名校验：{para_ref} 的 model {model!r}",
+            f"[AVM] 模型目录：{api} 接口未取到上游清单，跳过模型名校验："
+            f"{para_ref} 的 model {model!r}",
             file=sys.stderr,
         )
         return
     listed = sorted(
-        e.get("id") for e in (llm.get("models") or []) if isinstance(e, MetaDict)
+        e.get("id") for e in (interface.get("models") or []) if isinstance(e, MetaDict)
     )
     if model not in listed:
         raise IllegalOperationError(
-            f"{para_ref} 的 model {model!r} 不在上游模型清单里（可用：{listed}）"
+            f"{para_ref} 的 model {model!r} 不在 {api} 接口的模型清单里（可用：{listed}）"
         )
 
 
@@ -1696,7 +1705,7 @@ class Core:
         """安装/补齐模型目录的静态部分。幂等；镜像或检查点里已有的字段不覆盖。
 
         整树替换（load_image）之后必须重装一次，否则镜像会把启动节点冲掉。
-        静态部分不依赖网络：PLM 注册表、para 能用的 API 参数、必填字段。
+        静态部分不依赖网络：LLM 各接口的参数白名单、PLM 注册表、必填字段。
         """
         root = self.mem._data
         catalog = root.get(MODEL_CATALOG_KEY)
@@ -1705,21 +1714,31 @@ class Core:
             root[MODEL_CATALOG_KEY] = catalog
         llm = catalog.get("llm")
         if not isinstance(llm, MetaDict):
-            llm = MetaDict(data={}, metadata="可用的 LLM 模型；source 说明这份清单的来源")
+            llm = MetaDict(data={},
+                           metadata="可用的 LLM 模型；按接口分栏（interfaces），default 是缺省接口")
             catalog["llm"] = llm
-        llm.setdefault("source", "unavailable")
-        llm.setdefault("required", "model")
-        params = llm.get("params")
-        if not isinstance(params, MetaDict):
-            params = MetaDict(data={}, metadata="可以写进 para 的 API 参数（model 之外全部可选）")
-            llm["params"] = params
-        llm_service = self.services.llm
-        numeric_params = set(llm_service.numeric_param_names())
-        for name in llm_service.api_param_names():
-            if name not in params:
-                params[name] = "数值型" if name in numeric_params else "字符串/原样"
-        if not isinstance(llm.get("models"), MetaList):
-            llm["models"] = MetaList(data=[], metadata="上游模型清单；每项一个 id")
+        llm.setdefault("default", "chat")
+        interfaces = llm.get("interfaces")
+        if not isinstance(interfaces, MetaDict):
+            interfaces = MetaDict(data={}, metadata="按接口（chat/responses/anthropic/gemini）分栏")
+            llm["interfaces"] = interfaces
+        for api, adapter in self.services.llm.interfaces().items():
+            entry = interfaces.get(api)
+            if not isinstance(entry, MetaDict):
+                entry = MetaDict(data={}, metadata=f"{api} 接口：参数与上游模型清单")
+                interfaces[api] = entry
+            entry.setdefault("source", "unavailable")
+            entry.setdefault("required", "model")
+            params = entry.get("params")
+            if not isinstance(params, MetaDict):
+                params = MetaDict(data={}, metadata="可以写进 para 的 API 参数（model 之外全部可选）")
+                entry["params"] = params
+            numeric = set(getattr(adapter, "numeric_param_names", lambda: ())())
+            for name in adapter.api_param_names():
+                if name not in params:
+                    params[name] = "数值型" if name in numeric else "字符串/原样"
+            if not isinstance(entry.get("models"), MetaList):
+                entry["models"] = MetaList(data=[], metadata="上游模型清单；每项一个 id")
         if not isinstance(catalog.get("plm"), MetaList):
             catalog["plm"] = MetaList(
                 data=self.services.plm.catalog_entries(self.plms),
@@ -1728,87 +1747,74 @@ class Core:
 
 
     def refresh_model_catalog(self, timeout: float = 10.0) -> dict:
-        """拉一次上游 `/models` 写进目录。任何失败都收敛成 source="unavailable"，不抛。
+        """拉一次各接口的 `/models` 写进目录；单接口失败不抛、不影响其它接口。
 
-        防御按讨论案第五节：自己校验信封、除 id 外全部按可选字段读、忽略未知字段。
+        每个适配器负责信封校验与字段归一化（parse_models）；Core 只写内存并汇总。
         清单只当参考——取不到不拦启动，也不拦模型名（后者见 _check_model_namespace）。
         """
         self.install_model_catalog()
-        llm = self.mem._data[MODEL_CATALOG_KEY]["llm"]
-
-        def _unavailable(reason: str) -> dict:
-            llm["source"] = "unavailable"
-            llm["reason"] = reason
-            print(
-                f"[AVM] 模型目录：没能取到上游清单（{reason}），本轮不校验 LLM 模型名",
-                file=sys.stderr,
-            )
-            return {"source": "unavailable", "reason": reason}
-
-        try:
-            # 用原始响应自己解析：SDK 默认模式对非 OpenAI 信封抛的是 AttributeError/TypeError，
-            # 分不清"这家不是 OpenAI 形状"与"SDK 有 bug"；自己校验信封才有确定的诊断。
-            payload = self.lmu.fetch_models_raw(timeout)
-        except Exception as e:
-            return _unavailable(f"{type(e).__name__}: {e}")
-        if (
-            not isinstance(payload, dict)
-            or payload.get("object") != "list"
-            or not isinstance(payload.get("data"), list)
-        ):
-            return _unavailable("上游 /models 的信封不是 OpenAI 形状（object=list 且 data 是数组）")
-        entries = []
-        skipped = 0
-        for item in payload["data"]:
-            if not isinstance(item, dict):
-                skipped += 1
+        interfaces = self.mem._data[MODEL_CATALOG_KEY]["llm"]["interfaces"]
+        summary = {}
+        for api, adapter in self.services.llm.interfaces().items():
+            entry = interfaces.get(api)
+            if not isinstance(entry, MetaDict):
                 continue
-            model_id = item.get("id")
-            if not isinstance(model_id, str) or not model_id:
-                skipped += 1
+            try:
+                payload = adapter.fetch_models_raw(timeout)
+                entries = adapter.parse_models(payload)
+            except Exception as e:
+                reason = f"{type(e).__name__}: {e}"
+                entry["source"] = "unavailable"
+                entry["reason"] = reason
+                print(
+                    f"[AVM] 模型目录：{api} 接口没能取到上游清单（{reason}），"
+                    f"本轮不校验该接口的模型名",
+                    file=sys.stderr,
+                )
+                summary[api] = {"source": "unavailable", "reason": reason}
                 continue
-            entry = MetaDict(data={"id": model_id}, metadata="上游模型 id")
-            for key in ("name", "owned_by", "context_window", "max_output_tokens",
-                        "input_modalities", "output_modalities"):
-                value = item.get(key)
-                if value is None:
+            items = []
+            for item in entries:
+                if not isinstance(item, dict):
                     continue
-                # 内存约定：para 与目录里的值都以 str 存储
-                entry[key] = ", ".join(str(v) for v in value) if isinstance(value, list) else str(value)
-            effort = item.get("effort")
-            if isinstance(effort, dict):
-                levels = effort.get("supported_levels")
-                if isinstance(levels, list):
-                    entry["reasoning_effort_levels"] = ", ".join(str(v) for v in levels)
-                default_level = effort.get("default_level")
-                if isinstance(default_level, str) and default_level:
-                    entry["default_effort_level"] = default_level
-            entries.append(entry)
-        llm["models"] = MetaList(data=entries, metadata="上游模型清单；每项一个 id")
-        llm["source"] = "api"
-        if "reason" in llm:
-            del llm["reason"]
-        print(
-            f"[AVM] 模型目录：从上游取到 {len(entries)} 个模型"
-            + (f"（跳过 {skipped} 条形状不合法的条目）" if skipped else ""),
-            file=sys.stderr,
-        )
-        self._warn_unlisted_para_model(llm)
-        return {"source": "api", "count": len(entries), "skipped": skipped}
+                model_id = item.get("id")
+                if not isinstance(model_id, str) or not model_id:
+                    continue
+                meta = MetaDict(data={"id": model_id}, metadata="上游模型 id")
+                for key, value in item.items():
+                    if key == "id" or value is None:
+                        continue
+                    meta[key] = (", ".join(str(v) for v in value)
+                                 if isinstance(value, list) else str(value))
+                items.append(meta)
+            entry["models"] = MetaList(data=items, metadata="上游模型清单；每项一个 id")
+            entry["source"] = "api"
+            if "reason" in entry:
+                del entry["reason"]
+            print(f"[AVM] 模型目录：{api} 接口取到 {len(items)} 个模型", file=sys.stderr)
+            summary[api] = {"source": "api", "count": len(items)}
+        self._warn_unlisted_para_model(interfaces)
+        return {"interfaces": summary}
 
-    def _warn_unlisted_para_model(self, llm: MetaDict) -> None:
-        """默认 para 的 model 不在清单里时提醒运行者（例如用着已退役的别名）。"""
+    def _warn_unlisted_para_model(self, interfaces: MetaDict) -> None:
+        """默认 para 的 model 不在该接口清单里时提醒运行者（例如用着已退役的别名）。"""
         try:
             para = self.unwrap(self.para_ref, for_llm=False)
         except Exception:
             return
-        model = para.get("model") if isinstance(para, MetaDict) else None
+        if not isinstance(para, MetaDict):
+            return
+        model = para.get("model")
         if not isinstance(model, str) or not model:
             return
-        listed = {e.get("id") for e in (llm.get("models") or []) if isinstance(e, MetaDict)}
+        api = para.get("api") or "chat"
+        entry = interfaces.get(api)
+        if not isinstance(entry, MetaDict) or entry.get("source") != "api":
+            return
+        listed = {e.get("id") for e in (entry.get("models") or []) if isinstance(e, MetaDict)}
         if model not in listed:
             print(
-                f"[AVM] 模型目录：para {self.para_ref} 的 model {model!r} 不在上游清单里"
+                f"[AVM] 模型目录：para {self.para_ref} 的 model {model!r} 不在 {api} 接口的清单里"
                 f"（可能是拼写错误或已退役的别名）",
                 file=sys.stderr,
             )

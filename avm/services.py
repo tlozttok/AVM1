@@ -19,3 +19,8 @@ class Services:
 
 def default_services() -> Services:
     return Services()
+
+
+def services_from_env(load_env: bool = True) -> Services:
+    """宿主启动时用：按环境变量装配全部可用 LLM 接口（chat 总在）。"""
+    return Services(llm=LLMService.from_env(load_env=load_env))
