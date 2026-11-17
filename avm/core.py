@@ -239,6 +239,14 @@ def _validate_instruction_args(instr_cls, args) -> Optional[str]:
     """
     if not isinstance(args, dict):
         return f"参数必须是对象，得到 {type(args).__name__}"
+    error = _check_declared_shape(instr_cls, args)
+    if error is not None:
+        return error
+    return _check_tool_semantics(instr_cls.tool_name, args)
+
+
+def _check_declared_shape(instr_cls, args) -> Optional[str]:
+    """按 tool_def 的声明校验：必填参数齐全、给的参数值类型对得上。"""
     params = _parameters_of(instr_cls)
     properties = params.get("properties") or {}
     for name in params.get("required") or []:
@@ -250,37 +258,66 @@ def _validate_instruction_args(instr_cls, args) -> Optional[str]:
             continue
         if not _value_matches(value, spec):
             return f"参数 {name} 不合法：{value!r}"
-    tool = instr_cls.tool_name
-    if tool in ("memory_read", "memory_write", "memory_delete") and not args["ref"].startswith("$"):
-        return f"ref 必须是 $ 开头的内存引用，得到 {args['ref']!r}"
+    return None
+
+
+def _check_tool_semantics(tool: str, args) -> Optional[str]:
+    """声明管不到的语义约束：引用形态、以及各工具自己的必填组合。"""
+    if tool in ("memory_read", "memory_write", "memory_delete"):
+        return _check_ref_form(args["ref"])
     if tool == "memory_make":
-        try:
-            check_new_key(args["key"])
-        except VMMemoryError as e:
-            return str(e)
+        return _check_make_key(args["key"])
     if tool == "edit_metadata":
-        op = args.get("type")
-        if op not in ("set", "get", "del"):
-            return f"type 必须是 set/get/del，得到 {op!r}"
-        if op == "set":
-            if not args.get("key"):
-                return "type=set 时 key 必须是非空字符串"
-            if "value" not in args:
-                return "type=set 时 value 必需（可以是空字符串）"
-        if op == "del" and "key" not in args:
-            return "type=del 时 key 必需"
+        return _check_edit_metadata_args(args)
     if tool == "listen_event":
-        action = args.get("action")
-        if action == "listen":
-            if args.get("handler_ref") is None:
-                return "action=listen 时必须提供 handler_ref"
-        if action == "modify":
-            if args.get("listener_id") is None:
-                return "action=modify 时必须提供 listener_id"
-            if args.get("handler_ref") is None and args.get("priority") is None:
-                return "action=modify 时必须提供 handler_ref 或 priority"
-        if action == "cancel" and args.get("listener_id") is None:
-            return "action=cancel 时必须提供 listener_id"
+        return _check_listen_event_args(args)
+    return None
+
+
+def _check_ref_form(ref) -> Optional[str]:
+    """内存引用必须以 $ 开头（根名省略等于让内核猜，直接拒）。"""
+    if not ref.startswith("$"):
+        return f"ref 必须是 $ 开头的内存引用，得到 {ref!r}"
+    return None
+
+
+def _check_make_key(key) -> Optional[str]:
+    """新建键的语法（点号/空键）由 memory 侧统一裁决，这里只翻译成工具响应。"""
+    try:
+        check_new_key(key)
+    except VMMemoryError as e:
+        return str(e)
+    return None
+
+
+def _check_edit_metadata_args(args) -> Optional[str]:
+    """edit_metadata：type 决定 key/value 的必填组合。"""
+    op = args.get("type")
+    if op not in ("set", "get", "del"):
+        return f"type 必须是 set/get/del，得到 {op!r}"
+    if op == "set":
+        if not args.get("key"):
+            return "type=set 时 key 必须是非空字符串"
+        if "value" not in args:
+            return "type=set 时 value 必需（可以是空字符串）"
+    if op == "del" and "key" not in args:
+        return "type=del 时 key 必需"
+    return None
+
+
+def _check_listen_event_args(args) -> Optional[str]:
+    """listen_event：action 决定 handler_ref / listener_id 的必填组合。"""
+    action = args.get("action")
+    if action == "listen":
+        if args.get("handler_ref") is None:
+            return "action=listen 时必须提供 handler_ref"
+    if action == "modify":
+        if args.get("listener_id") is None:
+            return "action=modify 时必须提供 listener_id"
+        if args.get("handler_ref") is None and args.get("priority") is None:
+            return "action=modify 时必须提供 handler_ref 或 priority"
+    if action == "cancel" and args.get("listener_id") is None:
+        return "action=cancel 时必须提供 listener_id"
     return None
 
 
