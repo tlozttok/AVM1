@@ -235,6 +235,92 @@ class ConsoleConflict(RuntimeError):
     """宿主策略冲突（生命周期或客户端席位）：HTTP 层映射为 409。"""
 
 
+class ClientLease:
+    """单客户端准入：同一时刻只让一个面板客户端占住席位。
+
+    真实宿主开启（第二个标签页即使知道 token 也进不来），单测与 e2e mock 关闭。
+    判过期用单调时钟——租约是宿主策略，不该受系统墙钟校正影响。
+
+    自带一把锁，只保护租约本身；Console 另有一把锁管生命周期/暂停状态。
+    两把锁从不嵌套，所以不会互相等。
+    """
+
+    def __init__(self, single_client: bool = False, lease_seconds: float = 15.0):
+        self.single_client = bool(single_client)
+        self.lease_seconds = float(lease_seconds)
+        self._lock = threading.Lock()
+        self._lease: Optional[dict] = None  # {client_id, since, last_seen, last_seen_mono}
+
+    def _expired(self, lease: dict) -> bool:
+        return (time.monotonic() - lease["last_seen_mono"]) > self.lease_seconds
+
+    def status(self) -> dict:
+        with self._lock:
+            lease = self._lease
+            if lease is not None and self._expired(lease):
+                self._lease = None
+                lease = None
+            return {
+                "single_client": self.single_client,
+                "held": lease is not None,
+                "client_id": lease["client_id"] if lease else None,
+                "since": lease["since"] if lease else None,
+                "lease_seconds": self.lease_seconds,
+            }
+
+    def acquire(self, client_id: Optional[str]) -> dict:
+        """占住唯一席位；已声明身份的其它客户端在租约有效期内一律被挡。"""
+        if not isinstance(client_id, str) or not client_id:
+            raise ValueError("client_id 必须是非空字符串")
+        if not self.single_client:
+            return {"client_id": client_id, "single_client": False}
+        now = time.time()
+        with self._lock:
+            lease = self._lease
+            if (lease is not None and lease["client_id"] != client_id
+                    and not self._expired(lease)):
+                raise ConsoleConflict(
+                    f"已有客户端连接（{lease['client_id']}，"
+                    f"自 {time.strftime('%H:%M:%S', time.localtime(lease['since']))} 起）；"
+                    f"关闭它或等待租约 {self.lease_seconds:g} 秒过期"
+                )
+            since = lease["since"] if (lease and lease["client_id"] == client_id
+                                       and not self._expired(lease)) else now
+            self._lease = {"client_id": client_id, "since": since,
+                           "last_seen": now, "last_seen_mono": time.monotonic()}
+        return {"client_id": client_id, "single_client": True, "since": since}
+
+    def release(self, client_id: Optional[str]) -> dict:
+        with self._lock:
+            lease = self._lease
+            released = bool(lease and client_id and lease["client_id"] == client_id)
+            if released:
+                self._lease = None
+        return {"released": released}
+
+    def check(self, client_id: Optional[str]) -> bool:
+        """普通 API 请求：带身份的必须就是席位持有者；不带身份的按宿主本地调用放行。
+
+        面板前端所有请求都带 `X-AVM-Client`（SSE 靠 cookie），所以第二个浏览器
+        标签页即使知道 token 也会被挡在 `/api/` 之外。
+        """
+        if not self.single_client or client_id is None:
+            return True
+        now = time.time()
+        with self._lock:
+            lease = self._lease
+            if lease is None or self._expired(lease):
+                self._lease = {"client_id": client_id, "since": now,
+                               "last_seen": now,
+                               "last_seen_mono": time.monotonic()}
+                return True
+            if lease["client_id"] != client_id:
+                return False
+            lease["last_seen"] = now
+            lease["last_seen_mono"] = time.monotonic()
+            return True
+
+
 class Console:
     """调试控制台：面板对话 + 观测 + 介入 + 屏蔽账本。"""
 
@@ -276,11 +362,11 @@ class Console:
         self._api_resume_event = threading.Event()
         # 关机流程：请求关机后要等满 force_stop_delay 秒才允许强制退出。
         self.force_stop_delay = float(force_stop_delay)
-        # 单客户端准入是宿主策略：真实面板宿主开启，单测与 e2e mock 关闭。
-        self.single_client = bool(single_client)
-        self.client_lease_seconds = float(client_lease_seconds)
-        self._client_lock = threading.Lock()
-        self._client_lease: Optional[dict] = None  # {client_id, since, last_seen}
+        # 单客户端准入（宿主策略）单独一个对象管，见 ClientLease。
+        self.clients = ClientLease(single_client=single_client,
+                                   lease_seconds=client_lease_seconds)
+        # 这把锁保护生命周期、暂停位与屏蔽账本；与 ClientLease 内部的锁互不嵌套。
+        self._state_lock = threading.Lock()
 
         self.running = False                       # Core.run 是否在跑，由 runner 设置
         self._memory_mask: Dict[str, Any] = {}     # ref → 摘下来的节点
@@ -321,77 +407,30 @@ class Console:
             bucket.append(dev)
 
     # -- 单客户端准入 --------------------------------------------------
+    #
+    # 规则全在 ClientLease 里，这里只保留对外的方法名（HTTP 层与测试都用这几个）。
 
-    def _lease_expired(self, lease: dict) -> bool:
-        # 用单调时钟判定过期：租约是宿主策略，不受系统墙钟校正影响。
-        return (time.monotonic() - lease["last_seen_mono"]
-                > self.client_lease_seconds)
+    @property
+    def single_client(self) -> bool:
+        return self.clients.single_client
+
+    @property
+    def client_lease_seconds(self) -> float:
+        return self.clients.lease_seconds
 
     def client_status(self) -> dict:
-        with self._client_lock:
-            lease = self._client_lease
-            if lease is not None and self._lease_expired(lease):
-                self._client_lease = None
-                lease = None
-            return {
-                "single_client": self.single_client,
-                "held": lease is not None,
-                "client_id": lease["client_id"] if lease else None,
-                "since": lease["since"] if lease else None,
-                "lease_seconds": self.client_lease_seconds,
-            }
+        return self.clients.status()
 
     def acquire_client(self, client_id: Optional[str]) -> dict:
         """占住唯一席位；已声明身份的其它客户端在租约有效期内一律被挡。"""
-        if not isinstance(client_id, str) or not client_id:
-            raise ValueError("client_id 必须是非空字符串")
-        if not self.single_client:
-            return {"client_id": client_id, "single_client": False}
-        now = time.time()
-        with self._client_lock:
-            lease = self._client_lease
-            if (lease is not None and lease["client_id"] != client_id
-                    and not self._lease_expired(lease)):
-                raise ConsoleConflict(
-                    f"已有客户端连接（{lease['client_id']}，"
-                    f"自 {time.strftime('%H:%M:%S', time.localtime(lease['since']))} 起）；"
-                    f"关闭它或等待租约 {self.client_lease_seconds:g} 秒过期"
-                )
-            since = lease["since"] if (lease and lease["client_id"] == client_id
-                                       and not self._lease_expired(lease)) else now
-            self._client_lease = {"client_id": client_id, "since": since,
-                                  "last_seen": now, "last_seen_mono": time.monotonic()}
-        return {"client_id": client_id, "single_client": True, "since": since}
+        return self.clients.acquire(client_id)
 
     def release_client(self, client_id: Optional[str]) -> dict:
-        with self._client_lock:
-            lease = self._client_lease
-            released = bool(lease and client_id and lease["client_id"] == client_id)
-            if released:
-                self._client_lease = None
-        return {"released": released}
+        return self.clients.release(client_id)
 
     def check_client(self, client_id: Optional[str]) -> bool:
-        """普通 API 请求：带身份的必须就是席位持有者；不带身份的按宿主本地调用放行。
-
-        面板前端所有请求都带 `X-AVM-Client`（SSE 靠 cookie），所以第二个浏览器
-        标签页即使知道 token 也会被挡在 `/api/` 之外。
-        """
-        if not self.single_client or client_id is None:
-            return True
-        now = time.time()
-        with self._client_lock:
-            lease = self._client_lease
-            if lease is None or self._lease_expired(lease):
-                self._client_lease = {"client_id": client_id, "since": now,
-                                      "last_seen": now,
-                                      "last_seen_mono": time.monotonic()}
-                return True
-            if lease["client_id"] != client_id:
-                return False
-            lease["last_seen"] = now
-            lease["last_seen_mono"] = time.monotonic()
-            return True
+        """普通 API 请求：带身份的必须就是席位持有者；不带身份的按宿主本地调用放行。"""
+        return self.clients.check(client_id)
 
     # -- 事件观察 ------------------------------------------------------
 
@@ -453,7 +492,7 @@ class Console:
 
     def force_stop_remaining(self) -> float:
         """还要等几秒才允许强制退出；尚未请求关机时给满额，已停止时给 0。"""
-        with self._client_lock:
+        with self._state_lock:
             since = self.stopping_since
             lifecycle = self.lifecycle
         if lifecycle == "stopped":
@@ -646,7 +685,7 @@ class Console:
         成功更诚实。清除暂停后主线程重新进入 core.run()。
         """
         core = self.core
-        with self._client_lock:
+        with self._state_lock:
             if not getattr(core, "paused", False):
                 raise ConsoleConflict("系统没有处于 API 暂停")
             core.clear_api_pause()
@@ -750,7 +789,7 @@ class Console:
         中断在下一个安全点能够派发；否则主线程停在暂停等待里，中断永远到不了接收方。
         没有 shutdown 处理程序时回到正常运行（warning 不变），force-stop 仍按秒数放行。
         """
-        with self._client_lock:
+        with self._state_lock:
             if self.lifecycle not in ("running", "paused"):
                 raise ConsoleConflict(f"面板处于 {self.lifecycle} 状态，不再接收关机请求")
             was_paused = self.lifecycle == "paused"
@@ -794,7 +833,7 @@ class Console:
             raise ConsoleConflict(
                 f"关机还在收尾：{remaining:.0f} 秒后才可强制退出（不写快照）"
             )
-        with self._client_lock:
+        with self._state_lock:
             self.lifecycle = "stopped"
         hook = self.force_stop_hook
         if callable(hook):
