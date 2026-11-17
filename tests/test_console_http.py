@@ -455,8 +455,9 @@ class TestInterventionFlow:
             assert body["known_tool"] is True
             assert body["auto_paused"] is False
 
-            assert wait_for(lambda: "from_panel" in core.mem)
-            assert core.mem["from_panel"] == "v"
+            # 等"写入落地"而不是"键存在"：from_panel 上面被种成空串，键一开始就在，
+            # 用 `in` 判断等于不等——动作是异步执行的，会偶发断言到空串。
+            assert wait_for(lambda: core.mem.get("from_panel") == "v"), "面板动作应当被执行"
             assert core._active_cid == console.panel.cid
 
             code, body = request(base, "POST", "/api/action",
