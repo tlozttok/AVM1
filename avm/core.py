@@ -22,6 +22,7 @@ from .api_errors import CONTEXT_LIMIT, INSUFFICIENT_BALANCE, CATEGORIES, classif
 from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, message_to_api_dict, LinkNode
 from .types import message_to_dict, batch_to_dict
 from .memory import Memory, check_new_key
+from .model_catalog import MODEL_CATALOG_KEY, ModelCatalog
 from .memory_device import MemoryDevice
 from .monitor import Monitor
 from .modules import (
@@ -177,19 +178,8 @@ _INSTRUCTION_ERRORS = (VMMemoryError, KeyError, IndexError, TypeError, ValueErro
 # 保持 `from avm.core import PANEL_CID` 的既有用法。
 
 
-# 启动自带的内存节点：模型目录。普通内存节点，不是设备——不产生事件、不参与调度。
-# 名字里的点号是禁的（$MEM 寻址按点切段），所以 plm.* 与带点的模型 id 一律装进列表项的字段。
-MODEL_CATALOG_KEY = "model_catalog"
-_CATALOG_META = "模型目录：可用的 LLM 模型与本地 PLM；两侧都写明各自接受的参数"
-_PLM_PARAMS_NOTE = "只有 model 有效；tools 由内核注入；LLM 参数无效"
-_PLM_OPERATOR_NOTE = "只能由宿主创建（plm.operator 需要注入操作员通道）；不能由镜像声明"
-
-
-def _first_line(text: str, limit: int = 72) -> str:
-    """取文档串首行，超长截断——目录里的说明要能一眼看完。"""
-    line = (text or "").strip().split("\n", 1)[0].strip()
-    return line if len(line) <= limit else line[: limit - 1] + "…"
-
+# 启动自带的内存节点：模型目录（$MEM.model_catalog）。普通内存节点，不是设备——
+# 不产生事件、不参与调度。安装与刷新在 model_catalog.ModelCatalog，这里只留键名。
 
 # 协议层拒绝（JSON 解析失败、未知工具名、缺少可配对的 call_id）时回给对话的占位文本。
 # 内容不携带错误细节：错误面向运行者（_report_tool_error），这里只为保住
@@ -1759,32 +1749,6 @@ class LMU:
         return result, return_calls, conversation
 
 
-def _raw_response_json(raw):
-    """从 SDK 的"原始响应"对象里取回 JSON 对象，兼容 openai 各版本。
-
-    - openai 2.x 的 `LegacyAPIResponse`：没有 `.json()`，有 `.http_response`（httpx 响应）与 `.text`；
-    - openai 1.x：有 `.json()`；
-    - 未来主版本把 `.text`/`.content` 改成方法——两者都按可调用或属性处理。
-    """
-    http = getattr(raw, "http_response", None)
-    json_fn = getattr(http, "json", None) if http is not None else None
-    if callable(json_fn):
-        return json_fn()
-    json_fn = getattr(raw, "json", None)
-    if callable(json_fn):
-        return json_fn()
-    text = getattr(raw, "text", None)
-    if callable(text):
-        text = text()
-    if isinstance(text, str) and text:
-        return json.loads(text)
-    content = getattr(raw, "content", None)
-    if callable(content):
-        content = content()
-    if isinstance(content, (bytes, bytearray)):
-        return json.loads(bytes(content).decode("utf-8"))
-    raise TypeError(f"无法从 {type(raw).__name__} 取原始 JSON 响应体")
-
 
 class Core:
     def __init__(self):
@@ -1820,6 +1784,10 @@ class Core:
         # 与宿主内建的 PLM_REGISTRY 并列，内建优先（镜像不得同名覆盖，装载期拒绝）。
         # 放在这里是因为本函数末尾的 install_model_catalog 要枚举它。
         self.plms: Dict[str, type] = {}
+        # 模型目录（内存节点 $MEM.model_catalog）的安装与刷新。参数清单由 LMU 注入：
+        # 真正做过滤的是 LMU，目录只负责把同一份清单讲给对话听。
+        self.model_catalog = ModelCatalog(self, LMU._API_PARAM_KEYS,
+                                          LMU._NUMERIC_API_PARAMS)
         # 安全配置（批次一 S4）：根注册表（名字 -> 真实段）。
         # 用户态对话的根表由软件动态授予（$MEM.conversations.<cid>.roots），内核不分配目录。
         self.root_registry: Dict[str, tuple] = {}
@@ -3240,144 +3208,18 @@ class Core:
 
     # ------------------------------------------------------------------
     # 模型目录（$MEM.model_catalog）
+    #
+    # 安装、刷新与"默认 para 用了清单外模型"的提醒都在 ModelCatalog 里；
+    # 这里只保留对外方法名（装载与启动流程按这两个名字调用）。
     # ------------------------------------------------------------------
 
     def install_model_catalog(self) -> None:
-        """安装/补齐模型目录的静态部分。幂等；镜像或检查点里已有的字段不覆盖。
-
-        整树替换（load_image）之后必须重装一次，否则镜像会把启动节点冲掉。
-        静态部分不依赖网络：PLM 注册表、para 能用的 API 参数、必填字段。
-        """
-        root = self.mem.root
-        catalog = root.get(MODEL_CATALOG_KEY)
-        if not isinstance(catalog, MetaDict):
-            catalog = MetaDict(data={}, metadata=_CATALOG_META)
-            root[MODEL_CATALOG_KEY] = catalog
-        llm = catalog.get("llm")
-        if not isinstance(llm, MetaDict):
-            llm = MetaDict(data={}, metadata="可用的 LLM 模型；source 说明这份清单的来源")
-            catalog["llm"] = llm
-        llm.setdefault("source", "unavailable")
-        llm.setdefault("required", "model")
-        params = llm.get("params")
-        if not isinstance(params, MetaDict):
-            params = MetaDict(data={}, metadata="可以写进 para 的 API 参数（model 之外全部可选）")
-            llm["params"] = params
-        for name in sorted(LMU._API_PARAM_KEYS):
-            if name not in params:
-                params[name] = "数值型" if name in LMU._NUMERIC_API_PARAMS else "字符串/原样"
-        if not isinstance(llm.get("models"), MetaList):
-            llm["models"] = MetaList(data=[], metadata="上游模型清单；每项一个 id")
-        if not isinstance(catalog.get("plm"), MetaList):
-            catalog["plm"] = MetaList(
-                data=[
-                    Core._plm_catalog_entry(name, cls)
-                    for name, cls in PLM_REGISTRY.items()
-                    if name not in HOST_ONLY_PLMS  # 宿主独占的 PLM 不列给对话
-                ] + [
-                    # 镜像声明的 PLM 也列进来（同名内建优先，装载期已拒绝重名）
-                    Core._plm_catalog_entry(name, cls)
-                    for name, cls in self.plms.items()
-                    if name not in PLM_REGISTRY
-                ],
-                metadata="PLM 注册表：本地实现，不需要网络",
-            )
-
-    @staticmethod
-    def _plm_catalog_entry(name: str, cls) -> MetaDict:
-        entry = MetaDict(
-            data={"name": name, "required": "model"},
-            metadata=_first_line(getattr(cls, "__doc__", "")) or name,
-        )
-        entry["params"] = _PLM_OPERATOR_NOTE if name == "plm.operator" else _PLM_PARAMS_NOTE
-        return entry
+        """安装/补齐模型目录的静态部分（实现见 ModelCatalog.install）。"""
+        self.model_catalog.install()
 
     def refresh_model_catalog(self, timeout: float = 10.0) -> dict:
-        """拉一次上游 `/models` 写进目录。任何失败都收敛成 source="unavailable"，不抛。
-
-        防御按讨论案第五节：自己校验信封、除 id 外全部按可选字段读、忽略未知字段。
-        清单只当参考——取不到不拦启动，也不拦模型名（后者见 _check_model_namespace）。
-        """
-        self.install_model_catalog()
-        llm = self.mem[MODEL_CATALOG_KEY]["llm"]
-
-        def _unavailable(reason: str) -> dict:
-            llm["source"] = "unavailable"
-            llm["reason"] = reason
-            print(
-                f"[AVM] 模型目录：没能取到上游清单（{reason}），本轮不校验 LLM 模型名",
-                file=sys.stderr,
-            )
-            return {"source": "unavailable", "reason": reason}
-
-        try:
-            # 用原始响应自己解析：SDK 默认模式对非 OpenAI 信封抛的是 AttributeError/TypeError，
-            # 分不清"这家不是 OpenAI 形状"与"SDK 有 bug"；自己校验信封才有确定的诊断。
-            raw = self.lmu.client.models.with_raw_response.list(timeout=timeout)
-            payload = _raw_response_json(raw)
-        except Exception as e:
-            return _unavailable(f"{type(e).__name__}: {e}")
-        if (
-            not isinstance(payload, dict)
-            or payload.get("object") != "list"
-            or not isinstance(payload.get("data"), list)
-        ):
-            return _unavailable("上游 /models 的信封不是 OpenAI 形状（object=list 且 data 是数组）")
-        entries = []
-        skipped = 0
-        for item in payload["data"]:
-            if not isinstance(item, dict):
-                skipped += 1
-                continue
-            model_id = item.get("id")
-            if not isinstance(model_id, str) or not model_id:
-                skipped += 1
-                continue
-            entry = MetaDict(data={"id": model_id}, metadata="上游模型 id")
-            for key in ("name", "owned_by", "context_window", "max_output_tokens",
-                        "input_modalities", "output_modalities"):
-                value = item.get(key)
-                if value is None:
-                    continue
-                # 内存约定：para 与目录里的值都以 str 存储
-                entry[key] = ", ".join(str(v) for v in value) if isinstance(value, list) else str(value)
-            effort = item.get("effort")
-            if isinstance(effort, dict):
-                levels = effort.get("supported_levels")
-                if isinstance(levels, list):
-                    entry["reasoning_effort_levels"] = ", ".join(str(v) for v in levels)
-                default_level = effort.get("default_level")
-                if isinstance(default_level, str) and default_level:
-                    entry["default_effort_level"] = default_level
-            entries.append(entry)
-        llm["models"] = MetaList(data=entries, metadata="上游模型清单；每项一个 id")
-        llm["source"] = "api"
-        if "reason" in llm:
-            del llm["reason"]
-        print(
-            f"[AVM] 模型目录：从上游取到 {len(entries)} 个模型"
-            + (f"（跳过 {skipped} 条形状不合法的条目）" if skipped else ""),
-            file=sys.stderr,
-        )
-        self._warn_unlisted_para_model(llm)
-        return {"source": "api", "count": len(entries), "skipped": skipped}
-
-    def _warn_unlisted_para_model(self, llm: MetaDict) -> None:
-        """默认 para 的 model 不在清单里时提醒运行者（例如用着已退役的别名）。"""
-        try:
-            para = self.unwrap(self.para_ref, for_llm=False)
-        except Exception:
-            return
-        model = para.get("model") if isinstance(para, MetaDict) else None
-        if not isinstance(model, str) or not model:
-            return
-        listed = {e.get("id") for e in (llm.get("models") or []) if isinstance(e, MetaDict)}
-        if model not in listed:
-            print(
-                f"[AVM] 模型目录：para {self.para_ref} 的 model {model!r} 不在上游清单里"
-                f"（可能是拼写错误或已退役的别名）",
-                file=sys.stderr,
-            )
+        """拉一次上游 `/models` 写进目录（实现见 ModelCatalog.refresh）。"""
+        return self.model_catalog.refresh(timeout)
 
     # ------------------------------------------------------------------
     # 内核转储（诊断快照，不是恢复输入）
