@@ -613,6 +613,70 @@ class DeviceActions:
         return record
 
 
+class OperatorActions:
+    """操作员动作：暂停 / 提交一次工具调用 / 让出执行权。
+
+    动作本身不进内核——它们只是往操作员通道里投递给面板对话，由面板在自己的
+    回合里执行。未暂停时先挂 operator 中断，让面板拿到执行权再说。
+    """
+
+    def __init__(self, core, panel, channel):
+        self.core = core
+        self.panel = panel
+        self.channel = channel
+
+    def request_pause(self) -> dict:
+        """请求暂停。中断在下一个安全点生效；系统空转结束时不会生效。
+
+        中断会向面板对话投一条 payload 为「已暂停」的消息，操作员在对话流里看得到。
+        """
+        self.core.interrupts.raise_("operator", payload="已暂停")
+        return {
+            "requested": True,
+            "pending": self.core.interrupts.pending_types(),
+            "panel_cid": self.panel.cid,
+            "already_active": self.core.active_conversation_id() == self.panel.cid,
+        }
+
+    def submit_action(self, tool: str, arguments: Optional[dict] = None) -> dict:
+        """提交一次操作员动作。未暂停时先自动中断。"""
+        if not isinstance(tool, str) or not tool:
+            raise ValueError("tool 必须是非空字符串")
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            raise ValueError("arguments 必须是对象")
+        paused = self.enqueue([{"tool": tool, "arguments": arguments}])
+        known = set(_instruction_registry())
+        return {
+            "submitted": True,
+            "tool": tool,
+            "auto_paused": not paused,
+            "known_tool": tool in known,
+            "warning": None if tool in known else (
+                f"未知工具 {tool!r}：Core 会在 stderr 报错，且不回工具响应"
+            ),
+        }
+
+    def enqueue(self, actions: List[dict],
+                interrupt_payload: Optional[str] = "已暂停") -> bool:
+        """投一批动作；返回提交前面板是否已经持有执行权。
+
+        动作批一次入队（`OperatorChannel.submit_actions`），避免其它端点的
+        `end` 动作插到批中间。未暂停时先请求中断，和单动作提交同一语义。
+        """
+        paused = self.core.active_conversation_id() == self.panel.cid
+        if not paused:
+            self.core.interrupts.raise_("operator", payload=interrupt_payload)
+        self.channel.submit_actions(actions)
+        return paused
+
+    def resume(self) -> dict:
+        """让面板结束本轮交互，把执行权让回就绪队列。"""
+        self.channel.submit_action({"end": True})
+        return {"submitted": True}
+
+
 class Console:
     """调试控制台：面板对话 + 观测 + 介入 + 屏蔽账本。"""
 
@@ -645,6 +709,8 @@ class Console:
         # 面板在自己的推理里阻塞等操作员动作。镜像声明的 guest idle 程序在
         # console 宿主下被这个向量覆盖（面板即 OS 空闲处理程序）。
         core.interrupts.register("idle", self.panel.cid)
+        # 操作员动作（暂停 / 提交工具调用 / 让出执行权）走通道，不进内核
+        self.actions = OperatorActions(core, self.panel, self.channel)
 
         self.auth_token = auth_token
         self.force_stop_hook = force_stop_hook
@@ -805,57 +871,21 @@ class Console:
         return self.snapshots.diff(frm, to)
 
     # -- 介入：中断与动作 ----------------------------------------------
+    #
+    # 三个动作的实际实现在 OperatorActions 里，这里只保留对外方法名。
 
     def request_pause(self) -> dict:
-        """请求暂停。中断在下一个安全点生效；系统空转结束时不会生效。
-
-        中断会向面板对话投一条 payload 为「已暂停」的消息，操作员在对话流里看得到。
-        """
-        self.core.interrupts.raise_("operator", payload="已暂停")
-        return {
-            "requested": True,
-            "pending": self.core.interrupts.pending_types(),
-            "panel_cid": self.panel.cid,
-            "already_active": self.core.active_conversation_id() == self.panel.cid,
-        }
+        return self.actions.request_pause()
 
     def submit_action(self, tool: str, arguments: Optional[dict] = None) -> dict:
-        """提交一次操作员动作。未暂停时先自动中断。"""
-        if not isinstance(tool, str) or not tool:
-            raise ValueError("tool 必须是非空字符串")
-        if arguments is None:
-            arguments = {}
-        if not isinstance(arguments, dict):
-            raise ValueError("arguments 必须是对象")
-        paused = self._enqueue_actions([{"tool": tool, "arguments": arguments}])
-        known = set(_instruction_registry())
-        return {
-            "submitted": True,
-            "tool": tool,
-            "auto_paused": not paused,
-            "known_tool": tool in known,
-            "warning": None if tool in known else (
-                f"未知工具 {tool!r}：Core 会在 stderr 报错，且不回工具响应"
-            ),
-        }
+        return self.actions.submit_action(tool, arguments)
 
     def _enqueue_actions(self, actions: List[dict],
                          interrupt_payload: Optional[str] = "已暂停") -> bool:
-        """投一批动作；返回提交前面板是否已经持有执行权。
-
-        动作批一次入队（`OperatorChannel.submit_actions`），避免其它端点的
-        `end` 动作插到批中间。未暂停时先请求中断，和单动作提交同一语义。
-        """
-        paused = self.core.active_conversation_id() == self.panel.cid
-        if not paused:
-            self.core.interrupts.raise_("operator", payload=interrupt_payload)
-        self.channel.submit_actions(actions)
-        return paused
+        return self.actions.enqueue(actions, interrupt_payload)
 
     def resume(self) -> dict:
-        """让面板结束本轮交互，把执行权让回就绪队列。"""
-        self.channel.submit_action({"end": True})
-        return {"submitted": True}
+        return self.actions.resume()
 
     # -- API 暂停与恢复 ------------------------------------------------
 
