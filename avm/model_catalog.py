@@ -58,6 +58,37 @@ def _raw_response_json(raw):
     raise TypeError(f"无法从 {type(raw).__name__} 取原始 JSON 响应体")
 
 
+def _catalog_entry(item: dict):
+    """一条上游模型条目 → 目录条目；没有可用 id 时返回 None（调用方计为跳过）。
+
+    除 id 外全部按可选字段读、未知字段忽略：上游加字段不该让启动失败，缺字段也不该
+    让整份清单作废。值一律转成字符串——内存约定 para 与目录里都存 str，数组按 ", "
+    拼起来（对话看到的是"有哪些可选值"，不是精确的数组结构）。
+
+    `effort` 那一坨单独收成两个扁平字段，因为它是嵌套对象，摊平之后对话才能直接
+    把 `reasoning_effort_levels` 抄进 para。
+    """
+    model_id = item.get("id")
+    if not isinstance(model_id, str) or not model_id:
+        return None
+    entry = MetaDict(data={"id": model_id}, metadata="上游模型 id")
+    for key in ("name", "owned_by", "context_window", "max_output_tokens",
+                "input_modalities", "output_modalities"):
+        value = item.get(key)
+        if value is None:
+            continue
+        entry[key] = ", ".join(str(v) for v in value) if isinstance(value, list) else str(value)
+    effort = item.get("effort")
+    if isinstance(effort, dict):
+        levels = effort.get("supported_levels")
+        if isinstance(levels, list):
+            entry["reasoning_effort_levels"] = ", ".join(str(v) for v in levels)
+        default_level = effort.get("default_level")
+        if isinstance(default_level, str) and default_level:
+            entry["default_effort_level"] = default_level
+    return entry
+
+
 class ModelCatalog:
     """模型目录的安装、刷新与"默认 para 用了清单外模型"的提醒。
 
@@ -156,29 +187,10 @@ class ModelCatalog:
         entries = []
         skipped = 0
         for item in payload["data"]:
-            if not isinstance(item, dict):
+            entry = _catalog_entry(item) if isinstance(item, dict) else None
+            if entry is None:
                 skipped += 1
                 continue
-            model_id = item.get("id")
-            if not isinstance(model_id, str) or not model_id:
-                skipped += 1
-                continue
-            entry = MetaDict(data={"id": model_id}, metadata="上游模型 id")
-            for key in ("name", "owned_by", "context_window", "max_output_tokens",
-                        "input_modalities", "output_modalities"):
-                value = item.get(key)
-                if value is None:
-                    continue
-                # 内存约定：para 与目录里的值都以 str 存储
-                entry[key] = ", ".join(str(v) for v in value) if isinstance(value, list) else str(value)
-            effort = item.get("effort")
-            if isinstance(effort, dict):
-                levels = effort.get("supported_levels")
-                if isinstance(levels, list):
-                    entry["reasoning_effort_levels"] = ", ".join(str(v) for v in levels)
-                default_level = effort.get("default_level")
-                if isinstance(default_level, str) and default_level:
-                    entry["default_effort_level"] = default_level
             entries.append(entry)
         llm["models"] = MetaList(data=entries, metadata="上游模型清单；每项一个 id")
         llm["source"] = "api"
