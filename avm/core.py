@@ -1087,93 +1087,116 @@ class ListenEventInstruction(Instruction):
         # before 事件：监听注册/修改/取消本身也受事件层检查与软件 Guard 裁决。
         # action=listen 先解析 handler 的 condition，before 载荷带解析后的条件；
         # 注册在 before 通过后进行，不再重复解析。
-        listener_id = getattr(self, "listener_id", None)
-        parsed_condition = None
-        if action == "listen":
-            handler_ref = getattr(self, "handler_ref", None)
-            if handler_ref is None:
-                conv.user_batch.add_tool_response(
-                    "Illegal: action=listen 时必须提供 handler_ref", self.call_id
-                )
-                return
-            try:
-                parsed_condition = core.events.parse_condition(
-                    conv.cid, handler_ref, space=conv.caps.space(),
-                    kernel_mode=(conv.caps.mode == "kernel"),
-                )
-            except _INSTRUCTION_ERRORS as e:
-                _respond_error(conv, self.call_id, e)
-                return
-            b_target, b_ref = _condition_before_target(parsed_condition)
-            b_payload = {
-                "action": action,
-                "event_type": getattr(self, "event_type", None),
-                "condition": parsed_condition,
-                "handler_ref": handler_ref,
-                "priority": getattr(self, "priority", None),
-                "tier": getattr(self, "tier", None),
-            }
-        else:
-            b_target = f"listener:{listener_id}"
-            b_payload = {"action": action, "listener_id": listener_id,
-                         "handler_ref": getattr(self, "handler_ref", None),
-                         "priority": getattr(self, "priority", None)}
-            b_ref = ("listener", listener_id) if isinstance(listener_id, int) else None
+        prepared = self._prepare_before(core, conv, action)
+        if prepared is None:
+            return
+        b_target, b_payload, b_ref, parsed_condition = prepared
         before = _dispatch_before_event(core, conv, "listen_event", b_target, b_payload, target_ref=b_ref)
         if before["action"] in ("replace", "handler_error"):
             conv.user_batch.add_tool_response(before["response"], self.call_id)
             return
         try:
-            if action == "listen":
-                priority = getattr(self, "priority", 0)
-                tier = getattr(self, "tier", None) or "normal"
-                listener_id = core.events.register_condition(
-                    conv.cid, handler_ref, space=conv.caps.space(),
-                    tier=tier, priority=0 if priority is None else priority,
-                    kernel_mode=(conv.caps.mode == "kernel"),
-                    condition=parsed_condition,
-                )
-                response = f"listener_id={listener_id} 已注册"
-                after_payload = {"listener_id": listener_id, "action": "listen", "actor_cid": conv.cid}
-            elif action == "modify":
-                listener_id = getattr(self, "listener_id", None)
-                handler_ref = getattr(self, "handler_ref", None)
-                if listener_id is None or (handler_ref is None and getattr(self, "priority", None) is None):
-                    raise IllegalOperationError(
-                        "action=modify 时必须提供 listener_id，以及 handler_ref 或 priority 至少一个"
-                    )
-                if (
-                    getattr(self, "event_type", None) is not None
-                    or getattr(self, "target", None) is not None
-                    or getattr(self, "phase", None) is not None
-                    or getattr(self, "tier", None) is not None
-                ):
-                    raise IllegalOperationError(
-                        "action=modify 只允许修改 handler_ref/priority，不能改 event_type/target/phase/tier"
-                    )
-                core.events.modify(listener_id, conv.cid, handler_ref, space=conv.caps.space(),
-                                   priority=getattr(self, "priority", None))
-                response = f"listener_id={listener_id} 已更新"
-                after_payload = {"listener_id": listener_id, "action": "modify", "actor_cid": conv.cid}
-            else:  # cancel
-                listener_id = getattr(self, "listener_id", None)
-                if listener_id is None:
-                    raise IllegalOperationError("action=cancel 时必须提供 listener_id")
-                core.events.cancel(listener_id, conv.cid)
-                response = f"listener_id={listener_id} 已取消"
-                after_payload = {"listener_id": listener_id, "action": "cancel", "actor_cid": conv.cid}
-
+            response, listener_id = self._apply(core, conv, action, parsed_condition)
+            # 三种动作的写后事件只差 payload 里的 action，其余相同
             _publish_core_after_safely(core,
                 "listen_event",
                 conv,
                 f"listener:{listener_id}",
-                after_payload,
+                {"listener_id": listener_id, "action": action, "actor_cid": conv.cid},
                 source_kind="core",
                 target_ref=("listener", listener_id),
             )
             conv.user_batch.add_tool_response(response, self.call_id)
         except _INSTRUCTION_ERRORS as e:
             _respond_error(conv, self.call_id, e)
+
+    def _prepare_before(self, core: 'Core', conv: Conversation, action: str) -> Optional[tuple]:
+        """构造 before 事件的 (target, payload, target_ref, 解析后的条件)；已回复错误时返回 None。"""
+        listener_id = getattr(self, "listener_id", None)
+        if action != "listen":
+            return (
+                f"listener:{listener_id}",
+                {"action": action, "listener_id": listener_id,
+                 "handler_ref": getattr(self, "handler_ref", None),
+                 "priority": getattr(self, "priority", None)},
+                ("listener", listener_id) if isinstance(listener_id, int) else None,
+                None,
+            )
+        handler_ref = getattr(self, "handler_ref", None)
+        if handler_ref is None:
+            conv.user_batch.add_tool_response(
+                "Illegal: action=listen 时必须提供 handler_ref", self.call_id
+            )
+            return None
+        try:
+            parsed_condition = core.events.parse_condition(
+                conv.cid, handler_ref, space=conv.caps.space(),
+                kernel_mode=(conv.caps.mode == "kernel"),
+            )
+        except _INSTRUCTION_ERRORS as e:
+            _respond_error(conv, self.call_id, e)
+            return None
+        b_target, b_ref = _condition_before_target(parsed_condition)
+        return (
+            b_target,
+            {
+                "action": action,
+                "event_type": getattr(self, "event_type", None),
+                "condition": parsed_condition,
+                "handler_ref": handler_ref,
+                "priority": getattr(self, "priority", None),
+                "tier": getattr(self, "tier", None),
+            },
+            b_ref,
+            parsed_condition,
+        )
+
+    def _apply(self, core: 'Core', conv: Conversation, action: str,
+               parsed_condition) -> tuple:
+        """执行注册/修改/取消，返回 (工具响应文本, listener_id)。"""
+        if action == "listen":
+            return self._register(core, conv, parsed_condition)
+        if action == "modify":
+            return self._modify(core, conv)
+        return self._cancel(core, conv)
+
+    def _register(self, core: 'Core', conv: Conversation, parsed_condition) -> tuple:
+        priority = getattr(self, "priority", 0)
+        tier = getattr(self, "tier", None) or "normal"
+        listener_id = core.events.register_condition(
+            conv.cid, getattr(self, "handler_ref", None), space=conv.caps.space(),
+            tier=tier, priority=0 if priority is None else priority,
+            kernel_mode=(conv.caps.mode == "kernel"),
+            condition=parsed_condition,
+        )
+        return f"listener_id={listener_id} 已注册", listener_id
+
+    def _modify(self, core: 'Core', conv: Conversation) -> tuple:
+        listener_id = getattr(self, "listener_id", None)
+        handler_ref = getattr(self, "handler_ref", None)
+        if listener_id is None or (handler_ref is None and getattr(self, "priority", None) is None):
+            raise IllegalOperationError(
+                "action=modify 时必须提供 listener_id，以及 handler_ref 或 priority 至少一个"
+            )
+        if (
+            getattr(self, "event_type", None) is not None
+            or getattr(self, "target", None) is not None
+            or getattr(self, "phase", None) is not None
+            or getattr(self, "tier", None) is not None
+        ):
+            raise IllegalOperationError(
+                "action=modify 只允许修改 handler_ref/priority，不能改 event_type/target/phase/tier"
+            )
+        core.events.modify(listener_id, conv.cid, handler_ref, space=conv.caps.space(),
+                           priority=getattr(self, "priority", None))
+        return f"listener_id={listener_id} 已更新", listener_id
+
+    def _cancel(self, core: 'Core', conv: Conversation) -> tuple:
+        listener_id = getattr(self, "listener_id", None)
+        if listener_id is None:
+            raise IllegalOperationError("action=cancel 时必须提供 listener_id")
+        core.events.cancel(listener_id, conv.cid)
+        return f"listener_id={listener_id} 已取消", listener_id
 
 
 def _instruction_registry() -> Dict[str, Type[Instruction]]:
