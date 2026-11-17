@@ -367,3 +367,28 @@ class TestTranscript:
         core.advance_conversation()
 
         assert not os.path.exists(path)
+
+
+    def test_transcript_serialize_failure_degrades_without_raising(self, tmp_path, capsys):
+        """序列化失败必须降级成占位，并且绝不能让 record() 抛异常。
+
+        这里曾经漏写 `import sys`：降级分支里的 print(..., file=sys.stderr)
+        自己抛 NameError，于是"观测面不得成为内核退出路径"这条约定被降级
+        路径本身违反了——越是出错的时候越会崩。
+        """
+        path = os.path.join(tmp_path, "t.txt")
+        core = make_core([("ok", [], None)])
+        core.monitor = Monitor(transcript_path=path)
+        _new_root(core)
+        core._active_cid = core._ready_cids.pop(0)
+        core.monitor.record_baseline(core)
+
+        # object() 不能 JSON 序列化，用来命中 messages 那一次 dumps 的降级分支
+        _with_last_call(core, messages=[{"role": "user", "content": object()}])
+        core.advance_conversation()
+
+        err = capsys.readouterr().err
+        assert "监测全文序列化失败" in err
+        text = open(path, encoding="utf-8").read()
+        assert "===== FRAME 1 =====" in text
+        assert "<序列化失败" in text
