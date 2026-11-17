@@ -308,6 +308,11 @@ class MetaListDevice(MemoryDevice):
         return value in self._data
 
     def to_llm_string(self) -> str:
+        # 这个导入只能放函数里：types -> capabilities -> modules -> memory_device
+        # 是一条会绕回本模块的链，放在模块顶部的话，先 import 本模块时 MemoryDevice
+        # 还没定义就已成环。本文件其它地方（set_value / resolve_path）同理。
+        from .types import MetaDict, MetaList
+
         kinds = set()
         for value in self._data:
             if isinstance(value, MetaDict):
