@@ -1,6 +1,7 @@
 """AVM 内存系统定义"""
 from types import MappingProxyType
 from typing import Any, List, Optional
+from . import memory_codec
 from .types import MetaList, MetaDict, LinkNode, StrNode
 from .exceptions import (VMMemoryError, IllegalOperationError, MemoryKeyNotFoundError, MemoryIndexOutOfRangeError,
                           MemoryTypeError, MemoryCircularReferenceError, MemoryLinkBrokenError)
@@ -1259,41 +1260,16 @@ class Memory:
 
     @staticmethod
     def serialize_node(value) -> dict:
-        """单个内存节点的显式表示（与镜像 mem 段、persist_to、日志效果同格式）。"""
-        if isinstance(value, MetaDict):
-            node = {"kind": "dict", "value": {k: Memory.serialize_node(v) for k, v in value.items()}}
-        elif isinstance(value, MetaList):
-            node = {"kind": "list", "value": [Memory.serialize_node(v) for v in value]}
-        elif isinstance(value, LinkNode):
-            node = {"kind": "link", "target": value.target, "value": None}
-        else:
-            node = {"kind": "str", "value": str(value)}
-            ctrl = value.get_ctrl() if isinstance(value, StrNode) else None
-            if ctrl is not None:
-                node["ctrl"] = ctrl
-            return node
-        meta = value.get_metadata() if hasattr(value, "get_metadata") else None
-        ctrl = value.get_ctrl() if hasattr(value, "get_ctrl") else None
-        if meta is not None:
-            node["meta"] = meta
-        if ctrl is not None:
-            node["ctrl"] = ctrl
-        return node
+        """单个内存节点的显式表示（实现见 memory_codec.serialize_node）。"""
+        return memory_codec.serialize_node(value)
 
     def to_image_dict(self) -> dict:
-        """内存树的显式节点表示（与镜像 mem 段、persist_to、内核转储同格式）。
-
-        不可 JSON 化的值降级为 `str(value)`（与既有行为一致）。
-        """
-        return self.serialize_node(self._data)
+        """内存树的显式节点表示（实现见 memory_codec.to_image_dict）。"""
+        return memory_codec.to_image_dict(self)
 
     def save(self, filepath: str) -> None:
-        """将内存数据持久化到 JSON 文件（仅 _data，不含设备）。
-        格式与系统镜像 mem 段一致：显式节点 {kind, meta, ctrl, value}。"""
-        import json
-
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(self.to_image_dict(), f, ensure_ascii=False, indent=2)
+        """把内存写进 JSON 文件（实现见 memory_codec.save）。"""
+        memory_codec.save(self, filepath)
 
     @classmethod
     def load(cls, filepath: str) -> "Memory":
@@ -1306,42 +1282,13 @@ class Memory:
 
         with open(filepath, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        mem.replace_root(cls._deserialize_node(raw))
+        mem.replace_root(memory_codec.deserialize_node(raw))
         return mem
 
     @classmethod
     def _deserialize_node(cls, value):
-        """解析单个显式节点（只接受 {kind, meta, ctrl, value/target} 格式）。"""
-        from .types import MetaList, MetaDict
-
-        if isinstance(value, dict):
-            if value.get("kind") in ("str", "dict", "list", "link"):
-                kind = value["kind"]
-                v = value.get("value")
-                meta = value.get("meta")
-                ctrl = value.get("ctrl")
-                if kind == "link":
-                    target = value.get("target")
-                    if not isinstance(target, str) or not target:
-                        raise VMMemoryError(f"link 节点的 target 必须是非空字符串：{target!r}")
-                    return LinkNode(target=target, metadata=meta, ctrl=ctrl)
-                if kind == "str":
-                    return StrNode(v if isinstance(v, str) else str(v), ctrl=ctrl)
-                if kind == "dict":
-                    return MetaDict(
-                        data={k: cls._deserialize_node(x) for k, x in (v or {}).items()},
-                        metadata=meta, ctrl=ctrl,
-                    )
-                if kind == "list":
-                    return MetaList(
-                        data=[cls._deserialize_node(x) for x in (v or [])],
-                        metadata=meta, ctrl=ctrl,
-                    )
-            raise VMMemoryError(
-                f"内存节点格式无效（缺合法 kind）：{value!r}；旧 __type 格式不再支持，"
-                "请用 reset 重建世界"
-            )
-        return value
+        """单个显式节点 → 内存树节点（实现见 memory_codec.deserialize_node）。"""
+        return memory_codec.deserialize_node(value)
 
     @classmethod
     def deserialize_node(cls, value):
@@ -1355,5 +1302,5 @@ class Memory:
         from .types import MetaDict
 
         mem = cls()
-        mem.replace_root(MetaDict(data={k: cls._deserialize_node(v) for k, v in tree.items()}))
+        mem.replace_root(MetaDict(data={k: memory_codec.deserialize_node(v) for k, v in tree.items()}))
         return mem
