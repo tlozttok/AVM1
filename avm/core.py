@@ -29,7 +29,8 @@ from .api_errors import (
 )
 from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, message_to_api_dict, LinkNode
 from .types import message_to_dict, batch_to_dict, tool_exchange
-from .memory import Memory, check_new_key
+from .memory import Memory
+from .memory_nodes import check_new_key
 from .model_catalog import MODEL_CATALOG_KEY, ModelCatalog
 from .memory_device import MemoryDevice
 from .monitor import Monitor

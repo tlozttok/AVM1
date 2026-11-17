@@ -2,6 +2,7 @@
 from types import MappingProxyType
 from typing import Any, List, Optional
 from . import memory_codec
+from . import memory_nodes as nodes
 from .types import MetaList, MetaDict, LinkNode, StrNode
 from .exceptions import (VMMemoryError, IllegalOperationError, MemoryKeyNotFoundError, MemoryIndexOutOfRangeError,
                           MemoryTypeError, MemoryCircularReferenceError, MemoryLinkBrokenError)
@@ -13,28 +14,9 @@ _MAX_PATH_SEGMENTS = 64  # 单条引用的段数上限（戊4）
 _MAX_VALUE_DEPTH = 64  # 写入值的嵌套深度上限（戊4）
 
 
-def _show(parts) -> str:
-    """把显示段序列拼成 `$根.段...` 形态（错误与地址回显用）。"""
-    return "$" + ".".join(str(s) for s in parts)
-
-
 def _root_unavailable(name: str) -> VMMemoryError:
     """未知/未授予的根：统一错误，不区分拼错与未授权。"""
     return VMMemoryError(f"引用根不可用：{name!r}（本对话根表不含该根）")
-
-
-def check_new_key(key) -> None:
-    """新建地址的键语法（指令边界与 Memory.make 共用一套）。
-
-    键是路径的一段，点号是段分隔符——带点的键建得出来但永远读不回来（模板：`$MEM.a.b`
-    会被切成 a、b 两段）。空键同理，还会让 `$MEM.` 与读根混淆。
-    """
-    if not isinstance(key, str):
-        raise IllegalOperationError(f"新地址的键必须是字符串，得到 {type(key).__name__}")
-    if key == "":
-        raise IllegalOperationError("新地址的键不能为空字符串")
-    if "." in key:
-        raise IllegalOperationError(f"新地址的键不能包含点号（点号是路径分隔符，该地址将无法寻址）：{key!r}")
 
 
 def _device_child(node: Any, key: Any) -> Any:
@@ -196,7 +178,7 @@ class Memory:
         for i in range(len(parts)):
             if ".".join(str(s) for s in parts[:i + 1]) in self._devices:
                 return ("device", list(parts), list(parts))
-        shown = _show(parts)
+        shown = nodes.show_path(parts)
         raise IllegalOperationError(
             f"无法识别的引用前缀：{first!r}（引用 {shown}）；只允许已声明的根或已挂载设备路径"
         )
@@ -243,7 +225,7 @@ class Memory:
             seen_links = []
         if any(seg == "" for seg in path):
             # 读侧与写侧用同一套语法：空段是语法错误，不是"键 '' 不存在"
-            shown = _show(path)
+            shown = nodes.show_path(path)
             if all(seg == "" for seg in path):
                 raise IllegalOperationError(f"引用不能为空：{shown!r}（至少要写 $MEM）")
             raise IllegalOperationError(f"引用不能有空段：{shown}")
@@ -264,7 +246,7 @@ class Memory:
                     remaining = list(real[i + 1:])
                     result = self._resolve_device(device, remaining, seen_links, prefix_str)
                     return self._convert_for_llm(result, for_llm)
-            shown = _show(display)
+            shown = nodes.show_path(display)
             raise IllegalOperationError(
                 f"无法识别的引用前缀：{real[0]!r}（引用 {shown}）；只允许已声明的根或已挂载设备路径"
             )
@@ -308,7 +290,7 @@ class Memory:
                     chain = " -> ".join(seen_links + [address])
                     raise MemoryCircularReferenceError(f"链接成环: {chain}")
                 seen_links.append(address)
-                kind, payload = self._link_target(node, address)
+                kind, payload = nodes.link_target(node, address)
                 if kind == "device":
                     device = self._require_device(payload, address)
                     remainder = list(path[index:])
@@ -327,25 +309,10 @@ class Memory:
             if index >= len(path):
                 return self._convert_for_llm(node, for_llm)
             key = path[index]
-            self._check_access(node, key, display)
-            node = node[self._index_key(node, key)]
+            nodes.check_access(node, key, display)
+            node = node[nodes.index_key(node, key)]
             walked.append(key)
             index += 1
-
-    @staticmethod
-    def _link_target(node: LinkNode, address: str = "") -> tuple:
-        """解析链接 target：返回 ("memory", segments) 或 ("device", 标识符)。"""
-        target = node.target
-        if not isinstance(target, str) or not target:
-            raise VMMemoryError(f"链接 {address or '$MEM'} 的 target 必须是非空字符串")
-        if target.startswith("$"):
-            parts = target[1:].split(".")
-            if not parts or parts[0] != "MEM":
-                raise VMMemoryError(
-                    f"链接 {address or '$MEM'} 的 target 只支持 $MEM 地址或设备标识符：{target!r}"
-                )
-            return ("memory", parts[1:])
-        return ("device", target)
 
     def _require_device(self, identifier: str, address: str = "") -> MemoryDevice:
         device = self._device_ids.get(identifier)
@@ -398,7 +365,7 @@ class Memory:
                     chain = " -> ".join(seen_links + [address])
                     raise MemoryCircularReferenceError(f"链接成环: {chain}")
                 seen_links.append(address)
-                kind, payload = self._link_target(node, address)
+                kind, payload = nodes.link_target(node, address)
                 if kind == "device":
                     device = self._require_device(payload, address)
                     remainder = list(current[index:])
@@ -482,46 +449,6 @@ class Memory:
             return device.follow_links(remainder, seen_links=[mount])
         return ("device", mount, remainder)
 
-    @staticmethod
-    def _index_key(node: Any, key: Any) -> Any:
-        """列表节点按引用寻址时用整数下标取值。
-
-        引用是一段字符串（`$MEM.a.0`），`_check_access` 已经确认这段是合法下标，
-        但取值前必须把字符串转成整数——否则 `MetaList.__getitem__("0")` 会抛
-        `TypeError: list indices must be integers`。设备列表自己会转，树里的列表靠这里。
-        """
-        return int(str(key)) if isinstance(node, (list, MetaList)) else key
-
-    @staticmethod
-    def _check_access(current, key: str, path: list, shown: Optional[str] = None):
-        """检查 key 是否可访问，不可则抛出对应的内存子类异常。
-
-        `path` 是显示段序列（含根名）；`shown` 指定时直接用它做错误里的地址。
-        """
-        from .memory_device import MemoryDevice
-
-        if isinstance(current, MemoryDevice):
-            return
-        partial = shown if shown is not None else _show(path)
-        if isinstance(current, str):
-            raise MemoryTypeError(f"字符串没有子节点：{partial}")
-        if isinstance(current, (dict, MetaDict)):
-            if key == "-1":
-                raise IllegalOperationError(f"字典里不能用 -1（-1 只表示列表追加位置）：{partial}")
-            if key not in current:
-                raise MemoryKeyNotFoundError(f"键 {key!r} 不存在：{partial}（可用 memory_make 创建）")
-        elif isinstance(current, (list, MetaList)):
-            try:
-                idx = int(key)
-            except ValueError:
-                raise IllegalOperationError(f"列表索引必须是数字，got {key!r}：{partial}")
-            if idx < 0:
-                raise IllegalOperationError(f"负下标不支持：{partial}（-1 只表示追加位置）")
-            if idx >= len(current):
-                raise MemoryIndexOutOfRangeError(f"索引越界：{idx}，列表长度：{len(current)}：{partial}")
-        else:
-            raise MemoryTypeError(f"无法访问子路径：父节点是 {type(current).__name__} 类型：{partial}")
-
     def _convert_for_llm(self, value: Any, for_llm: bool) -> Any:
         """
         根据类型转换为 LLM 可读的字符串
@@ -594,9 +521,9 @@ class Memory:
             _device_put(parent, "-1", value)  # 设备层本轮保持旧语义
             return None
         if isinstance(parent, (list, MetaList)):
-            self._check_append_same_type(parent, "str")
+            nodes.check_append_same_type(parent, "str")
             parent.append(_wrap_value(value))
-            return _show(list(display[:-1]) + [str(len(parent) - 1)])
+            return nodes.show_path(list(display[:-1]) + [str(len(parent) - 1)])
         if isinstance(parent, (dict, MetaDict)):
             raise IllegalOperationError("字典里不能用 -1（-1 只表示列表追加位置）")
         if isinstance(parent, str):
@@ -646,74 +573,21 @@ class Memory:
         """普通路径处理：只改已存在的地址（创建归 memory_make）。"""
         node = self._data
         for i, key in enumerate(path[:-1]):
-            child, exists = self._child(node, key, display, i)
+            child, exists = nodes.child(node, key, display, i)
             if not exists:
                 raise MemoryKeyNotFoundError(
-                    f"路径不存在：{_show(display)}"
+                    f"路径不存在：{nodes.show_path(display)}"
                     "——memory_write 不建节点，先用 memory_make 创建"
                 )
             node = child
 
-        _, exists = self._child(node, path[-1], display, len(path) - 1)
+        _, exists = nodes.child(node, path[-1], display, len(path) - 1)
         if not exists:
             raise MemoryKeyNotFoundError(
-                f"键 {path[-1]!r} 不存在：{_show(display)}"
+                f"键 {path[-1]!r} 不存在：{nodes.show_path(display)}"
                 "——memory_write 不建节点，先用 memory_make 创建"
             )
-        self._assign(node, path[-1], _wrap_value(value), display, len(path) - 1)
-
-    @staticmethod
-    def _child(node: Any, key: Any, display: list, index: int):
-        """(子节点, 是否存在)。node 不是容器时抛 MemoryTypeError（含请求路径，不含链接目标）。"""
-        shown = _show(display)
-        if isinstance(node, (dict, MetaDict)):
-            return node.get(key), (key in node)
-        if isinstance(node, (list, MetaList)):
-            idx = Memory._index_of(node, key)
-            if idx < 0:
-                raise MemoryIndexOutOfRangeError(
-                    f"负下标不支持：{shown}（-1 只表示追加位置）"
-                )
-            if idx >= len(node):
-                raise MemoryIndexOutOfRangeError(
-                    f"索引越界：{idx}，列表长度：{len(node)}：{shown}"
-                )
-            return node[idx], True
-        raise MemoryTypeError(
-            f"无法写入：{shown} 是 {type(node).__name__} 类型，没有子节点 (.{key})"
-        )
-
-    @staticmethod
-    def _assign(node: Any, key: Any, value: Any, display: list, index: int) -> None:
-        """把 value 落到 node 的 key 上。已存在的容器节点按既有规则解释为改元数据。"""
-        if isinstance(node, (dict, MetaDict)):
-            existing = node.get(key)
-            if isinstance(existing, (MetaList, MetaDict)):
-                existing.set_metadata(value)
-                return
-            if isinstance(existing, str):
-                # 写字符串叶子：只改内容，不动节点的 ctrl（写入不夺权）。
-                keep = existing.get_ctrl() if isinstance(existing, StrNode) else None
-                node[key] = StrNode(str(value), ctrl=keep)
-                return
-            node[key] = value
-            return
-        if isinstance(node, (list, MetaList)):
-            idx = Memory._index_of(node, key)
-            if idx < 0:
-                raise IllegalOperationError("负下标不支持（-1 只表示追加位置）")
-            if idx >= len(node):
-                raise MemoryIndexOutOfRangeError(f"索引越界：{idx}，列表长度：{len(node)}")
-            existing = node[idx]
-            if isinstance(existing, str):
-                keep = existing.get_ctrl() if isinstance(existing, StrNode) else None
-                node[idx] = StrNode(str(value), ctrl=keep)
-                return
-            node[idx] = value
-            return
-        raise MemoryTypeError(
-            f"无法写入：{_show(display)} 是 {type(node).__name__} 类型，不支持子路径"
-        )
+        nodes.assign(node, path[-1], _wrap_value(value), display, len(path) - 1)
 
     def _expand_write_ref(self, ref: str, space: Optional[AddressSpace] = None):
         """写入引用：校验语法后展开，返回 (真实段, 显示段)。
@@ -733,7 +607,7 @@ class Memory:
         """
         parts = self._parse_ref(ref)
         kind, real, display = self._expand_ref_parts(parts, space)
-        self._check_delete_target(ref, kind, display)
+        nodes.check_delete_target(ref, kind, display)
         segments = list(real)
         resolved = self._resolve_delete_path(ref, segments, space)
         container = self._walk_to_container(ref, resolved)
@@ -745,21 +619,6 @@ class Memory:
         else:
             del container[idx]  # 列表元素删除后，后续元素下标前移
         return deleted_type, ref
-
-    @staticmethod
-    def _check_delete_target(ref: str, kind: str, display) -> None:
-        """删除目标的静态拒绝：设备空间、根名本身、负下标。"""
-        if kind == "device":
-            raise IllegalOperationError(
-                f"{ref} 落在设备上：不能在设备空间删除节点（设备内容由设备自己管理）"
-            )
-        if len(display) == 1:
-            if display[0] == MEM_ROOT_NAME:
-                raise IllegalOperationError("不能删除 $MEM 根节点")
-            raise IllegalOperationError(f"不能删除根：{ref}（根是内核声明，不是内存节点）")
-        # 请求段（根名之后）的负下标检查
-        if any(seg == "-1" or (seg.startswith("-") and seg[1:].isdigit()) for seg in display[1:]):
-            raise IllegalOperationError(f"负下标不支持：{ref}（-1 只表示追加位置）")
 
     def _resolve_delete_path(self, ref: str, segments: list, space) -> list:
         """定位父容器的路径段：中间段跟随链接，最终段不跟随。设备空间一律拒绝。"""
@@ -781,8 +640,8 @@ class Memory:
         for key in resolved:
             if isinstance(container, LinkNode):
                 raise VMMemoryError(f"{ref} 的中间段落在链接上，无法删除")
-            self._check_access(container, key, [], shown=ref)
-            container = container[self._index_key(container, key)]
+            nodes.check_access(container, key, [], shown=ref)
+            container = container[nodes.index_key(container, key)]
         return container
 
     def _locate_delete_child(self, ref: str, container, last, resolved: list) -> tuple:
@@ -792,7 +651,7 @@ class Memory:
                 raise MemoryKeyNotFoundError(f"键 {last!r} 不存在：{ref}")
             return container[last], ".".join(resolved + [last]), None
         if isinstance(container, (list, MetaList)):
-            idx = self._index_of(container, last)
+            idx = nodes.index_of(container, last)
             if idx < 0:
                 raise IllegalOperationError("负下标不支持（-1 只表示追加位置）")
             if idx >= len(container):
@@ -866,23 +725,13 @@ class Memory:
                 raise VMMemoryError(
                     f"{ref} 落在链接上：调试原语只作用于数据节点，链接请用 unmount/mount"
                 )
-            self._check_access(container, key, path)
-            container = container[self._index_key(container, key)]
+            nodes.check_access(container, key, path)
+            container = container[nodes.index_key(container, key)]
         if isinstance(container, (dict, MetaDict)) and isinstance(container.get(path[-1]), LinkNode):
             raise VMMemoryError(
                 f"{ref} 落在链接上：调试原语只作用于数据节点，链接请用 unmount/mount"
             )
         return container, path[-1]
-
-    @staticmethod
-    def _index_of(container, key):
-        """列表容器把键转成整数下标；字典容器原样返回键。"""
-        if isinstance(container, (list, MetaList)):
-            try:
-                return int(key)
-            except (TypeError, ValueError):
-                raise MemoryTypeError(f"列表索引必须是数字：{key}") from None
-        return key
 
     def detach(self, ref: str) -> Any:
         """调试用：按路径摘除节点并原样返回（meta / ctrl 一并保留）。
@@ -898,7 +747,7 @@ class Memory:
             del container[key]
             return node
         if isinstance(container, (list, MetaList)):
-            idx = self._index_of(container, key)
+            idx = nodes.index_of(container, key)
             if idx < 0 or idx >= len(container):
                 raise MemoryIndexOutOfRangeError(
                     f"索引越界：{idx}，列表长度：{len(container)}"
@@ -923,7 +772,7 @@ class Memory:
             container[key] = node
             return
         if isinstance(container, (list, MetaList)):
-            idx = self._index_of(container, key)
+            idx = nodes.index_of(container, key)
             if idx < 0 or idx > len(container):
                 raise VMMemoryError(
                     f"还原冲突：{ref} 的下标 {idx} 越界（当前长度 {len(container)}）"
@@ -1073,7 +922,7 @@ class Memory:
 
         `-1` 只表示追加位置，不是下标：`-2` 及以下一律报错。
         """
-        self._check_make_args(mem_type, key)
+        nodes.check_make_args(mem_type, key)
         parts = self._parse_ref(ref)
         kind, real_ref, display = self._expand_ref_parts(parts, space)
         self._check_root_alias(space, kind, parts)
@@ -1084,13 +933,6 @@ class Memory:
         if node is None:
             node, address_parts = self._build_make_path(kind, ref, parts, display, space)
         return self._create_in_container(node, key, mem_type, address_parts, ref)
-
-    @staticmethod
-    def _check_make_args(mem_type: str, key: str) -> None:
-        """建节点前先挡掉类型名写错与非法键。"""
-        if mem_type not in ('str', 'dict', 'list'):
-            raise IllegalOperationError(f"不支持的类型：{mem_type}，必须是 'str', 'dict', 'list' 之一")
-        check_new_key(key)
 
     def _check_root_alias(self, space, kind: str, parts: list) -> None:
         """根别名：目标本身必须存在（根无效），不通过别名补建根目标。"""
@@ -1134,19 +976,19 @@ class Memory:
                 raise IllegalOperationError(f"字典里不能用 -1（-1 只表示列表追加位置）：{ref}")
             if key in node:
                 raise VMMemoryError(
-                    f"地址已存在：{_show(address_parts + [key])}——memory_make 只创建新地址，不覆盖"
+                    f"地址已存在：{nodes.show_path(address_parts + [key])}——memory_make 只创建新地址，不覆盖"
                 )
-            node[key] = self._new_node(mem_type)
-            return _show(address_parts + [key])
+            node[key] = nodes.new_node(mem_type)
+            return nodes.show_path(address_parts + [key])
         if isinstance(node, (list, MetaList)):
             if key != "-1":
                 raise IllegalOperationError(
                     f"列表位置的 key 只能是 -1（追加），得到 {key!r}；列表长度 {len(node)}"
                 )
             # 仅新列表可随意指定类型；列表已有值时必须与已有元素同类型
-            self._check_append_same_type(node, mem_type)
-            node.append(self._new_node(mem_type))
-            return _show(address_parts + [str(len(node) - 1)])
+            nodes.check_append_same_type(node, mem_type)
+            node.append(nodes.new_node(mem_type))
+            return nodes.show_path(address_parts + [str(len(node) - 1)])
         if isinstance(node, str):
             raise VMMemoryError(f"不能在字符串类型的路径下创建新键：{ref}")
         raise VMMemoryError(f"不支持在类型 {type(node).__name__} 下创建新键：{ref}")
@@ -1155,47 +997,6 @@ class Memory:
         """根目标是否完整存在（不触发设备 resolve_path 副作用）。"""
         result = self._walk_links(list(target_segments))
         return not (result[0] == "memory" and result[2] is False)
-
-    @staticmethod
-    def _list_elem_type(node: list) -> str:
-        """列表的元素类型（同类规则的依据）。混合列表报错：类型不唯一时不做猜测。"""
-        kinds = set()
-        for item in node:
-            if isinstance(item, MetaDict) or isinstance(item, dict):
-                kinds.add("dict")
-            elif isinstance(item, MetaList) or isinstance(item, list):
-                kinds.add("list")
-            elif isinstance(item, LinkNode):
-                kinds.add("link")
-            else:
-                kinds.add("str")
-        if not kinds:
-            return "str"  # 空列表默认 str（write 追加的默认类型）
-        if len(kinds) > 1:
-            raise VMMemoryError(
-                f"列表元素类型不一致：{sorted(kinds)}，同类规则的依据不唯一（该列表来自旧数据，需重建）"
-            )
-        return kinds.pop()
-
-    @staticmethod
-    def _check_append_same_type(node: list, append_kind: str) -> None:
-        """非空列表追加必须与已有元素同类型；空列表不检查（新列表可任意指定）。"""
-        if not node:
-            return
-        elem = Memory._list_elem_type(node)
-        if elem != append_kind:
-            raise VMMemoryError(
-                f"同类节点必须与已有元素同类型：列表元素是 {elem}，不能追加 {append_kind}"
-            )
-
-    @staticmethod
-    def _new_node(mem_type: str):
-        """按 mem_type 造一个新节点（新节点不带 ctrl）。"""
-        if mem_type == 'str':
-            return StrNode("")
-        if mem_type == 'dict':
-            return MetaDict(data={})
-        return MetaList(data=[])
 
     def _walk_make_path(self, segments: list, display: list, offset: int, ref: str) -> tuple:
         """沿 make 的真实路径下钻并建出缺失段，返回 (终端容器, 地址显示段)。
@@ -1230,7 +1031,7 @@ class Memory:
                 if seg in node:
                     node = node[seg]
                     continue
-                created = self._new_node('list' if next_seg == "-1" else 'dict')
+                created = nodes.new_node('list' if next_seg == "-1" else 'dict')
                 node[seg] = created
                 node = created
                 continue
@@ -1239,8 +1040,8 @@ class Memory:
                     raise VMMemoryError(
                         f"列表位置的路径段只能是 -1（追加），得到 {seg!r}：{ref}"
                     )
-                self._check_append_same_type(node, "dict")
-                created = self._new_node('dict')
+                nodes.check_append_same_type(node, "dict")
+                created = nodes.new_node('dict')
                 node.append(created)
                 di = display_index(j)
                 if di is not None:
