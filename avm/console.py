@@ -677,6 +677,133 @@ class OperatorActions:
         return {"submitted": True}
 
 
+class Lifecycle:
+    """控制台生命周期：running / paused / stopping / stopped，以及关机流程。
+
+    状态机、唤醒信号、强制退出闸门放在同一个对象里，因为它们互相牵制：关机要
+    唤醒正停在暂停里的主线程，强制退出要等满 force_stop_delay 才放行。分散在
+    Console 里就变成"三处各自盯着两个字段"。
+
+    自带的锁只保护这三个字段（与 ClientLease 的锁互不嵌套）。外部直接改状态
+    （`console.lifecycle = "paused"`）走的是单字段赋值，和以前一样不加锁。
+    """
+
+    RUNNING, PAUSED, STOPPING, STOPPED = "running", "paused", "stopping", "stopped"
+
+    def __init__(self, core, panel, channel, force_stop_hook=None,
+                 force_stop_delay: float = 10.0):
+        self.core = core
+        self.panel = panel
+        self.channel = channel
+        self.state = self.RUNNING
+        self.stopping_since: Optional[float] = None
+        self.force_stop_hook = force_stop_hook
+        self.force_stop_delay = float(force_stop_delay)
+        self.api_resume_event = threading.Event()
+        self._lock = threading.Lock()
+
+    def remaining(self) -> float:
+        """还要等几秒才允许强制退出；尚未请求关机时给满额，已停止时给 0。"""
+        with self._lock:
+            since = self.stopping_since
+            state = self.state
+        if state == self.STOPPED:
+            return 0.0
+        if since is None:
+            return self.force_stop_delay
+        return max(0.0, self.force_stop_delay - (time.time() - since))
+
+    def resume_api_pause(self) -> dict:
+        """清除内核的 API 暂停，并唤醒等待恢复的主线程。
+
+        只有真正处于暂停时才接受：没有暂停时调它说明操作员按错了，回 409 比假装
+        成功更诚实。清除暂停后主线程重新进入 core.run()。
+        """
+        core = self.core
+        with self._lock:
+            if not getattr(core, "paused", False):
+                raise ConsoleConflict("系统没有处于 API 暂停")
+            core.clear_api_pause()
+            self.state = self.RUNNING
+            self.api_resume_event.set()
+        return {"status": "resumed", "paused": False}
+
+    def wait_for_api_resume(self) -> None:
+        """主线程在 API 暂停后等待操作员恢复；关机请求也会置位（见 request_shutdown）。"""
+        self.api_resume_event.wait()
+        self.api_resume_event.clear()
+
+    def request_shutdown(self) -> dict:
+        """挂 `shutdown` 中断通知系统关机（中断是 VM 通知软件的通道）。
+
+        镜像声明了 `meta.guest_programs.shutdown` 时，把该角色程序的入口正文作为
+        payload 挂中断：Core 在下一个安全点把执行权交给监督程序，由它收尾并写
+        `$MEM.sys.power.state = "off"`；宿主在安全点看到 off 才写快照/persist 并退出。
+        没有声明 shutdown 角色时中断没有接收方：只返回 warning 并保持 stopping，
+        不自行断电，操作员可在 force_stop_delay 之后强制退出。
+
+        面板对话空闲时正阻塞在自己的推理里等操作员动作，中断要等它回到安全点才能
+        派发；所以面板关机按钮在挂中断的同时向操作员通道提交一次 `{"end": True}`，
+        让阻塞的面板回合回到安全点（作者 2026-11-11 定）。面板没有占执行权时中断
+        在下一个安全点自然派发，不提交动作，避免在通道里留下一枚过早的 end。
+        这不是"经保留对话写世界"：只是让阻塞的面板让出执行权。新输入从这一刻起被拦住。
+
+        API 暂停中也可以请求关机：关机优先于暂停，先清暂停并唤醒主线程，让 shutdown
+        中断在下一个安全点能够派发；否则主线程停在暂停等待里，中断永远到不了接收方。
+        没有 shutdown 处理程序时回到正常运行（warning 不变），force-stop 仍按秒数放行。
+        """
+        with self._lock:
+            if self.state not in (self.RUNNING, self.PAUSED):
+                raise ConsoleConflict(f"面板处于 {self.state} 状态，不再接收关机请求")
+            was_paused = self.state == self.PAUSED
+            self.state = self.STOPPING
+            self.stopping_since = time.time()
+        info = self.core.guest_roles.get("shutdown")
+        warning = None
+        if info is None:
+            warning = (
+                "镜像没有声明 shutdown 处理程序（meta.guest_programs.shutdown）："
+                "关机中断没有接收方，系统不会自行断电；等待 force_stop_after 秒后"
+                "可走 force-stop 强制退出"
+            )
+        else:
+            self.core.interrupts.raise_("shutdown", payload=info.get("entry"))
+            if self.core.active_conversation_id() == self.panel.cid:
+                # 面板关机按钮同时向操作员通道提交一次：结束面板这一轮，Core 回到
+                # 安全点才能派发 shutdown 中断（作者 2026-11-11 定）。
+                self.channel.submit_action({"end": True})
+        if was_paused:
+            # 中断已挂起；清暂停让主线程重新进入 run()，在安全点派发它。
+            self.core.clear_api_pause()
+            self.api_resume_event.set()
+        return {
+            "status": "stopping",
+            "request": "shutdown",
+            "interrupt": "shutdown" if info is not None else None,
+            "payload": info.get("entry") if info is not None else None,
+            "force_stop_after": self.force_stop_delay,
+            "warning": warning,
+        }
+
+    def force_stop(self) -> dict:
+        """强制退出：不写快照。只有注入了回调的真实宿主才真的结束进程。
+
+        只在「已请求关机且等满 force_stop_delay 秒」之后放行，防止顺手把还在
+        正常收尾的宿主杀掉；回调由 main() 注入，单测与 mock 不结束进程。
+        """
+        remaining = self.remaining()
+        if remaining > 0:
+            raise ConsoleConflict(
+                f"关机还在收尾：{remaining:.0f} 秒后才可强制退出（不写快照）"
+            )
+        with self._lock:
+            self.state = self.STOPPED
+        hook = self.force_stop_hook
+        if callable(hook):
+            threading.Thread(target=hook, daemon=True).start()
+        return {"status": "force-stopped", "snapshot_written": False}
+
+
 class Console:
     """调试控制台：面板对话 + 观测 + 介入 + 屏蔽账本。"""
 
@@ -713,18 +840,14 @@ class Console:
         self.actions = OperatorActions(core, self.panel, self.channel)
 
         self.auth_token = auth_token
-        self.force_stop_hook = force_stop_hook
-        self.lifecycle = "running"                 # running / paused / stopping / stopped
-        self.stopping_since: Optional[float] = None
-        # API 暂停后主线程等待恢复信号；POST /api/system/resume 置位并清除内核暂停。
-        self._api_resume_event = threading.Event()
-        # 关机流程：请求关机后要等满 force_stop_delay 秒才允许强制退出。
-        self.force_stop_delay = float(force_stop_delay)
+        # 生命周期（running / paused / stopping / stopped）、关机闸门与唤醒信号整块
+        # 交给 Lifecycle；对外仍按 `console.lifecycle` 这个老名字读写，见下面的属性。
+        self.lifecycle_state = Lifecycle(core, self.panel, self.channel,
+                                         force_stop_hook=force_stop_hook,
+                                         force_stop_delay=force_stop_delay)
         # 单客户端准入（宿主策略）单独一个对象管，见 ClientLease。
         self.clients = ClientLease(single_client=single_client,
                                    lease_seconds=client_lease_seconds)
-        # 这把锁保护生命周期、暂停位与屏蔽账本；与 ClientLease 内部的锁互不嵌套。
-        self._state_lock = threading.Lock()
 
         self.running = False                       # Core.run 是否在跑，由 runner 设置
         self.masks = MaskLedger(core)              # 屏蔽账本（摘下来的节点/设备）
@@ -733,6 +856,23 @@ class Console:
         # 只读投影（对话/内存/监听器/设备的展示形状），与动作记录共用同一个列表
         self.view = ConsoleView(core, self.panel, self.device_actions.log)
         core.events.add_observer(self._on_event)
+
+    # -- 生命周期 ------------------------------------------------------
+    #
+    # 状态与关机流程都在 Lifecycle 里；Console 只留 `lifecycle` 这一个老名字。
+
+    @property
+    def lifecycle(self) -> str:
+        """宿主视角的生命周期：running / paused / stopping / stopped。
+
+        状态住在 Lifecycle 里，这里只是保住 Console 上的旧名字——面板端点、关机
+        流程和测试都按 `console.lifecycle` 读写，换名字会把调用点全扯进来。
+        """
+        return self.lifecycle_state.state
+
+    @lifecycle.setter
+    def lifecycle(self, value: str) -> None:
+        self.lifecycle_state.state = value
 
     # -- 操作面板 IO 设备挂载 ------------------------------------------
 
@@ -832,21 +972,14 @@ class Console:
             "pause_category": getattr(core, "pause_category", None),
             "recovery": getattr(core, "recovery", {}),
             "io": self.io_bus.status(),
-            "force_stop_after": self.force_stop_delay,
+            "force_stop_after": self.lifecycle_state.force_stop_delay,
             "force_stop_remaining": self.force_stop_remaining(),
             "client": self.client_status(),
         }
 
     def force_stop_remaining(self) -> float:
         """还要等几秒才允许强制退出；尚未请求关机时给满额，已停止时给 0。"""
-        with self._state_lock:
-            since = self.stopping_since
-            lifecycle = self.lifecycle
-        if lifecycle == "stopped":
-            return 0.0
-        if since is None:
-            return self.force_stop_delay
-        return max(0.0, self.force_stop_delay - (time.time() - since))
+        return self.lifecycle_state.remaining()
 
     def conversation(self, cid: int) -> dict:
         return self.view.conversation(cid)
@@ -888,26 +1021,16 @@ class Console:
         return self.actions.resume()
 
     # -- API 暂停与恢复 ------------------------------------------------
+    #
+    # 暂停位是内核状态，生命周期与唤醒信号在 Lifecycle 里，这里只保留对外方法名。
 
     def resume_api_pause(self) -> dict:
-        """清除内核的 API 暂停，并唤醒等待恢复的主线程。
-
-        只有真正处于暂停时才接受：没有暂停时调它说明操作员按错了，回 409 比假装
-        成功更诚实。清除暂停后主线程重新进入 core.run()。
-        """
-        core = self.core
-        with self._state_lock:
-            if not getattr(core, "paused", False):
-                raise ConsoleConflict("系统没有处于 API 暂停")
-            core.clear_api_pause()
-            self.lifecycle = "running"
-            self._api_resume_event.set()
-        return {"status": "resumed", "paused": False}
+        """清除内核的 API 暂停，并唤醒等待恢复的主线程（实现见 Lifecycle）。"""
+        return self.lifecycle_state.resume_api_pause()
 
     def wait_for_api_resume(self) -> None:
-        """主线程在 API 暂停后等待操作员恢复；关机请求也会置位（见 request_shutdown）。"""
-        self._api_resume_event.wait()
-        self._api_resume_event.clear()
+        """主线程在 API 暂停后等待操作员恢复；关机请求也会置位。"""
+        self.lifecycle_state.wait_for_api_resume()
 
     def invoke_device_action(self, mount: str, index: Optional[int] = None,
                              arguments: Optional[dict] = None,
@@ -936,74 +1059,12 @@ class Console:
                 "target": entry["target"], "text": entry["text"]}
 
     def request_shutdown(self) -> dict:
-        """挂 `shutdown` 中断通知系统关机（中断是 VM 通知软件的通道）。
-
-        镜像声明了 `meta.guest_programs.shutdown` 时，把该角色程序的入口正文作为
-        payload 挂中断：Core 在下一个安全点把执行权交给监督程序，由它收尾并写
-        `$MEM.sys.power.state = "off"`；宿主在安全点看到 off 才写快照/persist 并退出。
-        没有声明 shutdown 角色时中断没有接收方：只返回 warning 并保持 stopping，
-        不自行断电，操作员可在 force_stop_delay 之后强制退出。
-
-        面板对话空闲时正阻塞在自己的推理里等操作员动作，中断要等它回到安全点才能
-        派发；所以面板关机按钮在挂中断的同时向操作员通道提交一次 `{"end": True}`，
-        让阻塞的面板回合回到安全点（作者 2026-11-11 定）。面板没有占执行权时中断
-        在下一个安全点自然派发，不提交动作，避免在通道里留下一枚过早的 end。
-        这不是"经保留对话写世界"：只是让阻塞的面板让出执行权。新输入从这一刻起被拦住。
-
-        API 暂停中也可以请求关机：关机优先于暂停，先清暂停并唤醒主线程，让 shutdown
-        中断在下一个安全点能够派发；否则主线程停在暂停等待里，中断永远到不了接收方。
-        没有 shutdown 处理程序时回到正常运行（warning 不变），force-stop 仍按秒数放行。
-        """
-        with self._state_lock:
-            if self.lifecycle not in ("running", "paused"):
-                raise ConsoleConflict(f"面板处于 {self.lifecycle} 状态，不再接收关机请求")
-            was_paused = self.lifecycle == "paused"
-            self.lifecycle = "stopping"
-            self.stopping_since = time.time()
-        info = self.core.guest_roles.get("shutdown")
-        warning = None
-        if info is None:
-            warning = (
-                "镜像没有声明 shutdown 处理程序（meta.guest_programs.shutdown）："
-                "关机中断没有接收方，系统不会自行断电；等待 force_stop_after 秒后"
-                "可走 force-stop 强制退出"
-            )
-        else:
-            self.core.interrupts.raise_("shutdown", payload=info.get("entry"))
-            if self.core.active_conversation_id() == self.panel.cid:
-                # 面板关机按钮同时向操作员通道提交一次：结束面板这一轮，Core 回到
-                # 安全点才能派发 shutdown 中断（作者 2026-11-11 定）。
-                self.channel.submit_action({"end": True})
-        if was_paused:
-            # 中断已挂起；清暂停让主线程重新进入 run()，在安全点派发它。
-            self.core.clear_api_pause()
-            self._api_resume_event.set()
-        return {
-            "status": "stopping",
-            "request": "shutdown",
-            "interrupt": "shutdown" if info is not None else None,
-            "payload": info.get("entry") if info is not None else None,
-            "force_stop_after": self.force_stop_delay,
-            "warning": warning,
-        }
+        """挂 `shutdown` 中断通知系统关机（实现与设计说明见 Lifecycle.request_shutdown）。"""
+        return self.lifecycle_state.request_shutdown()
 
     def force_stop(self) -> dict:
-        """强制退出：不写快照。只有注入了回调的真实宿主才真的结束进程。
-
-        只在「已请求关机且等满 force_stop_delay 秒」之后放行，防止顺手把还在
-        正常收尾的宿主杀掉；回调由 main() 注入，单测与 mock 不结束进程。
-        """
-        remaining = self.force_stop_remaining()
-        if remaining > 0:
-            raise ConsoleConflict(
-                f"关机还在收尾：{remaining:.0f} 秒后才可强制退出（不写快照）"
-            )
-        with self._state_lock:
-            self.lifecycle = "stopped"
-        hook = self.force_stop_hook
-        if callable(hook):
-            threading.Thread(target=hook, daemon=True).start()
-        return {"status": "force-stopped", "snapshot_written": False}
+        """强制退出，不写快照（实现与放行条件见 Lifecycle.force_stop）。"""
+        return self.lifecycle_state.force_stop()
 
     # -- 屏蔽与还原 ----------------------------------------------------
     #
@@ -1523,8 +1584,9 @@ def _serve_until_stop(core, console) -> int:
             if not core.paused:
                 # 恢复/关机端点可能抢在主线程读到暂停之前清掉 core.paused 并置位
                 # 事件；事件已置位说明这是暂停后的继续，不是正常退出。
-                if console._api_resume_event.is_set():
-                    console._api_resume_event.clear()
+                resume_event = console.lifecycle_state.api_resume_event
+                if resume_event.is_set():
+                    resume_event.clear()
                     continue
                 break
             _wait_while_paused(core, console)

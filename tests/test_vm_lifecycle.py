@@ -752,8 +752,8 @@ class TestConsoleShutdownRequest:
     def test_force_stop_immediately_ends_host_without_snapshot(self, tmp_path):
         core, console = self._console(tmp_path)
         exited = threading.Event()
-        console.force_stop_hook = exited.set
-        console.force_stop_delay = 0.0
+        console.lifecycle_state.force_stop_hook = exited.set
+        console.lifecycle_state.force_stop_delay = 0.0
         console.request_shutdown()
 
         response = console.force_stop()
