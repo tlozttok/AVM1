@@ -329,11 +329,15 @@ class LinkNode:
 
 """AVM 消息类型定义"""
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Tuple, Union
+from typing import Optional, List, Dict, Any, Tuple, Union, TypedDict
 from enum import Enum
-from openai.types.chat import ChatCompletionMessageToolCallUnion
 
-type ToolCall=ChatCompletionMessageToolCallUnion
+
+class ToolCall(TypedDict):
+    """工具调用的 chat 投影形状（本仓类型；不再依赖 openai SDK 的类型）。"""
+    id: str
+    type: str
+    function: dict
 
 class Role(str, Enum):
     """消息角色"""

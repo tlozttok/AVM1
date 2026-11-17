@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
 
-from .core import _build_tools, _instruction_registry
+from .instructions import build_tools as _build_tools, instruction_registry as _instruction_registry
 from .exceptions import VMMemoryError, RunnerStop
 from .io_bus import IOBus
 from .io_devices import IOInputDevice, IOOutputDevice
