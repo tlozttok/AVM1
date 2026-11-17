@@ -403,6 +403,20 @@ def _init_para_ref(core: Core, init: dict, node: Optional[MetaDict], node_type: 
 
 def _start_init(core: Core, init: dict):
     name = init.get("name", "init")
+    system, user, node, node_type, system_ref = _resolve_init_program(core, init)
+    para_ref = _init_para_ref(core, init, node, node_type)
+    if node_type == "python":
+        _start_python_init(core, system_ref, para_ref, user, name, node)
+        return
+    _start_llm_init(core, system, user, para_ref, name, node)
+
+
+def _resolve_init_program(core: Core, init: dict) -> tuple:
+    """init 段 → (system 正文, user 正文, 程序节点, 节点类型, system_ref)。
+
+    两个二选一：system/system_ref、user/user_ref。写成"必须且只能"是因为镜像里
+    同时给或都不给都无法判断作者意图，早报错好过猜。
+    """
     system_ref, user_ref = init.get("system_ref"), init.get("user_ref")
     system, user = init.get("system"), init.get("user")
     if (system is None) == (system_ref is None):
@@ -412,19 +426,7 @@ def _start_init(core: Core, init: dict):
     node: Optional[MetaDict] = None
     node_type: Optional[str] = None
     if system_ref is not None:
-        if not isinstance(system_ref, str) or not system_ref.startswith("$"):
-            raise ImageError("system_ref 必须是 $ 开头的内存引用（字面量请用 system 字段）")
-        node = core.unwrap(system_ref, for_llm=False)
-        node_type = (node.get_ctrl() or {}).get("type") if isinstance(node, MetaDict) else None
-        if node_type not in ("settingup", "python"):
-            raise ImageError(
-                f"system_ref {system_ref} 必须指向 ctrl.type='settingup'（LLM 程序）或 "
-                "'python'（Python 程序）的 dict 节点（str 节点、无类型 dict 节点不接受）"
-            )
-        content = node.get("content")
-        if not isinstance(content, str):
-            raise ImageError(f"程序节点 {system_ref} 必须有字符串 content 字段")
-        system = content
+        node, node_type, system = _read_program_node(core, system_ref)
     if user_ref is not None:
         if not isinstance(user_ref, str) or not user_ref.startswith("$"):
             raise ImageError("user_ref 必须是 $ 开头的内存引用（字面量请用 user 字段）")
@@ -434,31 +436,56 @@ def _start_init(core: Core, init: dict):
             "init 的 system/user 必须是字符串（system 字面量或程序节点的 content；"
             "user_ref 需指向 str 节点）"
         )
-    para_ref = _init_para_ref(core, init, node, node_type)
-    if node_type == "python":
-        # PLM 入口：0 号对话是 Python 对话。分派与模型命名空间校验复用 _build_conversation，
-        # 它建好 SystemMessage（程序代码）、注册对话、设 para_ref 与 is_python；
-        # 这里补用户消息与"0 号 + 就绪"语义（与 Core.start 对齐，区别只在执行器是 PLM）。
-        if node is not None:
-            try:
-                _derive_child_caps(core, None, node, is_sub=False, is_init=True)
-            except (VMMemoryError, IllegalOperationError) as e:
-                raise ImageError(f"init 程序的能力声明非法：{e}")
-        conv = _build_conversation(core, system_ref, para_ref, parent=None, is_sub=False, is_init=True)
-        conv.append_user_message(user)
-        conv.is_root = True
-        conv.name = name
-        core.wake(conv.cid)  # 首次入队（摘掉残留 + 排到就绪末尾）
-        return
+    return system, user, node, node_type, system_ref
+
+
+def _read_program_node(core: Core, system_ref: str) -> tuple:
+    """system_ref → (程序节点, 节点类型, 程序正文)；不是程序节点就报镜像错误。"""
+    if not isinstance(system_ref, str) or not system_ref.startswith("$"):
+        raise ImageError("system_ref 必须是 $ 开头的内存引用（字面量请用 system 字段）")
+    node = core.unwrap(system_ref, for_llm=False)
+    node_type = (node.get_ctrl() or {}).get("type") if isinstance(node, MetaDict) else None
+    if node_type not in ("settingup", "python"):
+        raise ImageError(
+            f"system_ref {system_ref} 必须指向 ctrl.type='settingup'（LLM 程序）或 "
+            "'python'（Python 程序）的 dict 节点（str 节点、无类型 dict 节点不接受）"
+        )
+    content = node.get("content")
+    if not isinstance(content, str):
+        raise ImageError(f"程序节点 {system_ref} 必须有字符串 content 字段")
+    return node, node_type, content
+
+
+def _start_python_init(core: Core, system_ref, para_ref, user: str, name: str, node) -> None:
+    """PLM 入口：0 号对话是 Python 对话。
+
+    分派与模型命名空间校验复用 _build_conversation，它建好 SystemMessage（程序代码）、
+    注册对话、设 para_ref 与 is_python；这里补用户消息与"0 号 + 就绪"语义
+    （与 Core.start 对齐，区别只在执行器是 PLM）。
+    """
+    if node is not None:
+        _check_init_caps(core, node)
+    conv = _build_conversation(core, system_ref, para_ref, parent=None, is_sub=False, is_init=True)
+    conv.append_user_message(user)
+    conv.is_root = True
+    conv.name = name
+    core.wake(conv.cid)  # 首次入队（摘掉残留 + 排到就绪末尾）
+
+
+def _start_llm_init(core: Core, system: str, user: str, para_ref, name: str, node) -> None:
+    """LLM 入口：先建对话，再按程序 ctrl.caps 覆盖 init 能力（init 一律内核态）。"""
     conv = core.start(system, user, para_ref)
     if node is not None:
-        # LLM 入口同样按程序 ctrl.caps 计算 init 能力；init 强制内核态
-        try:
-            caps = _derive_child_caps(core, None, node, is_sub=False, is_init=True)
-        except (VMMemoryError, IllegalOperationError) as e:
-            raise ImageError(f"init 程序的能力声明非法：{e}")
-        conv.caps = caps
+        conv.caps = _check_init_caps(core, node)
     conv.name = name
+
+
+def _check_init_caps(core: Core, node):
+    """init 程序的能力声明校验；非法声明翻成 ImageError（镜像作者看得懂的话）。"""
+    try:
+        return _derive_child_caps(core, None, node, is_sub=False, is_init=True)
+    except (VMMemoryError, IllegalOperationError) as e:
+        raise ImageError(f"init 程序的能力声明非法：{e}")
 
 
 def _parse_guest_programs(raw) -> dict:
