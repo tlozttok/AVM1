@@ -161,10 +161,12 @@ Core 内置只读信息设备：`$MEM.conversations`（对话列表与单对话�
 
 启动自带的普通内存节点（不是设备、不产生事件），由 `Core.install_model_catalog()` 在 `Core()` 与镜像装载之后安装，镜像或检查点里已有的字段不覆盖。作用是让对话读得到"有哪些模型可用、各自要什么参数"，并给 `create_cmd` / `create_sub` 的命名空间校验提供依据。
 
-- `llm`：`source`（`"api"` 已从上游 `/models` 取到 / `"unavailable"` 没取到 / `"image"` 镜像自带）、`reason`（取不到时的原因）、`required`（`"model"`）、`params`（可写进 para 的 API 参数，来自 `LMU._API_PARAM_KEYS`，标注数值型或字符串型）、`models`（列表，每项 `id` 加可选的上游元数据：`name` / `owned_by` / `context_window` / `max_output_tokens` / 输入输出模态 / `reasoning_effort_levels` / `default_effort_level`）。
+- `llm`：`default`（缺省接口，当前为 `"chat"`）与 `interfaces`（按接口分栏的普通 dict，只列宿主已装配的接口）：
+  - `interfaces.<api>`：`api` 取 `chat` / `responses` / `anthropic` / `gemini`；每栏有 `source`（`"api"` 已从该接口上游 `/models` 取到 / `"unavailable"` 没取到 / `"image"` 镜像自带）、`reason`（取不到时的原因）、`required`（`"model"`）、`params`（该接口接受的 para 参数，数值型由适配器标注）、`models`（该接口的上游清单，每项 `id` 加可选元数据：`name` / `owned_by` / `context_window` / `max_output_tokens` / 输入输出模态 / `reasoning_effort_levels` / `default_effort_level`）。
+  - para 的 `api` 选择接口（缺省 `chat`），`model` 按该接口的清单校验；接口未装配或模型不在清单时拒绝建对话，清单取不到时只警告（见下文命名空间校验）。
 - `plm`：列表，每项 `name`（`plm.simple` 等）、`required`、`params`（`只有 model 有效；tools 由内核注入；LLM 参数无效`）与来自类文档串首行的说明；宿主独占的 PLM（如 `plm.operator`）不列进这个列表——模型目录是对话可见面。
 - 名字（`plm.*` 与带点的模型 id）装在列表项的 `name` / `id` 字段里，不当键——`$MEM` 寻址按点号切段，带点的键读不回来。
-- `Core.refresh_model_catalog(timeout)` 拉一次上游 `GET {base_url}/models` 填充 `models`：自己校验信封（`object="list"` 且 `data` 是数组）、除 `id` 外全部按可选字段读、任何失败都收敛成 `source="unavailable"` 并只打一行 stderr。原始响应的解析兼容 openai 各版本（1.x 的 `.json()`、2.x 的 `.http_response`/`.text`），不依赖 SDK 的强类型页面对象。清单只当参考：取不到时不拦启动，也不拦模型名。宿主在启动时调一次（`avm/boot.py` 的 `start_core`）。
+- `Core.refresh_model_catalog(timeout)` 拉一次上游 `GET {base_url}/models` 填充 `models`：自己校验信封（`object="list"` 且 `data` 是数组）、除 `id` 外全部按可选字段读、任何失败都收敛成 `source="unavailable"` 并只打一行 stderr。原始响应的解析兼容 openai 各版本（1.x 的 `.json()`、2.x 的 `.http_response`/`.text`），不依赖 SDK 的强类型页面对象；该解析在 LLM 服务模块（`avm/llm.py`）里，目录节点写入仍由 Core 负责。清单只当参考：取不到时不拦启动，也不拦模型名。宿主在启动时调一次（`avm/boot.py` 的 `start_core`）。
 
 ### 模块目录（`$MEM.module_catalog`）
 
@@ -195,7 +197,7 @@ Core 内置只读信息设备：`$MEM.conversations`（对话列表与单对话�
 
 ### 命名空间校验（输入边界）
 
-`model` 一个字段承载两种命名：LLM 模型名与 PLM 注册表名。`create_cmd` / `create_sub` 在建对话前交叉校验：
+`model` 一个字段承载两种命名：LLM 模型名与 PLM 注册表名；`api` 只在 LLM 侧选择接口（缺省 `chat`）。`create_cmd` / `create_sub` 在建对话前交叉校验：
 
 - `system_ref` 指向 `python` 程序 → `model` 必须是 `plm` 列表里的注册名，否则 `Illegal:` 工具响应、不创建对话；
 - 宿主独占的 PLM（不在对话可见的 `plm` 列表里）→ 统一回 `Illegal: 操作被外部原因拒绝`，不创建对话；拒绝理由只写 stderr（对话不接触宿主/调试实现）；
@@ -666,7 +668,7 @@ Guard 是软件层（镜像/OS 程序）注册的一个普通内核态监听器�
 
 ### 重启快照（snapshot，缓存）
 
-`avm/snapshot.py`；`format="avm.snapshot"`、`version=2`（显式版本化，旧版本拒绝恢复并提示 `reset`），`generation` 必须存在且为正整数。形状与内核转储同源（调度、内存、安全段、对话、监听器、设备表），差别：不截断、带 `seq`（已提交的日志位置）与 `generation`（日志代际）、带 `device_specs`（设备来源表）、对话额外带 cid/parent_cid/待发批次。它是加速重启的缓存；没有快照就没有可恢复的对话态。
+`avm/snapshot.py`；`format="avm.snapshot"`、`version=3`（显式版本化，旧版本拒绝恢复并提示 `reset`），`generation` 必须存在且为正整数。形状与内核转储同源（调度、内存、安全段、对话、监听器、设备表），差别：不截断、带 `seq`（已提交的日志位置）与 `generation`（日志代际）、带 `device_specs`（设备来源表）、对话额外带 cid/parent_cid/待发批次。它是加速重启的缓存；没有快照就没有可恢复的对话态。
 
 `Core.snapshot_to(path)` 只在安全点调用（宿主正常退出路径，以及定时快照触发）。`Core.restore_from(path)` 顺序：清空调度/对话/监听器 → 换内存树 → 按来源表重建设备并重新物化挂载点 → 按 cid 重建对话与父子引用 → 恢复监听器 → 安全配置/para_ref/下一个 cid → 跑安全点自检。对话身份与历史按硬承诺保留；设备内部状态不序列化，按 spec 重建实例。
 

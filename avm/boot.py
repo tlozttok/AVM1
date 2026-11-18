@@ -521,13 +521,13 @@ def _restored_counts(core: Core) -> dict:
 
 def _boot_resume(image_path: str, snapshot_path: str, last_exit: str,
                  host_flags: Optional[dict], checkpoint_in: Optional[str],
-                 report_mode: str = "resume") -> Core:
+                 report_mode: str = "resume", services=None) -> Core:
     if checkpoint_in:
         raise ImageError(
             "resume 从快照恢复，不能同时用 checkpoint_in（单对话检查点属于冷启动调试路径）"
         )
     doc = _require_snapshot(snapshot_path, "resume")
-    core = load_image(Core(), image_path, host_flags=host_flags, restore=True)
+    core = load_image(Core(services=services), image_path, host_flags=host_flags, restore=True)
     doc = _restore_snapshot(core, snapshot_path)
     applied = _resume_journal_tail(core, doc)
     restore_guest_roles(core)
@@ -543,7 +543,7 @@ def _boot_resume(image_path: str, snapshot_path: str, last_exit: str,
 
 def _boot_reboot(image_path: str, snapshot_path: str, journal_path: Optional[str],
                  last_exit: str, host_flags: Optional[dict],
-                 checkpoint_in: Optional[str]) -> Core:
+                 checkpoint_in: Optional[str], services=None) -> Core:
     if checkpoint_in:
         raise ImageError(
             "reboot 会丢弃全部对话，不能同时用 checkpoint_in（单对话检查点属于冷启动调试路径）"
@@ -551,7 +551,7 @@ def _boot_reboot(image_path: str, snapshot_path: str, journal_path: Optional[str
     doc = _require_snapshot(snapshot_path, "reboot")
     generation = _snapshot_generation(doc)
     snapshot_seq = int(doc.get("seq", 0) or 0)
-    core = Core()
+    core = Core(services=services)
     # 快照的 cid 计数先就位：init 与 guest 程序按它继续分配 cid（世界重建不重置编号）。
     core.restore_next_cid(_next_cid_from(doc))
     load_image(core, image_path, host_flags=host_flags, restore=True)
@@ -581,9 +581,9 @@ def _boot_reboot(image_path: str, snapshot_path: str, journal_path: Optional[str
 def _boot_reset(image_path: str, snapshot_path: Optional[str],
                 journal_path: Optional[str], last_exit: str,
                 host_flags: Optional[dict], checkpoint_in: Optional[str],
-                report_mode: str = "reset") -> Core:
+                report_mode: str = "reset", services=None) -> Core:
     generation = _generation_hint(snapshot_path, journal_path)
-    core = load_image(Core(), image_path, checkpoint_in=checkpoint_in,
+    core = load_image(Core(services=services), image_path, checkpoint_in=checkpoint_in,
                       host_flags=host_flags)
     archived_journal, archived_generation = archive_file(journal_path, generation)
     # 快照是上一代世界的缓存：reset 后它没有意义，归档而不是留着让下一次 reboot 误用。
@@ -611,6 +611,7 @@ def boot(
     refresh_models: bool = True,
     timeout: float = 10.0,
     api_error_policy=None,
+    services=None,
 ) -> Core:
     """加载区的便捷入口：创建空核心 → 加载镜像 →（按模式恢复/重放）→ 启动核心。
 
@@ -618,6 +619,7 @@ def boot(
     否则等价 reset；没有"镜像 + 日志重放"的冷启动路径。
     restore：显式快照路径，等价 resume（严格——快照读不出来直接报错）。
     checkpoint_in：调试用单对话检查点；只用于冷启动（reset）。
+    services：宿主装配的服务层（多接口 LLM 适配器）；缺省只装配 chat。
     """
     _check_mode(mode)
     snapshot_path = _declared_snapshot_path(image_path)
@@ -639,13 +641,15 @@ def boot(
         )
     if resolved == "resume":
         core = _boot_resume(image_path, snapshot_path, last_exit, host_flags,
-                            checkpoint_in, report_mode=report_mode)
+                            checkpoint_in, report_mode=report_mode,
+                            services=services)
     elif resolved == "reboot":
         core = _boot_reboot(image_path, snapshot_path, journal_path, last_exit,
-                            host_flags, checkpoint_in)
+                            host_flags, checkpoint_in, services=services)
     else:
         core = _boot_reset(image_path, snapshot_path, journal_path, last_exit,
-                           host_flags, checkpoint_in, report_mode=report_mode)
+                           host_flags, checkpoint_in, report_mode=report_mode,
+                           services=services)
     return start_core(
         core,
         refresh_models=refresh_models,

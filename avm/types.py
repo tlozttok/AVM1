@@ -1,13 +1,11 @@
 """AVM 类型系统：带元数据的集合类"""
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union
-
-from openai.types.chat import ChatCompletionMessageToolCallUnion
+from typing import Any, Dict, List, Optional, Tuple, TypedDict, Union
 
 from .capabilities import Capability, caps_from_dict, caps_to_dict, default_kernel_caps
 
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 3
 
 # 保留对话 cid（作者规定）：宿主侧操作员对话的身份，不参与正常分配，也不会撞上
 # `_next_cid` 的正数。它对普通对话隐藏：不出现在 $MEM.conversations / $MEM.scheduler
@@ -21,57 +19,110 @@ CHECKPOINT_VERSION = 2
 PANEL_CID = -1
 
 
-def _tool_call_to_dict(tc) -> dict:
-    """工具调用无损转 dict（兼容 ToolCall 对象与已转好的 dict，检查点序列化用）"""
-    if isinstance(tc, dict):
-        fn = tc.get("function") or {}
-        return {
-            "id": tc.get("id"),
-            "type": tc.get("type", "function"),
-            "function": {"name": fn.get("name"), "arguments": fn.get("arguments")},
-        }
-    fn = tc.function
-    return {
-        "id": tc.id,
-        "type": getattr(tc, "type", "function"),
-        "function": {"name": fn.name, "arguments": fn.arguments},
-    }
+def _part_field_order(part_type: str) -> tuple:
+    return _PART_FIELD_ORDER.get(part_type, ())
+
+
+_PART_FIELD_ORDER = {
+    "text": ("type", "text"),
+    "tool_call": ("type", "call_id", "name", "args"),
+    "tool_result": ("type", "call_id", "content", "is_error"),
+    "reasoning": ("type", "interface", "text", "opaque", "summary"),
+    "provider": ("type", "interface", "kind", "data"),
+}
+PART_TYPES = tuple(_PART_FIELD_ORDER)
+
+
+def normalize_part(part: dict) -> dict:
+    """IR part 归一化：已知类型按声明字段顺序写，多余键按原顺序附后。
+
+    字段顺序固定是检查点/日志"逐字节稳定"的基础；未知类型也保留，
+    供跨协议扩展块原样往返。
+    """
+    if not isinstance(part, dict):
+        raise TypeError(f"IR part 必须是对象，得到 {type(part).__name__}")
+    part_type = part.get("type")
+    if not isinstance(part_type, str) or not part_type:
+        raise TypeError(f"IR part.type 必须是非空字符串，得到 {part_type!r}")
+    order = _part_field_order(part_type)
+    out = {}
+    for key in order:
+        if key in part:
+            value = part[key]
+            out[key] = dict(value) if isinstance(value, dict) else value
+    for key, value in part.items():
+        if key in out:
+            continue
+        out[key] = dict(value) if isinstance(value, dict) else value
+    return out
+
+
+def normalize_parts(parts) -> list:
+    return [normalize_part(part) for part in (parts or [])]
+
+
+def text_part(text: str) -> dict:
+    return {"type": "text", "text": str(text)}
+
+
+def tool_call_part(call_id: str, name: str, args: str) -> dict:
+    return {"type": "tool_call", "call_id": call_id, "name": name, "args": args}
+
+
+def tool_result_part(call_id: str, content: str, is_error=None) -> dict:
+    part = {"type": "tool_result", "call_id": call_id, "content": content}
+    if is_error is not None:
+        part["is_error"] = bool(is_error)
+    return part
+
+
+def reasoning_part(interface: str, *, text=None, opaque=None, summary=None,
+                   **extra) -> dict:
+    part = {"type": "reasoning", "interface": interface}
+    if text is not None:
+        part["text"] = text
+    if opaque is not None:
+        part["opaque"] = opaque
+    if summary is not None:
+        part["summary"] = summary
+    part.update(extra)  # 协议作用域的额外字段（如 Responses 的 reasoning item id）
+    return part
+
+
+def provider_part(interface: str, kind: str, data: dict) -> dict:
+    return {"type": "provider", "interface": interface, "kind": kind, "data": data}
+
+
+def _parts_text(parts) -> str:
+    return "".join(part.get("text", "") for part in parts if part.get("type") == "text")
 
 
 def message_to_dict(msg: "Message") -> dict:
-    """消息的无损 JSON 形状（检查点、重启快照、回合日志共用；字段顺序固定）。
-
-    保留每条消息的全部字段：content 空串照写、tool_calls 原样、reasoning_content
-    区分 None 与空串、tool_call_id 原样。恢复后发给 API 的前缀逐字节一致。
-    """
-    d = {"role": msg.role, "content": msg.content}
-    if isinstance(msg, ToolMessage):
-        d["tool_call_id"] = msg.tool_call_id
-    if isinstance(msg, AssistantMessage):
-        if msg.tool_calls:
-            d["tool_calls"] = [_tool_call_to_dict(tc) for tc in msg.tool_calls]
-        if msg.reasoning_content is not None:
-            d["reasoning_content"] = msg.reasoning_content
-    return d
+    """消息的 IR JSON 形状（检查点、重启快照、回合日志共用；字段顺序固定）。"""
+    return {"role": msg.role, "parts": [normalize_part(part) for part in msg.parts]}
 
 
 def message_from_dict(d: dict) -> "Message":
-    """message_to_dict 的逆操作（未知角色按普通 Message 保留）。"""
-    role = d.get("role")
-    content = d.get("content", "")
+    """message_to_dict 的逆操作：只接受 IR 形状（旧 chat 形状由版本号拒绝）。"""
+    if not isinstance(d, dict):
+        raise TypeError(f"消息载荷必须是对象，得到 {type(d).__name__}")
+    parts = d.get("parts")
+    if not isinstance(parts, list):
+        raise TypeError(f"消息载荷缺少 parts 数组：{d!r}")
+    return message_from_parts(d.get("role"), parts)
+
+
+def message_from_parts(role, parts) -> "Message":
+    normalized = normalize_parts(parts)
     if role == "assistant":
-        return AssistantMessage(
-            content=content,
-            tool_calls=d.get("tool_calls"),
-            reasoning_content=d.get("reasoning_content"),
-        )
+        return AssistantMessage(parts=normalized)
     if role == "tool":
-        return ToolMessage(content=content, tool_call_id=d.get("tool_call_id", ""))
+        return ToolMessage(parts=normalized)
     if role == "user":
-        return UserMessage(content=content)
+        return UserMessage(parts=normalized)
     if role == "system":
-        return SystemMessage(content=content)
-    return Message(content=content, role=role or "")
+        return SystemMessage(parts=normalized)
+    return Message(role=role or "", parts=normalized)
 
 
 def batch_to_dict(batch: 'UserMessageBatch') -> dict:
@@ -343,9 +394,21 @@ class LinkNode:
 
 # ---------------------------------------------------------------------------
 # 消息类型（原为独立模块，追加到本文件末尾；导入已并入顶部模块头）
+#
+# 存储形状是 `role + parts[]`（作者 2026-11-17 裁决）：reasoning 是 assistant 的
+# part；工具返回在 tool 角色消息里；tool_call.args 保留原始 JSON 字符串；不透明
+# 字段叫 opaque；system 允许多条。`content` / `tool_calls` / `reasoning_content` /
+# `tool_call_id` 保留为 chat 投影属性——PLM 合同、guest transcript、monitor 与既有
+# 测试都依赖它们。IR 的中立性与多协议落点见 plan-ir-multiprotocol-2026-11-17。
 # ---------------------------------------------------------------------------
 
-type ToolCall=ChatCompletionMessageToolCallUnion
+
+class ToolCall(TypedDict):
+    """工具调用的 chat 投影形状（本仓类型；不再依赖 openai SDK 的类型）。"""
+    id: str
+    type: str
+    function: dict
+
 
 class Role(str, Enum):
     """消息角色"""
@@ -355,39 +418,153 @@ class Role(str, Enum):
     TOOL = "tool"
 
 
-@dataclass
 class Message:
-    """消息基类"""
-    content: str
-    role: str = ""
+    """消息基类：role + parts；content 是 text parts 的投影视图。"""
+
+    def __init__(self, content: str = "", role: str = "", *, parts=None):
+        self.role = role
+        if parts is not None:
+            self.parts = normalize_parts(parts)
+        else:
+            self.parts = [text_part(content)] if content != "" else []
+
+    @property
+    def content(self) -> str:
+        return _parts_text(self.parts)
+
+    @content.setter
+    def content(self, value: str) -> None:
+        others = [part for part in self.parts if part.get("type") != "text"]
+        self.parts = ([text_part(value)] if value != "" else []) + others
+
+    def __eq__(self, other):
+        return (isinstance(other, Message) and other.role == self.role
+                and other.parts == self.parts)
+
+    __hash__ = None
+
+    def __repr__(self):
+        return f"{type(self).__name__}(role={self.role!r}, parts={self.parts!r})"
 
 
-
-@dataclass
 class SystemMessage(Message):
-    """系统消息"""
-    role: str = "system"
+    """系统消息（IR 允许多条；投影规则由各协议决定）"""
+
+    def __init__(self, content: str = "", role: Optional[str] = None, *, parts=None):
+        super().__init__(content, role if role is not None else Role.SETTING.value,
+                         parts=parts)
 
 
-@dataclass
 class UserMessage(Message):
     """用户消息"""
-    role: str = "user"
+
+    def __init__(self, content: str = "", role: Optional[str] = None, *, parts=None):
+        super().__init__(content, role if role is not None else Role.CMD.value, parts=parts)
 
 
-@dataclass
 class AssistantMessage(Message):
-    """助手消息"""
-    role: str = "assistant"
-    tool_calls: Optional[List[ToolCall]] = None
-    reasoning_content: Optional[str] = None
+    """助手消息：text / reasoning / tool_call 都可以是它的 part。"""
+
+    def __init__(self, content: str = "", role: Optional[str] = None,
+                 tool_calls: Optional[List[dict]] = None,
+                 reasoning_content: Optional[str] = None, *, parts=None):
+        if parts is None:
+            built = []
+            if content != "":
+                built.append(text_part(content))
+            if reasoning_content is not None:
+                built.append(reasoning_part("chat", text=reasoning_content))
+            for tc in tool_calls or []:
+                if isinstance(tc, dict):
+                    call_id = tc.get("id")
+                    fn = tc.get("function") or {}
+                else:
+                    call_id = getattr(tc, "id", None)
+                    fn = getattr(tc, "function", None)
+                    fn = {"name": getattr(fn, "name", None),
+                          "arguments": getattr(fn, "arguments", "")} if fn is not None else {}
+                built.append(tool_call_part(call_id, fn.get("name"), fn.get("arguments", "")))
+            parts = built
+        super().__init__("", role if role is not None else Role.ASSISTANT.value,
+                         parts=parts)
+
+    @property
+    def tool_calls(self) -> Optional[List[dict]]:
+        calls = [part for part in self.parts if part.get("type") == "tool_call"]
+        if not calls:
+            return None
+        return [{"id": part.get("call_id"), "type": "function",
+                 "function": {"name": part.get("name"),
+                              "arguments": part.get("args", "")}}
+                for part in calls]
+
+    @tool_calls.setter
+    def tool_calls(self, value) -> None:
+        others = [part for part in self.parts if part.get("type") != "tool_call"]
+        built = []
+        for tc in value or []:
+            fn = tc.get("function") or {}
+            built.append(tool_call_part(tc.get("id"), fn.get("name"),
+                                        fn.get("arguments", "")))
+        self.parts = others + built
+
+    @property
+    def reasoning_content(self) -> Optional[str]:
+        texts = [part.get("text", "") for part in self.parts
+                 if part.get("type") == "reasoning" and part.get("interface") == "chat"]
+        if not texts:
+            return None
+        return "".join(texts)
+
+    @reasoning_content.setter
+    def reasoning_content(self, value) -> None:
+        others = [part for part in self.parts
+                  if not (part.get("type") == "reasoning"
+                          and part.get("interface") == "chat")]
+        if value is None:
+            self.parts = others
+        else:
+            self.parts = others + [reasoning_part("chat", text=value)]
 
 
-@dataclass
 class ToolMessage(Message):
-    """工具响应消息"""
-    role: str = "tool"
-    tool_call_id: str = ""
+    """工具响应消息：content 是 tool_result part 的投影。"""
+
+    def __init__(self, content: str = "", tool_call_id: str = "",
+                 role: Optional[str] = None, *, parts=None):
+        if parts is None:
+            parts = [tool_result_part(tool_call_id, content)]
+        super().__init__("", role if role is not None else Role.TOOL.value, parts=parts)
+
+    @property
+    def content(self) -> str:
+        for part in self.parts:
+            if part.get("type") == "tool_result":
+                return part.get("content", "")
+        return ""
+
+    @content.setter
+    def content(self, value: str) -> None:
+        for part in self.parts:
+            if part.get("type") == "tool_result":
+                part["content"] = value
+                return
+        self.parts.append(tool_result_part("", value))
+
+    @property
+    def tool_call_id(self) -> str:
+        for part in self.parts:
+            if part.get("type") == "tool_result":
+                return part.get("call_id", "")
+        return ""
+
+    @tool_call_id.setter
+    def tool_call_id(self, value: str) -> None:
+        for part in self.parts:
+            if part.get("type") == "tool_result":
+                part["call_id"] = value
+                return
+        self.parts.append(tool_result_part(value, ""))
 
 
 def message_to_api_dict(msg: Message) -> dict:
@@ -401,7 +578,6 @@ def message_to_api_dict(msg: Message) -> dict:
     if isinstance(msg, ToolMessage):
         d["tool_call_id"] = msg.tool_call_id
     return d
-
 
 
 class Conversation:
@@ -539,9 +715,8 @@ class Conversation:
     def to_checkpoint(self) -> dict:
         """单对话检查点：无损、确定性序列化（调试用）。
 
-        保留每条消息的全部字段（content 空串、tool_calls 原样、reasoning_content、
-        tool_call_id），字段顺序固定，保证恢复后 to_api_messages() 与保存时逐字节一致
-        （前缀缓存命中的前提）。
+        存 IR（role + parts，字段顺序固定）；恢复后 to_api_messages()（chat 投影）
+        与保存时逐字节一致（前缀缓存命中的前提）。
         """
         return {
             "version": CHECKPOINT_VERSION,

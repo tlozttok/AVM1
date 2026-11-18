@@ -89,7 +89,7 @@ class TestMessageToApiDict:
         assert d == {"role": "assistant", "content": "ok", "reasoning_content": ""}
 
     def test_assistant_with_tool_calls(self):
-        tc = [{"id": "1", "type": "function", "function": {"name": "read"}}]
+        tc = [{"id": "1", "type": "function", "function": {"name": "read", "arguments": ""}}]
         d = message_to_api_dict(AssistantMessage(content="", tool_calls=tc))
         assert d["tool_calls"] == tc
         assert d["reasoning_content"] == ""
@@ -165,7 +165,7 @@ class TestConversationFromAnyList:
         assert conv.messages[0].role == "system"
 
     def test_dict_with_tool_calls(self):
-        tc = [{"id": "1", "type": "function", "function": {"name": "read"}}]
+        tc = [{"id": "1", "type": "function", "function": {"name": "read", "arguments": ""}}]
         conv = Conversation.from_any_list([
             {"role": "assistant", "content": "", "tool_calls": tc},
         ])
@@ -218,7 +218,7 @@ class TestConversationApi:
         conv = Conversation.from_any_list([
             ("system", "s"), ("user", "u"), ("assistant", "a"),
         ])
-        tc = [{"id": "1", "type": "function", "function": {"name": "read"}}]
+        tc = [{"id": "1", "type": "function", "function": {"name": "read", "arguments": ""}}]
         conv.append_assistant_message("ok", tool_calls=tc)
         assert conv.messages[-1].role == "assistant"
         assert conv.messages[-1].tool_calls == tc

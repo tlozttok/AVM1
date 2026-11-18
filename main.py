@@ -26,6 +26,7 @@ from avm.boot import (
 from avm.exceptions import VMMemoryError, RunnerStop
 from avm.image import ImageError
 from avm.monitor import Monitor
+from avm.services import services_from_env
 
 
 def _load_config(path: str) -> dict:
@@ -160,7 +161,8 @@ def _boot(opts: dict):
     """加载镜像并返回内核；镜像有问题时打印原因返回 None（由 main 转成退出码 1）。"""
     try:
         return boot(opts["image"], mode=opts["mode"],
-                    checkpoint_in=opts["checkpoint_in"], restore=opts["restore"])
+                    checkpoint_in=opts["checkpoint_in"], restore=opts["restore"],
+                    services=services_from_env())
     except (ImageError, VMMemoryError, OSError, ValueError) as e:
         print(f"[AVM] 镜像错误: {e}", file=sys.stderr)
         return None

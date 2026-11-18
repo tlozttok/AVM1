@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
 
-from .core import _build_tools, _instruction_registry
+from .instructions import build_tools as _build_tools, instruction_registry as _instruction_registry
 from .exceptions import VMMemoryError, RunnerStop
 from .io_bus import IOBus
 from .io_devices import IOInputDevice, IOOutputDevice
@@ -1488,12 +1488,15 @@ def _boot_core(args):
     退出码 1，不给 traceback。
     """
     from .boot import boot
+    from .services import services_from_env
+    from .exceptions import VMMemoryError
     from .image import ImageError
 
     try:
         return boot(args.image, mode=args.mode,
                     checkpoint_in=args.checkpoint_in,
-                    host_flags={"console": True})
+                    host_flags={"console": True},
+                    services=services_from_env())
     except (ImageError, VMMemoryError, OSError, ValueError) as e:
         print(f"[console] 镜像错误: {e}", file=sys.stderr)
         return None

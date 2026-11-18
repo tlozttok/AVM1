@@ -131,7 +131,7 @@ class TestCapsSerialization:
 
     def test_old_checkpoint_without_caps_is_rejected(self):
         cp = {
-            "version": 2,
+            "version": 3,
             "name": "old",
             "para_ref": "$MEM.model_params",
             "is_python": False,
@@ -139,8 +139,8 @@ class TestCapsSerialization:
             "is_root": True,
             "metadata": {},
             "messages": [
-                {"role": "system", "content": "s"},
-                {"role": "user", "content": "u"},
+                {"role": "system", "parts": [{"type": "text", "text": "s"}]},
+                {"role": "user", "parts": [{"type": "text", "text": "u"}]},
             ],
         }
         with pytest.raises(ValueError, match="caps"):

@@ -4,8 +4,6 @@ from contextlib import contextmanager
 from types import MappingProxyType
 from typing import Optional, List, Dict, Type, Any
 
-from openai import OpenAI
-from dotenv import load_dotenv
 import json
 import os
 import sys
@@ -30,15 +28,13 @@ from .types import SystemMessage, UserMessage, Conversation, LinkNode
 from .types import message_to_dict, batch_to_dict, tool_exchange
 from .memory import Memory
 from .memory_nodes import check_new_key
-from .model_catalog import MODEL_CATALOG_KEY, ModelCatalog
 from .monitor import Monitor
 from .modules import (
     BASE_MODULES, ModuleCatalogDevice, ModuleLoaderDevice,
     grantable_module_names, module_descriptor, register_module_from_source,
     register_module as register_catalog_module,
 )
-from .python_server import HOST_ONLY_PLMS, PLM_REGISTRY, create_plm
-from .events import EventSystem, build_event
+from .events import EventSystem, build_event, EVENT_TYPES
 from .journal import (
     JOURNAL_RECORD_VERSION, Journal, JournalError, apply as apply_journal_record,
     conversation_create_payload, scheduler_delta,
@@ -49,32 +45,21 @@ from .info_devices import (
 )
 from .interrupts import InterruptTable
 
-
-def _effect_space(conv: Conversation) -> dict:
-    """把对话的地址空间写成日志效果可重放形状（根名 → 真实段）。"""
-    return {name: list(segments) for name, segments in conv.caps.space().as_roots().items()}
-
-
-def _note_memory_write(core: 'Core', conv: Conversation, ref: str, content: str) -> None:
-    """内存写（含追加）的日志效果。
-
-    目标是设备（或 legacy LinkDevice 透明挂载）时只记审计条目：设备内部状态不在
-    `$MEM` 里，重放不访问设备。LinkDevice 把写委托进内存树的路径因此不会被重放——
-    它是"不要用于新设计"的兼容设备，日志不承诺覆盖（见 docs/runtime.md）。
-    """
-    if not core.is_journaling():
-        return
-    try:
-        split = core.mem.split_path(ref, space=conv.caps.space())
-    except (VMMemoryError, IllegalOperationError, ValueError):
-        split = None
-    if split is not None and split[0] == "device":
-        core.note_effect("device_write", ref=ref, mount=split[1])
-        return
-    core.note_effect(
-        "memory_set", ref=ref, value=content,
-        space=_effect_space(conv),
-    )
+# 指令集与工具面（计划 S1：从 core.py 抽到 instructions.py；旧名保留兼容）
+from .executor import Executor, assemble_messages, commit_round, parse_json_args
+from .services import Services, default_services
+from .instructions import (
+    Instruction, MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction,
+    MemoryDeleteInstruction, EditMetadataInstruction, CreateInstruction, CreateSubInstruction,
+    SendInstruction, CloseInstruction, ListenEventInstruction,
+    _instruction_registry, _build_tools, _build_imports,
+    _effect_space, _note_memory_write, _report_tool_error, _canonical_ref,
+    _condition_before_target, _dispatch_before_event,
+    _parameters_of, _value_matches, _validate_instruction_args, _respond_error,
+    _publish_after_safely, _publish_core_after_safely,
+    _INSTRUCTION_ERRORS, _UNEXECUTED_TOOL_RESPONSE,
+    instruction_registry, build_tools, build_imports,
+)
 
 
 # 操作员对话的系统消息：说明这条对话的执行器是操作员而不是模型。
@@ -84,60 +69,33 @@ _OPERATOR_SYSTEM_PROMPT = (
 )
 
 
-def _report_tool_error(conv: Conversation, message: str):
-    """工具调用错误面向运行者（stderr）输出，不喂回给 LLM。"""
-    print(f"[AVM] 对话 {conv.cid}: {message}", file=sys.stderr)
 
 
-def _canonical_ref(core: 'Core', target, space=None, follow_final: bool = True):
-    """把请求别名转成事件内部 canonical target_ref；无法解析时返回 None。
-
-    follow_final=False 用于删除链接：最终段不跟随，canonical 指向链接节点本身。
-    """
-    return core.canonical_ref(target, space=space, follow_final=follow_final)
 
 
-def _condition_before_target(condition: dict) -> tuple:
-    """listen_event before 事件的目标：condition 目标的 canonical ref。
-
-    无 target（全局条件）时用 "*"；返回 (target 别名, canonical target_ref)。
-    """
-    target = (condition or {}).get("target") or {}
-    kind = target.get("kind")
-    ref = None
-    if kind in ("exact", "subtree"):
-        ref = (target.get("refs") or {}).get("normal")
-    elif kind in ("cid_owner", "self_lifecycle"):
-        cid = target.get("cid")
-        if isinstance(cid, int):
-            ref = ("cid", cid)
-    if not ref:
-        return "*", ("*",)
-    ref = tuple(ref)
-    tag = ref[0]
-    if tag == "memory":
-        return "$MEM" + ("." + ".".join(ref[1]) if ref[1] else ""), ref
-    if tag == "device":
-        return "$MEM." + ref[1] + ("." + ".".join(ref[2]) if ref[2] else ""), ref
-    if tag == "cid":
-        return f"cid:{ref[1]}", ref
-    if tag == "listener":
-        return f"listener:{ref[1]}", ref
-    return "*", ("*",)
 
 
-def _dispatch_before_event(core: 'Core', conv: Conversation, event_type: str, target: str,
-                           payload: dict, target_ref=None):
-    """构造并派发一条 before 事件（10 条指令共用）；返回处理后的 event。"""
-    event = build_event(
-        core, event_type, "before", conv=conv, target=target,
-        payload=payload, target_ref=target_ref,
-    )
-    event = core.events.dispatch(event)
-    core.events.deliver_notifies(event)
-    if event["action"] == "handler_error":
-        _report_tool_error(conv, event["response"])
-    return event
+
+
+
+
+# 指令执行体约定的错误类：可判定、可返回给对话的一类。九条指令共用同一套，
+# 不在这套之内的异常是内核缺陷，由 advance_conversation 记帧后向上抛（不在这里吞）。
+
+# 保留对话 cid（作者规定）：宿主侧操作员对话的身份，不参与正常分配，也不会撞上
+# `_next_cid` 的正数。它对普通对话隐藏：不出现在 $MEM.conversations / $MEM.scheduler
+# 里，也不可用 send_instruction / close_conversation 或 $conv.<cid> / $batch.<cid>
+# 寻址。隐藏只是显示/寻址策略：对话本身随快照/日志正常恢复，日志里它的回合按普通
+# 回合重放。
+#
+# 定义与语义说明在 avm.types.PANEL_CID（上面已 import），此处只是重新导出，
+# 保持 `from avm.core import PANEL_CID` 的既有用法。
+
+
+# 启动自带的内存节点：模型目录。普通内存节点，不是设备——不产生事件、不参与调度。
+# 名字里的点号是禁的（$MEM 寻址按点切段），所以 plm.* 与带点的模型 id 一律装进列表项的字段。
+MODEL_CATALOG_KEY = "model_catalog"
+_CATALOG_META = "模型目录：可用的 LLM 模型与本地 PLM；两侧都写明各自接受的参数"
 
 
 def _publish_memory_after(
@@ -177,1154 +135,53 @@ def _publish_memory_after(
     )
 
 
-# 指令执行体约定的错误类：可判定、可返回给对话的一类。九条指令共用同一套，
-# 不在这套之内的异常是内核缺陷，由 advance_conversation 记帧后向上抛（不在这里吞）。
-_INSTRUCTION_ERRORS = (VMMemoryError, KeyError, IndexError, TypeError, ValueError)
 
-# 保留对话 cid（作者规定）——定义与语义说明在 avm.types.PANEL_CID，此处只是重新导出，
-# 保持 `from avm.core import PANEL_CID` 的既有用法。
-
-
-# 启动自带的内存节点：模型目录（$MEM.model_catalog）。普通内存节点，不是设备——
-# 不产生事件、不参与调度。安装与刷新在 model_catalog.ModelCatalog，这里只留键名。
 
 # 协议层拒绝（JSON 解析失败、未知工具名、缺少可配对的 call_id）时回给对话的占位文本。
 # 内容不携带错误细节：错误面向运行者（_report_tool_error），这里只为保住
 # 「assistant 的 tool_calls 与 tool 消息一一配对」这条协议不变量。
-_UNEXECUTED_TOOL_RESPONSE = "（该工具调用未执行）"
-
-
-def _parameters_of(instr_cls) -> dict:
-    """指令的参数规格。tool_def 是唯一来源，仲裁层不维护第二份 schema。"""
-    return (instr_cls.tool_def.get("function") or {}).get("parameters") or {}
-
-
-def _value_matches(value, spec: dict) -> bool:
-    """按 tool_def 实际用到的 JSON Schema 子集校验一个值。未声明的形状不做假设。"""
-    if not isinstance(spec, dict):
-        return True
-    if "anyOf" in spec:
-        return any(_value_matches(value, sub) for sub in spec["anyOf"])
-    if "enum" in spec:
-        return value in spec["enum"]
-    kind = spec.get("type")
-    if kind == "integer":
-        # bool 是 int 的子类，但 JSON 里是两种类型
-        return isinstance(value, int) and not isinstance(value, bool)
-    if kind == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if kind == "boolean":
-        return isinstance(value, bool)
-    if kind == "array":
-        if not isinstance(value, list):
-            return False
-        items = spec.get("items")
-        return all(_value_matches(v, items) for v in value) if items else True
-    if kind == "object":
-        return isinstance(value, dict)
-    if kind == "string":
-        return isinstance(value, str)
-    return True
-
-
-def _validate_instruction_args(instr_cls, args) -> Optional[str]:
-    """指令参数仲裁：返回错误说明，None 表示通过。
-
-    可判定的参数错误在进入指令对象之前拦下（非法操作），由调用方回一条工具响应。
-    未知键不在这里拒绝：它们不进指令对象（见 Instruction.__init__ 的白名单），
-    白名单之外的键不构成错误，避免把提示词里常见的多余字段变成硬失败。
-    """
-    if not isinstance(args, dict):
-        return f"参数必须是对象，得到 {type(args).__name__}"
-    error = _check_declared_shape(instr_cls, args)
-    if error is not None:
-        return error
-    return _check_tool_semantics(instr_cls.tool_name, args)
-
-
-def _check_declared_shape(instr_cls, args) -> Optional[str]:
-    """按 tool_def 的声明校验：必填参数齐全、给的参数值类型对得上。"""
-    params = _parameters_of(instr_cls)
-    properties = params.get("properties") or {}
-    for name in params.get("required") or []:
-        if name not in args or args[name] is None:
-            return f"缺少必填参数 {name}"
-    for name, value in args.items():
-        spec = properties.get(name)
-        if spec is None:
-            continue
-        if not _value_matches(value, spec):
-            return f"参数 {name} 不合法：{value!r}"
-    return None
-
-
-def _check_tool_semantics(tool: str, args) -> Optional[str]:
-    """声明管不到的语义约束：引用形态、以及各工具自己的必填组合。"""
-    if tool in ("memory_read", "memory_write", "memory_delete"):
-        return _check_ref_form(args["ref"])
-    if tool == "memory_make":
-        return _check_make_key(args["key"])
-    if tool == "edit_metadata":
-        return _check_edit_metadata_args(args)
-    if tool == "listen_event":
-        return _check_listen_event_args(args)
-    return None
-
-
-def _check_ref_form(ref) -> Optional[str]:
-    """内存引用必须以 $ 开头（根名省略等于让内核猜，直接拒）。"""
-    if not ref.startswith("$"):
-        return f"ref 必须是 $ 开头的内存引用，得到 {ref!r}"
-    return None
-
-
-def _check_make_key(key) -> Optional[str]:
-    """新建键的语法（点号/空键）由 memory 侧统一裁决，这里只翻译成工具响应。"""
-    try:
-        check_new_key(key)
-    except VMMemoryError as e:
-        return str(e)
-    return None
-
-
-def _check_edit_metadata_args(args) -> Optional[str]:
-    """edit_metadata：type 决定 key/value 的必填组合。"""
-    op = args.get("type")
-    if op not in ("set", "get", "del"):
-        return f"type 必须是 set/get/del，得到 {op!r}"
-    if op == "set":
-        if not args.get("key"):
-            return "type=set 时 key 必须是非空字符串"
-        if "value" not in args:
-            return "type=set 时 value 必需（可以是空字符串）"
-    if op == "del" and "key" not in args:
-        return "type=del 时 key 必需"
-    return None
-
-
-def _check_listen_event_args(args) -> Optional[str]:
-    """listen_event：action 决定 handler_ref / listener_id 的必填组合。"""
-    action = args.get("action")
-    if action == "listen":
-        if args.get("handler_ref") is None:
-            return "action=listen 时必须提供 handler_ref"
-    if action == "modify":
-        if args.get("listener_id") is None:
-            return "action=modify 时必须提供 listener_id"
-        if args.get("handler_ref") is None and args.get("priority") is None:
-            return "action=modify 时必须提供 handler_ref 或 priority"
-    if action == "cancel" and args.get("listener_id") is None:
-        return "action=cancel 时必须提供 listener_id"
-    return None
-
-
-def _respond_error(conv: Conversation, call_id: str, exc: BaseException) -> None:
-    """错误响应统一出口：输入边界非法用 Illegal（改参数可重试），世界不配合用 Error。"""
-    prefix = "Illegal" if isinstance(exc, IllegalOperationError) else "Error"
-    conv.user_batch.add_tool_response(f"{prefix}: {exc}", call_id)
-
-
-def _publish_after_safely(conv: Conversation, label: str, publish) -> None:
-    """执行一次 after 事实事件发布，失败只记 stderr（fail-open）。
-
-    发布属于观测面：它失败不该改调用者看到的工具响应，更不该让同一个工具调用出现
-    第二条响应——那会破坏 assistant 的 tool_calls 与 tool 消息一一配对（配对不变量）。
-    """
-    try:
-        publish()
-    except Exception as e:
-        _report_tool_error(conv, f"{label} 的 after 事件发布失败（{type(e).__name__}: {e}），已忽略")
-
-
-def _publish_core_after_safely(core: 'Core', event_type: str, conv: Conversation, target: str,
-                               payload: dict, source_kind: str = "core",
-                               target_ref=None) -> None:
-    """发布一条 Core / 内存侧 after 事实事件，失败只记 stderr（fail-open）。
-
-    与 `_publish_after_safely` 同一件事，只是把 `core.events.publish_after_event`
-    的参数原样接过来，省掉每处一层 lambda。
-    """
-    _publish_after_safely(
-        conv,
-        event_type,
-        lambda: core.events.publish_after_event(
-            event_type, conv, target, payload, source_kind=source_kind,
-            target_ref=target_ref,
-        ),
-    )
-
-
-class Instruction:
-    tool_name: str = ""
-    tool_def: dict = {}
-
-    call_id: str
-    caller_id: int
-
-    def __init__(self, call_id: str, caller_id: int, args: dict):
-        self.call_id = call_id
-        self.caller_id = caller_id
-        # 键名白名单：只接受 tool_def 声明过的键。参数里的 call_id / execute 之类
-        # 名字不能改写指令对象自己的属性（否则 tool_call_id 可被伪造、方法可被遮蔽）。
-        allowed = set((_parameters_of(type(self)).get("properties") or {}))
-        for k, v in args.items():
-            if k in allowed:
-                setattr(self, k, v)
-
-    def execute(self, core: 'Core', conv: Conversation):
-        raise NotImplementedError
-
-
-class MemoryReadInstruction(Instruction):
-    tool_name = "memory_read"
-    tool_def = {
-        "type": "function",
-        "function": {
-            "name": "memory_read",
-            "description": "从内存读取数据",
-            "parameters": {
-                "type": "object",
-                "properties": {"ref": {"type": "string", "description": "内存引用如 $MEM.input"}},
-                "required": ["ref"],
-            }
-        }
-    }
-    ref: str
-
-    def execute(self, core: 'Core', conv: Conversation):
-        event = build_event(core, "memory_read", "before", conv=conv, target=self.ref,
-                            payload={"ref": self.ref},
-                            target_ref=_canonical_ref(core, self.ref, conv.caps.space()))
-        event = core.events.dispatch(event)
-        core.events.deliver_notifies(event)
-        if event["action"] == "handler_error":
-            _report_tool_error(conv, event["response"])
-        if event["action"] in ("replace", "handler_error"):
-            conv.user_batch.add_tool_response(event["response"], self.call_id)
-            return
-        try:
-            content = core.unwrap(self.ref, for_llm=True, space=conv.caps.space())
-        except _INSTRUCTION_ERRORS as e:
-            _respond_error(conv, self.call_id, e)
-            return
-        if not isinstance(content, str):
-            # 值域：进 LLM 可见通道的必须是字符串。$conv.N 这类伪地址会返回活对象；
-            # 内存里也可能留着非字符串的叶子（早期写入或镜像预置）。
-            conv.user_batch.add_tool_response(
-                f"Error: {self.ref} 的值是 {type(content).__name__}，不能作为工具响应", self.call_id
-            )
-            return
-        conv.user_batch.add_tool_response(content, self.call_id)
-        _publish_after_safely(
-            conv,
-            "memory_read",
-            lambda: _publish_memory_after(
-                core,
-                "memory_read",
-                conv,
-                self.ref,
-                {"ref": self.ref, "actor_cid": conv.cid, "result": content},
-                result={"result": content},
-                space=conv.caps.space(),
-            ),
-        )
-
-
-class MemoryWriteInstruction(Instruction):
-    tool_name = "memory_write"
-    tool_def = {
-        "type": "function",
-        "function": {
-            "name": "memory_write",
-            "description": "向内存写入数据",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ref": {"type": "string"},
-                    "content": {"type": "string"},
-                },
-                "required": ["ref", "content"],
-            }
-        }
-    }
-    ref: str
-    content: str
-
-    def execute(self, core: 'Core', conv: Conversation):
-        event = build_event(
-            core,
-            "memory_write",
-            "before",
-            conv=conv,
-            target=self.ref,
-            payload={"ref": self.ref, "content": self.content},
-            target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
-        )
-        event = core.events.dispatch(event)
-        core.events.deliver_notifies(event)
-        if event["action"] == "handler_error":
-            _report_tool_error(conv, event["response"])
-        if event["action"] in ("replace", "handler_error"):
-            conv.user_batch.add_tool_response(event["response"], self.call_id)
-            return
-        content = event["payload"]["content"]
-        try:
-            address = core.mem.set(self.ref, content, space=conv.caps.space())
-        except _INSTRUCTION_ERRORS as e:
-            _respond_error(conv, self.call_id, e)
-            return
-        _note_memory_write(core, conv, self.ref, content)
-        after_payload = {"ref": self.ref, "content": content, "actor_cid": conv.cid}
-        if address is not None:
-            # 列表追加：-1 换成了真实下标，响应给出可寻址地址
-            conv.user_batch.add_tool_response(f"Success appended str at {address}", self.call_id)
-            after_payload["address"] = address  # 真实地址放 payload；after 的 target 仍是原 ref
-        else:
-            conv.user_batch.add_tool_response(f"Success set: {self.ref}", self.call_id)
-        _publish_after_safely(
-            conv,
-            "memory_write",
-            lambda: _publish_memory_after(
-                core,
-                "memory_write",
-                conv,
-                self.ref,
-                after_payload,
-                result={"content": content},
-                follow_target=address,
-                space=conv.caps.space(),
-            ),
-        )
-
-
-class MemoryMakeInstruction(Instruction):
-    tool_name = "memory_make"
-    tool_def = {
-        "type": "function",
-        "function": {
-            "name": "memory_make",
-            "description": "创建新内存地址",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ref": {"type": "string"},
-                    "key": {"type": "string"},
-                    "mem_type": {"type": "string", "enum": ["str", "dict", "list"]},
-                },
-                "required": ["ref", "key", "mem_type"],
-            }
-        }
-    }
-    ref: str
-    key: str
-    mem_type: str
-
-    def execute(self, core: 'Core', conv: Conversation):
-        target = f"{self.ref}.{self.key}" if self.ref != "$MEM" else f"$MEM.{self.key}"
-        event = build_event(
-            core,
-            "memory_make",
-            "before",
-            conv=conv,
-            target=target,
-            payload={"ref": self.ref, "key": self.key, "mem_type": self.mem_type},
-            target_ref=_canonical_ref(core, target, conv.caps.space()),
-        )
-        event = core.events.dispatch(event)
-        core.events.deliver_notifies(event)
-        if event["action"] == "handler_error":
-            _report_tool_error(conv, event["response"])
-        if event["action"] in ("replace", "handler_error"):
-            conv.user_batch.add_tool_response(event["response"], self.call_id)
-            return
-        try:
-            address = core.mem.make(self.ref, self.key, self.mem_type,
-                                     space=conv.caps.space())
-        except _INSTRUCTION_ERRORS as e:
-            _respond_error(conv, self.call_id, e)
-            return
-        if core.is_journaling():
-            core.note_effect(
-                "memory_make", ref=self.ref, key=self.key, mem_type=self.mem_type,
-                space=_effect_space(conv),
-            )
-        # 真实地址：链上新建的段与 -1 追加段都带真实下标，调用者据此可寻址
-        if self.key == "-1":
-            conv.user_batch.add_tool_response(f"Success created {self.mem_type} at {address}", self.call_id)
-        else:
-            conv.user_batch.add_tool_response(
-                f"Success created {self.mem_type} at {address}, key={self.key!r}", self.call_id
-            )
-        _publish_after_safely(
-            conv,
-            "memory_make",
-            lambda: _publish_memory_after(
-                core,
-                "memory_make",
-                conv,
-                address,
-                {
-                    "ref": self.ref,
-                    "key": self.key,
-                    "mem_type": self.mem_type,
-                    "path": address,
-                    "actor_cid": conv.cid,
-                },
-                result={"key": self.key, "mem_type": self.mem_type, "path": address},
-                space=conv.caps.space(),
-            ),
-        )
-
-
-class MemoryDeleteInstruction(Instruction):
-    tool_name = "memory_delete"
-    tool_def = {
-        "type": "function",
-        "function": {
-            "name": "memory_delete",
-            "description": "删除内存节点（只删叶子与空容器；挂载点与根不能删；整棵子树删除保留给内核态对话）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ref": {"type": "string", "description": "要删除的内存地址，如 $MEM.a.b"},
-                },
-                "required": ["ref"],
-            }
-        }
-    }
-    ref: str
-
-    def execute(self, core: 'Core', conv: Conversation):
-        event = build_event(
-            core,
-            "memory_delete",
-            "before",
-            conv=conv,
-            target=self.ref,
-            payload={"ref": self.ref},
-            target_ref=_canonical_ref(core, self.ref, conv.caps.space(), follow_final=False),
-        )
-        event = core.events.dispatch(event)
-        core.events.deliver_notifies(event)
-        if event["action"] == "handler_error":
-            _report_tool_error(conv, event["response"])
-        if event["action"] in ("replace", "handler_error"):
-            conv.user_batch.add_tool_response(event["response"], self.call_id)
-            return
-        try:
-            deleted_type, address = core.mem.delete(self.ref, space=conv.caps.space())
-        except _INSTRUCTION_ERRORS as e:
-            _respond_error(conv, self.call_id, e)
-            return
-        if core.is_journaling():
-            core.note_effect("memory_delete", ref=self.ref, space=_effect_space(conv))
-        conv.user_batch.add_tool_response(f"Success deleted {deleted_type} at {address}", self.call_id)
-        _publish_core_after_safely(
-            core,
-            "memory_delete",
-            conv,
-            address,
-            {"ref": address, "deleted_type": deleted_type, "actor_cid": conv.cid},
-            source_kind="memory",
-            target_ref=_canonical_ref(core, address, conv.caps.space(), follow_final=False),
-        )
-
-
-class EditMetadataInstruction(Instruction):
-    tool_name = "edit_metadata"
-    tool_def = {
-        "type": "function",
-        "function": {
-            "name": "edit_metadata",
-            "description": "编辑内存节点的 ctrl 元数据（元数据二，dict[str,str]）。type=set：用 value 写入 ctrl[key]（key/value 都必需，ctrl 不存在时创建）；type=get：key 省略时返回整个 ctrl（JSON），带 key 时返回 ctrl[key]；type=del：删除 ctrl[key]（key 必需）。非法参数以 Error 工具响应返回，对话保持活跃可自纠",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ref": {"type": "string", "description": "内存节点引用，如 $MEM.a.b"},
-                    "type": {"type": "string", "enum": ["set", "get", "del"], "description": "操作类型"},
-                    "key": {"type": "string", "description": "ctrl 键名；type=set/del 时必需"},
-                    "value": {"type": "string", "description": "ctrl 值（字符串）；仅 type=set 时使用且必需"},
-                },
-                "required": ["ref", "type"],
-            }
-        }
-    }
-    ref: str
-
-    def execute(self, core: 'Core', conv: Conversation):
-        op = getattr(self, "type", None)
-        key = getattr(self, "key", None)
-        value = getattr(self, "value", None)
-        # 在参数合法性校验之前先分发 before 事件；处理器可以 replace 短路。
-        event = build_event(
-            core,
-            "edit_metadata",
-            "before",
-            conv=conv,
-            target=self.ref,
-            payload={"ref": self.ref, "type": op, "key": key, "value": value},
-            target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
-        )
-        event = core.events.dispatch(event)
-        core.events.deliver_notifies(event)
-        if event["action"] == "handler_error":
-            _report_tool_error(conv, event["response"])
-        if event["action"] in ("replace", "handler_error"):
-            conv.user_batch.add_tool_response(event["response"], self.call_id)
-            return
-        value = event["payload"].get("value")
-        if op not in ("set", "get", "del"):
-            conv.user_batch.add_tool_response(
-                f"Illegal: edit_metadata 的 type 必须是 set/get/del，得到 {op!r}", self.call_id
-            )
-            return
-        try:
-            node = core.unwrap(self.ref, for_llm=False, space=conv.caps.space())
-        except _INSTRUCTION_ERRORS as e:
-            _respond_error(conv, self.call_id, e)
-            return
-        if not hasattr(node, "get_ctrl"):
-            conv.user_batch.add_tool_response(
-                f"Error: {self.ref} 不是带控制数据的节点（dict/list/str），无法编辑 ctrl",
-                self.call_id,
-            )
-            return
-        if op == "set":
-            self._ctrl_set(core, conv, node, key, value)
-        elif op == "get":
-            self._ctrl_get(core, conv, node, key, value)
-        else:
-            self._ctrl_del(core, conv, node, key, value)
-
-    def _respond(self, conv, text: str) -> None:
-        """把结果作为本次工具调用的响应写回（三条分支共用，省掉 call_id 重复）。"""
-        conv.user_batch.add_tool_response(text, self.call_id)
-
-    def _publish_after(self, core: 'Core', conv, op: str, key, value) -> None:
-        """写后事件。三种操作只差 payload 里的 type，其余完全相同——
-        原先五个分支各抄了一遍，缩进还抄歪了。"""
-        _publish_core_after_safely(
-            core,
-            "edit_metadata",
-            conv,
-            self.ref,
-            {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
-            source_kind="memory",
-            target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
-        )
-
-    def _ctrl_set(self, core: 'Core', conv, node, key, value) -> None:
-        """type=set：key/value 都必需（value 可以是空字符串，但不能缺）。"""
-        if not key:
-            self._respond(conv, "Illegal: edit_metadata type=set 时 key 必须是非空字符串")
-            return
-        if value is None:
-            self._respond(conv, "Illegal: edit_metadata type=set 时 value 必需（可以是空字符串）")
-            return
-        ctrl = dict(node.get_ctrl() or {})
-        ctrl[key] = value
-        node.set_ctrl(ctrl)
-        if core.is_journaling():
-            core.note_effect(
-                "edit_metadata", ref=self.ref, type="set", key=key, value=value,
-                space=_effect_space(conv),
-            )
-        self._respond(conv, f"ctrl.{key} = {value!r} 已写入")
-        self._publish_after(core, conv, "set", key, value)
-
-    def _ctrl_get(self, core: 'Core', conv, node, key, value) -> None:
-        """type=get：不带 key 返回整个 ctrl（JSON）；带 key 返回值。读失败不发写后事件。"""
-        ctrl = dict(node.get_ctrl() or {})
-        if not key:
-            self._respond(conv, json.dumps(ctrl, ensure_ascii=False) if ctrl else "{}")
-        elif key in ctrl:
-            self._respond(conv, str(ctrl[key]))
-        else:
-            self._respond(conv, f"Error: ctrl 中没有键 {key}")
-            return
-        self._publish_after(core, conv, "get", key, value)
-
-    def _ctrl_del(self, core: 'Core', conv, node, key, value) -> None:
-        """type=del：key 必需且必须已存在。"""
-        if not key:
-            self._respond(conv, "Illegal: edit_metadata type=del 时 key 必需")
-            return
-        ctrl = dict(node.get_ctrl() or {})
-        if key not in ctrl:
-            self._respond(conv, f"Error: ctrl 中没有键 {key}")
-            return
-        del ctrl[key]
-        node.set_ctrl(ctrl)
-        if core.is_journaling():
-            core.note_effect(
-                "edit_metadata", ref=self.ref, type="del", key=key,
-                space=_effect_space(conv),
-            )
-        self._respond(conv, f"ctrl.{key} 已删除")
-        self._publish_after(core, conv, "del", key, value)
-
-
-class CreateInstruction(Instruction):
-    tool_name = "create_cmd"
-    tool_def = {
-        "type": "function",
-        "function": {
-            "name": "create_cmd",
-            "description": "创建子对话（system_ref 必须指向 ctrl.type='settingup' 的 LLM 程序节点或 ctrl.type='python' 的 Python 程序节点；只创建并返回 cid，子对话进入休眠等待指令；本对话保持活跃）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "system_ref": {"type": "string", "description": "程序节点引用（settingup 或 python）"},
-                    "para_ref": {"type": "string", "description": "参数引用"},
-                },
-                "required": ["system_ref", "para_ref"],
-            }
-        }
-    }
-    system_ref: str
-    para_ref: str
-
-    def execute(self, core: 'Core', conv: Conversation):
-        before = _dispatch_before_event(
-            core, conv, "create_cmd", self.system_ref,
-            {"system_ref": self.system_ref, "para_ref": self.para_ref},
-            target_ref=_canonical_ref(core, self.system_ref, conv.caps.space()),
-        )
-        if before["action"] in ("replace", "handler_error"):
-            conv.user_batch.add_tool_response(before["response"], self.call_id)
-            return
-        try:
-            node = core.unwrap(self.system_ref, for_llm=False, space=conv.caps.space())
-            child = _build_conversation(core, self.system_ref, self.para_ref, parent=conv, is_sub=False,
-                                        space=conv.caps.space())
-        except _INSTRUCTION_ERRORS as e:
-            # system_ref 不是程序节点或引用不存在：错误作为工具响应返回，不创建对话，本对话保持活跃可自纠
-            _respond_error(conv, self.call_id, e)
-            return
-        # 带名字的对话必然来自 settingup 文件：name 是节点数据字段，不是元信息
-        if isinstance(node, MetaDict):
-            name = node.get("name")
-            if isinstance(name, str) and name:
-                child.name = name
-        # 子对话创建后进入休眠，等待 send_instruction 投递指令
-        core.sleep(child.cid)
-        if core.is_journaling():
-            core.note_effect("conversation_create", **conversation_create_payload(core, child))
-        _publish_core_after_safely(core,
-            "create_cmd",
-            conv,
-            f"cid:{child.cid}",
-            {"cid": child.cid, "actor_cid": conv.cid},
-            source_kind="core",
-            target_ref=("cid", child.cid),
-        )
-        conv.user_batch.add_tool_response(f"Success created: cid={child.cid}", self.call_id)
-
-
-class CreateSubInstruction(Instruction):
-    tool_name = "create_sub"
-    tool_def = {
-        "type": "function",
-        "function": {
-            "name": "create_sub",
-            "description": "创建亚对话",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "system_ref": {"type": "string", "description": "系统提示词引用"},
-                    "user_ref": {"type": "string", "description": "用户消息引用"},
-                    "para_ref": {"type": "string", "description": "参数引用"},
-                },
-                "required": ["system_ref", "user_ref", "para_ref"],
-            }
-        }
-    }
-    system_ref: str
-    user_ref: str
-    para_ref: str
-
-    def execute(self, core: 'Core', conv: Conversation):
-        before = _dispatch_before_event(
-            core, conv, "create_sub", self.system_ref,
-            {"system_ref": self.system_ref, "user_ref": self.user_ref, "para_ref": self.para_ref},
-            target_ref=_canonical_ref(core, self.system_ref, conv.caps.space()),
-        )
-        if before["action"] in ("replace", "handler_error"):
-            conv.user_batch.add_tool_response(before["response"], self.call_id)
-            return
-        try:
-            user_content = core.unwrap(self.user_ref, for_llm=False, space=conv.caps.space())
-            if not isinstance(user_content, str):
-                raise VMMemoryError(
-                    f"{self.user_ref} 不是字符串节点：user_ref 必须指向 str 节点"
-                    f"（得到 {type(user_content).__name__}）"
-                )
-            sub = _build_conversation(core, self.system_ref, self.para_ref, parent=conv, is_sub=True,
-                                      space=conv.caps.space())
-        except _INSTRUCTION_ERRORS as e:
-            # system_ref 不是程序节点或引用不存在：错误作为工具响应返回，不创建对话，本对话保持活跃可自纠
-            _respond_error(conv, self.call_id, e)
-            return
-        sub.append_user_message(user_content)  # 亚对话的任务在创建时直接给出
-        sub.metadata["call_id"] = self.call_id
-        # 父进入休眠等待亚对话完成，完成时由 core 唤醒（_on_conversation_finished）
-        core.prioritize(sub.cid)  # 亚对话插队：它的任务在创建时就已给定，先跑
-        core.sleep(conv.cid)
-        if core.is_journaling():
-            core.note_effect("conversation_create", **conversation_create_payload(core, sub))
-        _publish_core_after_safely(core,
-            "create_sub",
-            conv,
-            f"cid:{sub.cid}",
-            {"cid": sub.cid, "actor_cid": conv.cid},
-            source_kind="core",
-            target_ref=("cid", sub.cid),
-        )
-
-
-class SendInstruction(Instruction):
-    tool_name = "send_instruction"
-    tool_def = {
-        "type": "function",
-        "function": {
-            "name": "send_instruction",
-            "description": "向指定 cid 的对话投递指令内容（不保证对方返回消息，只确认投递成功）。不允许向自己投递。cid 可为整数或整数列表（多播，每个目标各收一条）；多播先整体校验所有目标的存在性与开启状态，任一不满足则整体不投递；校验通过后，单个目标被事件拦截/处理失败不阻断其他目标。投递后本对话继续执行，不等待返回；是否休眠由本对话自己决定",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "cid": {"anyOf": [{"type": "integer"}, {"type": "array", "items": {"type": "integer"}}], "description": "目标对话的 cid 或 cid 列表"},
-                    "content": {"type": "string", "description": "投递的指令内容"},
-                },
-                "required": ["cid", "content"],
-            }
-        }
-    }
-    cid: int
-    content: str
-
-    def execute(self, core: 'Core', conv: Conversation):
-        targets = self.cid if isinstance(self.cid, list) else [self.cid]
-        if not self._check_legal(conv, targets):
-            return
-        # 先解析目标，任一不存在或已关闭即整体失败
-        resolved = self._resolve_targets(core, conv, targets)
-        if resolved is None:
-            return
-        delivered_cids, blocked, failed = self._deliver_all(core, conv, resolved)
-        self._report(conv, resolved, delivered_cids, blocked, failed)
-
-    def _reject(self, conv: Conversation, msg: str, kind: str = "Error") -> None:
-        """整次投递不成立：记终端提示并回一条工具响应。kind=Illegal 表示越权/非法用法。"""
-        _report_tool_error(conv, msg)
-        conv.user_batch.add_tool_response(f"{kind}: {msg}", self.call_id)
-
-    def _check_legal(self, conv: Conversation, targets: list) -> bool:
-        """投递前置校验（空列表 / 亚对话发往主对话 / 自我投递）。False 表示已回复、不再继续。"""
-        if not targets:
-            self._reject(conv, "send_instruction 失败：cid 列表为空")
-            return False
-        if conv.is_sub:
-            ancestor = conv.parent
-            while ancestor is not None:
-                if ancestor.cid in targets:
-                    self._reject(conv, "send_instruction 失败：亚对话不能向主对话发送消息，"
-                                       "只能用 create_sub 的返回通道", "Illegal")
-                    return False
-                ancestor = ancestor.parent
-        for cid in targets:
-            if cid == conv.cid:
-                self._reject(conv, f"send_instruction 不允许自我投递（cid={cid} 是当前对话）",
-                             "Illegal")
-                return False
-        return True
-
-    def _resolve_targets(self, core: 'Core', conv: Conversation, targets: list) -> Optional[list]:
-        """把 cid 列表解析成对话对象。任一不存在或已关闭即整体失败（多播的原子性）。"""
-        resolved = []
-        for cid in targets:
-            target = core.get_conversation(cid)
-            if target is None or core.is_hidden_cid(cid):
-                self._reject(conv, f"send_instruction 失败：对话 {cid} 不存在")
-                return None
-            if core.is_finished(cid):
-                self._reject(conv, f"send_instruction 失败：对话 {cid} 已关闭")
-                return None
-            resolved.append(target)
-        return resolved
-
-    def _deliver_all(self, core: 'Core', conv: Conversation, resolved: list) -> tuple:
-        """逐个投递。单个目标被拦截/处理失败不阻断其他目标，结果分三堆收着。"""
-        delivered_cids, blocked, failed = [], [], []
-        for target in resolved:
-            outcome, text = self._deliver_one(core, conv, target)
-            if outcome == "delivered":
-                delivered_cids.append(target.cid)
-            elif outcome == "blocked":
-                blocked.append(text)
-            else:
-                failed.append(text)
-        return delivered_cids, blocked, failed
-
-    def _deliver_one(self, core: 'Core', conv: Conversation, target: Conversation) -> tuple:
-        """向单个目标投递一条内容，返回 (delivered / blocked / failed, 说明文本)。"""
-        event = build_event(
-            core,
-            "send_instruction",
-            "before",
-            conv=conv,
-            target=f"cid:{target.cid}",
-            payload={"cid": target.cid, "content": self.content},
-            target_ref=("cid", target.cid),
-        )
-        event = core.events.dispatch(event)
-        core.events.deliver_notifies(event)
-        if event["action"] == "handler_error":
-            _report_tool_error(conv, event["response"])
-            return "failed", event["response"]
-        if event["action"] == "replace":
-            return "blocked", event["response"]
-        content = event["payload"]["content"]
-        # 简单投递：内容原样放入目标对话的输入批次，不包装 JSON 信封
-        target.user_batch.add_user_content(content)
-        core.note_effect("delivery", to_cid=target.cid, user_contents=[content])
-        # 事实事件按"消息已被接受"发布：等待返回的目标只入批次、也照样有 after。
-        # TODO(issue): send_instruction 事实事件的语义需进一步研究
-        _publish_core_after_safely(core,
-            "send_instruction",
-            conv,
-            f"cid:{target.cid}",
-            {"cid": target.cid, "content": content, "actor_cid": conv.cid},
-            source_kind="core",
-            target_ref=("cid", target.cid),
-        )
-        # 等亚对话返回的对话：消息只入批次，不唤醒；亚对话结束后父对话先跑。
-        if not core.is_waiting_for_return(target):
-            core.wake(target.cid)  # 排队调度：被唤醒者进队列末尾
-        return "delivered", None
-
-    def _report(self, conv: Conversation, resolved: list,
-                delivered_cids: list, blocked: list, failed: list) -> None:
-        """回报投递结果：部分成功要说明拦截/失败数量，全失败时把第一条原因原样带回去。"""
-        delivered = len(delivered_cids)
-        if delivered > 0 and (blocked or failed):
-            conv.user_batch.add_tool_response(
-                f"已投递到 cid={delivered_cids}（{len(blocked)} 个被拦截，{len(failed)} 个处理失败）",
-                self.call_id,
-            )
-            return
-        if delivered == 0:
-            if failed:
-                conv.user_batch.add_tool_response(failed[0], self.call_id)
-                return
-            if blocked:
-                conv.user_batch.add_tool_response(blocked[0], self.call_id)
-                return
-        if len(resolved) > 1:
-            conv.user_batch.add_tool_response(f"已投递到 cid={delivered_cids}", self.call_id)
-        else:
-            conv.user_batch.add_tool_response(
-                f"已投递到 {resolved[0].identity}（cid={resolved[0].cid}）", self.call_id
-            )
-
-
-class CloseInstruction(Instruction):
-    tool_name = "close_conversation"
-    tool_def = {
-        "type": "function",
-        "function": {
-            "name": "close_conversation",
-            "description": "内核级关闭指令：关闭指定 cid 的对话（可关闭自身或其他对话），不需要被关闭对话的回应。关闭后该对话不可再调度、不可再被调用，记录为 finished；其注册的事件监听自动撤销、PLM 状态释放。若目标还有待执行批次，关闭会一并丢弃，工具响应里会说明",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "cid": {"type": "integer", "description": "要关闭的对话 cid（自身 cid 可从 create_cmd 的工具响应或 $MEM.conversations 获取）"},
-                },
-                "required": ["cid"],
-            }
-        }
-    }
-    cid: int
-
-    def execute(self, core: 'Core', conv: Conversation):
-        if conv.is_sub:
-            ancestor = conv.parent
-            while ancestor is not None:
-                if ancestor.cid == self.cid:
-                    msg = "close_conversation 失败：亚对话不能关闭主对话，只能通过返回通道结束"
-                    _report_tool_error(conv, msg)
-                    conv.user_batch.add_tool_response(f"Illegal: {msg}", self.call_id)
-                    return
-                ancestor = ancestor.parent
-        target = core.get_conversation(self.cid)
-        if target is None or core.is_hidden_cid(self.cid):
-            conv.user_batch.add_tool_response(f"Error: 对话 {self.cid} 不存在", self.call_id)
-            return
-        if core.is_finished(self.cid):
-            conv.user_batch.add_tool_response(f"Error: 对话 {self.cid} 已关闭", self.call_id)
-            return
-        if conv.caps.mode != MODE_KERNEL and target.caps.mode == MODE_KERNEL:
-            msg = f"用户态对话不能关闭内核态对话（目标 cid={self.cid} mode=kernel）"
-            _report_tool_error(conv, msg)
-            conv.user_batch.add_tool_response(f"Illegal: {msg}", self.call_id)
-            return
-        before = _dispatch_before_event(
-            core, conv, "close_conversation", f"cid:{self.cid}",
-            {"cid": self.cid},
-            target_ref=("cid", self.cid),
-        )
-        if before["action"] in ("replace", "handler_error"):
-            conv.user_batch.add_tool_response(before["response"], self.call_id)
-            return
-        dropped = bool(target.user_batch.tool_responses or target.user_batch.user_contents)
-        dropped = dropped or core.is_ready(self.cid)
-        core._close_conversation(self.cid)
-        _publish_core_after_safely(core,
-            "close_conversation",
-            conv,
-            f"cid:{self.cid}",
-            {"cid": self.cid, "actor_cid": conv.cid},
-            source_kind="core",
-            target_ref=("cid", self.cid),
-        )
-        hint = "，其待执行批次已丢弃" if dropped else ""
-        conv.user_batch.add_tool_response(f"对话 {self.cid} 已关闭（finished）{hint}", self.call_id)
-
-
-class ListenEventInstruction(Instruction):
-    tool_name = "listen_event"
-    tool_def = {
-        "type": "function",
-        "function": {
-            "name": "listen_event",
-            "description": "注册/修改/取消事件监听。监听条件在 handler 节点的 condition 数据叶子中声明（events/phase/target/source；用户态只能用命名条件子集 preset）。action=listen：只提供 handler_ref，注册时解析 handler 的 condition；priority 可选（0 起，降序执行；>0 只有内核态对话可设置）；tier 可选 normal/kernel（kernel 级载荷含目标完整数据与来源上下文，只有内核态对话可注册）；action=modify：用新的 handler_ref 和/或 priority 更新已注册监听器（重新解析 handler 的 condition；event_type/target/phase/tier 不可变）；action=cancel：取消监听器。注册/修改/取消只允许所有者执行。处理器返回 notify 时不允许投递给当前对话（禁止自我投递）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["listen", "modify", "cancel"]},
-                    "handler_ref": {"type": "string"},
-                    "listener_id": {"type": "integer"},
-                    "priority": {"type": "integer", "description": "监听优先级，非负整数，缺省 0；大的先执行"},
-                    "tier": {"type": "string", "enum": ["normal", "kernel"], "description": "载荷级别，缺省 normal"},
-                },
-                "required": ["action"],
-            }
-        }
-    }
-
-    def execute(self, core: 'Core', conv: Conversation):
-        action = getattr(self, "action", None)
-        if action not in ("listen", "modify", "cancel"):
-            conv.user_batch.add_tool_response(
-                f"Illegal: listen_event 的 action 必须是 listen/modify/cancel，得到 {action!r}",
-                self.call_id,
-            )
-            return
-        # before 事件：监听注册/修改/取消本身也受事件层检查与软件 Guard 裁决。
-        # action=listen 先解析 handler 的 condition，before 载荷带解析后的条件；
-        # 注册在 before 通过后进行，不再重复解析。
-        prepared = self._prepare_before(core, conv, action)
-        if prepared is None:
-            return
-        b_target, b_payload, b_ref, parsed_condition = prepared
-        before = _dispatch_before_event(core, conv, "listen_event", b_target, b_payload, target_ref=b_ref)
-        if before["action"] in ("replace", "handler_error"):
-            conv.user_batch.add_tool_response(before["response"], self.call_id)
-            return
-        try:
-            response, listener_id = self._apply(core, conv, action, parsed_condition)
-            # 三种动作的写后事件只差 payload 里的 action，其余相同
-            _publish_core_after_safely(core,
-                "listen_event",
-                conv,
-                f"listener:{listener_id}",
-                {"listener_id": listener_id, "action": action, "actor_cid": conv.cid},
-                source_kind="core",
-                target_ref=("listener", listener_id),
-            )
-            conv.user_batch.add_tool_response(response, self.call_id)
-        except _INSTRUCTION_ERRORS as e:
-            _respond_error(conv, self.call_id, e)
-
-    def _prepare_before(self, core: 'Core', conv: Conversation, action: str) -> Optional[tuple]:
-        """构造 before 事件的 (target, payload, target_ref, 解析后的条件)；已回复错误时返回 None。"""
-        listener_id = getattr(self, "listener_id", None)
-        if action != "listen":
-            return (
-                f"listener:{listener_id}",
-                {"action": action, "listener_id": listener_id,
-                 "handler_ref": getattr(self, "handler_ref", None),
-                 "priority": getattr(self, "priority", None)},
-                ("listener", listener_id) if isinstance(listener_id, int) else None,
-                None,
-            )
-        handler_ref = getattr(self, "handler_ref", None)
-        if handler_ref is None:
-            conv.user_batch.add_tool_response(
-                "Illegal: action=listen 时必须提供 handler_ref", self.call_id
-            )
-            return None
-        try:
-            parsed_condition = core.events.parse_condition(
-                conv.cid, handler_ref, space=conv.caps.space(),
-                kernel_mode=(conv.caps.mode == "kernel"),
-            )
-        except _INSTRUCTION_ERRORS as e:
-            _respond_error(conv, self.call_id, e)
-            return None
-        b_target, b_ref = _condition_before_target(parsed_condition)
-        return (
-            b_target,
-            {
-                "action": action,
-                "event_type": getattr(self, "event_type", None),
-                "condition": parsed_condition,
-                "handler_ref": handler_ref,
-                "priority": getattr(self, "priority", None),
-                "tier": getattr(self, "tier", None),
-            },
-            b_ref,
-            parsed_condition,
-        )
-
-    def _apply(self, core: 'Core', conv: Conversation, action: str,
-               parsed_condition) -> tuple:
-        """执行注册/修改/取消，返回 (工具响应文本, listener_id)。"""
-        if action == "listen":
-            return self._register(core, conv, parsed_condition)
-        if action == "modify":
-            return self._modify(core, conv)
-        return self._cancel(core, conv)
-
-    def _register(self, core: 'Core', conv: Conversation, parsed_condition) -> tuple:
-        priority = getattr(self, "priority", 0)
-        tier = getattr(self, "tier", None) or "normal"
-        listener_id = core.events.register_condition(
-            conv.cid, getattr(self, "handler_ref", None), space=conv.caps.space(),
-            tier=tier, priority=0 if priority is None else priority,
-            kernel_mode=(conv.caps.mode == "kernel"),
-            condition=parsed_condition,
-        )
-        return f"listener_id={listener_id} 已注册", listener_id
-
-    def _modify(self, core: 'Core', conv: Conversation) -> tuple:
-        listener_id = getattr(self, "listener_id", None)
-        handler_ref = getattr(self, "handler_ref", None)
-        if listener_id is None or (handler_ref is None and getattr(self, "priority", None) is None):
-            raise IllegalOperationError(
-                "action=modify 时必须提供 listener_id，以及 handler_ref 或 priority 至少一个"
-            )
-        if (
-            getattr(self, "event_type", None) is not None
-            or getattr(self, "target", None) is not None
-            or getattr(self, "phase", None) is not None
-            or getattr(self, "tier", None) is not None
-        ):
-            raise IllegalOperationError(
-                "action=modify 只允许修改 handler_ref/priority，不能改 event_type/target/phase/tier"
-            )
-        core.events.modify(listener_id, conv.cid, handler_ref, space=conv.caps.space(),
-                           priority=getattr(self, "priority", None))
-        return f"listener_id={listener_id} 已更新", listener_id
-
-    def _cancel(self, core: 'Core', conv: Conversation) -> tuple:
-        listener_id = getattr(self, "listener_id", None)
-        if listener_id is None:
-            raise IllegalOperationError("action=cancel 时必须提供 listener_id")
-        core.events.cancel(listener_id, conv.cid)
-        return f"listener_id={listener_id} 已取消", listener_id
-
-
-def _instruction_registry() -> Dict[str, Type[Instruction]]:
-    # 删除默认只删叶子与空容器；整棵子树删除留给内核态对话（尚未实现），见 Memory.delete。
-    return {
-        cls.tool_name: cls
-        for cls in [
-            MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction,
-            MemoryDeleteInstruction, EditMetadataInstruction,
-            CreateInstruction, CreateSubInstruction,
-            SendInstruction, CloseInstruction, ListenEventInstruction,
-        ]
-    }
-
-
-def _build_tools(conv: Optional[Conversation] = None) -> list:
-    """全部工具定义；给了对话时只返回该对话工具集里的工具（宿主/控制台传 None 拿全量）。"""
-    tools = [cls.tool_def for cls in _instruction_registry().values()]
-    if conv is None:
-        return tools
-    return [t for t in tools if conv.caps.tool_allowed((t.get("function") or {}).get("name"))]
-
-
-def _build_imports(conv: Optional[Conversation] = None) -> list:
-    """一次 PLM 执行可 import 的模块名 = 基线 ∪ 对话 caps.imports。
-
-    与 `_build_tools` 同构：PLM 执行器每次调用经 params["imports"] 收到该清单；
-    白名单在对话生命周期内稳定（caps 创建后只读，运行期不提供修改入口）。
-    """
-    if conv is None:
-        return sorted(set(BASE_MODULES) | set(grantable_module_names()))
-    return sorted(set(BASE_MODULES) | set(conv.caps.imports))
-
-
-class PLMExecutor:
-    """把 PLMServer 适配成与 LMU 相同的 exec 接口，供 Core 统一调度。
-
-    输入：Conversation + para；内部构建 OpenAI 格式消息调用 PLM，
-    输出：(result, return_calls, conversation)，与 LMU.exec 形状一致。
-    """
-
-    def __init__(self, plm):
-        self.plm = plm
-        self.last_call: Optional[dict] = None
-
-    def exec(self, conversation: Conversation, para: MetaDict):
-        messages = conversation.to_api_messages()
-        messages.extend(conversation.user_batch.to_tool_messages())
-        user_content = conversation.user_batch.get_user_content()
-        if user_content:
-            messages.append({"role": "user", "content": user_content})
-
-        params = para.to_dict()
-        params["tools"] = _build_tools(conversation)
-        # 覆盖 para 里可能同名出现的字段：白名单只由对话 caps 决定（防 para 伪造）。
-        params["imports"] = _build_imports(conversation)
-        response = self.plm.handle_messages(messages, params)
-        result = response.get("content", "") or ""
-        return_calls = self._parse_tool_calls(response.get("tool_calls") or [])
-        self.last_call = {
-            "messages": messages,
-            "result": result,
-            "tool_calls": return_calls,
-        }
-
-        # 提交历史（与 LMU.exec 一致）：工具响应 → 用户内容 → 新的 assistant 消息
-        for resp in conversation.user_batch.tool_responses:
-            conversation.append_tool_message(resp.content, resp.tool_call_id)
-        if user_content:
-            conversation.append_user_message(user_content)
-        tc_list = [
-            {"id": t.get("id"), "type": t.get("type", "function"), "function": t.get("function")}
-            for t in (response.get("tool_calls") or [])
-        ] or None
-        conversation.append_assistant_message(result, tool_calls=tc_list)
-        return result, return_calls, conversation
-
-    @staticmethod
-    def _parse_tool_calls(tool_calls: list) -> list:
-        out = []
-        for tc in tool_calls:
-            fn = tc.get("function") or {}
-            args_raw = fn.get("arguments", "{}")
-            try:
-                args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
-            except ValueError as e:
-                out.append({
-                    "call_id": tc.get("id"), "cmd_type": "json_error",
-                    "args": {"error": str(e), "name": fn.get("name"), "raw": args_raw},
-                })
-                continue
-            out.append({"call_id": tc.get("id"), "cmd_type": fn.get("name"), "args": args})
-        return out
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _check_model_namespace(core: 'Core', program_type: str, para: MetaDict, para_ref: str) -> None:
@@ -1338,7 +195,7 @@ def _check_model_namespace(core: 'Core', program_type: str, para: MetaDict, para
         return
     model = para.get("model")
     if program_type == "python":
-        if isinstance(model, str) and model in HOST_ONLY_PLMS:
+        if core.services.plm.is_host_only(model):
             # 宿主独占 PLM：拒绝理由涉及宿主/调试实现，不返回给对话
             raise IllegalOperationError("操作被外部原因拒绝")
         names = sorted(
@@ -1360,18 +217,27 @@ def _check_model_namespace(core: 'Core', program_type: str, para: MetaDict, para
             f"{para_ref} 缺少 model：settingup 程序的 model 必须是 LLM 模型名"
         )
     llm = catalog.get("llm")
-    if not isinstance(llm, MetaDict) or llm.get("source") != "api":
+    interfaces = llm.get("interfaces") if isinstance(llm, MetaDict) else None
+    api = para.get("api") or (llm.get("default") if isinstance(llm, MetaDict) else None) or "chat"
+    available_apis = sorted(interfaces.keys()) if isinstance(interfaces, MetaDict) else []
+    if not isinstance(interfaces, MetaDict) or api not in interfaces:
+        raise IllegalOperationError(
+            f"{para_ref} 的 api {api!r} 未配置（可用：{available_apis}）"
+        )
+    interface = interfaces[api]
+    if not isinstance(interface, MetaDict) or interface.get("source") != "api":
         print(
-            f"[AVM] 模型目录未取到上游清单，跳过 LLM 模型名校验：{para_ref} 的 model {model!r}",
+            f"[AVM] 模型目录：{api} 接口未取到上游清单，跳过模型名校验："
+            f"{para_ref} 的 model {model!r}",
             file=sys.stderr,
         )
         return
     listed = sorted(
-        e.get("id") for e in (llm.get("models") or []) if isinstance(e, MetaDict)
+        e.get("id") for e in (interface.get("models") or []) if isinstance(e, MetaDict)
     )
     if model not in listed:
         raise IllegalOperationError(
-            f"{para_ref} 的 model {model!r} 不在上游模型清单里（可用：{listed}）"
+            f"{para_ref} 的 model {model!r} 不在 {api} 接口的模型清单里（可用：{listed}）"
         )
 
 
@@ -1602,171 +468,21 @@ def _build_conversation(core: 'Core', system_ref: str, para_ref: str, parent: Co
     return conv
 
 
-class LMU:
-    _client: Optional[OpenAI] = None
 
-    def __init__(self):
-        self._client = None
-        self.last_call: Optional[dict] = None  # 最近一次 API 调用全文（供监测器写全文文件）
-
-    @property
-    def client(self):
-        if self._client is None:
-            load_dotenv()
-            self._client = OpenAI()
-        return self._client
-
-    def reset_client(self) -> None:
-        """丢弃缓存的客户端，按当前环境重建。
-
-        运行者选"更新环境"后调用：光重建客户端不够——load_dotenv 默认不覆盖已存在的
-        环境变量，第二次读 .env 不会生效，这里显式 override。
-        """
-        self._client = None
-        load_dotenv(override=True)
-
-    _API_PARAM_KEYS: set = {
-        "temperature", "max_tokens", "top_p", "frequency_penalty",
-        "presence_penalty", "stop", "stream", "extra_body",
-        "seed", "logit_bias", "logprobs", "top_logprobs",
-        "n", "response_format", "timeout", "reasoning_effort",
-    }
-    _NUMERIC_API_PARAMS: set = {
-        "temperature", "max_tokens", "top_p", "frequency_penalty",
-        "presence_penalty", "n", "seed", "timeout", "logprobs", "top_logprobs",
-    }
-
-    def _filter_api_params(self, para: dict) -> dict:
-        out = {}
-        for k, v in para.items():
-            if k not in self._API_PARAM_KEYS:
-                continue
-            # para 以 str 存储在内存中，数值型参数需要还原为数值
-            if k in self._NUMERIC_API_PARAMS and isinstance(v, str):
-                try:
-                    v = float(v) if ("." in v or "e" in v.lower()) else int(v)
-                except ValueError:
-                    pass
-            out[k] = v
-        return out
-
-    def _parse_tool_args(self, tool_call, return_calls: list):
-        call_id = tool_call.id
-        try:
-            return json.loads(tool_call.function.arguments)
-        except json.JSONDecodeError as e:
-            return_calls.append({
-                "call_id": call_id,
-                "cmd_type": "json_error",
-                "args": {"error": str(e), "name": tool_call.function.name, "raw": tool_call.function.arguments},
-            })
-            return None
-
-    def _return_calls_from_message(self, message) -> list:
-        return_calls = []
-        if not message.tool_calls:
-            return return_calls
-
-        for tool_call in message.tool_calls:
-            call_id = tool_call.id
-            name = tool_call.function.name
-            args = self._parse_tool_args(tool_call, return_calls)
-            if args is None:
-                continue
-
-            # 解析器不查指令集：名字原样进 cmd_type。认不认识这个名字由
-            # _process_return_calls 在处理指令时判断一次——查表只在一处发生，
-            # 解析器因此不必知道指令集，也不会把未知名字改写掉。
-            return_calls.append({"call_id": call_id, "cmd_type": name, "args": args})
-
-        return return_calls
-
-    def exec(self, conversation: Conversation, para: MetaDict):
-        messages = conversation.to_api_messages()
-        messages.extend(conversation.user_batch.to_tool_messages())
-
-        user_content = conversation.user_batch.get_user_content()
-        if user_content:
-            messages.append({"role": "user", "content": user_content})
-
-        extra_para = self._filter_api_params(para.to_dict())
-        use_tool = para.get("use_tool")
-        tools = _build_tools(conversation)
-        model = para.get("model", "gpt-4")
-
-        start = time.time()
-        try:
-            response = self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=tools,
-                tool_choice=use_tool,
-                **extra_para
-            )
-        except Exception as e:
-            self.last_call = {
-                "model": model,
-                "messages": messages,
-                "result": None,
-                "tool_calls": [],
-                "elapsed_ms": (time.time() - start) * 1000,
-                "error": f"{type(e).__name__}: {e}",
-            }
-            # 失败时历史与输入批次都没动过（追加在下面、clear 在 exec 返回之后），
-            # 所以从这里重试同一轮是干净的，不需要检查点或回退。
-            category, detail = classify_api_error(e)
-            raise APIError(
-                f"{type(e).__name__}: {e}",
-                category=category,
-                status_code=detail["status_code"],
-                detail=detail,
-            ) from e
-
-        choice = response.choices[0]
-        message = choice.message
-        result = message.content
-        # 思维链内容：防御性读取（openai SDK 对非标准响应字段的支持依赖版本）
-        reasoning_content = getattr(message, "reasoning_content", None)
-        return_calls = self._return_calls_from_message(message)
-
-        for resp in conversation.user_batch.tool_responses:
-            conversation.append_tool_message(resp.content, resp.tool_call_id)
-
-        if user_content:
-            conversation.append_user_message(user_content)
-
-        tc_list = None
-        if message.tool_calls:
-            tc_list = [{"id": tc.id, "type": tc.type, "function": {"name": tc.function.name, "arguments": tc.function.arguments}} for tc in message.tool_calls]
-        conversation.append_assistant_message(
-            result or "",
-            tool_calls=tc_list,
-            reasoning_content=reasoning_content,
-        )
-
-        self.last_call = {
-            "model": model,
-            "messages": messages,
-            "result": result,
-            "reasoning": reasoning_content,
-            "tool_calls": return_calls,
-            "elapsed_ms": (time.time() - start) * 1000,
-            "error": None,
-        }
-        return result, return_calls, conversation
 
 
 
 class Core:
-    def __init__(self):
+    def __init__(self, services: Optional[Services] = None):
+        # 服务层（计划 S5）：LLM 与 PLM 服务由组合根注入；默认装配见 services.py。
+        self.services: Services = services if services is not None else default_services()
         self._conv_by_cid: Dict[int, Conversation] = {}
         self._ready_cids: List[int] = []
         self._dormant_cids: List[int] = []
         self._active_cid: Optional[int] = None
         self._next_cid: int = 0
         self.mem: Memory = Memory()
-        self.lmu: LMU = LMU()
-        self._executors: Dict[int, PLMExecutor] = {}  # cid → PLM 执行器（Python 对话；PLM 状态跨轮次保留）
+        self._executors: Dict[int, Executor] = {}  # cid → PLM 执行器（Python 对话；PLM 状态跨轮次保留）
         self._finished: set = set()  # 已关闭（个体结束）的对话 cid；记录供监测/信息设备展示
         self._instruction_budget: int = 50  # 每次激活的指令预算（核心中断阈值）
         self._activation_instructions: int = 0
@@ -1791,10 +507,6 @@ class Core:
         # 与宿主内建的 PLM_REGISTRY 并列，内建优先（镜像不得同名覆盖，装载期拒绝）。
         # 放在这里是因为本函数末尾的 install_model_catalog 要枚举它。
         self.plms: Dict[str, type] = {}
-        # 模型目录（内存节点 $MEM.model_catalog）的安装与刷新。参数清单由 LMU 注入：
-        # 真正做过滤的是 LMU，目录只负责把同一份清单讲给对话听。
-        self.model_catalog = ModelCatalog(self, LMU._API_PARAM_KEYS,
-                                          LMU._NUMERIC_API_PARAMS)
         # 安全配置（批次一 S4）：根注册表（名字 -> 真实段）。
         # 用户态对话的根表由软件动态授予（$MEM.conversations.<cid>.roots），内核不分配目录。
         self.root_registry: Dict[str, tuple] = {}
@@ -2327,7 +1039,9 @@ class Core:
             raise ValueError("v1 检查点不支持 Python 对话")
         cp = conv.to_checkpoint()
         msgs = cp["messages"]
-        if msgs and msgs[-1].get("role") == "assistant" and "tool_calls" in msgs[-1]:
+        last_parts = (msgs[-1].get("parts") or []) if msgs else []
+        if (msgs and msgs[-1].get("role") == "assistant"
+                and any(part.get("type") == "tool_call" for part in last_parts)):
             msgs = msgs[:-1]  # 末尾未配对工具调用：截断到最后一个完整交换
             cp["messages"] = msgs
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -2929,19 +1643,20 @@ class Core:
         if conv.cid in self._executors:
             return self._executors[conv.cid]
         model = para.get("model")
+        plm_service = self.services.plm
         if conv.is_python:
-            if not isinstance(model, str) or not (model in PLM_REGISTRY or model in self.plms):
-                available = list(PLM_REGISTRY) + sorted(set(self.plms) - set(PLM_REGISTRY))
+            if not isinstance(model, str) or model not in plm_service.available(self.plms):
                 raise ValueError(
-                    f"Python 对话 {conv.cid} 的 model {model!r} 不在 PLM_REGISTRY 中（可用: {available}）"
+                    f"Python 对话 {conv.cid} 的 model {model!r} 不在 PLM_REGISTRY 中"
+                    f"（可用: {plm_service.available(self.plms)}）"
                 )
-            executor = PLMExecutor(create_plm(model, extra=self.plms))
+            executor = plm_service.create_executor(model, extra=self.plms)
             self._executors[conv.cid] = executor
             self._warm_restored_python_executor(executor, conv)
             return executor
         return self.lmu
 
-    def _warm_restored_python_executor(self, executor: PLMExecutor, conv: Conversation) -> None:
+    def _warm_restored_python_executor(self, executor, conv: Conversation) -> None:
         """恢复出来的 Python 对话：重建执行器后重放 system 消息、把已有历史标记为已处理。
 
         PLM 的命名空间不序列化（计划 A5 待定夺第 1 项的默认取舍）：跨轮状态必须由
@@ -2952,10 +1667,7 @@ class Core:
             return
         self._warmup_needed.discard(conv.cid)
         messages = conv.to_api_messages()
-        restore_state = getattr(executor.plm, "restore_state", None)
-        if not callable(restore_state):
-            return
-        restore_state(messages, {"tools": _build_tools(conv), "imports": _build_imports(conv)})
+        executor.warm_restore(messages, {"tools": _build_tools(conv), "imports": _build_imports(conv)})
 
     def _get_para(self, conv: Conversation):
         """按对话自己的 para_ref 读取模型调用参数（缺省用 Core.para_ref）"""
@@ -2972,6 +1684,37 @@ class Core:
         except VMMemoryError:
             para = MetaDict(data={"model": "gpt-4"})
         return para
+
+    def publish_memory_after(self, event_type: str, conv: Conversation, target: str,
+                             payload: dict, result: Optional[dict] = None,
+                             follow_target: Optional[str] = None, space=None) -> None:
+        """供指令集发布 memory/device after 事实事件（计划 S1）。
+
+        instructions.py 不 import Core；指令经 core 对象调用本方法，Core 内的
+        `_publish_memory_after` 保持可被测试替换（monkeypatch avm.core 上的名字）。
+        """
+        return _publish_memory_after(self, event_type, conv, target, payload,
+                                     result=result, follow_target=follow_target,
+                                     space=space)
+
+    @property
+    def lmu(self):
+        """兼容名：LLM 服务执行器（计划 S5 保留属性，测试与 monitor 零修改）。"""
+        return self.services.llm
+
+    @lmu.setter
+    def lmu(self, value):
+        self.services.llm = value
+
+    def build_conversation(self, system_ref: str, para_ref: str, parent: Conversation,
+                           is_sub: bool, space=None) -> Conversation:
+        """供指令集构造子对话（创建与能力派生留在 Core）。
+
+        instructions.py 不 import Core；CreateInstruction/CreateSubInstruction 经
+        core 对象调用这个方法（计划 S1）。
+        """
+        return _build_conversation(self, system_ref, para_ref, parent=parent,
+                                   is_sub=is_sub, space=space)
 
     def start(self, system: str, user: str, para_ref: str = "$MEM.model_params") -> Conversation:
         conv = Conversation(
@@ -3023,7 +1766,7 @@ class Core:
         """把控制台通道绑到保留对话；没有就先建出来，返回该对话。"""
         conv = self.ensure_operator_conversation(para_ref)
         conv.para_ref = para_ref or self.para_ref
-        self._executors[conv.cid] = PLMExecutor(create_plm("plm.operator", channel=channel))
+        self._executors[conv.cid] = self.services.plm.create_executor("plm.operator", channel=channel)
         return conv
 
     # ------------------------------------------------------------------
@@ -3130,17 +1873,127 @@ class Core:
     # ------------------------------------------------------------------
     # 模型目录（$MEM.model_catalog）
     #
-    # 安装、刷新与"默认 para 用了清单外模型"的提醒都在 ModelCatalog 里；
-    # 这里只保留对外方法名（装载与启动流程按这两个名字调用）。
+    # 安装、刷新与"默认 para 用了清单外模型"的提醒都在本类里：目录只是普通内存
+    # 节点，但它的字段由适配器清单（services.llm.interfaces）决定，跟着启动流程走。
     # ------------------------------------------------------------------
 
     def install_model_catalog(self) -> None:
-        """安装/补齐模型目录的静态部分（实现见 ModelCatalog.install）。"""
-        self.model_catalog.install()
+        """安装/补齐模型目录的静态部分。幂等；镜像或检查点里已有的字段不覆盖。
+
+        整树替换（load_image）之后必须重装一次，否则镜像会把启动节点冲掉。
+        静态部分不依赖网络：LLM 各接口的参数白名单、PLM 注册表、必填字段。
+        """
+        root = self.mem._data
+        catalog = root.get(MODEL_CATALOG_KEY)
+        if not isinstance(catalog, MetaDict):
+            catalog = MetaDict(data={}, metadata=_CATALOG_META)
+            root[MODEL_CATALOG_KEY] = catalog
+        llm = catalog.get("llm")
+        if not isinstance(llm, MetaDict):
+            llm = MetaDict(data={},
+                           metadata="可用的 LLM 模型；按接口分栏（interfaces），default 是缺省接口")
+            catalog["llm"] = llm
+        llm.setdefault("default", "chat")
+        interfaces = llm.get("interfaces")
+        if not isinstance(interfaces, MetaDict):
+            interfaces = MetaDict(data={}, metadata="按接口（chat/responses/anthropic/gemini）分栏")
+            llm["interfaces"] = interfaces
+        for api, adapter in self.services.llm.interfaces().items():
+            entry = interfaces.get(api)
+            if not isinstance(entry, MetaDict):
+                entry = MetaDict(data={}, metadata=f"{api} 接口：参数与上游模型清单")
+                interfaces[api] = entry
+            entry.setdefault("source", "unavailable")
+            entry.setdefault("required", "model")
+            params = entry.get("params")
+            if not isinstance(params, MetaDict):
+                params = MetaDict(data={}, metadata="可以写进 para 的 API 参数（model 之外全部可选）")
+                entry["params"] = params
+            numeric = set(getattr(adapter, "numeric_param_names", lambda: ())())
+            for name in adapter.api_param_names():
+                if name not in params:
+                    params[name] = "数值型" if name in numeric else "字符串/原样"
+            if not isinstance(entry.get("models"), MetaList):
+                entry["models"] = MetaList(data=[], metadata="上游模型清单；每项一个 id")
+        if not isinstance(catalog.get("plm"), MetaList):
+            catalog["plm"] = MetaList(
+                data=self.services.plm.catalog_entries(self.plms),
+                metadata="PLM 注册表：本地实现，不需要网络",
+            )
+
 
     def refresh_model_catalog(self, timeout: float = 10.0) -> dict:
-        """拉一次上游 `/models` 写进目录（实现见 ModelCatalog.refresh）。"""
-        return self.model_catalog.refresh(timeout)
+        """拉一次各接口的 `/models` 写进目录；单接口失败不抛、不影响其它接口。
+
+        每个适配器负责信封校验与字段归一化（parse_models）；Core 只写内存并汇总。
+        清单只当参考——取不到不拦启动，也不拦模型名（后者见 _check_model_namespace）。
+        """
+        self.install_model_catalog()
+        interfaces = self.mem._data[MODEL_CATALOG_KEY]["llm"]["interfaces"]
+        summary = {}
+        for api, adapter in self.services.llm.interfaces().items():
+            entry = interfaces.get(api)
+            if not isinstance(entry, MetaDict):
+                continue
+            try:
+                payload = adapter.fetch_models_raw(timeout)
+                entries = adapter.parse_models(payload)
+            except Exception as e:
+                reason = f"{type(e).__name__}: {e}"
+                entry["source"] = "unavailable"
+                entry["reason"] = reason
+                print(
+                    f"[AVM] 模型目录：{api} 接口没能取到上游清单（{reason}），"
+                    f"本轮不校验该接口的模型名",
+                    file=sys.stderr,
+                )
+                summary[api] = {"source": "unavailable", "reason": reason}
+                continue
+            items = []
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                model_id = item.get("id")
+                if not isinstance(model_id, str) or not model_id:
+                    continue
+                meta = MetaDict(data={"id": model_id}, metadata="上游模型 id")
+                for key, value in item.items():
+                    if key == "id" or value is None:
+                        continue
+                    meta[key] = (", ".join(str(v) for v in value)
+                                 if isinstance(value, list) else str(value))
+                items.append(meta)
+            entry["models"] = MetaList(data=items, metadata="上游模型清单；每项一个 id")
+            entry["source"] = "api"
+            if "reason" in entry:
+                del entry["reason"]
+            print(f"[AVM] 模型目录：{api} 接口取到 {len(items)} 个模型", file=sys.stderr)
+            summary[api] = {"source": "api", "count": len(items)}
+        self._warn_unlisted_para_model(interfaces)
+        return {"interfaces": summary}
+
+    def _warn_unlisted_para_model(self, interfaces: MetaDict) -> None:
+        """默认 para 的 model 不在该接口清单里时提醒运行者（例如用着已退役的别名）。"""
+        try:
+            para = self.unwrap(self.para_ref, for_llm=False)
+        except Exception:
+            return
+        if not isinstance(para, MetaDict):
+            return
+        model = para.get("model")
+        if not isinstance(model, str) or not model:
+            return
+        api = para.get("api") or "chat"
+        entry = interfaces.get(api)
+        if not isinstance(entry, MetaDict) or entry.get("source") != "api":
+            return
+        listed = {e.get("id") for e in (entry.get("models") or []) if isinstance(e, MetaDict)}
+        if model not in listed:
+            print(
+                f"[AVM] 模型目录：para {self.para_ref} 的 model {model!r} 不在 {api} 接口的清单里"
+                f"（可能是拼写错误或已退役的别名）",
+                file=sys.stderr,
+            )
 
     # ------------------------------------------------------------------
     # 内核转储（诊断快照，不是恢复输入）
@@ -3611,3 +2464,14 @@ class Core:
             return conv if value[1] == "conv" else conv.user_batch
         else:
             return self.mem.unwrap(value, for_llm=for_llm, space=space)
+
+
+def __getattr__(name):
+    """兼容旧导入路径：LMU/PLMExecutor 已迁到服务模块（计划 S5）。"""
+    if name == "LMU":
+        from .llm_chat import LMU
+        return LMU
+    if name == "PLMExecutor":
+        from .plm import PLMExecutor
+        return PLMExecutor
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
