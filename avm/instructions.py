@@ -148,6 +148,14 @@ def _validate_instruction_args(instr_cls, args) -> Optional[str]:
     """
     if not isinstance(args, dict):
         return f"参数必须是对象，得到 {type(args).__name__}"
+    error = _check_declared_shape(instr_cls, args)
+    if error is not None:
+        return error
+    return _check_tool_semantics(instr_cls.tool_name, args)
+
+
+def _check_declared_shape(instr_cls, args) -> Optional[str]:
+    """按 tool_def 的声明校验：必填参数齐全、给的参数值类型对得上。"""
     params = _parameters_of(instr_cls)
     properties = params.get("properties") or {}
     for name in params.get("required") or []:
@@ -159,37 +167,66 @@ def _validate_instruction_args(instr_cls, args) -> Optional[str]:
             continue
         if not _value_matches(value, spec):
             return f"参数 {name} 不合法：{value!r}"
-    tool = instr_cls.tool_name
-    if tool in ("memory_read", "memory_write", "memory_delete") and not args["ref"].startswith("$"):
-        return f"ref 必须是 $ 开头的内存引用，得到 {args['ref']!r}"
+    return None
+
+
+def _check_tool_semantics(tool: str, args) -> Optional[str]:
+    """声明管不到的语义约束：引用形态、以及各工具自己的必填组合。"""
+    if tool in ("memory_read", "memory_write", "memory_delete"):
+        return _check_ref_form(args["ref"])
     if tool == "memory_make":
-        try:
-            check_new_key(args["key"])
-        except VMMemoryError as e:
-            return str(e)
+        return _check_make_key(args["key"])
     if tool == "edit_metadata":
-        op = args.get("type")
-        if op not in ("set", "get", "del"):
-            return f"type 必须是 set/get/del，得到 {op!r}"
-        if op == "set":
-            if not args.get("key"):
-                return "type=set 时 key 必须是非空字符串"
-            if "value" not in args:
-                return "type=set 时 value 必需（可以是空字符串）"
-        if op == "del" and "key" not in args:
-            return "type=del 时 key 必需"
+        return _check_edit_metadata_args(args)
     if tool == "listen_event":
-        action = args.get("action")
-        if action == "listen":
-            if args.get("handler_ref") is None:
-                return "action=listen 时必须提供 handler_ref"
-        if action == "modify":
-            if args.get("listener_id") is None:
-                return "action=modify 时必须提供 listener_id"
-            if args.get("handler_ref") is None and args.get("priority") is None:
-                return "action=modify 时必须提供 handler_ref 或 priority"
-        if action == "cancel" and args.get("listener_id") is None:
-            return "action=cancel 时必须提供 listener_id"
+        return _check_listen_event_args(args)
+    return None
+
+
+def _check_ref_form(ref) -> Optional[str]:
+    """内存引用必须以 $ 开头（根名省略等于让内核猜，直接拒）。"""
+    if not ref.startswith("$"):
+        return f"ref 必须是 $ 开头的内存引用，得到 {ref!r}"
+    return None
+
+
+def _check_make_key(key) -> Optional[str]:
+    """新建键的语法（点号/空键）由 memory 侧统一裁决，这里只翻译成工具响应。"""
+    try:
+        check_new_key(key)
+    except VMMemoryError as e:
+        return str(e)
+    return None
+
+
+def _check_edit_metadata_args(args) -> Optional[str]:
+    """edit_metadata：type 决定 key/value 的必填组合。"""
+    op = args.get("type")
+    if op not in ("set", "get", "del"):
+        return f"type 必须是 set/get/del，得到 {op!r}"
+    if op == "set":
+        if not args.get("key"):
+            return "type=set 时 key 必须是非空字符串"
+        if "value" not in args:
+            return "type=set 时 value 必需（可以是空字符串）"
+    if op == "del" and "key" not in args:
+        return "type=del 时 key 必需"
+    return None
+
+
+def _check_listen_event_args(args) -> Optional[str]:
+    """listen_event：action 决定 handler_ref / listener_id 的必填组合。"""
+    action = args.get("action")
+    if action == "listen":
+        if args.get("handler_ref") is None:
+            return "action=listen 时必须提供 handler_ref"
+    if action == "modify":
+        if args.get("listener_id") is None:
+            return "action=modify 时必须提供 listener_id"
+        if args.get("handler_ref") is None and args.get("priority") is None:
+            return "action=modify 时必须提供 handler_ref 或 priority"
+    if action == "cancel" and args.get("listener_id") is None:
+        return "action=cancel 时必须提供 listener_id"
     return None
 
 
@@ -561,84 +598,79 @@ class EditMetadataInstruction(Instruction):
                 self.call_id,
             )
             return
-        ctrl = dict(node.get_ctrl() or {})
         if op == "set":
-            if not key:
-                conv.user_batch.add_tool_response(
-                    "Illegal: edit_metadata type=set 时 key 必须是非空字符串", self.call_id
-                )
-                return
-            if value is None:
-                conv.user_batch.add_tool_response(
-                    "Illegal: edit_metadata type=set 时 value 必需（可以是空字符串）", self.call_id
-                )
-                return
-            ctrl[key] = value
-            node.set_ctrl(ctrl)
-            if core.is_journaling():
-                core.note_effect(
-                    "edit_metadata", ref=self.ref, type="set", key=key, value=value,
-                    space=_effect_space(conv),
-                )
-            conv.user_batch.add_tool_response(f"ctrl.{key} = {value!r} 已写入", self.call_id)
-            _publish_core_after_safely(core, 
-                "edit_metadata",
-                conv,
-                self.ref,
-                {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
-                source_kind="memory",
-                target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
-            )
+            self._ctrl_set(core, conv, node, key, value)
         elif op == "get":
-            if not key:
-                conv.user_batch.add_tool_response(
-                    json.dumps(ctrl, ensure_ascii=False) if ctrl else "{}", self.call_id
-                )
-                _publish_core_after_safely(core, 
-                    "edit_metadata",
-                    conv,
-                    self.ref,
-                    {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
-                    source_kind="memory",
-                target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
-                )
-            elif key in ctrl:
-                conv.user_batch.add_tool_response(str(ctrl[key]), self.call_id)
-                _publish_core_after_safely(core, 
-                    "edit_metadata",
-                    conv,
-                    self.ref,
-                    {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
-                    source_kind="memory",
-                target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
-                )
-            else:
-                conv.user_batch.add_tool_response(f"Error: ctrl 中没有键 {key}", self.call_id)
-        else:  # del
-            if not key:
-                conv.user_batch.add_tool_response(
-                    "Illegal: edit_metadata type=del 时 key 必需", self.call_id
-                )
-                return
-            if key not in ctrl:
-                conv.user_batch.add_tool_response(f"Error: ctrl 中没有键 {key}", self.call_id)
-                return
-            del ctrl[key]
-            node.set_ctrl(ctrl)
-            if core.is_journaling():
-                core.note_effect(
-                    "edit_metadata", ref=self.ref, type="del", key=key,
-                    space=_effect_space(conv),
-                )
-            conv.user_batch.add_tool_response(f"ctrl.{key} 已删除", self.call_id)
-            _publish_core_after_safely(core, 
-                "edit_metadata",
-                conv,
-                self.ref,
-                {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
-                source_kind="memory",
-                target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
+            self._ctrl_get(core, conv, node, key, value)
+        else:
+            self._ctrl_del(core, conv, node, key, value)
+
+    def _respond(self, conv, text: str) -> None:
+        """把结果作为本次工具调用的响应写回（三条分支共用，省掉 call_id 重复）。"""
+        conv.user_batch.add_tool_response(text, self.call_id)
+
+    def _publish_after(self, core: 'Core', conv, op: str, key, value) -> None:
+        """写后事件。三种操作只差 payload 里的 type，其余完全相同——
+        原先五个分支各抄了一遍，缩进还抄歪了。"""
+        _publish_core_after_safely(
+            core,
+            "edit_metadata",
+            conv,
+            self.ref,
+            {"ref": self.ref, "type": op, "key": key, "value": value, "actor_cid": conv.cid},
+            source_kind="memory",
+            target_ref=_canonical_ref(core, self.ref, conv.caps.space()),
+        )
+
+    def _ctrl_set(self, core: 'Core', conv, node, key, value) -> None:
+        """type=set：key/value 都必需（value 可以是空字符串，但不能缺）。"""
+        if not key:
+            self._respond(conv, "Illegal: edit_metadata type=set 时 key 必须是非空字符串")
+            return
+        if value is None:
+            self._respond(conv, "Illegal: edit_metadata type=set 时 value 必需（可以是空字符串）")
+            return
+        ctrl = dict(node.get_ctrl() or {})
+        ctrl[key] = value
+        node.set_ctrl(ctrl)
+        if core.is_journaling():
+            core.note_effect(
+                "edit_metadata", ref=self.ref, type="set", key=key, value=value,
+                space=_effect_space(conv),
             )
+        self._respond(conv, f"ctrl.{key} = {value!r} 已写入")
+        self._publish_after(core, conv, "set", key, value)
+
+    def _ctrl_get(self, core: 'Core', conv, node, key, value) -> None:
+        """type=get：不带 key 返回整个 ctrl（JSON）；带 key 返回值。读失败不发写后事件。"""
+        ctrl = dict(node.get_ctrl() or {})
+        if not key:
+            self._respond(conv, json.dumps(ctrl, ensure_ascii=False) if ctrl else "{}")
+        elif key in ctrl:
+            self._respond(conv, str(ctrl[key]))
+        else:
+            self._respond(conv, f"Error: ctrl 中没有键 {key}")
+            return
+        self._publish_after(core, conv, "get", key, value)
+
+    def _ctrl_del(self, core: 'Core', conv, node, key, value) -> None:
+        """type=del：key 必需且必须已存在。"""
+        if not key:
+            self._respond(conv, "Illegal: edit_metadata type=del 时 key 必需")
+            return
+        ctrl = dict(node.get_ctrl() or {})
+        if key not in ctrl:
+            self._respond(conv, f"Error: ctrl 中没有键 {key}")
+            return
+        del ctrl[key]
+        node.set_ctrl(ctrl)
+        if core.is_journaling():
+            core.note_effect(
+                "edit_metadata", ref=self.ref, type="del", key=key,
+                space=_effect_space(conv),
+            )
+        self._respond(conv, f"ctrl.{key} 已删除")
+        self._publish_after(core, conv, "del", key, value)
 
 
 class CreateInstruction(Instruction):
@@ -684,8 +716,7 @@ class CreateInstruction(Instruction):
             if isinstance(name, str) and name:
                 child.name = name
         # 子对话创建后进入休眠，等待 send_instruction 投递指令
-        if child.cid not in core._dormant_cids:
-            core._dormant_cids.append(child.cid)
+        core.sleep(child.cid)
         if core.is_journaling():
             core.note_effect("conversation_create", **conversation_create_payload(core, child))
         _publish_core_after_safely(core,
@@ -746,9 +777,8 @@ class CreateSubInstruction(Instruction):
         sub.append_user_message(user_content)  # 亚对话的任务在创建时直接给出
         sub.metadata["call_id"] = self.call_id
         # 父进入休眠等待亚对话完成，完成时由 core 唤醒（_on_conversation_finished）
-        core._ready_cids.insert(0, sub.cid)
-        if conv.cid not in core._dormant_cids:
-            core._dormant_cids.append(conv.cid)
+        core.prioritize(sub.cid)  # 亚对话插队：它的任务在创建时就已给定，先跑
+        core.sleep(conv.cid)
         if core.is_journaling():
             core.note_effect("conversation_create", **conversation_create_payload(core, sub))
         _publish_core_after_safely(core,
@@ -783,91 +813,108 @@ class SendInstruction(Instruction):
 
     def execute(self, core: 'Core', conv: Conversation):
         targets = self.cid if isinstance(self.cid, list) else [self.cid]
-        if not targets:
-            msg = "send_instruction 失败：cid 列表为空"
-            _report_tool_error(conv, msg)
-            conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
+        if not self._check_legal(conv, targets):
             return
+        # 先解析目标，任一不存在或已关闭即整体失败
+        resolved = self._resolve_targets(core, conv, targets)
+        if resolved is None:
+            return
+        delivered_cids, blocked, failed = self._deliver_all(core, conv, resolved)
+        self._report(conv, resolved, delivered_cids, blocked, failed)
+
+    def _reject(self, conv: Conversation, msg: str, kind: str = "Error") -> None:
+        """整次投递不成立：记终端提示并回一条工具响应。kind=Illegal 表示越权/非法用法。"""
+        _report_tool_error(conv, msg)
+        conv.user_batch.add_tool_response(f"{kind}: {msg}", self.call_id)
+
+    def _check_legal(self, conv: Conversation, targets: list) -> bool:
+        """投递前置校验（空列表 / 亚对话发往主对话 / 自我投递）。False 表示已回复、不再继续。"""
+        if not targets:
+            self._reject(conv, "send_instruction 失败：cid 列表为空")
+            return False
         if conv.is_sub:
             ancestor = conv.parent
             while ancestor is not None:
                 if ancestor.cid in targets:
-                    msg = ("send_instruction 失败：亚对话不能向主对话发送消息，"
-                           "只能用 create_sub 的返回通道")
-                    _report_tool_error(conv, msg)
-                    conv.user_batch.add_tool_response(f"Illegal: {msg}", self.call_id)
-                    return
+                    self._reject(conv, "send_instruction 失败：亚对话不能向主对话发送消息，"
+                                       "只能用 create_sub 的返回通道", "Illegal")
+                    return False
                 ancestor = ancestor.parent
         for cid in targets:
             if cid == conv.cid:
-                msg = f"send_instruction 不允许自我投递（cid={cid} 是当前对话）"
-                _report_tool_error(conv, msg)
-                conv.user_batch.add_tool_response(f"Illegal: {msg}", self.call_id)
-                return
-        # 先解析目标，任一不存在或已关闭即整体失败
+                self._reject(conv, f"send_instruction 不允许自我投递（cid={cid} 是当前对话）",
+                             "Illegal")
+                return False
+        return True
+
+    def _resolve_targets(self, core: 'Core', conv: Conversation, targets: list) -> Optional[list]:
+        """把 cid 列表解析成对话对象。任一不存在或已关闭即整体失败（多播的原子性）。"""
         resolved = []
         for cid in targets:
-            target = core._conv_by_cid.get(cid)
+            target = core.get_conversation(cid)
             if target is None or core.is_hidden_cid(cid):
-                msg = f"send_instruction 失败：对话 {cid} 不存在"
-                _report_tool_error(conv, msg)
-                conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
-                return
-            if cid in core._finished:
-                msg = f"send_instruction 失败：对话 {cid} 已关闭"
-                _report_tool_error(conv, msg)
-                conv.user_batch.add_tool_response(f"Error: {msg}", self.call_id)
-                return
+                self._reject(conv, f"send_instruction 失败：对话 {cid} 不存在")
+                return None
+            if core.is_finished(cid):
+                self._reject(conv, f"send_instruction 失败：对话 {cid} 已关闭")
+                return None
             resolved.append(target)
+        return resolved
 
-        delivered = 0
-        delivered_cids = []
-        blocked = []
-        failed = []
+    def _deliver_all(self, core: 'Core', conv: Conversation, resolved: list) -> tuple:
+        """逐个投递。单个目标被拦截/处理失败不阻断其他目标，结果分三堆收着。"""
+        delivered_cids, blocked, failed = [], [], []
         for target in resolved:
-            event = build_event(
-                core,
-                "send_instruction",
-                "before",
-                conv=conv,
-                target=f"cid:{target.cid}",
-                payload={"cid": target.cid, "content": self.content},
-                target_ref=("cid", target.cid),
-            )
-            event = core.events.dispatch(event)
-            core.events.deliver_notifies(event)
-            if event["action"] == "handler_error":
-                failed.append(event["response"])
-                _report_tool_error(conv, event["response"])
-                continue
-            if event["action"] == "replace":
-                blocked.append(event["response"])
-                continue
-            content = event["payload"]["content"]
-            # 简单投递：内容原样放入目标对话的输入批次，不包装 JSON 信封
-            target.user_batch.add_user_content(content)
-            core.note_effect("delivery", to_cid=target.cid, user_contents=[content])
-            delivered_cids.append(target.cid)
-            delivered += 1
-            # 事实事件按"消息已被接受"发布：等待返回的目标只入批次、也照样有 after。
-            # TODO(issue): send_instruction 事实事件的语义需进一步研究
-            _publish_core_after_safely(core,
-                "send_instruction",
-                conv,
-                f"cid:{target.cid}",
-                {"cid": target.cid, "content": content, "actor_cid": conv.cid},
-                source_kind="core",
-                target_ref=("cid", target.cid),
-            )
-            if core.is_waiting_for_return(target):
-                # 等亚对话返回的对话：消息只入批次，不唤醒；亚对话结束后父对话先跑。
-                continue
-            if target.cid in core._dormant_cids:
-                core._dormant_cids.remove(target.cid)
-            if target.cid in core._ready_cids:
-                core._ready_cids.remove(target.cid)
-            core._ready_cids.append(target.cid)  # 排队调度：被唤醒者进队列末尾
+            outcome, text = self._deliver_one(core, conv, target)
+            if outcome == "delivered":
+                delivered_cids.append(target.cid)
+            elif outcome == "blocked":
+                blocked.append(text)
+            else:
+                failed.append(text)
+        return delivered_cids, blocked, failed
 
+    def _deliver_one(self, core: 'Core', conv: Conversation, target: Conversation) -> tuple:
+        """向单个目标投递一条内容，返回 (delivered / blocked / failed, 说明文本)。"""
+        event = build_event(
+            core,
+            "send_instruction",
+            "before",
+            conv=conv,
+            target=f"cid:{target.cid}",
+            payload={"cid": target.cid, "content": self.content},
+            target_ref=("cid", target.cid),
+        )
+        event = core.events.dispatch(event)
+        core.events.deliver_notifies(event)
+        if event["action"] == "handler_error":
+            _report_tool_error(conv, event["response"])
+            return "failed", event["response"]
+        if event["action"] == "replace":
+            return "blocked", event["response"]
+        content = event["payload"]["content"]
+        # 简单投递：内容原样放入目标对话的输入批次，不包装 JSON 信封
+        target.user_batch.add_user_content(content)
+        core.note_effect("delivery", to_cid=target.cid, user_contents=[content])
+        # 事实事件按"消息已被接受"发布：等待返回的目标只入批次、也照样有 after。
+        # TODO(issue): send_instruction 事实事件的语义需进一步研究
+        _publish_core_after_safely(core,
+            "send_instruction",
+            conv,
+            f"cid:{target.cid}",
+            {"cid": target.cid, "content": content, "actor_cid": conv.cid},
+            source_kind="core",
+            target_ref=("cid", target.cid),
+        )
+        # 等亚对话返回的对话：消息只入批次，不唤醒；亚对话结束后父对话先跑。
+        if not core.is_waiting_for_return(target):
+            core.wake(target.cid)  # 排队调度：被唤醒者进队列末尾
+        return "delivered", None
+
+    def _report(self, conv: Conversation, resolved: list,
+                delivered_cids: list, blocked: list, failed: list) -> None:
+        """回报投递结果：部分成功要说明拦截/失败数量，全失败时把第一条原因原样带回去。"""
+        delivered = len(delivered_cids)
         if delivered > 0 and (blocked or failed):
             conv.user_batch.add_tool_response(
                 f"已投递到 cid={delivered_cids}（{len(blocked)} 个被拦截，{len(failed)} 个处理失败）",
@@ -917,11 +964,11 @@ class CloseInstruction(Instruction):
                     conv.user_batch.add_tool_response(f"Illegal: {msg}", self.call_id)
                     return
                 ancestor = ancestor.parent
-        target = core._conv_by_cid.get(self.cid)
+        target = core.get_conversation(self.cid)
         if target is None or core.is_hidden_cid(self.cid):
             conv.user_batch.add_tool_response(f"Error: 对话 {self.cid} 不存在", self.call_id)
             return
-        if self.cid in core._finished:
+        if core.is_finished(self.cid):
             conv.user_batch.add_tool_response(f"Error: 对话 {self.cid} 已关闭", self.call_id)
             return
         if conv.caps.mode != MODE_KERNEL and target.caps.mode == MODE_KERNEL:
@@ -938,7 +985,7 @@ class CloseInstruction(Instruction):
             conv.user_batch.add_tool_response(before["response"], self.call_id)
             return
         dropped = bool(target.user_batch.tool_responses or target.user_batch.user_contents)
-        dropped = dropped or self.cid in core._ready_cids
+        dropped = dropped or core.is_ready(self.cid)
         core._close_conversation(self.cid)
         _publish_core_after_safely(core,
             "close_conversation",
@@ -984,93 +1031,116 @@ class ListenEventInstruction(Instruction):
         # before 事件：监听注册/修改/取消本身也受事件层检查与软件 Guard 裁决。
         # action=listen 先解析 handler 的 condition，before 载荷带解析后的条件；
         # 注册在 before 通过后进行，不再重复解析。
-        listener_id = getattr(self, "listener_id", None)
-        parsed_condition = None
-        if action == "listen":
-            handler_ref = getattr(self, "handler_ref", None)
-            if handler_ref is None:
-                conv.user_batch.add_tool_response(
-                    "Illegal: action=listen 时必须提供 handler_ref", self.call_id
-                )
-                return
-            try:
-                parsed_condition = core.events.parse_condition(
-                    conv.cid, handler_ref, space=conv.caps.space(),
-                    kernel_mode=(conv.caps.mode == "kernel"),
-                )
-            except _INSTRUCTION_ERRORS as e:
-                _respond_error(conv, self.call_id, e)
-                return
-            b_target, b_ref = _condition_before_target(parsed_condition)
-            b_payload = {
-                "action": action,
-                "event_type": getattr(self, "event_type", None),
-                "condition": parsed_condition,
-                "handler_ref": handler_ref,
-                "priority": getattr(self, "priority", None),
-                "tier": getattr(self, "tier", None),
-            }
-        else:
-            b_target = f"listener:{listener_id}"
-            b_payload = {"action": action, "listener_id": listener_id,
-                         "handler_ref": getattr(self, "handler_ref", None),
-                         "priority": getattr(self, "priority", None)}
-            b_ref = ("listener", listener_id) if isinstance(listener_id, int) else None
+        prepared = self._prepare_before(core, conv, action)
+        if prepared is None:
+            return
+        b_target, b_payload, b_ref, parsed_condition = prepared
         before = _dispatch_before_event(core, conv, "listen_event", b_target, b_payload, target_ref=b_ref)
         if before["action"] in ("replace", "handler_error"):
             conv.user_batch.add_tool_response(before["response"], self.call_id)
             return
         try:
-            if action == "listen":
-                priority = getattr(self, "priority", 0)
-                tier = getattr(self, "tier", None) or "normal"
-                listener_id = core.events.register_condition(
-                    conv.cid, handler_ref, space=conv.caps.space(),
-                    tier=tier, priority=0 if priority is None else priority,
-                    kernel_mode=(conv.caps.mode == "kernel"),
-                    condition=parsed_condition,
-                )
-                response = f"listener_id={listener_id} 已注册"
-                after_payload = {"listener_id": listener_id, "action": "listen", "actor_cid": conv.cid}
-            elif action == "modify":
-                listener_id = getattr(self, "listener_id", None)
-                handler_ref = getattr(self, "handler_ref", None)
-                if listener_id is None or (handler_ref is None and getattr(self, "priority", None) is None):
-                    raise IllegalOperationError(
-                        "action=modify 时必须提供 listener_id，以及 handler_ref 或 priority 至少一个"
-                    )
-                if (
-                    getattr(self, "event_type", None) is not None
-                    or getattr(self, "target", None) is not None
-                    or getattr(self, "phase", None) is not None
-                    or getattr(self, "tier", None) is not None
-                ):
-                    raise IllegalOperationError(
-                        "action=modify 只允许修改 handler_ref/priority，不能改 event_type/target/phase/tier"
-                    )
-                core.events.modify(listener_id, conv.cid, handler_ref, space=conv.caps.space(),
-                                   priority=getattr(self, "priority", None))
-                response = f"listener_id={listener_id} 已更新"
-                after_payload = {"listener_id": listener_id, "action": "modify", "actor_cid": conv.cid}
-            else:  # cancel
-                listener_id = getattr(self, "listener_id", None)
-                if listener_id is None:
-                    raise IllegalOperationError("action=cancel 时必须提供 listener_id")
-                core.events.cancel(listener_id, conv.cid)
-                response = f"listener_id={listener_id} 已取消"
-                after_payload = {"listener_id": listener_id, "action": "cancel", "actor_cid": conv.cid}
-
+            response, listener_id = self._apply(core, conv, action, parsed_condition)
+            # 三种动作的写后事件只差 payload 里的 action，其余相同
             _publish_core_after_safely(core,
                 "listen_event",
                 conv,
                 f"listener:{listener_id}",
-                after_payload,
+                {"listener_id": listener_id, "action": action, "actor_cid": conv.cid},
                 source_kind="core",
                 target_ref=("listener", listener_id),
             )
             conv.user_batch.add_tool_response(response, self.call_id)
         except _INSTRUCTION_ERRORS as e:
             _respond_error(conv, self.call_id, e)
+
+    def _prepare_before(self, core: 'Core', conv: Conversation, action: str) -> Optional[tuple]:
+        """构造 before 事件的 (target, payload, target_ref, 解析后的条件)；已回复错误时返回 None。"""
+        listener_id = getattr(self, "listener_id", None)
+        if action != "listen":
+            return (
+                f"listener:{listener_id}",
+                {"action": action, "listener_id": listener_id,
+                 "handler_ref": getattr(self, "handler_ref", None),
+                 "priority": getattr(self, "priority", None)},
+                ("listener", listener_id) if isinstance(listener_id, int) else None,
+                None,
+            )
+        handler_ref = getattr(self, "handler_ref", None)
+        if handler_ref is None:
+            conv.user_batch.add_tool_response(
+                "Illegal: action=listen 时必须提供 handler_ref", self.call_id
+            )
+            return None
+        try:
+            parsed_condition = core.events.parse_condition(
+                conv.cid, handler_ref, space=conv.caps.space(),
+                kernel_mode=(conv.caps.mode == "kernel"),
+            )
+        except _INSTRUCTION_ERRORS as e:
+            _respond_error(conv, self.call_id, e)
+            return None
+        b_target, b_ref = _condition_before_target(parsed_condition)
+        return (
+            b_target,
+            {
+                "action": action,
+                "event_type": getattr(self, "event_type", None),
+                "condition": parsed_condition,
+                "handler_ref": handler_ref,
+                "priority": getattr(self, "priority", None),
+                "tier": getattr(self, "tier", None),
+            },
+            b_ref,
+            parsed_condition,
+        )
+
+    def _apply(self, core: 'Core', conv: Conversation, action: str,
+               parsed_condition) -> tuple:
+        """执行注册/修改/取消，返回 (工具响应文本, listener_id)。"""
+        if action == "listen":
+            return self._register(core, conv, parsed_condition)
+        if action == "modify":
+            return self._modify(core, conv)
+        return self._cancel(core, conv)
+
+    def _register(self, core: 'Core', conv: Conversation, parsed_condition) -> tuple:
+        priority = getattr(self, "priority", 0)
+        tier = getattr(self, "tier", None) or "normal"
+        listener_id = core.events.register_condition(
+            conv.cid, getattr(self, "handler_ref", None), space=conv.caps.space(),
+            tier=tier, priority=0 if priority is None else priority,
+            kernel_mode=(conv.caps.mode == "kernel"),
+            condition=parsed_condition,
+        )
+        return f"listener_id={listener_id} 已注册", listener_id
+
+    def _modify(self, core: 'Core', conv: Conversation) -> tuple:
+        listener_id = getattr(self, "listener_id", None)
+        handler_ref = getattr(self, "handler_ref", None)
+        if listener_id is None or (handler_ref is None and getattr(self, "priority", None) is None):
+            raise IllegalOperationError(
+                "action=modify 时必须提供 listener_id，以及 handler_ref 或 priority 至少一个"
+            )
+        if (
+            getattr(self, "event_type", None) is not None
+            or getattr(self, "target", None) is not None
+            or getattr(self, "phase", None) is not None
+            or getattr(self, "tier", None) is not None
+        ):
+            raise IllegalOperationError(
+                "action=modify 只允许修改 handler_ref/priority，不能改 event_type/target/phase/tier"
+            )
+        core.events.modify(listener_id, conv.cid, handler_ref, space=conv.caps.space(),
+                           priority=getattr(self, "priority", None))
+        return f"listener_id={listener_id} 已更新", listener_id
+
+    def _cancel(self, core: 'Core', conv: Conversation) -> tuple:
+        listener_id = getattr(self, "listener_id", None)
+        if listener_id is None:
+            raise IllegalOperationError("action=cancel 时必须提供 listener_id")
+        core.events.cancel(listener_id, conv.cid)
+        return f"listener_id={listener_id} 已取消", listener_id
 
 
 def _instruction_registry() -> Dict[str, Type[Instruction]]:
