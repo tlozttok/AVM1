@@ -4,14 +4,13 @@ import contextlib
 import inspect
 import io
 import json
-import re
 import sys
 from typing import List, Optional
 from abc import ABC, abstractmethod
 
+from .machine_dsl import MachineParser
 from .types import (
-    Conversation, MetaDict, MetaList, Role, message_to_api_dict, Message,
-    SystemMessage, UserMessage, AssistantMessage, ToolMessage,
+    Message, SystemMessage, UserMessage, AssistantMessage, ToolMessage,
 )
 from .modules import BASE_MODULES, catalog_exports, sandbox_globals
 from .sandbox import SecurityError, check_code
@@ -634,8 +633,13 @@ class FunctionPLM(PLMServer):
         return ""
 
 
-class _MachineParseError(Exception):
-    """状态机定义解析错误，携带行号信息。"""
+class _MachineRuntimeError(Exception):
+    """状态机执行一轮时的错误（guard 求值失败、无匹配事件、工具名未声明）。
+
+    出现这类错误时本轮不提交状态，并且要清掉上一轮留下的工具输出——
+    否则旧输出会混进下一次 guard 的 last。用异常是为了让各步骤各自报错，
+    而不必每层都写一遍"清空 + 拼错误文本 + 返回"。
+    """
 
 
 class StateMachinePLM(PLMServer):
@@ -644,10 +648,10 @@ class StateMachinePLM(PLMServer):
     状态与变量只活在本实例内；tool 消息追加到 last 供 guard 使用。
     """
 
-    _VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
     def __init__(self):
         super().__init__()
+        # DSL 编译交给 MachineParser：它只通过 _tool_check 问"这个工具名允许吗"。
+        self._parser = MachineParser(check_tool=self._tool_check)
         self._initial = None
         self._states = {}
         self._state = None
@@ -657,12 +661,20 @@ class StateMachinePLM(PLMServer):
         self._fsm_counter = 0
 
     # ------------------------------------------------------------------
-    # system 消息：解析 DSL
+    # system 消息：装一份状态机
+    #
+    # 语法由 machine_dsl.MachineParser 编译（文本 → 初始状态 + 状态表），这里只
+    # 负责把结果落到运行期字段上；解析失败时清空，让后续消息报"定义解析失败"。
     # ------------------------------------------------------------------
 
     def _execute_system_message(self, content: str):
         try:
-            self._parse_machine(content)
+            initial, states = self._parser.parse(content)
+            # 解析成功才落地：解析器出错时这里一个字都不改，交给 except 走"清空"。
+            self._initial = initial
+            self._states = states
+            self._state = initial
+            self._vars = {}
             self._parse_error = None
             self._last_tool_output = ""
         except Exception as e:
@@ -672,176 +684,11 @@ class StateMachinePLM(PLMServer):
             self._vars = {}
             self._parse_error = str(e)
 
-    def _parse_machine(self, content: str):
-        initial = None
-        states = {}
-        current_state = None
-        lines = content.splitlines()
-        i = 0
-        while i < len(lines):
-            lineno = i + 1
-            line = lines[i].strip()
-            if not line or line.startswith("#"):
-                i += 1
-                continue
-            if line.startswith("initial:"):
-                name = line.split(":", 1)[1].strip()
-                if not name:
-                    raise _MachineParseError(f"第 {lineno} 行: initial 缺少状态名")
-                initial = name
-                i += 1
-                continue
-            if line.startswith("state "):
-                rest = line[6:].strip()
-                if not rest.endswith(":"):
-                    raise _MachineParseError(f"第 {lineno} 行: state 行必须以 : 结尾")
-                name = rest[:-1].strip()
-                if not name:
-                    raise _MachineParseError(f"第 {lineno} 行: state 缺少名称")
-                if name in states:
-                    raise _MachineParseError(f"第 {lineno} 行: state {name} 重复定义")
-                states[name] = []
-                current_state = name
-                i += 1
-                continue
-            if line.startswith("on "):
-                if current_state is None:
-                    raise _MachineParseError(f"第 {lineno} 行: 转移行出现在任何 state 之前")
-                text = line
-                # 可选 response JSON 允许跨多行：持续吸收后续行，直到 JSON 可解析。
-                if "|" in text:
-                    while True:
-                        resp_text = text.partition("|")[2].strip()
-                        try:
-                            json.loads(resp_text)
-                            break
-                        except Exception:
-                            if i + 1 >= len(lines):
-                                break
-                            nxt = lines[i + 1].strip()
-                            if not nxt or nxt.startswith(("initial:", "state ", "on ")):
-                                break
-                            i += 1
-                            text = text + "\n" + lines[i]
-                states[current_state].append(self._parse_transition(text, lineno))
-                i += 1
-                continue
-            raise _MachineParseError(f"第 {lineno} 行: 无法识别的语句: {line}")
-
-        if initial is None:
-            raise _MachineParseError("缺少 initial: 声明")
-        if initial not in states:
-            raise _MachineParseError(f"initial 状态 {initial} 未声明")
-        for state_name, transitions in states.items():
-            for t in transitions:
-                if t["next"] not in states:
-                    raise _MachineParseError(
-                        f"第 {t['line']} 行: 转移目标 {t['next']} 未声明"
-                    )
-        self._initial = initial
-        self._states = states
-        self._state = initial
-        self._vars = {}
-
-    def _parse_transition(self, line: str, lineno: int) -> dict:
-        text = line[3:].strip()
-        if "->" not in text:
-            raise _MachineParseError(f"第 {lineno} 行: 转移行缺少 ->")
-        src, _, dest = text.rpartition("->")
-        src = src.strip()
-        dest = dest.strip()
-        if not src:
-            raise _MachineParseError(f"第 {lineno} 行: 转移行缺少事件名")
-        if not dest:
-            raise _MachineParseError(f"第 {lineno} 行: 转移行缺少目标状态")
-
-        # 解析目标状态与可选 response JSON
-        next_state = dest
-        content = ""
-        tools = []
-        if "|" in dest:
-            left, _, resp_text = dest.partition("|")
-            next_state = left.strip()
-            resp_text = resp_text.strip()
-            try:
-                response = json.loads(resp_text)
-            except Exception as e:
-                raise _MachineParseError(f"第 {lineno} 行: response JSON 解析失败: {e}")
-            if not isinstance(response, dict):
-                raise _MachineParseError(f"第 {lineno} 行: response 必须是 JSON 对象")
-            content = response.get("content", "")
-            if content is None:
-                content = ""
-            if not isinstance(content, str):
-                raise _MachineParseError(f"第 {lineno} 行: response.content 必须是字符串")
-            tools = response.get("tools") or []
-            if not isinstance(tools, list):
-                raise _MachineParseError(f"第 {lineno} 行: response.tools 必须是数组")
-            checked = []
-            for tool in tools:
-                if not isinstance(tool, dict):
-                    raise _MachineParseError(f"第 {lineno} 行: response.tools 每项必须是对象")
-                name = tool.get("name")
-                arguments = tool.get("arguments", {})
-                if not isinstance(name, str) or not name:
-                    raise _MachineParseError(f"第 {lineno} 行: tool.name 必须是非空字符串")
-                if not isinstance(arguments, dict):
-                    raise _MachineParseError(f"第 {lineno} 行: tool.arguments 必须是对象")
-                checked.append({"name": name, "arguments": arguments})
-            tools = checked
-
-        # 解析 set 块
-        sets = []
-        brace = src.find("{")
-        if brace != -1:
-            end = src.rfind("}")
-            if end < brace:
-                raise _MachineParseError(f"第 {lineno} 行: set 块缺少 }}")
-            block = src[brace + 1:end]
-            src = (src[:brace] + " " + src[end + 1:]).strip()
-            for raw_stmt in block.split(";"):
-                stmt = raw_stmt.strip()
-                if not stmt:
-                    continue
-                if not stmt.startswith("set "):
-                    raise _MachineParseError(f"第 {lineno} 行: set 块语句必须以 set 开头")
-                assignment = stmt[4:].strip()
-                var, sep, expr = assignment.partition("=")
-                var = var.strip()
-                expr = expr.strip()
-                if not sep or not var or not expr:
-                    raise _MachineParseError(f"第 {lineno} 行: set 语句格式应为 set <var> = <expr>")
-                if not self._VAR_NAME_RE.match(var):
-                    raise _MachineParseError(f"第 {lineno} 行: 非法变量名 {var!r}")
-                sets.append((var, expr))
-
-        # 解析事件与可选 guard
-        event, _, rest = src.partition(" ")
-        rest = rest.strip()
-        guard = None
-        if rest:
-            if not rest.startswith("if "):
-                raise _MachineParseError(f"第 {lineno} 行: 事件后只能是 if guard 或 set 块")
-            guard = rest[3:].strip()
-            if not guard:
-                raise _MachineParseError(f"第 {lineno} 行: if 后缺少 guard 表达式")
-
-        if self._tools_declared:
-            for tool in tools:
-                if not self._tool_allowed(tool["name"]):
-                    raise _MachineParseError(
-                        f"第 {lineno} 行: 未知工具 {tool['name']}（可用: {sorted(self._tools)}）"
-                    )
-
-        return {
-            "event": event,
-            "guard": guard,
-            "sets": sets,
-            "next": next_state,
-            "content": content,
-            "tools": tools,
-            "line": lineno,
-        }
+    def _tool_check(self, name: str):
+        """给解析器用：None 表示允许，否则返回错误原因（行号由解析器拼）。"""
+        if not self._tools_declared or self._tool_allowed(name):
+            return None
+        return f"未知工具 {name}（可用: {sorted(self._tools)}）"
 
     # ------------------------------------------------------------------
     # user / tool 消息
@@ -858,27 +705,56 @@ class StateMachinePLM(PLMServer):
     def _execute_user_message(self, content: str):
         if self._parse_error is not None:
             return self._error(f"定义解析失败: {self._parse_error}")
+        parsed = self._parse_user_event(content)
+        if isinstance(parsed, str):
+            return self._error(parsed)
+        event_name, event_data = parsed
+        context = self._build_context(event_name, event_data)
+
+        # 从这里起，任何失败都要清掉上一轮的工具输出：否则旧的 last 会混进下一次 guard。
+        try:
+            chosen = self._pick_transition(event_name, context)
+            next_vars = self._apply_sets(chosen, context)
+            self._check_chosen_tools(chosen)
+        except _MachineRuntimeError as e:
+            self._last_tool_output = ""
+            return self._error(str(e))
+
+        # 提交状态（判据全部通过之后才动本实例的状态）
+        self._vars = next_vars
+        self._state = chosen["next"]
+        self._last_tool_output = ""
+        return self._build_response(chosen["content"], chosen["tools"])
+
+    @staticmethod
+    def _parse_user_event(content: str):
+        """用户消息 → (事件名, 事件数据)。形状不对时返回错误说明文本。"""
         try:
             msg = json.loads(content)
         except Exception as e:
-            return self._error(f"{type(e).__name__}: {e}")
+            return f"{type(e).__name__}: {e}"
         if not isinstance(msg, dict):
-            return self._error("用户消息必须是 JSON 对象")
+            return "用户消息必须是 JSON 对象"
         event_name = msg.get("event")
         if not isinstance(event_name, str):
-            return self._error("用户消息必须包含字符串 event")
+            return "用户消息必须包含字符串 event"
         event_data = msg.get("data", {})
         if not isinstance(event_data, dict):
-            return self._error("event.data 必须是对象")
+            return "event.data 必须是对象"
+        return event_name, event_data
 
+    def _build_context(self, event_name: str, event_data: dict) -> dict:
+        """guard / set 表达式能看到的上下文：变量 + 本次事件 + 上一次工具输出。"""
         context = dict(self._vars)
         context.update({
             "event_name": event_name,
             "event_data": event_data,
             "last": self._last_tool_output,
         })
+        return context
 
-        chosen = None
+    def _pick_transition(self, event_name: str, context: dict) -> dict:
+        """在已定义的转移里挑第一条命中的（同事件或通配，且 guard 为真）。"""
         for transition in self._states.get(self._state, []):
             if transition["event"] != event_name and transition["event"] != "*":
                 continue
@@ -887,42 +763,36 @@ class StateMachinePLM(PLMServer):
                     if not self._eval_expr(transition["guard"], context):
                         continue
                 except Exception as e:
-                    self._last_tool_output = ""
-                    return self._error(f"{type(e).__name__}: {e}")
-            chosen = transition
-            break
+                    raise _MachineRuntimeError(f"{type(e).__name__}: {e}")
+            return transition
+        raise _MachineRuntimeError(f"state {self._state} 无匹配事件 {event_name}")
 
-        if chosen is None:
-            self._last_tool_output = ""
-            return self._error(f"state {self._state} 无匹配事件 {event_name}")
-
-        # set 事务化：先在临时上下文求值，全部成功后再写回。
+    def _apply_sets(self, transition: dict, context: dict) -> dict:
+        """set 事务化：先在临时上下文里把全部表达式求出来，全成功才算数。"""
         try:
             next_vars = dict(self._vars)
             eval_context = dict(context)
-            for var, expr in chosen["sets"]:
+            for var, expr in transition["sets"]:
                 value = self._eval_expr(expr, eval_context)
                 eval_context[var] = value
                 next_vars[var] = value
+            return next_vars
         except Exception as e:
-            self._last_tool_output = ""
-            return self._error(f"{type(e).__name__}: {e}")
+            raise _MachineRuntimeError(f"{type(e).__name__}: {e}")
 
-        # 工具名校验（若已捕获 tools 定义）
+    def _check_chosen_tools(self, transition: dict) -> None:
+        """工具名校验（若已捕获 tools 定义）。"""
         try:
-            for tool in chosen["tools"]:
+            for tool in transition["tools"]:
                 if not self._tool_allowed(tool["name"]):
                     raise ValueError(f"未知工具 {tool['name']}")
         except Exception as e:
-            self._last_tool_output = ""
-            return self._error(f"{type(e).__name__}: {e}")
+            raise _MachineRuntimeError(f"{type(e).__name__}: {e}")
 
-        # 提交状态
-        self._vars = next_vars
-        self._state = chosen["next"]
-
+    def _build_response(self, content: str, tools: list) -> dict:
+        """把转移的 content/tools 变成 PLM 的返回形状（每个工具调用分配一个 id）。"""
         tool_calls = []
-        for tool in chosen["tools"]:
+        for tool in tools:
             call_id = f"fsm-{self._fsm_counter}"
             self._fsm_counter += 1
             tool_calls.append({
@@ -933,9 +803,7 @@ class StateMachinePLM(PLMServer):
                     "arguments": json.dumps(tool["arguments"], ensure_ascii=False),
                 },
             })
-
-        self._last_tool_output = ""
-        response = {"content": chosen["content"]}
+        response = {"content": content}
         if tool_calls:
             response["tool_calls"] = tool_calls
         return response

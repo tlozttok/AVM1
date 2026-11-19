@@ -101,7 +101,7 @@ class TestStrictOrdering:
         assert core._ready_cids[0] == sub.cid, "亚对话应排在最前（父子之间没有其他对话）"
         _finish(core, sub)
         assert core._active_cid == parent.cid, "亚对话结束后父对话应立即运行"
-        assert not core._is_waiting_for_return(parent), "返回已写回，父不再等待"
+        assert not core.is_waiting_for_return(parent), "返回已写回，父不再等待"
 
 
 class TestSubCannotSendToParent:
@@ -211,13 +211,13 @@ class TestMultipleSubsInOneTurn:
         # 第一个子完成：父还在等第二个，不能成为活跃对话；活跃指针不能留在已删个体上
         assert core._active_cid != sub_a.cid
         assert core._active_cid in (None, sub_b.cid)
-        assert core._is_waiting_for_return(parent)
+        assert core.is_waiting_for_return(parent)
         assert sub_a.cid not in core._conv_by_cid
 
         core._active_cid = sub_b.cid
         core.advance_conversation()
         assert core._active_cid == parent.cid
-        assert not core._is_waiting_for_return(parent)
+        assert not core.is_waiting_for_return(parent)
         assert [r.tool_call_id for r in parent.user_batch.tool_responses] == ["call_a", "call_b"]
 
         for r in parent.user_batch.tool_responses:

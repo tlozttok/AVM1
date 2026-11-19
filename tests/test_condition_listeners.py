@@ -5,8 +5,8 @@ import json
 from avm.capabilities import ALL_TOOL_NAMES
 from avm.core import (
     Core,
-    CreateInstruction,
-    ListenEventInstruction,
+    
+    
     MemoryReadInstruction,
     MemoryWriteInstruction,
 )

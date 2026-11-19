@@ -17,7 +17,7 @@ import threading
 from typing import Any
 
 from .exceptions import MemoryIndexOutOfRangeError, MemoryTypeError, VMMemoryError
-from .memory_device import MetaListDevice
+from .memory_device import MetaListDevice, input_queue_tools
 
 
 class IOInputDevice(MetaListDevice):
@@ -47,12 +47,15 @@ class IOInputDevice(MetaListDevice):
 
     def _identities(self) -> list:
         """当前对话的可寻址身份：cid、名字、identity。"""
-        if self._core is None or getattr(self._core, "_active_cid", None) is None:
+        if self._core is None:
             return []
-        conv = self._core._conv_by_cid.get(self._core._active_cid)
+        cid = self._core.active_conversation_id()
+        if cid is None:
+            return []
+        conv = self._core.get_conversation(cid)
         if conv is None:
             return []
-        return [str(self._core._active_cid), getattr(conv, "name", None),
+        return [str(cid), getattr(conv, "name", None),
                 getattr(conv, "identity", None)]
 
     # -- 调试动作（与标准输入设备同名同形）----------------------------
@@ -75,26 +78,10 @@ class IOInputDevice(MetaListDevice):
                            if bus is not None else 0)
             return {"queued": queued + bus_pending, "waiting": self._waiting}
 
-        return [
-            {
-                "name": "投喂一行输入",
-                "description": "把一行文本排进输入队列；下一次 $MEM.inputs.next 直接取走它。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "content": {"type": "string", "description": "要交给对话的一行文本"},
-                    },
-                    "required": ["content"],
-                },
-                "run": feed,
-            },
-            {
-                "name": "查询队列",
-                "description": "看队列里还有几行、设备当前是否正等着输入。",
-                "parameters": {"type": "object", "properties": {}},
-                "run": pending,
-            },
-        ]
+        return input_queue_tools(
+            feed, pending,
+            "把一行文本排进输入队列；下一次 $MEM.inputs.next 直接取走它。",
+        )
 
     def notify_input(self) -> None:
         """宿主总线来了输入：唤醒可能正等在 `next` 上的读。"""
@@ -184,7 +171,7 @@ class IOOutputDevice(MetaListDevice):
         if bus is None:
             return
         bus.publish_output(
-            source=getattr(self._core, "_active_cid", None),
+            source=self._core.active_conversation_id(),
             text=value,
             kind="notify" if notify else "text",
             meta={"notify": True} if notify else None,

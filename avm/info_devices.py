@@ -18,7 +18,7 @@ MAX_LISTENER_PRIORITY = 10000
 
 
 def _caller_is_kernel(core, owner_cid) -> bool:
-    conv = core._conv_by_cid.get(owner_cid)
+    conv = core.get_conversation(owner_cid)
     return conv is not None and conv.caps.mode == "kernel"
 
 
@@ -33,11 +33,11 @@ def _parse_json_field(value, field: str):
 
 
 def _state_of(core, cid):
-    if core._active_cid == cid:
+    if core.active_conversation_id() == cid:
         return "active"
-    if cid in core._dormant_cids:
+    if core.is_dormant(cid):
         return "dormant"
-    if cid in core._ready_cids:
+    if core.is_ready(cid):
         return "ready"
     return "finished"
 
@@ -87,7 +87,7 @@ class ConversationsDevice(MemoryDevice):
     def to_llm_string(self):
         """按状态分组列出存活对话；finished 与运行态分开，cid 空洞不做伪造补全。"""
         groups = {}
-        for cid, conv in self._core._conv_by_cid.items():
+        for cid, conv in self._core.conversations.items():
             if self._core.is_hidden_cid(cid):
                 continue
             groups.setdefault(_state_of(self._core, cid), []).append((cid, conv))
@@ -105,14 +105,14 @@ class ConversationsDevice(MemoryDevice):
         return "\n".join(lines)
 
     def _conv_read(self, cid: int):
-        conv = self._core._conv_by_cid.get(cid)
+        conv = self._core.get_conversation(cid)
         if conv is None or self._core.is_hidden_cid(cid):
             raise VMMemoryError(f"对话 {cid} 不存在")
         return conv
 
     def _conv_write(self, cid: int):
         conv = self._conv_read(cid)
-        if cid in self._core._finished:
+        if self._core.is_finished(cid):
             raise VMMemoryError(f"对话 {cid} 已关闭")
         return conv
 
@@ -123,13 +123,13 @@ class ConversationsDevice(MemoryDevice):
         except (TypeError, ValueError):
             raise VMMemoryError(f"cid 必须是数字: {raw}")
 
-    def _core_roots(self, conv):
+    def core_roots(self, conv):
         """Core 拥有的根（目前只有能力自述根 caps）：控制面不可覆盖。"""
         target = conv.caps.roots.get("caps")
         return {"caps": tuple(target)} if target is not None else {}
 
     def _read_roots_json(self, conv) -> str:
-        core_roots = self._core_roots(conv)
+        core_roots = self.core_roots(conv)
         data = {}
         for name, target in conv.caps.roots.items():
             if name == "MEM":
@@ -326,21 +326,21 @@ class SchedulerDevice(MemoryDevice):
 
     def to_llm_string(self):
         return (
-            f"active={self._visible(self._core._active_cid)}\n"
-            f"ready={self._visible_list(self._core._ready_cids)}\n"
-            f"dormant={self._visible_list(self._core._dormant_cids)}\n"
-            f"instruction_budget={self._core._instruction_budget} "
-            f"(当前链计数={self._core._activation_instructions})"
+            f"active={self._visible(self._core.active_conversation_id())}\n"
+            f"ready={self._visible_list(self._core.ready_ids())}\n"
+            f"dormant={self._visible_list(self._core.dormant_ids())}\n"
+            f"instruction_budget={self._core.instruction_budget} "
+            f"(当前链计数={self._core.activation_instructions})"
         )
 
     def resolve_path(self, path):
         if len(path) != 1 or path[0] not in ("active", "ready", "dormant", "budget"):
             raise VMMemoryError("$MEM.scheduler 支持 active/ready/dormant/budget")
         return {
-            "active": self._visible(self._core._active_cid),
-            "ready": self._visible_list(self._core._ready_cids),
-            "dormant": self._visible_list(self._core._dormant_cids),
-            "budget": f"{self._core._activation_instructions}/{self._core._instruction_budget}",
+            "active": self._visible(self._core.active_conversation_id()),
+            "ready": self._visible_list(self._core.ready_ids()),
+            "dormant": self._visible_list(self._core.dormant_ids()),
+            "budget": f"{self._core.activation_instructions}/{self._core.instruction_budget}",
         }[path[0]]
 
 
@@ -356,7 +356,7 @@ class MemorySummaryDevice(MemoryDevice):
     def to_llm_string(self):
         from .types import MetaDict, MetaList, LinkNode
 
-        root = self._core.mem._data
+        root = self._core.mem.root
         counts = {"dict": 0, "list": 0, "str": 0, "link": 0}
 
         def walk(v):
@@ -582,7 +582,7 @@ class CapsDevice(MemoryDevice):
         return "str"
 
     def _conv(self, cid: int):
-        conv = self._core._conv_by_cid.get(cid)
+        conv = self._core.get_conversation(cid)
         if conv is None or self._core.is_hidden_cid(cid):
             raise VMMemoryError(f"对话 {cid} 不存在")
         return conv
@@ -608,7 +608,7 @@ class CapsDevice(MemoryDevice):
         }
 
     def to_llm_string(self):
-        cids = [cid for cid in sorted(self._core._conv_by_cid)
+        cids = [cid for cid in sorted(self._core.conversations)
                 if not self._core.is_hidden_cid(cid)]
         return "能力自述：读 $MEM.caps.<cid> 查询（可用 cid：" + str(cids) + "）"
 

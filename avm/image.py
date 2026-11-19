@@ -13,7 +13,6 @@
    snapshot_to 在正常退出时写重启快照。
 """
 
-import argparse
 import hashlib
 import importlib.util
 import json
@@ -23,10 +22,9 @@ from typing import Optional
 
 from .core import Core, _build_conversation, _derive_child_caps
 from .capabilities import grant_target_segments
-from .exceptions import IllegalOperationError, VMMemoryError, RunnerStop
+from .exceptions import IllegalOperationError, ImageError, VMMemoryError
 from .memory_device import MemoryDevice, BUILTIN_DEVICE_CLASSES
 from .python_server import PLM_REGISTRY, PLMServer
-from .runner_prompt import prompt_api_error
 from .types import MetaDict, MetaList, LinkNode, StrNode
 
 IMAGE_VERSION = 1
@@ -34,10 +32,6 @@ KINDS = ("str", "dict", "list", "device", "link")
 # 镜像 meta.guest_programs 允许的角色：内核按这个固定顺序在冷启动时创建对话。
 # 宿主用中断唤醒这些对话（向量名 = 角色名），不代替它们直接 send_instruction。
 GUEST_ROLES = ("boot", "idle", "shutdown")
-
-
-class ImageError(ValueError):
-    """镜像格式错误：面向运行者，应修复镜像而不是吞掉"""
 
 
 def _parse_node(value, path, markers):
@@ -326,7 +320,7 @@ def _mount_devices(core: Core, image_path: str, devices: list, mem_device_paths:
             raise ImageError(f"mem 中标记 kind=device 的路径 {mp} 未在 devices 段声明")
 
     # 挂载完成后校验所有 LinkDevice 目标可达（面向运行者的诊断错误可含真实路径）。
-    for device in core.mem._devices.values():
+    for device in core.mem.devices.values():
         if getattr(device, "is_link", False):
             try:
                 device.validate()
@@ -408,6 +402,20 @@ def _init_para_ref(core: Core, init: dict, node: Optional[MetaDict], node_type: 
 
 def _start_init(core: Core, init: dict):
     name = init.get("name", "init")
+    system, user, node, node_type, system_ref = _resolve_init_program(core, init)
+    para_ref = _init_para_ref(core, init, node, node_type)
+    if node_type == "python":
+        _start_python_init(core, system_ref, para_ref, user, name, node)
+        return
+    _start_llm_init(core, system, user, para_ref, name, node)
+
+
+def _resolve_init_program(core: Core, init: dict) -> tuple:
+    """init 段 → (system 正文, user 正文, 程序节点, 节点类型, system_ref)。
+
+    两个二选一：system/system_ref、user/user_ref。写成"必须且只能"是因为镜像里
+    同时给或都不给都无法判断作者意图，早报错好过猜。
+    """
     system_ref, user_ref = init.get("system_ref"), init.get("user_ref")
     system, user = init.get("system"), init.get("user")
     if (system is None) == (system_ref is None):
@@ -417,19 +425,7 @@ def _start_init(core: Core, init: dict):
     node: Optional[MetaDict] = None
     node_type: Optional[str] = None
     if system_ref is not None:
-        if not isinstance(system_ref, str) or not system_ref.startswith("$"):
-            raise ImageError("system_ref 必须是 $ 开头的内存引用（字面量请用 system 字段）")
-        node = core.unwrap(system_ref, for_llm=False)
-        node_type = (node.get_ctrl() or {}).get("type") if isinstance(node, MetaDict) else None
-        if node_type not in ("settingup", "python"):
-            raise ImageError(
-                f"system_ref {system_ref} 必须指向 ctrl.type='settingup'（LLM 程序）或 "
-                "'python'（Python 程序）的 dict 节点（str 节点、无类型 dict 节点不接受）"
-            )
-        content = node.get("content")
-        if not isinstance(content, str):
-            raise ImageError(f"程序节点 {system_ref} 必须有字符串 content 字段")
-        system = content
+        node, node_type, system = _read_program_node(core, system_ref)
     if user_ref is not None:
         if not isinstance(user_ref, str) or not user_ref.startswith("$"):
             raise ImageError("user_ref 必须是 $ 开头的内存引用（字面量请用 user 字段）")
@@ -439,31 +435,56 @@ def _start_init(core: Core, init: dict):
             "init 的 system/user 必须是字符串（system 字面量或程序节点的 content；"
             "user_ref 需指向 str 节点）"
         )
-    para_ref = _init_para_ref(core, init, node, node_type)
-    if node_type == "python":
-        # PLM 入口：0 号对话是 Python 对话。分派与模型命名空间校验复用 _build_conversation，
-        # 它建好 SystemMessage（程序代码）、注册对话、设 para_ref 与 is_python；
-        # 这里补用户消息与"0 号 + 就绪"语义（与 Core.start 对齐，区别只在执行器是 PLM）。
-        if node is not None:
-            try:
-                _derive_child_caps(core, None, node, is_sub=False, is_init=True)
-            except (VMMemoryError, IllegalOperationError) as e:
-                raise ImageError(f"init 程序的能力声明非法：{e}")
-        conv = _build_conversation(core, system_ref, para_ref, parent=None, is_sub=False, is_init=True)
-        conv.append_user_message(user)
-        conv.is_root = True
-        conv.name = name
-        core._ready_cids.append(conv.cid)
-        return
+    return system, user, node, node_type, system_ref
+
+
+def _read_program_node(core: Core, system_ref: str) -> tuple:
+    """system_ref → (程序节点, 节点类型, 程序正文)；不是程序节点就报镜像错误。"""
+    if not isinstance(system_ref, str) or not system_ref.startswith("$"):
+        raise ImageError("system_ref 必须是 $ 开头的内存引用（字面量请用 system 字段）")
+    node = core.unwrap(system_ref, for_llm=False)
+    node_type = (node.get_ctrl() or {}).get("type") if isinstance(node, MetaDict) else None
+    if node_type not in ("settingup", "python"):
+        raise ImageError(
+            f"system_ref {system_ref} 必须指向 ctrl.type='settingup'（LLM 程序）或 "
+            "'python'（Python 程序）的 dict 节点（str 节点、无类型 dict 节点不接受）"
+        )
+    content = node.get("content")
+    if not isinstance(content, str):
+        raise ImageError(f"程序节点 {system_ref} 必须有字符串 content 字段")
+    return node, node_type, content
+
+
+def _start_python_init(core: Core, system_ref, para_ref, user: str, name: str, node) -> None:
+    """PLM 入口：0 号对话是 Python 对话。
+
+    分派与模型命名空间校验复用 _build_conversation，它建好 SystemMessage（程序代码）、
+    注册对话、设 para_ref 与 is_python；这里补用户消息与"0 号 + 就绪"语义
+    （与 Core.start 对齐，区别只在执行器是 PLM）。
+    """
+    if node is not None:
+        _check_init_caps(core, node)
+    conv = _build_conversation(core, system_ref, para_ref, parent=None, is_sub=False, is_init=True)
+    conv.append_user_message(user)
+    conv.is_root = True
+    conv.name = name
+    core.wake(conv.cid)  # 首次入队（摘掉残留 + 排到就绪末尾）
+
+
+def _start_llm_init(core: Core, system: str, user: str, para_ref, name: str, node) -> None:
+    """LLM 入口：先建对话，再按程序 ctrl.caps 覆盖 init 能力（init 一律内核态）。"""
     conv = core.start(system, user, para_ref)
     if node is not None:
-        # LLM 入口同样按程序 ctrl.caps 计算 init 能力；init 强制内核态
-        try:
-            caps = _derive_child_caps(core, None, node, is_sub=False, is_init=True)
-        except (VMMemoryError, IllegalOperationError) as e:
-            raise ImageError(f"init 程序的能力声明非法：{e}")
-        conv.caps = caps
+        conv.caps = _check_init_caps(core, node)
     conv.name = name
+
+
+def _check_init_caps(core: Core, node):
+    """init 程序的能力声明校验；非法声明翻成 ImageError（镜像作者看得懂的话）。"""
+    try:
+        return _derive_child_caps(core, None, node, is_sub=False, is_init=True)
+    except (VMMemoryError, IllegalOperationError) as e:
+        raise ImageError(f"init 程序的能力声明非法：{e}")
 
 
 def _parse_guest_programs(raw) -> dict:
@@ -576,9 +597,9 @@ def start_guest_programs(core: Core, decl: Optional[dict] = None) -> dict:
         entry = _guest_entry(role, node_type)
         if role == "boot":
             conv.append_user_message(entry)
-            core._ready_cids.append(conv.cid)
+            core.wake(conv.cid)  # boot 角色开局即排入就绪
         else:
-            core._dormant_cids.append(conv.cid)
+            core.sleep(conv.cid)
         core.interrupts.register(role, conv.cid)
         created[role] = {"cid": conv.cid, "entry": entry, "kind": node_type}
     core.guest_roles = created
@@ -594,7 +615,7 @@ def restore_guest_roles(core: Core, decl: Optional[dict] = None) -> dict:
     """
     roles = dict(decl if decl is not None else getattr(core, "guest_programs_decl", {}) or {})
     found = {}
-    for conv in core._conv_by_cid.values():
+    for conv in core.conversations.values():
         role = (conv.attrs or {}).get("guest_role")
         if not isinstance(role, str) or not role:
             continue
@@ -646,7 +667,7 @@ def start_cold(core: Core) -> dict:
     reboot/reset 用：世界先由快照/原始镜像就位，再让 init 对话与 guest 程序对话
     出现在新世界里（cid 从 Core._next_cid 起按创建顺序分配）。
     """
-    init = getattr(core, "_image_init", None)
+    init = core.stashed_image_init()
     if init is not None:
         if not isinstance(init, dict):
             raise ImageError("init 段必须是对象")
@@ -676,12 +697,40 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
 
     镜像的 plms 段（顶层数组，条目 {model, file, class}）在这里装载进 core.plms，
     与内建 PLM_REGISTRY 并列；没有该段时行为与从前一致。
+
+    装载顺序本身就是语义，不要重排：宿主事实早于设备挂载（设备的 attach_core 要读），
+    PLM 早于模型目录（目录要列出 PLM），para 早于安全配置（安全区要拦设备链接）。
+    每一步的"为什么"写在对应的 _xxx 里。
     """
-    if core._conv_by_cid:
+    _require_empty_core(core)
+    image, meta = _read_image_document(image_path)
+    _apply_host_facts(core, image_path, host_flags)
+    _apply_image_meta(core, meta)
+    device_markers = _build_memory_tree(core, image["mem"])
+    _install_plms_and_catalog(core, image_path, image)
+    _apply_para_ref(core, image)
+    _mount_devices_and_security(core, image_path, image, device_markers)
+    _start_conversations(core, image, meta, checkpoint_in, restore)
+    _apply_output_paths(core, image, image_path)
+    return core
+
+
+def _require_empty_core(core: Core) -> None:
+    """装载只接受空核心：已经有对话说明这条路径被用错了。"""
+    if core.conversations:
         raise ImageError(
-            f"load_image 需要一个空核心（当前已有 {len(core._conv_by_cid)} 个对话）："
+            f"load_image 需要一个空核心（当前已有 {len(core.conversations)} 个对话）："
             f"先用 Core() 建空核心，再往里装载"
         )
+
+
+def _read_image_document(image_path: str):
+    """读镜像文件，做文档级校验，返回 (image, meta)。
+
+    文档级 = 不需要 Core 就能判断的那些：根对象、meta 形状、版本号、mem 段存在。
+    meta 缺省补成空对象；显式的非对象（1、"x"、[1]）一律拒——`or {}` 会放过它们，
+    随后 meta.get 抛 AttributeError。
+    """
     if not os.path.isfile(image_path):
         raise ImageError(f"镜像文件不存在: {image_path}")
     with open(image_path, "r", encoding="utf-8") as f:
@@ -692,26 +741,35 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
     if meta is None:
         meta = {}
     elif not isinstance(meta, dict):
-        # `or {}` 会放过真值非对象（如 1、"x"、[1]），随后 meta.get 抛 AttributeError
         raise ImageError(f"meta 必须是对象，得到 {type(meta).__name__}")
     version = meta.get("version", 1)
     if version != IMAGE_VERSION:
         raise ImageError(f"不支持的镜像版本 {version}（当前支持 {IMAGE_VERSION}）")
     if not isinstance(image.get("mem"), dict):
         raise ImageError("镜像必须包含 mem 段（对象）")
+    return image, meta
 
+
+def _apply_host_facts(core: Core, image_path: str, host_flags: Optional[dict]) -> None:
+    """写入宿主事实：谁在托管、镜像在哪个目录、镜像叫什么。
+
+    启动标志要在挂载设备之前就位，这样每个设备的 attach_core 都读得到。
+    """
     if host_flags is not None and not isinstance(host_flags, dict):
         raise ImageError("host_flags 必须是对象")
     for key in (host_flags or {}):
         if not isinstance(key, str) or not key:
             raise ImageError("host_flags 的键必须是非空字符串")
-    # 启动标志：在挂载设备之前就位，这样每个设备的 attach_core 都读得到。
     core.host_flags = dict(host_flags or {})
     core.image_dir = os.path.dirname(os.path.abspath(image_path))
     core.image_name = os.path.splitext(os.path.basename(image_path))[0]
+
+
+def _apply_image_meta(core: Core, meta: dict) -> None:
+    """meta 段里三个改变内核运行方式的开关：指令预算、快照间隔、API 重试次数。"""
     budget = meta.get("instruction_budget")
     if isinstance(budget, int) and budget > 0:
-        core._instruction_budget = budget
+        core.set_instruction_budget(budget)
     snapshot_every = meta.get("snapshot_every")
     if snapshot_every is not None:
         if (not isinstance(snapshot_every, int) or isinstance(snapshot_every, bool)
@@ -728,31 +786,60 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
                     or max_retries < 0):
                 raise ImageError("meta.api_error.max_retries 必须是非负整数")
             core.api_error_max_retries = max_retries
+
+
+def _build_memory_tree(core: Core, mem_decl: dict) -> list:
+    """把镜像 mem 段解析成节点树并整树替换进内核，返回镜像声明的设备标记。
+
+    设备标记（mem 里 kind=device 的节点）不进树：它们只是"这里要挂什么"的声明，
+    由 _mount_devices 按声明挂载。
+    """
     device_markers = []
     root = MetaDict(data={})
-    for key, node in image["mem"].items():
+    for key, node in mem_decl.items():
         parsed = _parse_node(node, [key], device_markers)
         if parsed is None:
             continue
         root[key] = parsed
-    core.mem._data = root
+    core.mem.replace_root(root)
     # Core 的内建设备在 __init__ 里挂载，早于这次整树替换；按设备表把挂载点链接重新物化
     core.mem.materialize_mount_links()
-    # 镜像声明的 PLM 必须在安装模型目录之前装载：$MEM.model_catalog.plm 是它的可见面，
-    # 装完目录再注册就不会出现在对话看得见的清单里。
+    return device_markers
+
+
+def _install_plms_and_catalog(core: Core, image_path: str, image: dict) -> None:
+    """装载镜像声明的 PLM，再（重）安装模型目录。
+
+    两件事的顺序不能反：$MEM.model_catalog.plm 是 PLM 的可见面，装完目录再注册
+    就不会出现在对话看得见的清单里。目录本身也会被整树替换冲掉，所以要重装
+    （幂等，镜像里已有的字段不覆盖）。
+    """
     _load_plms(core, image_path, image.get("plms") or [])
-    # 启动自带的模型目录同样会被整树替换冲掉，这里重装（幂等，镜像已有的字段不覆盖）
     core.install_model_catalog()
 
+
+def _apply_para_ref(core: Core, image: dict) -> None:
+    """解析 para_ref 并挂到内核（缺省 $MEM.model_params）。"""
     para_ref = image.get("para_ref", "$MEM.model_params")
     if not isinstance(para_ref, str) or not para_ref:
         # 显式 null / 数字 / 空串都会让 core.unwrap 抛 AttributeError（不是 ImageError）
         raise ImageError(f"para_ref 必须是非空字符串，得到 {para_ref!r}")
     core.para_ref = _resolve_para(core, para_ref)
+
+
+def _mount_devices_and_security(core: Core, image_path: str, image: dict,
+                                device_markers: list) -> None:
+    """按声明挂载设备，然后安装安全配置。
+
+    security 段必须在设备挂载之后：区域子树里的设备挂载链接此时已物化，才拦得住。
+    """
     _mount_devices(core, image_path, image.get("devices") or [], device_markers)
-    # security 段在设备挂载之后安装：区域子树里的设备挂载链接此时已物化，能被拒绝
     _parse_security(core, image)
 
+
+def _start_conversations(core: Core, image: dict, meta: dict,
+                         checkpoint_in: Optional[str], restore: bool) -> None:
+    """按启动模式建对话：恢复 / 单对话检查点 / init / 空镜像，再决定是否起 guest。"""
     init = image.get("init")
     # guest 程序声明是镜像事实：装载期校验形状，冷启动在 init 之后创建对话，
     # 恢复路径先暂存，resume 按 attrs 找回（见 avm.boot 的三种启动模式）。
@@ -763,7 +850,7 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
         if checkpoint_in:
             raise ImageError("restore 与 checkpoint_in 不能同时使用（重启恢复与单对话恢复是两条路径）")
         # 恢复路径：对话与内存由快照/日志接管；init 段暂存给冷启动模式补跑。
-        core._image_init = init
+        core.stash_image_init(init)
     elif checkpoint_in:
         # 调试用：后续启动加载已保存的对话，而不是重新从 init 开始
         if not isinstance(checkpoint_in, str) or not checkpoint_in:
@@ -786,24 +873,27 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
         # 冷启动：init 之后按固定顺序创建 guest 程序对话并注册中断向量。
         start_guest_programs(core)
 
+
+def _apply_output_paths(core: Core, image: dict, image_path: str) -> None:
+    """落点配置：日志、快照、持久化、内核转储。
+
+    相对路径一律相对镜像所在目录解释——镜像里写的落点说的是"镜像旁边"。
+    """
     journal_to = image.get("journal_to")
     if journal_to is not None:
         if not isinstance(journal_to, str) or not journal_to:
             raise ImageError("journal_to 必须是非空字符串路径")
-        core.journal_path = journal_to if os.path.isabs(journal_to) else os.path.normpath(
-            os.path.join(os.path.dirname(os.path.abspath(image_path)), journal_to))
+        core.journal_path = _resolve_output_path(image_path, journal_to)
     snapshot_to = image.get("snapshot_to")
     if snapshot_to is not None:
         if not isinstance(snapshot_to, str) or not snapshot_to:
             raise ImageError("snapshot_to 必须是非空字符串路径")
-        core.snapshot_path = snapshot_to if os.path.isabs(snapshot_to) else os.path.normpath(
-            os.path.join(os.path.dirname(os.path.abspath(image_path)), snapshot_to))
+        core.snapshot_path = _resolve_output_path(image_path, snapshot_to)
     persist_to = image.get("persist_to")
     if persist_to is not None:
         if not isinstance(persist_to, str):
             raise ImageError("persist_to 必须是字符串路径")
-        core.persist_to = persist_to if os.path.isabs(persist_to) else os.path.normpath(
-            os.path.join(os.path.dirname(os.path.abspath(image_path)), persist_to))
+        core.persist_to = _resolve_output_path(image_path, persist_to)
     # 内核转储（诊断快照，不是恢复输入）：core_dump 开关、core_dump_to 落点，与 persist_to 同为顶层字段
     core_dump = image.get("core_dump")
     if core_dump is not None and not isinstance(core_dump, bool):
@@ -813,63 +903,29 @@ def load_image(core: Core, image_path: str, checkpoint_in: Optional[str] = None,
     if core_dump_to is not None:
         if not isinstance(core_dump_to, str) or not core_dump_to:
             raise ImageError("core_dump_to 必须是非空字符串路径")
-        # normpath：镜像里写的相对落点常用 "/"，拼进目录后归一成宿主分隔符，
-        # 否则 Windows 上会产出 "dir\out/x.json" 这种混合形式
-        core.core_dump_to = core_dump_to if os.path.isabs(core_dump_to) else os.path.normpath(
-            os.path.join(os.path.dirname(os.path.abspath(image_path)), core_dump_to))
-    return core
+        core.core_dump_to = _resolve_output_path(image_path, core_dump_to)
+
+
+def _resolve_output_path(image_path: str, value: str) -> str:
+    r"""镜像里的相对落点按镜像目录解析。
+
+    normpath 把镜像里习惯写的 "/" 归一成宿主分隔符，否则 Windows 上会产出
+    "dir\out/x.json" 这种混合形式。
+    """
+    if os.path.isabs(value):
+        return value
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(image_path)), value))
+
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="AVM 系统镜像启动器")
-    parser.add_argument("image", help="系统镜像 JSON 文件路径")
-    parser.add_argument("--checkpoint-in", metavar="PATH",
-                        help="调试用：启动时加载单对话检查点（跳过 init，恢复为就绪对话）")
-    from .boot import add_core_dump_args, add_mode_arg, add_restore_arg
-    add_core_dump_args(parser)
-    add_restore_arg(parser)
-    add_mode_arg(parser)
-    args = parser.parse_args(argv)
-    # 局部导入：boot 依赖本模块的 load_image，模块级导入会成环
-    from .boot import boot, dump_on_death, write_snapshot
-    from .journal import JournalError
-    try:
-        core = boot(
-            args.image, mode=args.mode,
-            checkpoint_in=args.checkpoint_in, restore=args.restore,
-        )
-    except (ImageError, JournalError, VMMemoryError, OSError, json.JSONDecodeError) as e:
-        print(f"[AVM] 镜像错误: {e}", file=sys.stderr)
-        return 1
-    if args.no_core_dump:
-        core.core_dump_enabled = False
-    status = 0
-    snapshot_ok = True  # 只有安全点退出才写重启快照
-    try:
-        core.run()
-    except RunnerStop as e:
-        print(f"[AVM] {e}", file=sys.stderr)
-    except KeyboardInterrupt:
-        print("[AVM] 收到中断，写回后退出", file=sys.stderr)
-        status = 130
-        snapshot_ok = False
-    except BaseException as e:
-        # 内核死亡：先落现场快照，再保留原始 traceback 往上抛
-        dump_on_death(core, e, args.core_dump)
-        snapshot_ok = False
-        raise
-    finally:
-        if snapshot_ok:
-            write_snapshot(core)
-        persist_to = getattr(core, "persist_to", None)
-        if persist_to:
-            try:
-                os.makedirs(os.path.dirname(persist_to) or ".", exist_ok=True)
-                core.mem.save(persist_to)
-                print(f"[AVM] 内存已写回 {persist_to}")
-            except OSError as e:
-                print(f"[AVM] 写回失败: {e}", file=sys.stderr)
-    return status
+    """CLI 入口：`python -m avm.image <image.json>`。
+
+    实现在 avm.launcher：本模块只负责把镜像解析进空内核，启动与收尾属于宿主。
+    这样 image 不必反向依赖 boot（boot 依赖本模块的 load_image）。
+    """
+    from .launcher import main as _launcher_main
+    return _launcher_main(argv)
 
 
 if __name__ == "__main__":

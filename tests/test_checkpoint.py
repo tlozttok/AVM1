@@ -140,11 +140,16 @@ class TestSaveDebugCommand:
     """输入设备 /save 调试命令：拦截在输入前，对话感知不到"""
 
     class FakeCore:
+        """只实现设备用到的 Core 接口：活跃对话查询 + 检查点写入"""
+
         def __init__(self, tmp_path):
             self._active_cid = 7
             self.image_dir = str(tmp_path)
             self.image_name = "demo"
             self.saved = []
+
+        def active_conversation_id(self):
+            return self._active_cid
 
         def checkpoint_path(self, cid):
             return str(self.image_dir) + "/default.conv.json"

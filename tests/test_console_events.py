@@ -48,7 +48,7 @@ class TestEnabledFlag:
         core = make_core()
         listener_id = add_listener(core)
         assert core.events.listeners[0]["enabled"] is True
-        assert f"enabled=True" in core.mem["listeners"].to_llm_string()
+        assert "enabled=True" in core.mem["listeners"].to_llm_string()
         assert listener_id == 1
 
     def test_enabled_listener_intercepts(self):
@@ -158,7 +158,7 @@ class TestUpdate:
     def test_update_rejects_wildcard_for_non_lifecycle_event(self):
         core = make_core()
         listener_id = add_listener(core)
-        with pytest.raises(ValueError, match="不支持 \*"):
+        with pytest.raises(ValueError, match=r"不支持 \*"):
             core.events.update(listener_id, target="*")
 
     def test_update_reresolves_handler_code(self):

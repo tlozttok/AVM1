@@ -52,7 +52,10 @@ def _write(path: Path, value) -> str:
         text = value
     else:
         text = json.dumps(value, ensure_ascii=False, indent=2)
-    path.write_text(text, encoding="utf-8")
+    # newline="" 关掉平台换行翻译：测试要断言"读回来与写进去逐字节相同"，
+    # 而 write_text 默认在 Windows 上把 \n 翻成 \r\n，断言必然对不上。
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
     return text
 
 

@@ -1,10 +1,22 @@
 """AVM 类型系统：带元数据的集合类"""
-import json
-from typing import Dict, Optional, List
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, TypedDict, Union
 
 from .capabilities import Capability, caps_from_dict, caps_to_dict, default_kernel_caps
 
 CHECKPOINT_VERSION = 3
+
+# 保留对话 cid（作者规定）：宿主侧操作员对话的身份，不参与正常分配，也不会撞上
+# `_next_cid` 的正数。它对普通对话隐藏：不出现在 $MEM.conversations / $MEM.scheduler
+# 里，也不可用 send_instruction / close_conversation 或 $conv.<cid> / $batch.<cid>
+# 寻址。隐藏只是显示/寻址策略：对话本身随快照/日志正常恢复，日志里它的回合按普通
+# 回合重放。
+#
+# 定义在类型层而非 avm.core：日志重放要判断「保留对话可能需要补建」，而 avm.core
+# 模块级依赖 journal，journal 反过来依赖 core 就成了环。avm.core 仍重新导出该名字，
+# `from avm.core import PANEL_CID` 保持不变。
+PANEL_CID = -1
 
 
 def _part_field_order(part_type: str) -> tuple:
@@ -380,17 +392,15 @@ class LinkNode:
     def __repr__(self):
         return f"LinkNode(target={self.target!r}, metadata={self._metadata!r}, ctrl={self._ctrl!r})"
 
-"""AVM 消息类型定义（IR v1 + chat 投影兼容视图）
-
-存储形状是 `role + parts[]`（作者 2026-11-17 裁决）：reasoning 是 assistant 的
-part；工具返回在 tool 角色消息里；tool_call.args 保留原始 JSON 字符串；不透明
-字段叫 opaque；system 允许多条。`content` / `tool_calls` / `reasoning_content` /
-`tool_call_id` 保留为 chat 投影属性——PLM 合同、guest transcript、monitor 与既有
-测试都依赖它们。IR 的中立性与多协议落点见 plan-ir-multiprotocol-2026-11-17。
-"""
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Tuple, Union, TypedDict
-from enum import Enum
+# ---------------------------------------------------------------------------
+# 消息类型（原为独立模块，追加到本文件末尾；导入已并入顶部模块头）
+#
+# 存储形状是 `role + parts[]`（作者 2026-11-17 裁决）：reasoning 是 assistant 的
+# part；工具返回在 tool 角色消息里；tool_call.args 保留原始 JSON 字符串；不透明
+# 字段叫 opaque；system 允许多条。`content` / `tool_calls` / `reasoning_content` /
+# `tool_call_id` 保留为 chat 投影属性——PLM 合同、guest transcript、monitor 与既有
+# 测试都依赖它们。IR 的中立性与多协议落点见 plan-ir-multiprotocol-2026-11-17。
+# ---------------------------------------------------------------------------
 
 
 class ToolCall(TypedDict):
@@ -850,6 +860,39 @@ class UserMessageBatch:
 
 
 
+def tool_exchange(conv: 'Conversation'):
+    """最近一次"带工具调用"的 assistant 消息，与它已经拿到的响应。
+
+    返回 (wanted, got)：
+
+    - wanted：那条消息声明的 call id，按声明顺序，只留非空字符串（没有 id 的工具
+      调用两边都配不上，不参与配对）；
+    - got：已经能对上这些声明的响应 id，**按出现顺序、重复保留**——历史里排在它
+      之后的每条 tool 消息算一个，待发批次里的响应也算（工具响应先进批次，下一轮
+      推理才写进历史）。同一个 id 收到两次响应属于要判错的情形，去重会把它藏起来，
+      所以这里返回列表而不是集合；只做包含判断的调用方自己转 set。
+
+    从后往前找第一条带 tool_calls 的 assistant 消息：tool 响应总是紧跟它的那条，
+    再往后没有别的声明，所以找到第一条就够了。
+    """
+    messages = conv.messages
+    last = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].role == "assistant" and getattr(messages[i], "tool_calls", None):
+            last = i
+            break
+    if last is None:
+        return [], []
+    wanted = []
+    for tc in messages[last].tool_calls or []:
+        call_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+        if isinstance(call_id, str) and call_id:
+            wanted.append(call_id)
+    got = [m.tool_call_id for m in messages[last + 1:] if m.role == "tool"]
+    got += [r.tool_call_id for r in conv.user_batch.tool_responses]
+    return wanted, got
+
+
 __all__ = [
     'MetaList',
     'MetaDict',
@@ -866,6 +909,7 @@ __all__ = [
     'message_from_dict',
     'batch_to_dict',
     'batch_from_dict',
+    'tool_exchange',
     'Conversation',
     'UserMessageBatch',
 ]

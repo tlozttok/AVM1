@@ -5,7 +5,6 @@
 
 import json
 
-import pytest
 
 from avm.capabilities import ALL_TOOL_NAMES, Capability
 from avm.core import Core, _build_tools

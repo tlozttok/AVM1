@@ -52,8 +52,8 @@ from .capabilities import AddressSpace
 from .exceptions import VMMemoryError, IllegalOperationError
 from .memory import Memory
 from .types import (
-    Conversation, MetaDict, MetaList,
-    batch_from_dict, batch_to_dict, message_from_dict, message_to_dict,
+    Conversation, MetaDict, MetaList, PANEL_CID,
+    batch_from_dict, message_from_dict,
 )
 
 
@@ -79,11 +79,16 @@ class Journal:
         self._last_seq = 0
         self._rescan()
 
-    def _rescan(self) -> None:
-        """扫描已有文件确定 last_seq；坏行/半行之后的内容忽略。"""
-        last = 0
+    def _read_records(self):
+        """逐行解析已有记录；坏行/半行处停下，不再往后看。
+
+        这是日志文件的读取契约，`_rescan`（找 last_seq）与 `iter_records`（重放）
+        都要遵守：一条解析不了的行意味着"上一代留下的内容或崩溃时的半行"，它后面
+        的东西不属于本次恢复。两处各写一遍时，改一处的停止条件很容易漏掉另一处。
+
+        文件不存在时什么都不产出。
+        """
         if not os.path.isfile(self.path):
-            self._last_seq = 0
             return
         with open(self.path, "r", encoding="utf-8") as f:
             for line in f:
@@ -93,11 +98,17 @@ class Journal:
                 try:
                     record = json.loads(line)
                 except ValueError:
-                    break
-                seq = record.get("seq") if isinstance(record, dict) else None
-                if not isinstance(seq, int) or seq != last + 1:
-                    break
-                last = seq
+                    return
+                yield record
+
+    def _rescan(self) -> None:
+        """扫描已有文件确定 last_seq；坏行/半行之后的内容忽略。"""
+        last = 0
+        for record in self._read_records():
+            seq = record.get("seq") if isinstance(record, dict) else None
+            if not isinstance(seq, int) or seq != last + 1:
+                break
+            last = seq
         self._last_seq = last
 
     def append(self, record: dict) -> int:
@@ -122,23 +133,13 @@ class Journal:
 
         重放用这个接口：内存里只留一条记录，不把整段尾部读成列表。
         """
-        if not os.path.isfile(self.path):
-            return
-        with open(self.path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    break
-                seq = record.get("seq") if isinstance(record, dict) else None
-                if not isinstance(seq, int) or seq <= after_seq:
-                    if isinstance(seq, int) and seq <= after_seq:
-                        continue
-                    break
-                yield record
+        for record in self._read_records():
+            seq = record.get("seq") if isinstance(record, dict) else None
+            if not isinstance(seq, int):
+                break
+            if seq <= after_seq:
+                continue
+            yield record
 
     def generation(self) -> Optional[int]:
         """日志所属的代际 id（首条记录的 `generation` 字段）；空日志返回 None。"""
@@ -211,13 +212,14 @@ def archive_file(path: Optional[str], generation: int):
 
 def scheduler_to_snapshot(core) -> dict:
     """回合结束时的调度状态（日志记录与重启快照共用同一形状）。"""
+    sched = core.schedule_state()
     return {
-        "active": core._active_cid,
-        "ready": list(core._ready_cids),
-        "dormant": list(core._dormant_cids),
-        "finished": sorted(core._finished),
-        "activation_instructions": core._activation_instructions,
-        "next_cid": core._next_cid,
+        "active": sched["active"],
+        "ready": sched["ready"],
+        "dormant": sched["dormant"],
+        "finished": core.finished_ids(),
+        "activation_instructions": core.activation_instructions,
+        "next_cid": core.next_cid,
     }
 
 
@@ -230,13 +232,6 @@ def conversation_create_payload(core, conv) -> dict:
     doc = conv.to_snapshot()
     doc.pop("batch", None)  # 新建对话没有待发批次
     return {"conversation": doc}
-
-
-def _space_roots(space) -> Optional[dict]:
-    """AddressSpace → 根表 dict（JSON 安全）；None 保持 None。"""
-    if space is None:
-        return None
-    return {name: list(segments) for name, segments in space.as_roots().items()}
 
 
 def _space_from_roots(roots: Optional[dict]):
@@ -276,9 +271,8 @@ def apply(core, record: dict) -> None:
     if record.get("v") != JOURNAL_RECORD_VERSION:
         raise JournalError(_version_error(seq, record.get("v")))
     cid = record.get("cid")
-    conv = core._conv_by_cid.get(cid)
+    conv = core.get_conversation(cid)
     if conv is None:
-        from .core import PANEL_CID
         if cid == PANEL_CID:
             # 保留对话是世界的固定成员，身份固定且可恢复：日志里先出现、快照里
             # 还没有它时（只靠日志恢复），在这里补建。
@@ -288,15 +282,11 @@ def apply(core, record: dict) -> None:
     changes = record.get("changes")
     if not isinstance(changes, list):
         raise JournalError(f"日志 seq={seq}: changes 必须是数组")
-    was_replaying = core._replaying
-    core._replaying = True
-    try:
+    with core.replaying():
         for change in changes:
             _apply_change(core, change, cid, seq)
         # 这段历史来自日志（不是本进程跑出来的）：Python 对话的执行器需要预热
-        core._warmup_needed.add(cid)
-    finally:
-        core._replaying = was_replaying
+        core.mark_warmup_needed(cid)
 
 
 def _apply_change(core, change, cid: int, seq) -> None:
@@ -304,7 +294,7 @@ def _apply_change(core, change, cid: int, seq) -> None:
         raise JournalError(f"日志 seq={seq}: 变化条目形状不合法：{change!r}")
     kind = change["kind"]
     if kind == "message":
-        conv = core._conv_by_cid.get(cid)
+        conv = core.get_conversation(cid)
         if conv is None:
             raise JournalError(f"日志 seq={seq}: 消息的目标对话 cid={cid} 不存在")
         message = change.get("message")
@@ -317,7 +307,7 @@ def _apply_change(core, change, cid: int, seq) -> None:
         return
     if kind == "batch":
         target_cid = change.get("cid", cid)
-        conv = core._conv_by_cid.get(target_cid)
+        conv = core.get_conversation(target_cid)
         if conv is not None:
             conv.user_batch = batch_from_dict(change.get("batch"))
         return
@@ -327,11 +317,51 @@ def _apply_change(core, change, cid: int, seq) -> None:
     raise JournalError(f"日志 seq={seq}: 未知变化种类 {kind!r}")
 
 
+def scheduler_delta(before: dict, after: dict):
+    """把回合前后的调度状态压成一条增量变化；没有变化返回 None。
+
+    产出的是日志里 `kind=scheduler` 的 change，字段名与下面 _apply_scheduler_delta
+    一一对应：两份必须一起改。放在同一个文件里，就是为了让这件事一眼看得见——
+    以前产出端在 core.py、消费端在这里，改一个字段名靠记忆。
+
+    before / after 都是 _scheduler_state() 的形状：active / ready / dormant /
+    finished / activation_instructions / next_cid。
+    """
+    delta = {}
+    if before["active"] != after["active"]:
+        delta["active"] = after["active"]
+    for key in ("ready", "dormant"):
+        before_list = before[key]
+        after_list = after[key]
+        before_set = set(before_list)
+        after_set = set(after_list)
+        added = [cid for cid in after_list if cid not in before_set]
+        removed = [cid for cid in before_list if cid not in after_set]
+        if added:
+            delta[key + "_add"] = added
+        if removed:
+            delta[key + "_remove"] = removed
+    added_finished = sorted(after["finished"] - before["finished"])
+    removed_finished = sorted(before["finished"] - after["finished"])
+    if added_finished:
+        delta["finished_add"] = added_finished
+    if removed_finished:
+        delta["finished_remove"] = removed_finished
+    if before["activation_instructions"] != after["activation_instructions"]:
+        delta["activation_instructions"] = after["activation_instructions"]
+    if before["next_cid"] != after["next_cid"]:
+        delta["next_cid"] = after["next_cid"]
+    if not delta:
+        return None
+    return {"kind": "scheduler", **delta}
+
+
+
 def _apply_scheduler_delta(core, change, seq) -> None:
     """应用一条调度增量；引用不存在对话时警告并跳过（与快照恢复同一策略）。"""
 
     def _known(cid):
-        if cid in core._conv_by_cid:
+        if cid in core.conversations:
             return True
         print(
             f"[AVM] 日志 seq={seq}: 调度增量引用不存在的对话 cid={cid}，跳过",
@@ -341,24 +371,25 @@ def _apply_scheduler_delta(core, change, seq) -> None:
 
     if "active" in change:
         active = change.get("active")
-        core._active_cid = active if active is not None and _known(active) else None
-    for key, attr in (("ready", "_ready_cids"), ("dormant", "_dormant_cids")):
-        target = getattr(core, attr)
+        core.set_active(active if active is not None and _known(active) else None)
+    for key, add, remove in (
+        ("ready", core.add_ready, core.remove_ready),
+        ("dormant", core.add_dormant, core.remove_dormant),
+    ):
         for cid in change.get(key + "_remove") or []:
-            if cid in target:
-                target.remove(cid)
+            remove(cid)
         for cid in change.get(key + "_add") or []:
-            if _known(cid) and cid not in target:
-                target.append(cid)
+            if _known(cid):
+                add(cid)
     for cid in change.get("finished_remove") or []:
-        core._finished.discard(cid)
+        core.remove_finished(cid)
     for cid in change.get("finished_add") or []:
         if _known(cid):
-            core._finished.add(cid)
+            core.add_finished(cid)
     if isinstance(change.get("activation_instructions"), int):
-        core._activation_instructions = change["activation_instructions"]
+        core.set_activation_instructions(change["activation_instructions"])
     if isinstance(change.get("next_cid"), int):
-        core._next_cid = change["next_cid"]
+        core.restore_next_cid(change["next_cid"])
 
 
 def _apply_effect(core, effect, seq) -> None:
@@ -381,7 +412,7 @@ def apply_scheduler(core, scheduler, source: str = "日志") -> None:
         return
 
     def _known(cid):
-        if cid in core._conv_by_cid:
+        if cid in core.conversations:
             return True
         print(
             f"[AVM] {source}: 调度状态引用不存在的对话 cid={cid}（宿主侧对话不随恢复）",
@@ -390,14 +421,16 @@ def apply_scheduler(core, scheduler, source: str = "日志") -> None:
         return False
 
     active = scheduler.get("active")
-    core._active_cid = active if active is not None and _known(active) else None
-    core._ready_cids = [cid for cid in scheduler.get("ready") or [] if _known(cid)]
-    core._dormant_cids = [cid for cid in scheduler.get("dormant") or [] if _known(cid)]
-    core._finished = {cid for cid in scheduler.get("finished") or [] if _known(cid)}
+    core.restore_schedule(
+        active if active is not None and _known(active) else None,
+        [cid for cid in scheduler.get("ready") or [] if _known(cid)],
+        [cid for cid in scheduler.get("dormant") or [] if _known(cid)],
+    )
+    core.restore_finished({cid for cid in scheduler.get("finished") or [] if _known(cid)})
     if isinstance(scheduler.get("activation_instructions"), int):
-        core._activation_instructions = scheduler["activation_instructions"]
+        core.set_activation_instructions(scheduler["activation_instructions"])
     if isinstance(scheduler.get("next_cid"), int):
-        core._next_cid = scheduler["next_cid"]
+        core.restore_next_cid(scheduler["next_cid"])
 
 
 # ----------------------------------------------------------------------
@@ -428,7 +461,7 @@ def _effect_memory_attach(core, effect) -> None:
     if not isinstance(path, list) or not path:
         raise VMMemoryError("memory_attach 的 path 必须是非空段列表")
     node = Memory.deserialize_node(effect.get("node"))
-    parent = core.mem._data
+    parent = core.mem.root
     for key in path[:-1]:
         if isinstance(parent, (dict, MetaDict)):
             child = parent.get(key)
@@ -456,7 +489,7 @@ def _effect_memory_detach(core, effect) -> None:
     path = effect.get("path")
     if not isinstance(path, list) or not path:
         raise VMMemoryError("memory_detach 的 path 必须是非空段列表")
-    parent = core.mem._data
+    parent = core.mem.root
     for key in path[:-1]:
         if not isinstance(parent, (dict, MetaDict)) or key not in parent:
             raise VMMemoryError(f"memory_detach 的路径不存在：{'/'.join(str(x) for x in path)}")
@@ -496,19 +529,19 @@ def _effect_conversation_create(core, effect) -> None:
     conv = Conversation.from_snapshot(payload)
     parent_cid = payload.get("parent_cid")
     if parent_cid is not None:
-        parent = core._conv_by_cid.get(parent_cid)
+        parent = core.get_conversation(parent_cid)
         if parent is None:
             raise VMMemoryError(f"conversation_create 的父对话 cid={parent_cid} 不存在")
         conv.parent = parent
-    core._register(conv, cid=payload["cid"])
+    core.register(conv, cid=payload["cid"])
     # 日志里创建出来的对话在续跑时同样需要 Python 执行器预热
-    core._warmup_needed.add(conv.cid)
+    core.mark_warmup_needed(conv.cid)
 
 
 def _effect_conversation_roots(core, effect) -> None:
     """还原一次动态授予根：整体替换对话的非 core 根表（core 自述根保留）。"""
     cid = effect.get("cid")
-    conv = core._conv_by_cid.get(cid)
+    conv = core.get_conversation(cid)
     if conv is None:
         print(
             f"[AVM] 日志 conversation_roots 效果：对话 {cid} 不存在（可能已关闭），跳过",
@@ -518,7 +551,7 @@ def _effect_conversation_roots(core, effect) -> None:
     roots = effect.get("roots")
     if not isinstance(roots, dict):
         raise VMMemoryError("conversation_roots 缺少 roots 映射")
-    new_roots = core._core_roots(conv)
+    new_roots = core.core_roots(conv)
     for name, segments in roots.items():
         new_roots[name] = tuple(segments)
     conv.caps = conv.caps.copy(roots=new_roots)
@@ -526,39 +559,35 @@ def _effect_conversation_roots(core, effect) -> None:
 
 def _effect_conversation_close(core, effect) -> None:
     cid = effect["cid"]
-    conv = core._conv_by_cid.get(cid)
+    conv = core.get_conversation(cid)
     if conv is None:
         return
-    core._finished.add(cid)
-    for queue in (core._ready_cids, core._dormant_cids):
-        while cid in queue:
-            queue.remove(cid)
-    core._executors.pop(cid, None)
+    core.add_finished(cid)
+    core.drop_from_schedule(cid)
+    core.drop_executor(cid)
 
 
 def _effect_conversation_delete(core, effect) -> None:
     cid = effect["cid"]
 
     def _delete(target_cid):
-        for child in list(core._conv_by_cid.values()):
+        for child in list(core.conversations.values()):
             if child.is_sub and child.parent is not None and child.parent.cid == target_cid:
                 _delete(child.cid)
-        conv = core._conv_by_cid.pop(target_cid, None)
+        conv = core.remove_conversation(target_cid)
         if conv is None:
             return
-        for queue in (core._ready_cids, core._dormant_cids):
-            while target_cid in queue:
-                queue.remove(target_cid)
-        core._finished.discard(target_cid)
-        core._executors.pop(target_cid, None)
+        core.drop_from_schedule(target_cid)
+        core.remove_finished(target_cid)
+        core.drop_executor(target_cid)
 
     _delete(cid)
 
 
 def _effect_delivery(core, effect) -> None:
     cid = effect.get("to_cid")
-    target = core._conv_by_cid.get(cid)
-    if target is None or cid in core._finished:
+    target = core.get_conversation(cid)
+    if target is None or core.is_finished(cid):
         print(f"[AVM] 日志投递效果：对话 {cid} 不存在或已关闭，跳过", file=sys.stderr)
         return
     for item in effect.get("tool_responses") or []:
@@ -576,8 +605,7 @@ def _effect_listener_register(core, effect) -> None:
     listener = listener_from_snapshot(data)
     core.events.listeners.append(listener)
     listener_id = listener.get("listener_id")
-    if isinstance(listener_id, int) and listener_id >= core.events._next_listener_id:
-        core.events._next_listener_id = listener_id + 1
+    core.events.reserve_listener_id(listener_id)
 
 
 def _effect_listener_modify(core, effect) -> None:
@@ -737,11 +765,7 @@ def apply_world_record(core, record: dict) -> int:
     if record.get("v") != JOURNAL_RECORD_VERSION:
         raise JournalError(_version_error(seq, record.get("v")))
     effects = world_effects_of(record)
-    was_replaying = core._replaying
-    core._replaying = True
-    try:
+    with core.replaying():
         for effect in effects:
             _apply_effect(core, effect, seq)
-    finally:
-        core._replaying = was_replaying
     return len(effects)

@@ -585,7 +585,6 @@ class TestImagePlms:
         image = _plm_declaration_image([
             {"model": "plm.demo", "file": "plm_impl.py", "class": "NotAPlm"},
         ])
-        core = load_image  # 只是为了避免未使用告警
         with pytest.raises(ImageError, match="继承 PLMServer"):
             load_image(Core(), _write_plm(tmp_path, image, code=NOT_A_PLM_CODE))
 

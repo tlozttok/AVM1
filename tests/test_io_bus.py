@@ -276,7 +276,7 @@ class TestCoreLifecycle:
         core._pick_next_active = lambda: setattr(core, "_active_cid", 1)
         core.advance_conversation = lambda: advanced.append(1)
         core.interrupts.dispatch = lambda: None
-        core._check_invariants = lambda: None
+        core.check_invariants = lambda: None
         core.monitor.record_baseline = lambda _core: None
         core.run()
         assert advanced == [], "停止标志命中后不该再推进一轮"
@@ -390,7 +390,8 @@ class TestShutdownGrace:
         assert code == 200 and state["force_stop_remaining"] > 0
         code, _, _ = _request(base, "POST", "/api/system/force-stop", {})
         assert code == 409
-        console.stopping_since = time.time() - 31
+        # 把"已等待 31 秒"直接写进生命周期，省掉真等 30 秒（force_stop_delay=30）。
+        console.lifecycle_state.stopping_since = time.time() - 31
         code, _, _ = _request(base, "POST", "/api/system/force-stop", {})
         assert code == 202
 

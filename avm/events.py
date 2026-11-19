@@ -8,6 +8,10 @@
 
 监听注册的 memory 目标授权不在 Core：Core 只提供机制，策略由软件层的 Guard
 监听器（监听 listen_event before）按 caps/roots 实现。设备目标仍由设备授权。
+
+"这个目标指的是什么"这类只读读法（别名 → 节点/对话/监听器状态、normal 与
+kernel 两级的载荷形状）在 event_targets.TargetProbe 里：判权和拼载荷问的是
+同一组问题，写在两处就会漂移。
 """
 
 # TODO(issue-2026-11-01): 用户态事件子集（named presets）的名单与粒度是临时方案，待作者
@@ -15,31 +19,26 @@
 # send_instruction/listen_event 纳入子集。设计见
 # docs/private/Agents/implemented/design-unified-event-bus-2026-10-31.md §2.3、§8。
 import copy
-import json
 import sys
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 from .capabilities import AddressSpace
+from .event_conditions import EventConditions, condition_leaf
+from .event_contracts import (  # noqa: F401  (对外转出，见下方说明)
+    EVENT_TYPES,
+    KERNEL_TIER,
+    LISTENER_TIERS,
+    MAX_ANCESTORS_DEPTH,
+    NORMAL_TIER,
+)
+from .event_targets import TargetProbe
 from .exceptions import IllegalOperationError, VMMemoryError
 from .modules import BASE_MODULES, catalog_exports, import_function, shared_view
 from .sandbox import check_code, safe_globals
-from .types import MetaDict, MetaList
+from .types import MetaDict
 
-EVENT_TYPES = [
-    "memory_read",
-    "memory_write",
-    "memory_make",
-    "memory_delete",
-    "edit_metadata",
-    "send_instruction",
-    "create_cmd",
-    "create_sub",
-    "close_conversation",
-    "listen_event",
-]
-
-# 批次二：10 条指令全部有 before 事件
-INTERCEPTABLE_TYPES = set(EVENT_TYPES)
+if TYPE_CHECKING:  # 只为静态检查：core 反向依赖本模块，运行期导入会成环
+    from .core import Core
 
 # 生命周期事件：通配监听与创建/关闭/监听注册的权限规则与内存事件不同
 LIFECYCLE_TYPES = {
@@ -49,15 +48,21 @@ LIFECYCLE_TYPES = {
     "listen_event",
 }
 
-NORMAL_TIER = "normal"
-KERNEL_TIER = "kernel"
-LISTENER_TIERS = (NORMAL_TIER, KERNEL_TIER)
+# 地址类事件：target 是内存路径，权限判定落在"这段地址归谁"上（设备问设备，内存交给 Guard）
+MEMORY_EVENT_TYPES = {
+    "memory_read",
+    "memory_write",
+    "memory_make",
+    "memory_delete",
+    "edit_metadata",
+}
+
+# 层级名与祖先深度上限住在 event_contracts（事件系统与目标探针共用）；这里重新
+# 导出，`from .events import NORMAL_TIER` 这类外部写法不用改。
 
 # kernel 级 source_context 的截断上限（消息条数）；超出的旧消息不放进载荷
 SOURCE_CONTEXT_MAX_MESSAGES = 20
 
-# normal 载荷祖先链的深度上限（只保留最近 MAX_ANCESTORS_DEPTH 个祖先）
-MAX_ANCESTORS_DEPTH = 32
 
 # 各事件类型中处理器可以修改的 payload 字段。
 # 未列出的字段（身份字段等）一律不可由处理器修改。
@@ -79,6 +84,20 @@ def _to_tuple_ref(value):
     if isinstance(value, (list, tuple)):
         return tuple(_to_tuple_ref(item) for item in value)
     return value
+
+
+def _cid_from_ref(target: str, type_error: str, number_error: str) -> int:
+    """从 `cid:<n>` 形态的 target 里取出数字。
+
+    两条错误消息由调用方给：不同事件类型对同一个错误有各自的措辞，
+    放进本函数就会变成一句谁都不像的话。
+    """
+    if not target.startswith("cid:"):
+        raise IllegalOperationError(type_error)
+    try:
+        return int(target[4:])
+    except ValueError:
+        raise IllegalOperationError(number_error)
 
 
 def listener_to_snapshot(listener: dict) -> dict:
@@ -160,46 +179,117 @@ def build_event(
 
 
 
-# ----------------------------------------------------------------------
-# 声明式监听条件（R4，过渡实现：handler 节点带 condition 数据时启用）
-# ----------------------------------------------------------------------
-
-CONDITION_KEYS = frozenset({"preset", "events", "phase", "target", "source"})
-LIFECYCLE_EVENTS = ("create_cmd", "create_sub", "close_conversation", "listen_event")
-
-# 用户态对话可用的命名条件子集（名称是机制常量；名单待作者细化，见 issue-2026-11-01）
-# own_nodes.memory 依赖已删除的节点所有权 cid（owned_by_owner），不再提供。
-USER_CONDITION_PRESETS = {
-    "inbox": {
-        "events": ["send_instruction"],
-        "phase": ["before", "after"],
-        "target": {"kind": "cid_owner"},
-    },
-    "self.lifecycle": {
-        "events": list(LIFECYCLE_EVENTS),
-        "phase": ["before", "after"],
-        "target": {"kind": "self_lifecycle"},
-    },
-}
+# 声明式监听条件的解析与匹配在 event_conditions（EventConditions）。
 
 
-def _condition_leaf(node):
-    """读取 handler 节点的 condition 叶子（JSON 字符串）；缺省 None。"""
-    if not isinstance(node, MetaDict):
-        return None
-    raw = node.get("condition")
-    if raw is None:
-        return None
-    if not isinstance(raw, str):
-        raise IllegalOperationError("handler 节点的 condition 必须是 str 数据叶子")
-    try:
-        return json.loads(raw)
-    except ValueError as e:
-        raise IllegalOperationError(f"handler 节点的 condition 不是合法 JSON：{e}")
+def _merge_action(event: dict, out: dict, listener: Optional[dict]) -> None:
+    """action 只在 before 阶段生效；allow 是内核级特权（normal 级返回视为错误）。"""
+    if "action" not in out:
+        return
+    action = out["action"]
+    if event["phase"] != "before":
+        return  # after 阶段忽略 action
+    if action not in ("execute", "replace", "allow"):
+        raise EventHandlerError(
+            0,  # 调用方随后用真实 listener_id 包装
+            f"before 阶段 action 必须是 execute/replace/allow，得到 {action!r}",
+        )
+    if action == "allow" and (listener or {}).get("tier") != KERNEL_TIER:
+        raise EventHandlerError(0, "只有内核级监听器可以返回 allow")
+    event["action"] = action
+
+
+def _merge_replace_response(event: dict, out: dict) -> None:
+    """replace 的拒答文本：统一加 Interrupted 前缀，让调用者能分辨"被拦截"与"成功"。"""
+    if event.get("action") != "replace":
+        return
+    response = out.get("response", "")
+    if response is None:
+        response = ""
+    if not isinstance(response, str):
+        raise EventHandlerError(
+            0,
+            f"response 必须是字符串，得到 {type(response).__name__}",
+        )
+    # 处理器自定义文本也加前缀：调用者只看这一句，不能有一类漏掉标记。
+    event["response"] = f"Interrupted: {response or DEFAULT_REPLACE_RESPONSE}"
+
+
+def _merge_payload(event: dict, out: dict) -> None:
+    """载荷里只有该事件类型声明为可变的键能改；类型按事件类型校验。"""
+    mutable = MUTABLE_PAYLOAD_KEYS.get(event["event_type"], set())
+    payload_out = out.get("payload")
+    if not isinstance(payload_out, dict):
+        return
+    for key in mutable:
+        if key not in payload_out:
+            continue
+        # edit_metadata 的 value 只有原操作是 set 时才可变
+        if event["event_type"] == "edit_metadata" and event["payload"].get("type") != "set":
+            continue
+        val = payload_out[key]
+        if event["event_type"] in ("memory_write", "send_instruction") and not isinstance(val, str):
+            raise EventHandlerError(0, f"payload.{key} 必须是字符串，得到 {type(val).__name__}")
+        if event["event_type"] == "edit_metadata" and not isinstance(val, str):
+            raise EventHandlerError(0, f"payload.value 必须是字符串，得到 {type(val).__name__}")
+        event["payload"][key] = val
+
+
+def _reject_notify(event: dict, listener_id: Optional[int], error: str) -> None:
+    """notify 违规：before 阶段当处理器错误抛出；after 阶段记账、丢弃这一条、继续。"""
+    if event["phase"] == "before":
+        raise EventHandlerError(0, error)
+    event.setdefault("handler_errors", []).append({
+        "listener_id": listener_id,
+        "error": error,
+    })
+    print(f"[AVM] 事件监听器 {listener_id} 处理失败: {error}", file=sys.stderr)
+
+
+def _merge_notify(event: dict, out: dict, listener_id: Optional[int],
+                  listener: Optional[dict], owner_kernel: bool) -> None:
+    """notify 投递列表：形状校验 + 两条"不许投给谁"，通过后并进事件。"""
+    if "notify" not in out:
+        return
+    notifies = out["notify"]
+    if not isinstance(notifies, list):
+        raise EventHandlerError(0, "notify 必须是 list")
+    # 谁在发起这次投递：before 看事件来源，after 看载荷里的执行者
+    source_cid = None
+    if event["phase"] == "before":
+        source = event.get("source") or {}
+        if source.get("kind") == "core":
+            source_cid = source.get("initiator_cid")
+    else:
+        source_cid = (event.get("payload") or {}).get("actor_cid")
+    owner_cid = (listener or {}).get("owner_cid")
+    for item in notifies:
+        if not isinstance(item, dict) or not isinstance(item.get("cid"), int) or not isinstance(item.get("content"), str):
+            raise EventHandlerError(
+                0,
+                f"notify 每项必须是 {{\"cid\": int, \"content\": str}}，得到 {item!r}",
+            )
+        if source_cid is not None and item["cid"] == source_cid:
+            _reject_notify(event, listener_id, f"notify 不允许自我投递（cid={source_cid} 是当前对话）")
+            continue
+        if not owner_kernel and item["cid"] != owner_cid:
+            _reject_notify(
+                event, listener_id,
+                f"用户态监听器只能把 notify 投递给注册者自己"
+                f"（owner cid={owner_cid}，请求 cid={item['cid']}）",
+            )
+            continue
+        event["notify"].append({"cid": item["cid"], "content": item["content"]})
+
 
 class EventSystem:
     def __init__(self, core: 'Core'):
         self._core = core
+        # 声明式条件的解析与匹配（handler 节点上的 condition 数据）。
+        self.conditions = EventConditions(core)
+        # 目标读数（别名 → 节点/对话/监听器的真实状态）交给 TargetProbe。传的是
+        # "取法"而不是列表本身：cancel_all_for_owner 会整个重建 self.listeners。
+        self.targets = TargetProbe(core, lambda: self.listeners)
         # 注册顺序即优先级：先注册者先执行。
         self.listeners: List[dict] = []
         self._next_listener_id = 1
@@ -280,9 +370,9 @@ class EventSystem:
     # 注册 / 修改 / 取消
     # ------------------------------------------------------------------
 
-    def _journaling(self) -> bool:
+    def is_journaling(self) -> bool:
         """当前是否正在为回合日志记录（无日志/重放/非回合执行期为假）。"""
-        check = getattr(self._core, "_journaling", None)
+        check = getattr(self._core, "is_journaling", None)
         return bool(check()) if callable(check) else False
 
     def _note(self, kind: str, **payload) -> None:
@@ -290,6 +380,23 @@ class EventSystem:
         note = getattr(self._core, "note_effect", None)
         if callable(note):
             note(kind, **payload)
+
+    def reserve_listener_id(self, listener_id) -> None:
+        """重放/恢复用：保证下一个分配号大于已用过的 id。
+
+        日志里记录的是当时的 id，号段可能有跳号（注册后又撤销、或来自旧代际），
+        所以不能按"条数"推，只能按"见过的最大号"抬分配器。
+        """
+        if isinstance(listener_id, int) and listener_id >= self._next_listener_id:
+            self._next_listener_id = listener_id + 1
+
+    def reset_listener_ids(self) -> None:
+        """监听器 id 分配器归零（快照重建：监听器表整体替换后从 1 重发）。"""
+        self._next_listener_id = 1
+
+    def reset_event_ids(self) -> None:
+        """事件 id 分配器归零（快照重建：事件流水不跨重启，id 从 1 重发）。"""
+        self._next_event_id = 1
 
     def register(self, owner_cid: int, event_type: str, target: str, handler_ref: str, phase: str = "all",
                  space=None, tier: str = NORMAL_TIER, priority: int = 0,
@@ -334,7 +441,7 @@ class EventSystem:
             "owner_cid": owner_cid,
             "event_type": event_type,
             "target": target,
-            "target_ref": self._canonical_target_ref(
+            "target_ref": self.targets.canonical_ref(
                 target, space=space, follow_final=(event_type != "memory_delete")
             ),
             "handler_ref": handler_ref,
@@ -346,7 +453,7 @@ class EventSystem:
             "priority": priority,
             "space": space,
         })
-        if self._journaling():
+        if self.is_journaling():
             self._note("listener_register", listener=listener_to_snapshot(self.listeners[-1]))
         return listener_id
 
@@ -358,9 +465,9 @@ class EventSystem:
         if handler_ref is not None:
             handler_code = self.resolve_handler(self._core, handler_ref, space=space)
             node = self._core.unwrap(handler_ref, for_llm=False, space=space)
-            if _condition_leaf(node) is not None:
+            if condition_leaf(node) is not None:
                 owner_kernel = self._listener_owner_kernel(listener)
-                condition = self._resolve_condition(
+                condition = self.conditions.parse(
                     node, listener["owner_cid"], owner_kernel,
                     space=listener.get("space") if space is None else space,
                 )
@@ -373,7 +480,7 @@ class EventSystem:
             if priority > 0 and listener.get("tier") != KERNEL_TIER:
                 raise IllegalOperationError("priority>0 只有内核级监听器可以设置")
             listener["priority"] = priority
-        if self._journaling():
+        if self.is_journaling():
             self._note("listener_modify", listener_id=listener_id,
                        listener=listener_to_snapshot(listener))
 
@@ -381,7 +488,7 @@ class EventSystem:
         listener = self._get_listener(listener_id)
         self._check_owner(listener, owner_cid)
         self.listeners.remove(listener)
-        if self._journaling():
+        if self.is_journaling():
             self._note("listener_cancel", listener_id=listener_id)
 
     @staticmethod
@@ -392,7 +499,7 @@ class EventSystem:
 
     def cancel_all_for_owner(self, owner_cid: int) -> None:
         self.listeners = [l for l in self.listeners if l.get("owner_cid") != owner_cid]
-        if self._journaling():
+        if self.is_journaling():
             self._note("listener_cancel_all", owner_cid=owner_cid)
 
     # ------------------------------------------------------------------
@@ -455,7 +562,7 @@ class EventSystem:
 
         listener["event_type"] = event_type
         listener["target"] = target
-        listener["target_ref"] = self._canonical_target_ref(
+        listener["target_ref"] = self.targets.canonical_ref(
             target, space=listener.get("space"),
             follow_final=(event_type != "memory_delete"),
         )
@@ -510,395 +617,124 @@ class EventSystem:
         send/close：普通对话只能监听发往自己/关闭自己的事件；
         lifecycle：通配只有内核态可注册，其余按“自己相关”判定。
         """
-        if event_type in ("memory_read", "memory_write", "edit_metadata", "memory_make", "memory_delete"):
-            if kernel_mode:
-                return
-            split = self._core.mem.split_path(target, space=space)
-            if split[0] == "device":
-                _, mount_key, remainder = split
-                device = self._core.mem._devices[mount_key]
-                if not device.authorize_listener(event_type, remainder, owner_cid):
-                    raise ValueError(f"设备 {mount_key} 未授权对话 {owner_cid} 监听 {target}")
+        if event_type in MEMORY_EVENT_TYPES:
+            self._check_memory_target(event_type, target, owner_cid, space, kernel_mode)
             return
-
         if event_type == "send_instruction":
-            if not target.startswith("cid:"):
-                raise IllegalOperationError("send_instruction 事件的 target 必须是 cid:<cid>")
+            self._check_send_target(target, owner_cid, kernel_mode)
+            return
+        if event_type in LIFECYCLE_TYPES:
+            self._check_lifecycle_target(event_type, target, owner_cid, space, kernel_mode)
+            return
+        raise ValueError(f"不支持的事件注册类型：{event_type}")
+
+    def _check_memory_target(self, event_type: str, target: str, owner_cid: int,
+                             space, kernel_mode: bool) -> None:
+        """地址类事件：内核态直接放行；普通对话由设备裁决，内存节点交给软件层 Guard。"""
+        if kernel_mode:
+            return
+        self._check_device_target(event_type, target, owner_cid, space)
+
+    def _check_device_target(self, event_type: str, target: str, owner_cid: int, space) -> None:
+        """目标落在设备上就问设备的 authorize_listener；内存节点不做所有者判定。"""
+        split = self._core.mem.split_path(target, space=space)
+        if split[0] != "device":
+            return
+        _, mount_key, remainder = split
+        device = self._core.mem.devices[mount_key]
+        if not device.authorize_listener(event_type, remainder, owner_cid):
+            raise ValueError(f"设备 {mount_key} 未授权对话 {owner_cid} 监听 {target}")
+
+    @staticmethod
+    def _check_send_target(target: str, owner_cid: int, kernel_mode: bool) -> None:
+        """send_instruction：target 必须是 cid:<cid>，普通对话只能监听发往自己的。"""
+        cid = _cid_from_ref(
+            target,
+            "send_instruction 事件的 target 必须是 cid:<cid>",
+            f"send_instruction 事件的 target cid 必须是数字：{target}",
+        )
+        if kernel_mode or cid == owner_cid:
+            return
+        raise ValueError(f"对话只能监听发往自己的消息，不能监听 {target}")
+
+    def _check_lifecycle_target(self, event_type: str, target: str, owner_cid: int,
+                                space, kernel_mode: bool) -> None:
+        """生命周期事件：通配先判，其余按事件类型分流。"""
+        if target == "*":
+            if not kernel_mode:
+                raise ValueError("通配监听只有内核态对话可以注册")
+            return
+        if event_type == "close_conversation":
+            self._check_close_target(target, owner_cid, kernel_mode)
+            return
+        if event_type == "listen_event":
+            self._check_listen_target(target, owner_cid, space, kernel_mode)
+            return
+        self._check_program_target(event_type, target, space, kernel_mode)
+
+    @staticmethod
+    def _check_close_target(target: str, owner_cid: int, kernel_mode: bool) -> None:
+        """close_conversation：普通对话只能监听关闭自己的事件。"""
+        cid = _cid_from_ref(
+            target,
+            "close_conversation 事件的 target 必须是 cid:<cid>",
+            f"cid 必须是数字：{target}",
+        )
+        if kernel_mode or cid == owner_cid:
+            return
+        raise ValueError("普通对话只能监听关闭自己的事件")
+
+    def _check_listen_target(self, target: str, owner_cid: int, space, kernel_mode: bool) -> None:
+        """listen_event 的三种 target 形态：listener:<id>、cid:<id>、$<内存路径>。"""
+        if target.startswith("listener:"):
+            self._check_listener_target(target, owner_cid, kernel_mode)
+            return
+        if target.startswith("cid:"):
             try:
                 cid = int(target[4:])
             except ValueError:
-                raise IllegalOperationError(f"send_instruction 事件的 target cid 必须是数字：{target}")
-            if kernel_mode:
+                raise IllegalOperationError(f"cid 必须是数字：{target}")
+            if kernel_mode or cid == owner_cid:
                 return
-            if cid != owner_cid:
-                raise ValueError(f"对话只能监听发往自己的消息，不能监听 {target}")
+            raise ValueError("普通对话只能监听自己相关的事件")
+        if target.startswith("$"):
+            # action=listen 的 before target 是准备注册的目标（condition 的 canonical
+            # ref）：memory 目标不做所有者判定（交给 Guard），设备照旧询问设备。
+            self._check_device_target("listen_event", target, owner_cid, space)
             return
+        raise IllegalOperationError(
+            f"listen_event 事件的 target 不是可识别的形式：{target}"
+        )
 
-        if event_type in LIFECYCLE_TYPES:
-            if target == "*":
-                if not kernel_mode:
-                    raise ValueError("通配监听只有内核态对话可以注册")
-                return
-            if event_type == "close_conversation":
-                if not target.startswith("cid:"):
-                    raise IllegalOperationError("close_conversation 事件的 target 必须是 cid:<cid>")
-                try:
-                    cid = int(target[4:])
-                except ValueError:
-                    raise IllegalOperationError(f"cid 必须是数字：{target}")
-                if kernel_mode:
-                    return
-                if cid != owner_cid:
-                    raise ValueError("普通对话只能监听关闭自己的事件")
-                return
-            if event_type == "listen_event":
-                if target.startswith("listener:"):
-                    try:
-                        lid = int(target[9:])
-                    except ValueError:
-                        raise IllegalOperationError(f"listener 事件的 target 必须是 listener:<id>：{target}")
-                    record = next((x for x in self.listeners if x["listener_id"] == lid), None)
-                    if record is None:
-                        raise ValueError(f"监听器 {lid} 不存在")
-                    if kernel_mode:
-                        return
-                    if record.get("owner_cid") != owner_cid:
-                        raise ValueError("普通对话只能监听自己的监听器")
-                    return
-                if target.startswith("cid:"):
-                    try:
-                        cid = int(target[4:])
-                    except ValueError:
-                        raise IllegalOperationError(f"cid 必须是数字：{target}")
-                    if kernel_mode or cid == owner_cid:
-                        return
-                    raise ValueError("普通对话只能监听自己相关的事件")
-                if target.startswith("$"):
-                    # action=listen 的 before target 是准备注册的目标（condition 的 canonical
-                    # ref）：memory 目标不做所有者判定（交给 Guard），设备照旧询问设备。
-                    split = self._core.mem.split_path(target, space=space)
-                    if split[0] == "device":
-                        _, mount_key, remainder = split
-                        device = self._core.mem._devices[mount_key]
-                        if not device.authorize_listener(event_type, remainder, owner_cid):
-                            raise ValueError(f"设备 {mount_key} 未授权对话 {owner_cid} 监听 {target}")
-                        return
-                    return
-                raise IllegalOperationError(
-                    f"listen_event 事件的 target 不是可识别的形式：{target}"
-                )
-            # create_cmd / create_sub：target 是程序节点引用（内存节点；不做所有者判定）
-            if kernel_mode:
-                return
-            if not isinstance(target, str) or not target.startswith("$"):
-                raise IllegalOperationError(f"{event_type} 事件的 target 必须是程序节点引用")
-            split = self._core.mem.split_path(target, space=space)
-            if split[0] != "memory":
-                raise ValueError(f"不能监听设备上的程序节点：{target}")
+    def _check_listener_target(self, target: str, owner_cid: int, kernel_mode: bool) -> None:
+        """listener:<id>：监听器必须存在，普通对话只能监听自己的监听器。"""
+        try:
+            lid = int(target[9:])
+        except ValueError:
+            raise IllegalOperationError(f"listener 事件的 target 必须是 listener:<id>：{target}")
+        record = next((x for x in self.listeners if x["listener_id"] == lid), None)
+        if record is None:
+            raise ValueError(f"监听器 {lid} 不存在")
+        if kernel_mode:
             return
+        if record.get("owner_cid") != owner_cid:
+            raise ValueError("普通对话只能监听自己的监听器")
 
-        raise ValueError(f"不支持的事件注册类型：{event_type}")
-
-    # ------------------------------------------------------------------
-    # 目标规范化与载荷分层
-    # ------------------------------------------------------------------
-
-    def _canonical_target_ref(self, target: str, space=None, follow_final: bool = True):
-        """把请求别名转成内部 canonical target_ref；无法解析返回 None。
-
-        格式：("memory", 段序列) / ("device", 挂载键, 剩余段) / ("cid", id) /
-        ("listener", id) / ("*",)。canonical 只用于匹配与权限判定，不进 normal 载荷。
-        """
-        if not isinstance(target, str) or not target:
-            return None
-        if target == "*":
-            return ("*",)
-        if target.startswith("cid:"):
-            try:
-                return ("cid", int(target[4:]))
-            except ValueError:
-                return None
-        if target.startswith("listener:"):
-            try:
-                return ("listener", int(target[9:]))
-            except ValueError:
-                return None
-        if not target.startswith("$"):
-            return None
-        return self._core.canonical_ref(target, space=space, follow_final=follow_final)
-
-    def _conversation_snapshot(self, cid) -> Optional[dict]:
-        if not isinstance(cid, int):
-            return None
-        conv = self._core._conv_by_cid.get(cid)
-        if conv is None:
-            return None
-        if cid in self._core._finished:
-            state = "finished"
-        elif cid == self._core._active_cid:
-            state = "active"
-        elif cid in self._core._ready_cids:
-            state = "ready"
-        elif cid in self._core._dormant_cids:
-            state = "dormant"
-        else:
-            state = "unknown"
-        return {
-            "cid": cid,
-            "identity": conv.identity,
-            "name": getattr(conv, "name", None),
-            "mode": conv.caps.mode,
-            "groups": list(conv.caps.groups),
-            "is_sub": conv.is_sub,
-            "is_python": conv.is_python,
-            "parent_cid": conv.parent.cid if conv.parent is not None else None,
-            "state": state,
-            "para_ref": conv.para_ref,
-        }
-
-    def _actor_cid(self, event: dict):
-        source = event.get("source") or {}
-        for cid in (source.get("initiator_cid"), (event.get("payload") or {}).get("actor_cid")):
-            if isinstance(cid, int):
-                return cid
-        return None
-
-    @staticmethod
-    def _node_kind(node) -> str:
-        from .types import LinkNode
-        if isinstance(node, MetaDict):
-            return "dict"
-        if isinstance(node, MetaList):
-            return "list"
-        if isinstance(node, LinkNode):
-            return "link"
-        if isinstance(node, str):
-            return "str"
-        return type(node).__name__
-
-    @staticmethod
-    def _node_meta(node):
-        if hasattr(node, "get_metadata"):
-            return node.get_metadata()
-        return None
-
-    def _node_ancestors(self, segments) -> List[dict]:
-        """祖先链简单信息（type/meta/ctrl + depth）。
-
-        normal 载荷不暴露真实路径；祖先从根到父排列，超过 MAX_ANCESTORS_DEPTH
-        时只保留离目标最近的若干层（带 depth 便于判断截断）。
-        """
-        total = len(segments) - 1
-        if total <= 0:
-            return []
-        first = max(1, total - MAX_ANCESTORS_DEPTH + 1)
-        ancestors = []
-        for depth in range(first, total + 1):
-            prefix = list(segments[:depth])
-            try:
-                node = self._core.mem.resolve_path(["MEM"] + prefix, for_llm=False)
-            except Exception:
-                break
-            ctrl = dict(node.get_ctrl()) if hasattr(node, "get_ctrl") and node.get_ctrl() else None
-            ancestors.append({
-                "depth": depth,
-                "type": self._node_kind(node),
-                "meta": self._node_meta(node),
-                "ctrl": ctrl,
-            })
-        return ancestors
-
-    @staticmethod
-    def _alias_parent(alias):
-        if isinstance(alias, str) and alias.startswith("$") and "." in alias:
-            return alias.rsplit(".", 1)[0]
-        return None
-
-    _MISSING = object()
-
-    def _resolve_node_no_follow(self, segments):
-        """解析节点但不跟随最终段的链接（删链接时看链接节点本身）。"""
-        segments = list(segments)
-        if not segments:
-            return self._core.mem._data
-        try:
-            parent = self._core.mem.resolve_path(["MEM"] + segments[:-1], for_llm=False)
-        except Exception:
-            return self._MISSING
-        key = segments[-1]
-        try:
-            if isinstance(parent, (MetaDict, dict)):
-                return parent[key] if key in parent else self._MISSING
-        except Exception:
-            return self._MISSING
-        return self._MISSING
-
-    def _node_simple(self, segments, follow_final: bool = True):
-        """一个祖先节点的简单信息；节点不存在时返回 None。"""
-        if follow_final:
-            try:
-                node = self._core.mem.resolve_path(["MEM"] + list(segments), for_llm=False)
-            except Exception:
-                return None
-        else:
-            node = self._resolve_node_no_follow(segments)
-            if node is self._MISSING:
-                return None
-        return {
-            "type": self._node_kind(node),
-            "meta": self._node_meta(node),
-            "ctrl": dict(node.get_ctrl()) if hasattr(node, "get_ctrl") and node.get_ctrl() else None,
-            "ancestors": self._node_ancestors(list(segments)),
-        }
-
-    def _memory_context(self, segments, alias: str) -> dict:
-        """目标不存在时的上下文：最近存在前缀 + 直接父节点（用于 make/追加裁决）。"""
-        context = {}
-        existing_index = None
-        for i in range(len(segments) - 1, -1, -1):
-            if self._node_simple(segments[:i]) is not None:
-                existing_index = i
-                break
-            if i == 0:
-                existing_index = 0
-        if existing_index is not None:
-            prefix = self._node_simple(segments[:existing_index]) or {}
-            new_count = len(segments) - existing_index
-            prefix_alias = None
-            if isinstance(alias, str) and alias.startswith("$"):
-                parts = alias[1:].split(".")
-                keep = len(parts) - new_count
-                if keep > 0:
-                    prefix_alias = "$" + ".".join(parts[:keep])
-                elif keep == 0:
-                    prefix_alias = "$MEM"
-            prefix.update({
-                "alias": prefix_alias,
-                "depth": existing_index,
-                "ancestors": self._node_ancestors(segments[:existing_index]),
-            })
-            context["longest_existing_prefix"] = prefix
-        parent_segments = list(segments[:-1])
-        parent = self._node_simple(parent_segments) if parent_segments else None
-        if parent is not None:
-            parent["alias"] = self._alias_parent(alias)
-        context["parent"] = parent
-        return context
-
-    def _target_info(self, target_ref, alias: str, follow_final: bool = True) -> dict:
-        """normal 级目标信息：种类、别名、是否存在、类型、描述、ctrl、祖先链。"""
-        info = {"kind": "unknown", "ref": alias, "exists": False, "type": None,
-                "meta": None, "ctrl": None, "ancestors": []}
-        if not target_ref:
-            return info
-        tag = target_ref[0]
-        if tag == "memory":
-            segments = list(target_ref[1])
-            info.update({"kind": "memory"})
-            if follow_final:
-                try:
-                    node = self._core.mem.resolve_path(["MEM"] + segments, for_llm=False)
-                except Exception:
-                    info.update(self._memory_context(segments, alias))
-                    return info
-            else:
-                node = self._resolve_node_no_follow(segments)
-                if node is self._MISSING:
-                    info.update(self._memory_context(segments, alias))
-                    return info
-            info["exists"] = True
-            info["type"] = self._node_kind(node)
-            info["meta"] = self._node_meta(node)
-            info["ctrl"] = dict(node.get_ctrl()) if hasattr(node, "get_ctrl") and node.get_ctrl() else None
-            info["ancestors"] = self._node_ancestors(segments)
-            parent = self._node_simple(segments[:-1]) if segments else None
-            if parent is not None:
-                parent["alias"] = self._alias_parent(alias)
-            info["parent"] = parent
-            return info
-        if tag == "device":
-            mount_key, remainder = target_ref[1], list(target_ref[2])
-            device = self._core.mem._devices.get(mount_key)
-            info.update({"kind": "device", "mount": mount_key, "remainder": remainder})
-            if device is not None:
-                info["exists"] = True
-                try:
-                    info["device"] = device.to_llm_string()
-                except Exception:
-                    info["device"] = None
-            return info
-        if tag == "cid":
-            cid = target_ref[1]
-            conv = self._core._conv_by_cid.get(cid)
-            info.update({"kind": "conversation", "type": "conversation",
-                         "conversation": self._conversation_snapshot(cid)})
-            info["exists"] = conv is not None
-            return info
-        if tag == "listener":
-            lid = target_ref[1]
-            record = next((x for x in self.listeners if x["listener_id"] == lid), None)
-            info.update({"kind": "listener", "type": "listener",
-                         "listener": self._listener_summary(record) if record else None})
-            info["exists"] = record is not None
-            return info
-        if tag == "*":
-            info.update({"kind": "wildcard", "exists": True})
-        return info
-
-    def _listener_summary(self, listener: dict) -> dict:
-        """监听器记录摘要（不含 handler_code，避免把安全代码交给其他处理器）。"""
-        return {
-            "listener_id": listener["listener_id"],
-            "owner_cid": listener.get("owner_cid"),
-            "event_type": listener.get("event_type"),
-            "target": listener.get("target"),
-            "phase": listener.get("phase"),
-            "priority": listener.get("priority", 0),
-            "tier": listener.get("tier", NORMAL_TIER),
-            "enabled": listener.get("enabled", True),
-            "imports": sorted(listener.get("imports") or BASE_MODULES),
-        }
-
-    def _target_full(self, target_ref, follow_final: bool = True):
-        """kernel 级目标完整数据（JSON 安全结构）。"""
-        if not target_ref or target_ref[0] != "memory":
-            return None
-        segments = list(target_ref[1])
-        if follow_final:
-            try:
-                node = self._core.mem.resolve_path(["MEM"] + segments, for_llm=False)
-            except Exception:
-                return None
-        else:
-            node = self._resolve_node_no_follow(segments)
-            if node is self._MISSING:
-                return None
-        return self._json_safe_node(node)
-
-    def _json_safe_node(self, node):
-        from .types import LinkNode, StrNode
-        if isinstance(node, MetaDict):
-            return {"kind": "dict", "meta": node.get_metadata(),
-                    "ctrl": dict(node.get_ctrl()) if node.get_ctrl() else None,
-                    "value": {str(k): self._json_safe_node(v) for k, v in node.items()}}
-        if isinstance(node, MetaList):
-            return {"kind": "list", "meta": node.get_metadata(),
-                    "ctrl": dict(node.get_ctrl()) if node.get_ctrl() else None,
-                    "value": [self._json_safe_node(v) for v in node]}
-        if isinstance(node, LinkNode):
-            return {"kind": "link", "target": node.target}
-        if isinstance(node, StrNode):
-            return {"kind": "str", "ctrl": dict(node.get_ctrl()) if node.get_ctrl() else None,
-                    "value": str(node)}
-        if isinstance(node, str):
-            return {"kind": "str", "value": str(node)}
-        return {"kind": type(node).__name__, "value": str(node)}
+    def _check_program_target(self, event_type: str, target: str, space, kernel_mode: bool) -> None:
+        """create_cmd / create_sub：target 是程序节点引用（内存节点；不做所有者判定）。"""
+        if kernel_mode:
+            return
+        if not isinstance(target, str) or not target.startswith("$"):
+            raise IllegalOperationError(f"{event_type} 事件的 target 必须是程序节点引用")
+        split = self._core.mem.split_path(target, space=space)
+        if split[0] != "memory":
+            raise ValueError(f"不能监听设备上的程序节点：{target}")
 
     def _source_context(self, cid) -> Optional[dict]:
         """kernel 级来源对话上下文（消息列表，截断旧消息并标注）。"""
         if not isinstance(cid, int):
             return None
-        conv = self._core._conv_by_cid.get(cid)
+        conv = self._core.get_conversation(cid)
         if conv is None:
             return None
         messages = []
@@ -919,15 +755,15 @@ class EventSystem:
     def _enrich_event(self, event: dict, matched: List[dict]) -> None:
         """构造 normal 载荷；有 kernel 监听器时把重块放进内部 _kernel_payload。"""
         source = event.setdefault("source", {})
-        actor = self._actor_cid(event)
+        actor = self.targets.actor_cid(event)
         if actor is not None and "conversation" not in source:
             try:
-                source["conversation"] = self._conversation_snapshot(actor)
+                source["conversation"] = self.targets.conversation_snapshot(actor)
             except Exception:
                 source["conversation"] = None
         follow_final = event.get("event_type") != "memory_delete"
         try:
-            event["target_info"] = self._target_info(
+            event["target_info"] = self.targets.target_info(
                 event.get("target_ref"), event.get("target", ""), follow_final=follow_final,
             )
         except Exception as e:
@@ -938,7 +774,7 @@ class EventSystem:
             try:
                 ref = event.get("target_ref")
                 if ref and ref[0] == "memory":
-                    kernel["target_full"] = self._target_full(ref, follow_final=follow_final)
+                    kernel["target_full"] = self.targets.target_full(ref, follow_final=follow_final)
             except Exception as e:
                 kernel["target_full"] = None
                 kernel["target_full_error"] = f"{type(e).__name__}: {e}"
@@ -958,28 +794,6 @@ class EventSystem:
             view.update(kernel)
             return view
         return {k: v for k, v in event.items() if k != "_kernel_payload"}
-
-    # ------------------------------------------------------------------
-    # 设备前缀检查
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _has_device_prefix(core: 'Core', path: str) -> bool:
-        """路径的任意前缀是否命中已挂载设备。
-
-        权限检查不能触发设备 resolve_path（如 $MEM.inputs.next 会阻塞等待输入），
-        因此先做纯注册表检查。
-        """
-        if not isinstance(path, str) or not path.startswith("$MEM."):
-            return False
-        parts = path[1:].split(".")
-        if not parts or parts[0] != "MEM":
-            return False
-        rest = parts[1:]
-        for i in range(1, len(rest) + 1):
-            if ".".join(rest[:i]) in core.mem._devices:
-                return True
-        return False
 
     # ------------------------------------------------------------------
     # 处理器解析与执行
@@ -1008,7 +822,7 @@ class EventSystem:
         注册监听器时抄进记录（与 handler_code 同一种「注册时快照」语义）；owner 对话
         关闭/恢复后处理器仍按注册时的白名单运行。
         """
-        conv = self._core._conv_by_cid.get(owner_cid)
+        conv = self._core.get_conversation(owner_cid)
         granted = conv.caps.imports if conv is not None else frozenset()
         return sorted(set(BASE_MODULES) | set(granted))
 
@@ -1070,209 +884,29 @@ class EventSystem:
         allow 只有 kernel 级监听器可以返回（normal 级返回按处理器错误 fail closed）。
         after 阶段遇到 notify 自我投递时丢弃该条并记入 handler_errors；
         before 阶段遇到 notify 自我投递视为处理器错误。
+
+        四类字段各一个 _merge_xxx：动作、拒答文本、载荷、通知。它们只在"哪个阶段
+        抛错、哪个阶段记账"上不同，混在一起会看不出这个差别。
         """
-        if "action" in out:
-            action = out["action"]
-            if event["phase"] == "before":
-                if action not in ("execute", "replace", "allow"):
-                    raise EventHandlerError(
-                        0,  # 调用方随后用真实 listener_id 包装
-                        f"before 阶段 action 必须是 execute/replace/allow，得到 {action!r}",
-                    )
-                if action == "allow" and (listener or {}).get("tier") != KERNEL_TIER:
-                    raise EventHandlerError(0, "只有内核级监听器可以返回 allow")
-                event["action"] = action
-            # after 阶段忽略 action
-
-        if event.get("action") == "replace":
-            response = out.get("response", "")
-            if response is None:
-                response = ""
-            if not isinstance(response, str):
-                raise EventHandlerError(
-                    0,
-                    f"response 必须是字符串，得到 {type(response).__name__}",
-                )
-            # 调用者要能分辨"被拦截"与"成功"：统一加前缀；处理器自定义文本也加。
-            event["response"] = f"Interrupted: {response or DEFAULT_REPLACE_RESPONSE}"
-
-        mutable = MUTABLE_PAYLOAD_KEYS.get(event["event_type"], set())
-        payload_out = out.get("payload")
-        if isinstance(payload_out, dict):
-            for key in mutable:
-                if key not in payload_out:
-                    continue
-                # edit_metadata 的 value 只有原操作是 set 时才可变
-                if event["event_type"] == "edit_metadata" and event["payload"].get("type") != "set":
-                    continue
-                val = payload_out[key]
-                if event["event_type"] in ("memory_write", "send_instruction") and not isinstance(val, str):
-                    raise EventHandlerError(0, f"payload.{key} 必须是字符串，得到 {type(val).__name__}")
-                if event["event_type"] == "edit_metadata" and not isinstance(val, str):
-                    raise EventHandlerError(0, f"payload.value 必须是字符串，得到 {type(val).__name__}")
-                event["payload"][key] = val
-
-        if "notify" in out:
-            notifies = out["notify"]
-            if not isinstance(notifies, list):
-                raise EventHandlerError(0, "notify 必须是 list")
-            source_cid = None
-            if event["phase"] == "before":
-                source = event.get("source") or {}
-                if source.get("kind") == "core":
-                    source_cid = source.get("initiator_cid")
-            else:
-                source_cid = (event.get("payload") or {}).get("actor_cid")
-            for item in notifies:
-                if not isinstance(item, dict) or not isinstance(item.get("cid"), int) or not isinstance(item.get("content"), str):
-                    raise EventHandlerError(
-                        0,
-                        f"notify 每项必须是 {{\"cid\": int, \"content\": str}}，得到 {item!r}",
-                    )
-                if source_cid is not None and item["cid"] == source_cid:
-                    error = f"notify 不允许自我投递（cid={source_cid} 是当前对话）"
-                    if event["phase"] == "before":
-                        raise EventHandlerError(0, error)
-                    event.setdefault("handler_errors", []).append({
-                        "listener_id": listener_id,
-                        "error": error,
-                    })
-                    print(f"[AVM] 事件监听器 {listener_id} 处理失败: {error}", file=sys.stderr)
-                    continue
-                owner_cid = (listener or {}).get("owner_cid")
-                if not owner_kernel and item["cid"] != owner_cid:
-                    error = (
-                        f"用户态监听器只能把 notify 投递给注册者自己"
-                        f"（owner cid={owner_cid}，请求 cid={item['cid']}）"
-                    )
-                    if event["phase"] == "before":
-                        raise EventHandlerError(0, error)
-                    event.setdefault("handler_errors", []).append({
-                        "listener_id": listener_id,
-                        "error": error,
-                    })
-                    print(f"[AVM] 事件监听器 {listener_id} 处理失败: {error}", file=sys.stderr)
-                    continue
-                event["notify"].append({"cid": item["cid"], "content": item["content"]})
+        _merge_action(event, out, listener)
+        _merge_replace_response(event, out)
+        _merge_payload(event, out)
+        _merge_notify(event, out, listener_id, listener, owner_kernel)
 
     # ------------------------------------------------------------------
     # 分发
     # ------------------------------------------------------------------
 
     def _listener_owner_kernel(self, listener: dict) -> bool:
-        conv = self._core._conv_by_cid.get(listener.get("owner_cid"))
+        conv = self._core.get_conversation(listener.get("owner_cid"))
         return conv is not None and conv.caps.mode == "kernel"
 
 
     # ------------------------------------------------------------------
-    # 声明式条件解析与匹配
+    # 声明式条件
+    #
+    # 解析与匹配都在 EventConditions 里；这里只保留对外方法名（指令与 Guard 用）。
     # ------------------------------------------------------------------
-
-    def _resolve_condition(self, node, owner_cid: int, owner_kernel: bool,
-                           space=None) -> dict:
-        """把 handler 节点的 condition 数据解析成内部条件（canonical 目标）。"""
-        raw = _condition_leaf(node)
-        if raw is None:
-            raise IllegalOperationError(
-                "handler 节点没有 condition 数据；新式监听器必须在 handler 节点声明条件"
-            )
-        if not isinstance(raw, dict):
-            raise IllegalOperationError("handler 节点的 condition 必须是 JSON 对象")
-        unknown = sorted(set(raw) - CONDITION_KEYS)
-        if unknown:
-            raise IllegalOperationError(f"handler 节点 condition 含未知字段：{unknown}")
-        if "preset" in raw:
-            preset = raw["preset"]
-            if preset == "own_work.memory":
-                raise IllegalOperationError(
-                    "条件 preset 'own_work.memory' 已移除：工作空间不再由内核分配。"
-                    "改用 self.lifecycle，或由软件动态加根后自定义条件"
-                )
-            if preset == "own_nodes.memory":
-                raise IllegalOperationError(
-                    "条件 preset 'own_nodes.memory' 已移除：节点所有权 cid 不再写进 MEM。"
-                    "改用 self.lifecycle，或改用自定义 target（内核态）"
-                )
-            if preset not in USER_CONDITION_PRESETS:
-                raise IllegalOperationError(
-                    f"未知的用户态条件子集 {preset!r}（可用：{sorted(USER_CONDITION_PRESETS)}）"
-                )
-            raw = dict(USER_CONDITION_PRESETS[preset])
-            raw["target"] = dict(raw.get("target") or {})
-            raw["preset"] = preset
-        elif not owner_kernel:
-            # TODO(issue): owner 授权删除后用户态仍只能用 preset，无法给出 memory target；
-            # Guard 的 caps/roots 策略因此只能观察到内核态注册的 memory 监听。是否放开
-            # 用户自定义条件属于事件子集策略，留给作者决定（本计划未包含）。
-            raise IllegalOperationError(
-                "用户态对话只能使用命名条件子集（preset），不能自定义 condition"
-            )
-        events = raw.get("events")
-        if events is None:
-            events = list(EVENT_TYPES)
-        if not isinstance(events, list) or not all(isinstance(x, str) for x in events):
-            raise IllegalOperationError("condition.events 必须是事件类型字符串列表")
-        unknown_events = [x for x in events if x not in EVENT_TYPES]
-        if unknown_events:
-            raise IllegalOperationError(f"condition.events 含未知事件类型：{unknown_events}")
-        phases = raw.get("phase", ["before", "after"])
-        if phases == "all":
-            phases = ["before", "after"]
-        if not isinstance(phases, list) or not all(x in ("before", "after") for x in phases):
-            raise IllegalOperationError("condition.phase 必须是 before/after 列表")
-        target = raw.get("target")
-        resolved_target = None
-        if target is not None:
-            if not isinstance(target, dict):
-                raise IllegalOperationError("condition.target 必须是对象")
-            kind = target.get("kind")
-            if kind == "owned_by_owner":
-                raise IllegalOperationError(
-                    "condition.target.kind 'owned_by_owner' 已移除：节点所有权 cid 不再写进 MEM"
-                )
-            if kind not in ("exact", "subtree", "cid_owner", "self_lifecycle"):
-                raise IllegalOperationError(f"condition.target.kind 不支持：{kind!r}")
-            resolved = {"kind": kind}
-            if kind in ("exact", "subtree"):
-                ref = target.get("ref")
-                if not isinstance(ref, str) or not ref.startswith("$"):
-                    raise IllegalOperationError("condition.target.ref 必须是 $ 引用")
-                normal = self._core.canonical_ref(ref, space=space)
-                delete = self._core.canonical_ref(ref, space=space, follow_final=False)
-                if normal is None:
-                    raise IllegalOperationError(f"condition.target.ref 无法解析：{ref}")
-                resolved["refs"] = {"normal": normal, "delete": delete}
-            else:
-                resolved["cid"] = owner_cid
-            resolved_target = resolved
-        source = raw.get("source")
-        resolved_source = None
-        if source is not None:
-            if not isinstance(source, dict):
-                raise IllegalOperationError("condition.source 必须是对象")
-            unknown_source = sorted(set(source) - {"mode", "groups"})
-            if unknown_source:
-                if "cid" in unknown_source:
-                    raise IllegalOperationError(
-                        "condition.source.cid 已移除：不能按来源 cid 过滤事件"
-                    )
-                raise IllegalOperationError(
-                    f"condition.source 含未知字段：{unknown_source}（允许：mode/groups）"
-                )
-            resolved_source = {}
-            for key in ("mode", "groups"):
-                if key in source:
-                    value = source[key]
-                    if not isinstance(value, list):
-                        raise IllegalOperationError(f"condition.source.{key} 必须是列表")
-                    resolved_source[key] = value
-        return {
-            "preset": raw.get("preset"),
-            "events": list(events),
-            "phases": list(phases),
-            "target": resolved_target,
-            "source": resolved_source,
-        }
 
     def parse_condition(self, owner_cid: int, handler_ref: str, space=None,
                         kernel_mode: bool = False) -> dict:
@@ -1282,7 +916,7 @@ class EventSystem:
         解析结果随后原样交给 register_condition，避免注册时重复解析。
         """
         node = self._core.unwrap(handler_ref, for_llm=False, space=space)
-        return self._resolve_condition(node, owner_cid, kernel_mode, space=space)
+        return self.conditions.parse(node, owner_cid, kernel_mode, space=space)
 
     def register_condition(self, owner_cid: int, handler_ref: str, space=None,
                            tier: str = NORMAL_TIER, priority: int = 0,
@@ -1330,72 +964,9 @@ class EventSystem:
             "space": space,
             "condition": condition,
         })
-        if self._journaling():
+        if self.is_journaling():
             self._note("listener_register", listener=listener_to_snapshot(self.listeners[-1]))
         return listener_id
-
-    def _actor_conv(self, event: dict):
-        source = event.get("source") or {}
-        cid = source.get("initiator_cid") or (event.get("payload") or {}).get("actor_cid")
-        return self._core._conv_by_cid.get(cid) if isinstance(cid, int) else None
-
-    def _condition_target_matches(self, target: dict, event: dict) -> bool:
-        kind = target.get("kind")
-        if kind in ("exact", "subtree"):
-            refs = target.get("refs") or {}
-            ref = refs.get("delete" if event.get("event_type") == "memory_delete" else "normal")
-            if ref is None:
-                return False
-            ev = event.get("target_ref")
-            if ev is None:
-                return len(ref) >= 2 and event.get("target", "") == "$" + ref[0] + (
-                    "." + ".".join(ref[1]) if ref[1] else "")
-            if kind == "exact":
-                return tuple(ev) == tuple(ref)
-            if ref[0] != ev[0]:
-                if not (ref[0] == "memory" and ev[0] == "memory"):
-                    return False
-            if ref[0] == "memory":
-                return tuple(ev[1][:len(ref[1])]) == tuple(ref[1]) if len(ref[1]) <= len(ev[1]) else False
-            return ref[1] == ev[1] and len(ref[2]) <= len(ev[2]) and tuple(ev[2][:len(ref[2])]) == tuple(ref[2])
-        if kind == "cid_owner":
-            ev = event.get("target_ref")
-            return bool(ev) and ev[0] == "cid" and ev[1] == target.get("cid")
-        if kind == "self_lifecycle":
-            cid = target.get("cid")
-            ev = event.get("target_ref")
-            if ev and ev[0] == "cid" and ev[1] == cid:
-                return True
-            conv = self._actor_conv(event)
-            return conv is not None and conv.cid == cid
-        return False
-
-    def _condition_source_matches(self, source_filter, event: dict) -> bool:
-        if not source_filter:
-            return True
-        conv = self._actor_conv(event)
-        if conv is None:
-            return False
-        if "mode" in source_filter and conv.caps.mode not in source_filter["mode"]:
-            return False
-        if "groups" in source_filter and not (set(source_filter["groups"]) & set(conv.caps.groups)):
-            return False
-        return True
-
-    def _condition_matches(self, listener: dict, event: dict) -> bool:
-        condition = listener.get("condition")
-        if condition is None:
-            return False
-        if event["event_type"] not in condition["events"]:
-            return False
-        if event["phase"] not in condition["phases"]:
-            return False
-        target = condition.get("target")
-        if target is not None and not self._condition_target_matches(target, event):
-            return False
-        if not self._condition_source_matches(condition.get("source"), event):
-            return False
-        return True
 
     def _match(self, event: dict) -> List[dict]:
         """匹配监听器并排序：canonical target 优先，priority 降序、同优先级按注册顺序。"""
@@ -1405,7 +976,7 @@ class EventSystem:
             if listener.get("enabled", True) is False:
                 continue  # 调试控制台的暂时屏蔽：记录留着，只是不参与匹配
             if listener.get("condition") is not None:
-                if self._condition_matches(listener, event):
+                if self.conditions.matches(listener, event):
                     matched.append(listener)
                 continue
             if listener["event_type"] != event["event_type"]:
@@ -1501,7 +1072,7 @@ class EventSystem:
             summary["error"] = event["error"]
         if event.get("handler_errors"):
             summary["handler_errors"] = event["handler_errors"]
-        self._core._turn_events.append(summary)
+        self._core.note_turn_event(summary)
         for observer in list(self._observers):
             try:
                 observer(event)
@@ -1522,19 +1093,15 @@ class EventSystem:
         for item in event.get("notify") or []:
             cid = item["cid"]
             content = item["content"]
-            target = core._conv_by_cid.get(cid)
-            if target is None or cid in core._finished:
+            target = core.get_conversation(cid)
+            if target is None or core.is_finished(cid):
                 print(
                     f"[AVM] 事件通知投递失败：对话 {cid} 不存在或已关闭",
                     file=sys.stderr,
                 )
                 continue
             target.user_batch.add_user_content(content)
-            if core._is_waiting_for_return(target):
+            if core.is_waiting_for_return(target):
                 # 等亚对话返回的对话：notify 只入批次，不唤醒；亚对话结束后父对话先跑
                 continue
-            if cid in core._dormant_cids:
-                core._dormant_cids.remove(cid)
-            if cid in core._ready_cids:
-                core._ready_cids.remove(cid)
-            core._ready_cids.append(cid)
+            core.wake(cid)

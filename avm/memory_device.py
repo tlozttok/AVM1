@@ -8,6 +8,46 @@ import sys
 import threading
 from typing import Any, Optional, List
 
+from .exceptions import (
+    MemoryCircularReferenceError,
+    MemoryIndexOutOfRangeError,
+    MemoryTypeError,
+    VMMemoryError,
+)
+
+
+
+def input_queue_tools(feed, pending, feed_description: str) -> List[dict]:
+    """两个「输入队列」调试动作的定义（面板设备与总线设备共用这一份 schema）。
+
+    两边取队列的方式不同——面板设备读自己的队列，总线设备还要问宿主待取的行数——
+    但对外暴露的动作名、参数与顺序必须一样：同一个对话换个设备就得换调用方式，这
+    是设备该吸收掉的事，不该漏给对话看。schema 只写在这里，改 required 不会漏掉
+    另一半。
+
+    两个回调都是 `args -> dict`，原样挂在 `run` 上。
+    """
+    return [
+        {
+            "name": "投喂一行输入",
+            "description": feed_description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "要交给对话的一行文本"},
+                },
+                "required": ["content"],
+            },
+            "run": feed,
+        },
+        {
+            "name": "查询队列",
+            "description": "看队列里还有几行、设备当前是否正等着输入。",
+            "parameters": {"type": "object", "properties": {}},
+            "run": pending,
+        },
+    ]
+
 
 class MemoryDevice:
     """设备基类"""
@@ -57,7 +97,6 @@ class MemoryDevice:
 
     def resolve_path(self, path: list) -> Any:
         """设备子路径解析。默认不支持子路径。覆盖以实现符号链接等。"""
-        from .exceptions import VMMemoryError
         raise VMMemoryError(f"{type(self).__name__} 不支持子路径访问")
 
 
@@ -90,17 +129,16 @@ class LinkDevice(MemoryDevice):
     # 内部跟随
     # ------------------------------------------------------------------
 
-    def _follow_real(self, remainder, seen_links=None):
+    def follow_links(self, remainder, seen_links=None):
         """跟随目标（含链式链接），返回 ("memory", segments) 或 ("device", mount, remainder)。"""
         if self._core is None:
-            from .exceptions import VMMemoryError
             raise VMMemoryError("LinkDevice 未接入 Core")
         segments = self._target_segments + list(remainder or [])
-        return self._core.mem._follow_real(segments, seen_links or [])
+        return self._core.mem.follow_links(segments, seen_links or [])
 
     def _real_mem_segments(self, suffix, seen_links=None):
         """把别名后的剩余路径换算成真实 MEM 段（不含 MEM 根），供 set_by_path 委托。"""
-        follow = self._follow_real(suffix or [], seen_links=seen_links)
+        follow = self.follow_links(suffix or [], seen_links=seen_links)
         if follow[0] == "memory":
             return follow[1]
         _, mount, remainder = follow
@@ -109,9 +147,8 @@ class LinkDevice(MemoryDevice):
     def validate(self) -> None:
         """镜像加载期校验：真实解析目标，确认可达；失败抛异常（面向运行者，可含真实路径）。"""
         if self._core is None:
-            from .exceptions import VMMemoryError
             raise VMMemoryError("LinkDevice 未接入 Core")
-        self._core.mem._resolve_path(
+        self._core.mem.resolve_path(
             ["MEM"] + self._target_segments,
             for_llm=False,
             seen_links=[self.mount_path] if self.mount_path else [],
@@ -125,11 +162,10 @@ class LinkDevice(MemoryDevice):
         return "str"
 
     def to_llm_string(self) -> str:
-        from .exceptions import VMMemoryError
         if self._core is None:
             raise VMMemoryError("LinkDevice 未接入 Core")
         try:
-            return self._core.mem._resolve_path(
+            return self._core.mem.resolve_path(
                 ["MEM"] + self._target_segments,
                 for_llm=True,
                 seen_links=[self.mount_path] if self.mount_path else [],
@@ -141,12 +177,11 @@ class LinkDevice(MemoryDevice):
             raise VMMemoryError(f"链接目标不可达：{alias}") from None
 
     def resolve_path(self, path: list, seen_links=None) -> Any:
-        from .exceptions import VMMemoryError, MemoryCircularReferenceError
         if self._core is None:
             raise VMMemoryError("LinkDevice 未接入 Core")
         target_segments = self._target_segments + list(path or [])
         try:
-            return self._core.mem._resolve_path(
+            return self._core.mem.resolve_path(
                 ["MEM"] + target_segments,
                 for_llm=False,
                 seen_links=seen_links or ([self.mount_path] if self.mount_path else []),
@@ -161,15 +196,13 @@ class LinkDevice(MemoryDevice):
             raise VMMemoryError(f"链接目标不可达：{alias}") from None
 
     def set_value(self, value: Any) -> None:
-        from .exceptions import VMMemoryError
         if self._core is None:
             raise VMMemoryError("LinkDevice 未接入 Core")
         self._core.mem.set(self.target_ref, value)
 
     def authorize_listener(self, event_type: str, remainder: list, owner_cid: int) -> bool:
-        from .exceptions import MemoryCircularReferenceError
         try:
-            follow = self._follow_real(
+            follow = self.follow_links(
                 list(remainder or []),
                 seen_links=[self.mount_path] if self.mount_path else [],
             )
@@ -182,7 +215,7 @@ class LinkDevice(MemoryDevice):
             # 设备也不替 Core 猜策略；普通对话与内核态一视同仁。
             return True
         _, mount, dev_remainder = follow
-        device = self._core.mem._devices[mount]
+        device = self._core.mem.devices[mount]
         return device.authorize_listener(event_type, dev_remainder, owner_cid)
 
     def after_event(self, event_type: str, remainder: list, result: dict) -> Optional[dict]:
@@ -204,7 +237,6 @@ class StringDevice(MemoryDevice):
 
     def set_value(self, value: str) -> None:
         if not isinstance(value, str):
-            from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
             raise MemoryTypeError(f"StringDevice 只接受 str，got {type(value).__name__}")
         self._value = value
 
@@ -234,7 +266,6 @@ class MetaListDevice(MemoryDevice):
             try:
                 return int(index)
             except ValueError:
-                from .exceptions import MemoryTypeError
                 raise MemoryTypeError(
                     f"{type(self).__name__} 的索引必须是整数或命名子键，got {index!r}"
                 ) from None
@@ -243,14 +274,12 @@ class MetaListDevice(MemoryDevice):
     def __getitem__(self, index: int) -> Any:
         index = self._parse_index(index)
         if index < 0:
-            from .exceptions import MemoryIndexOutOfRangeError
             raise MemoryIndexOutOfRangeError(
                 f"{type(self).__name__} 不支持负下标（-1 只表示内存列表的追加位置），请用命名子键读取"
             )
         try:
             return self._data[index]
         except IndexError:
-            from .exceptions import MemoryIndexOutOfRangeError
             raise MemoryIndexOutOfRangeError(f"索引越界：{index}，列表长度：{len(self._data)}") from None
 
     def __setitem__(self, index: int, value: Any) -> None:
@@ -267,7 +296,6 @@ class MetaListDevice(MemoryDevice):
 
     def set_value(self, value: list) -> None:
         """整体替换内部数据（用于 Memory.set_by_path 的设备写入）"""
-        from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
         if not isinstance(value, list):
             raise MemoryTypeError(f"MetaListDevice 只接受 list，got {type(value).__name__}")
         self._data = value
@@ -276,6 +304,11 @@ class MetaListDevice(MemoryDevice):
         return value in self._data
 
     def to_llm_string(self) -> str:
+        # 这个导入只能放函数里：types -> capabilities -> modules -> memory_device
+        # 是一条会绕回本模块的链，放在模块顶部的话，先 import 本模块时 MemoryDevice
+        # 还没定义就已成环。本文件其它地方（set_value / resolve_path）同理。
+        from .types import MetaDict, MetaList
+
         kinds = set()
         for value in self._data:
             if isinstance(value, MetaDict):
@@ -354,26 +387,10 @@ class InputsListDevice(MetaListDevice):
             return {"queued": len(self._panel_inputs),
                     "waiting": self._pending_input}
 
-        return [
-            {
-                "name": "投喂一行输入",
-                "description": "把一行文本排进输入队列；下一次 $MEM.inputs.next 直接取走它，不碰终端。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "content": {"type": "string", "description": "要交给对话的一行文本"},
-                    },
-                    "required": ["content"],
-                },
-                "run": feed,
-            },
-            {
-                "name": "查询队列",
-                "description": "看队列里还有几行、设备当前是否正等着输入。",
-                "parameters": {"type": "object", "properties": {}},
-                "run": pending,
-            },
-        ]
+        return input_queue_tools(
+            feed, pending,
+            "把一行文本排进输入队列；下一次 $MEM.inputs.next 直接取走它，不碰终端。",
+        )
 
     def __getitem__(self, index):
         if index == "next":
@@ -381,7 +398,6 @@ class InputsListDevice(MetaListDevice):
             return self._request_input()
         index = self._parse_index(index)
         if isinstance(index, int) and index < 0:
-            from .exceptions import MemoryIndexOutOfRangeError
             raise MemoryIndexOutOfRangeError(
                 "InputsListDevice 不支持负下标；请求下一行输入请读 $MEM.inputs.next"
             )
@@ -449,9 +465,9 @@ class InputsListDevice(MetaListDevice):
         """调试用：输入提示，标明正在等待哪个对话输入（及 /save 调试命令）"""
         who = "对话"
         if self._core is not None:
-            cid = self._core._active_cid
+            cid = self._core.active_conversation_id()
             if cid is not None:
-                convs = getattr(self._core, "_conv_by_cid", {})
+                convs = getattr(self._core, "conversations", {})
                 conv = convs.get(cid)
                 who = f"{conv.identity}（cid={cid}）" if conv is not None else f"cid={cid}"
         return f"[{who} 等待输入，/save 保存检查点] "
@@ -470,7 +486,7 @@ class InputsListDevice(MetaListDevice):
         if self._core is None:
             print("[检查点] 设备未接入 Core，无法保存", flush=True)
             return
-        cid = self._core._active_cid
+        cid = self._core.active_conversation_id()
         if cid is None:
             print("[检查点] 无活跃对话，无法保存", flush=True)
             return
@@ -491,15 +507,12 @@ class InputsListDevice(MetaListDevice):
     def resolve_path(self, path: list) -> Any:
         if len(path) == 1:
             return self.__getitem__(path[0])
-        from .exceptions import VMMemoryError
-        raise VMMemoryError(f"InputsListDevice 不支持多级子路径")
+        raise VMMemoryError("InputsListDevice 不支持多级子路径")
 
     def __setitem__(self, index, value):
-        from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
         raise MemoryTypeError("InputsListDevice 是只读的，不允许写入")
 
     def set_value(self, value):
-        from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
         raise MemoryTypeError("InputsListDevice 是只读的，不允许写入")
 
     def to_llm_string(self) -> str:
@@ -525,14 +538,12 @@ class OutputsListDevice(MetaListDevice):
             try:
                 return int(index)
             except ValueError:
-                from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
                 raise MemoryTypeError(f"OutputsListDevice 索引必须是整数，got {index!r}")
         return index
 
     def __getitem__(self, index):
         index = self._parse_index(index)
         if isinstance(index, int) and index < 0:
-            from .exceptions import MemoryIndexOutOfRangeError
             raise MemoryIndexOutOfRangeError(
                 "OutputsListDevice 不支持负下标；输出文本请写 $MEM.outputs.out"
             )
@@ -542,12 +553,10 @@ class OutputsListDevice(MetaListDevice):
         if index == "out":
             self.append(value)
             return
-        from .exceptions import MemoryTypeError
         raise MemoryTypeError("OutputsListDevice 只支持命名写入 $MEM.outputs.out（追加并打印）")
 
     def append(self, value):
         if not isinstance(value, str):
-            from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
             raise MemoryTypeError(f"OutputsListDevice 只接受 str，got {type(value).__name__}")
         self._data.append(value)
         print(value, flush=True)  # 写入即打印到屏幕（文档承诺的"并打印到屏幕"）
@@ -559,7 +568,6 @@ class OutputsListDevice(MetaListDevice):
         elif isinstance(value, str):
             self.append(value)
         else:
-            from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
             raise MemoryTypeError(f"OutputsListDevice 只接受 str 或 list，got {type(value).__name__}")
 
     def to_llm_string(self) -> str:
@@ -568,8 +576,7 @@ class OutputsListDevice(MetaListDevice):
     def resolve_path(self, path: list) -> Any:
         if len(path) == 1:
             return self.__getitem__(path[0])
-        from .exceptions import VMMemoryError
-        raise VMMemoryError(f"OutputsListDevice 不支持多级子路径")
+        raise VMMemoryError("OutputsListDevice 不支持多级子路径")
 
 
 class MetaDictDevice(MemoryDevice):
@@ -608,7 +615,6 @@ class MetaDictDevice(MemoryDevice):
 
     def set_value(self, value: dict) -> None:
         """整体替换内部数据（用于 Memory.set_by_path 的设备写入）"""
-        from .exceptions import MemoryTypeError, MemoryIndexOutOfRangeError
         if not isinstance(value, dict):
             raise MemoryTypeError(f"MetaDictDevice 只接受 dict，got {type(value).__name__}")
         self._data = value

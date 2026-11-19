@@ -104,8 +104,8 @@ class InterruptTable:
         if cid is None:
             return self._drop(itype, f"没有为 {itype!r} 注册向量")
 
-        target = core._conv_by_cid.get(cid)
-        if target is None or cid in core._finished:
+        target = core.get_conversation(cid)
+        if target is None or core.is_finished(cid):
             return self._drop(itype, f"目标对话 {cid} 不存在或已关闭")
 
         # 投递放在 noop 判断之前：switch 与 noop 两条路径都投，dropped 没有目标才不投。
@@ -117,31 +117,25 @@ class InterruptTable:
         if payload is not None:
             target.user_batch.add_user_content(payload)
 
-        current = core._active_cid
+        current = core.active_conversation_id()
         if current == cid:
             return {"type": itype, "target": cid, "action": "noop",
                     "reason": "目标已是活跃对话"}
 
         preempted = None
-        if current is not None and current not in core._finished:
+        if current is not None and not core.is_finished(current):
             preempted = current
-            if current in core._dormant_cids:
-                core._dormant_cids.remove(current)
-            if current not in core._ready_cids:
-                core._ready_cids.insert(0, current)
+            core.prioritize(current)  # 被抢占者插到队首，中断返回后立刻续跑
 
         # 与 _pick_next_active 取活跃对话的两步保持一致：把目标从等待队列里摘掉，
         # 并在调用链断开时重新给满指令预算（否则 _activation_instructions 会带着
         # 上一条链的计数进入被中断的对话）。中断夺取执行权改变的就是"下一个执行
         # 谁"，不摘队列会让目标在本轮结束时被当成"自己让出"而立刻交出执行权。
-        if cid in core._ready_cids:
-            core._ready_cids.remove(cid)
-        if cid in core._dormant_cids:
-            core._dormant_cids.remove(cid)
-        if not core._same_chain(current, cid):
-            core._activation_instructions = 0
+        core.drop_from_schedule(cid)
+        if not core.same_chain(current, cid):
+            core.set_activation_instructions(0)  # 断链：重新给满预算
 
-        core._active_cid = cid
+        core.set_active(cid)
         return {"type": itype, "target": cid, "action": "switch",
                 "preempted": preempted, "payload": payload}
 

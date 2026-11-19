@@ -384,7 +384,7 @@ class TestPanelApproval:
         detail = core.unwrap(request_ref("extra"), for_llm=True)
         assert "状态：approved" in detail
         assert "panel-device-action" in detail
-        assert f"resume.extra" in detail
+        assert "resume.extra" in detail
         assert device(core).debug_actions() == []
 
     def test_approve_refuses_changed_file(self, tmp_path):

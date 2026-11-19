@@ -1,16 +1,14 @@
 """Core 调度系统测试"""
 
-import json
 import pytest
 from avm.core import Core, LMU, _instruction_registry, _build_conversation
 from avm.core import (
-    MemoryReadInstruction, MemoryWriteInstruction, MemoryMakeInstruction,
+    MemoryReadInstruction, 
     EditMetadataInstruction,
     CreateInstruction, CreateSubInstruction,
-    SendInstruction, CloseInstruction,
+    SendInstruction, 
 )
-from avm.types import Conversation, UserMessageBatch, SystemMessage, UserMessage, AssistantMessage, MetaDict, MetaList
-from avm.memory import Memory
+from avm.types import AssistantMessage, MetaDict, MetaList
 from avm.exceptions import VMMemoryError, MemoryKeyNotFoundError
 from types import SimpleNamespace
 
@@ -561,10 +559,8 @@ class TestSchedulingState:
         _new_root(core)
         core._active_cid = core._ready_cids.pop(0)
 
-        msgs_before = len(core._conv_by_cid[0].messages)
         core.advance_conversation()
 
-        conv = core._conv_by_cid[0]
         # real LMU.exec appends assistant; mock returns canned response
         # without modifying conversation — test just that advance runs
         assert core._active_cid is None  # conversation finished

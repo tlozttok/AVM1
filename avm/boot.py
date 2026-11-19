@@ -269,13 +269,13 @@ def _new_recovery(mode: str, last_exit: str) -> dict:
 def _finish_recovery(core: Core, recovery: dict) -> dict:
     """补齐运行期事实（代际/cid/guest 向量）并打印报告；写回 core.recovery。"""
     recovery["generation"] = int(getattr(core, "journal_generation", 1) or 1)
-    recovery["next_cid"] = int(core._next_cid)
+    recovery["next_cid"] = int(core.next_cid)
     recovery["guest_programs"] = {
         role: info["cid"] for role, info in (core.guest_roles or {}).items()
     }
     recovery["interrupt_vectors"] = dict(core.interrupts.vectors)
     core.recovery = recovery
-    core._last_snapshot_seq = core._journal_seq
+    core.mark_snapshot_taken()
     _print_recovery(recovery)
     return recovery
 
@@ -316,7 +316,7 @@ def _restore_snapshot(core: Core, path: str) -> dict:
         raise ImageError(f"重启快照恢复失败：{e}") from e
     print(
         f"[AVM] 已从重启快照恢复（seq={doc.get('seq', 0)}，"
-        f"{len(core._conv_by_cid)} 个对话）",
+        f"{len(core.conversations)} 个对话）",
         file=sys.stderr,
     )
     return doc
@@ -357,14 +357,14 @@ def _resume_journal_tail(core: Core, doc: dict) -> int:
         )
     core.journal_generation = snapshot_generation
     applied = core.replay_journal()
-    if core._journal_seq != snapshot_seq + applied:
+    if core.journal_seq != snapshot_seq + applied:
         raise JournalError(
             f"resume：重放结束 seq 不一致：恢复基线={snapshot_seq} + 尾部 {applied} 条 "
-            f"!= 内存已提交 seq={core._journal_seq}"
+            f"!= 内存已提交 seq={core.journal_seq}"
         )
-    if core._journal_seq != journal.last_seq():
+    if core.journal_seq != journal.last_seq():
         raise JournalError(
-            f"resume：重放结束 seq 不一致：内存={core._journal_seq}，"
+            f"resume：重放结束 seq 不一致：内存={core.journal_seq}，"
             f"日志末={journal.last_seq()}"
         )
     return applied
@@ -442,8 +442,7 @@ def _start_new_generation(core: Core, journal_path: Optional[str],
 def _begin_generation(core: Core, journal_path: Optional[str], generation: int) -> None:
     """把 Core 切到新代际：seq 归零、挂上（可能新建的）空日志文件。"""
     core.journal_generation = generation
-    core._journal_seq = 0
-    core._last_snapshot_seq = 0
+    core.reset_journal_seq()
     if not journal_path:
         return
     directory = os.path.dirname(os.path.abspath(journal_path))
@@ -455,8 +454,7 @@ def _begin_generation(core: Core, journal_path: Optional[str], generation: int) 
         print(f"[AVM] 新代际日志创建失败（{journal_path}）：{e}", file=sys.stderr)
         return
     core.attach_journal(journal_path)
-    core._journal_seq = 0
-    core._last_snapshot_seq = 0
+    core.reset_journal_seq()
 
 
 # ----------------------------------------------------------------------
@@ -515,7 +513,7 @@ def _restored_counts(core: Core) -> dict:
     except TypeError:
         listener_count = 0
     return {
-        "conversations": len(core._conv_by_cid),
+        "conversations": len(core.conversations),
         "listeners": listener_count,
         "devices": len(core.mem.mounted_devices()),
     }
@@ -555,7 +553,7 @@ def _boot_reboot(image_path: str, snapshot_path: str, journal_path: Optional[str
     snapshot_seq = int(doc.get("seq", 0) or 0)
     core = Core(services=services)
     # 快照的 cid 计数先就位：init 与 guest 程序按它继续分配 cid（世界重建不重置编号）。
-    core._next_cid = _next_cid_from(doc)
+    core.restore_next_cid(_next_cid_from(doc))
     load_image(core, image_path, host_flags=host_flags, restore=True)
     try:
         restore_world(core, doc)
@@ -568,7 +566,7 @@ def _boot_reboot(image_path: str, snapshot_path: str, journal_path: Optional[str
     new_generation, _archived = _start_new_generation(
         core, journal_path, generation, bump_when_absent=True,
     )
-    core._check_invariants()
+    core.check_invariants()
     recovery = _new_recovery("reboot", last_exit)
     recovery["source"] = "snapshot"
     recovery["world_source"] = "snapshot+journal" if replayed else "snapshot"

@@ -6,7 +6,6 @@ before 覆盖全部 10 条工具、canonical 匹配、监听注册权限、$MEM.
 
 import json
 
-import pytest
 
 from avm.capabilities import ALL_TOOL_NAMES, Capability
 from avm.core import (
@@ -16,7 +15,7 @@ from avm.core import (
     CreateSubInstruction,
     ListenEventInstruction,
     MemoryReadInstruction,
-    MemoryWriteInstruction,
+    
 )
 from avm.events import KERNEL_TIER, NORMAL_TIER
 from avm.types import MetaDict, MetaList, StrNode

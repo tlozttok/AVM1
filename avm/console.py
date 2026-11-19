@@ -235,143 +235,70 @@ class ConsoleConflict(RuntimeError):
     """宿主策略冲突（生命周期或客户端席位）：HTTP 层映射为 409。"""
 
 
-class Console:
-    """调试控制台：面板对话 + 观测 + 介入 + 屏蔽账本。"""
+class ClientLease:
+    """单客户端准入：同一时刻只让一个面板客户端占住席位。
 
-    def __init__(self, core, web_root: Optional[str] = None,
-                 auth_token: Optional[str] = None, force_stop_hook=None,
-                 single_client: bool = False, client_lease_seconds: float = 15.0,
-                 force_stop_delay: float = 10.0, mount_io_devices: bool = True):
-        self.core = core
-        # 前端构建产物目录（web/dist）。传 None 用仓库默认位置；测试传临时目录。
-        self.web_root = web_root if web_root is not None else _WEB_DIST
+    真实宿主开启（第二个标签页即使知道 token 也进不来），单测与 e2e mock 关闭。
+    判过期用单调时钟——租约是宿主策略，不该受系统墙钟校正影响。
 
-        # 操作面板：宿主侧 IO 总线与生命周期。auth_token 为 None 时不启用认证
-        # （单测与 e2e mock 走这条路），真实宿主由 main() 生成 token 后启用。
-        if getattr(core, "io_bus", None) is None:
-            core.io_bus = IOBus()
-        self.io_bus = core.io_bus
-        # 把镜像声明的 inputs / outputs 换成只认总线的两台 IO 设备。标准设备留在
-        # avm/memory_device.py 供终端宿主使用，本宿主不碰终端、不打印。
-        self.io_input_devices: List[IOInputDevice] = []
-        self.io_output_devices: List[IOOutputDevice] = []
-        if mount_io_devices:
-            self._install_io_devices()
+    自带一把锁，只保护租约本身；Console 另有一把锁管生命周期/暂停状态。
+    两把锁从不嵌套，所以不会互相等。
+    """
 
-        self.channel = OperatorChannel()
-        # 保留对话（cid -1）在装载时/重放时已经存在；这里只把操作员通道绑上去。
-        # 没有（例如测试直接构造 Core）时 bind 会创建一条。
-        self.panel = core.bind_console_conversation(self.channel)
-        core.interrupts.register("operator", self.panel.cid)
-        # 空闲态就是面板：系统没有可运行的对话时，Core 把执行权交给 `idle` 向量，
-        # 面板在自己的推理里阻塞等操作员动作。镜像声明的 guest idle 程序在
-        # console 宿主下被这个向量覆盖（面板即 OS 空闲处理程序）。
-        core.interrupts.register("idle", self.panel.cid)
-
-        self.auth_token = auth_token
-        self.force_stop_hook = force_stop_hook
-        self.lifecycle = "running"                 # running / paused / stopping / stopped
-        self.stopping_since: Optional[float] = None
-        # API 暂停后主线程等待恢复信号；POST /api/system/resume 置位并清除内核暂停。
-        self._api_resume_event = threading.Event()
-        # 关机流程：请求关机后要等满 force_stop_delay 秒才允许强制退出。
-        self.force_stop_delay = float(force_stop_delay)
-        # 单客户端准入是宿主策略：真实面板宿主开启，单测与 e2e mock 关闭。
+    def __init__(self, single_client: bool = False, lease_seconds: float = 15.0):
         self.single_client = bool(single_client)
-        self.client_lease_seconds = float(client_lease_seconds)
-        self._client_lock = threading.Lock()
-        self._client_lease: Optional[dict] = None  # {client_id, since, last_seen}
+        self.lease_seconds = float(lease_seconds)
+        self._lock = threading.Lock()
+        self._lease: Optional[dict] = None  # {client_id, since, last_seen, last_seen_mono}
 
-        self.running = False                       # Core.run 是否在跑，由 runner 设置
-        self._memory_mask: Dict[str, Any] = {}     # ref → 摘下来的节点
-        self._device_mask: Dict[str, Any] = {}     # 挂载键 → 设备实例
-        self._action_log: List[dict] = []          # 设备调试动作的调用记录
-        self._snapshots: List[Dict[str, Any]] = [_walk(core.unwrap("$MEM", for_llm=False))]
-        core.events.add_observer(self._on_event)
+    def _expired(self, lease: dict) -> bool:
+        return (time.monotonic() - lease["last_seen_mono"]) > self.lease_seconds
 
-    # -- 操作面板 IO 设备挂载 ------------------------------------------
-
-    def _install_io_devices(self) -> None:
-        """在 `inputs` / `outputs` 上换成总线前端；镜像没声明的路径不新增。
-
-        数据和元数据从镜像装出来的标准设备原样搬过去（快照恢复后的历史不能丢），
-        设备标识符与挂载键也照抄。已经挂了 IO 设备的宿主（e2e mock）只登记引用。
-        """
-        core = self.core
-        for mount, cls, bucket in (
-            ("inputs", IOInputDevice, self.io_input_devices),
-            ("outputs", IOOutputDevice, self.io_output_devices),
-        ):
-            old = core.mem.mounted_devices().get(mount)
-            if old is None:
-                continue
-            if isinstance(old, cls):
-                dev = old
-            elif isinstance(old, MetaListDevice):
-                dev = cls(data=list(old._data),
-                          metadata=old.get_metadata())
-                dev.device_id = getattr(old, "device_id", None)
-                core.mem.unmount(mount)
-                core.mem.mount(mount, dev)
-            else:
-                # 镜像在 inputs / outputs 上挂了别的设备：不猜它的语义，保持原样
-                continue
-            dev.mount_path = mount
-            dev.attach_core(core)
-            bucket.append(dev)
-
-    # -- 单客户端准入 --------------------------------------------------
-
-    def _lease_expired(self, lease: dict) -> bool:
-        # 用单调时钟判定过期：租约是宿主策略，不受系统墙钟校正影响。
-        return (time.monotonic() - lease["last_seen_mono"]
-                > self.client_lease_seconds)
-
-    def client_status(self) -> dict:
-        with self._client_lock:
-            lease = self._client_lease
-            if lease is not None and self._lease_expired(lease):
-                self._client_lease = None
+    def status(self) -> dict:
+        with self._lock:
+            lease = self._lease
+            if lease is not None and self._expired(lease):
+                self._lease = None
                 lease = None
             return {
                 "single_client": self.single_client,
                 "held": lease is not None,
                 "client_id": lease["client_id"] if lease else None,
                 "since": lease["since"] if lease else None,
-                "lease_seconds": self.client_lease_seconds,
+                "lease_seconds": self.lease_seconds,
             }
 
-    def acquire_client(self, client_id: Optional[str]) -> dict:
+    def acquire(self, client_id: Optional[str]) -> dict:
         """占住唯一席位；已声明身份的其它客户端在租约有效期内一律被挡。"""
         if not isinstance(client_id, str) or not client_id:
             raise ValueError("client_id 必须是非空字符串")
         if not self.single_client:
             return {"client_id": client_id, "single_client": False}
         now = time.time()
-        with self._client_lock:
-            lease = self._client_lease
+        with self._lock:
+            lease = self._lease
             if (lease is not None and lease["client_id"] != client_id
-                    and not self._lease_expired(lease)):
+                    and not self._expired(lease)):
                 raise ConsoleConflict(
                     f"已有客户端连接（{lease['client_id']}，"
                     f"自 {time.strftime('%H:%M:%S', time.localtime(lease['since']))} 起）；"
-                    f"关闭它或等待租约 {self.client_lease_seconds:g} 秒过期"
+                    f"关闭它或等待租约 {self.lease_seconds:g} 秒过期"
                 )
             since = lease["since"] if (lease and lease["client_id"] == client_id
-                                       and not self._lease_expired(lease)) else now
-            self._client_lease = {"client_id": client_id, "since": since,
-                                  "last_seen": now, "last_seen_mono": time.monotonic()}
+                                       and not self._expired(lease)) else now
+            self._lease = {"client_id": client_id, "since": since,
+                           "last_seen": now, "last_seen_mono": time.monotonic()}
         return {"client_id": client_id, "single_client": True, "since": since}
 
-    def release_client(self, client_id: Optional[str]) -> dict:
-        with self._client_lock:
-            lease = self._client_lease
+    def release(self, client_id: Optional[str]) -> dict:
+        with self._lock:
+            lease = self._lease
             released = bool(lease and client_id and lease["client_id"] == client_id)
             if released:
-                self._client_lease = None
+                self._lease = None
         return {"released": released}
 
-    def check_client(self, client_id: Optional[str]) -> bool:
+    def check(self, client_id: Optional[str]) -> bool:
         """普通 API 请求：带身份的必须就是席位持有者；不带身份的按宿主本地调用放行。
 
         面板前端所有请求都带 `X-AVM-Client`（SSE 靠 cookie），所以第二个浏览器
@@ -380,12 +307,12 @@ class Console:
         if not self.single_client or client_id is None:
             return True
         now = time.time()
-        with self._client_lock:
-            lease = self._client_lease
-            if lease is None or self._lease_expired(lease):
-                self._client_lease = {"client_id": client_id, "since": now,
-                                      "last_seen": now,
-                                      "last_seen_mono": time.monotonic()}
+        with self._lock:
+            lease = self._lease
+            if lease is None or self._expired(lease):
+                self._lease = {"client_id": client_id, "since": now,
+                               "last_seen": now,
+                               "last_seen_mono": time.monotonic()}
                 return True
             if lease["client_id"] != client_id:
                 return False
@@ -393,83 +320,131 @@ class Console:
             lease["last_seen_mono"] = time.monotonic()
             return True
 
-    # -- 事件观察 ------------------------------------------------------
 
-    def _on_event(self, event: dict) -> None:
-        self.channel.publish("event", _jsonable(event))
+class MaskLedger:
+    """屏蔽账本：把内存节点/设备从内核里摘下来寄存，随时能原样装回去。
 
-    # -- 观测 ----------------------------------------------------------
+    与内核的交互只有四件事：mem.detach / attach / unmount / mount。账本只负责
+    记着"摘了什么"——所以摘/装失败时账本一律不动，否则会出现"记录说还屏蔽着、
+    实际已经装回去了"的假象。
+    """
+
+    def __init__(self, core):
+        self.core = core
+        self._memory: Dict[str, Any] = {}   # ref → 摘下来的节点
+        self._devices: Dict[str, Any] = {}  # 挂载键 → 设备实例
+
+    def masked(self) -> dict:
+        """当前被屏蔽的地址与设备（state 里给面板看）。"""
+        return {"memory": sorted(self._memory), "devices": sorted(self._devices)}
+
+    def mask_memory(self, ref: str) -> dict:
+        if ref in self._memory:
+            raise ValueError(f"{ref} 已经被屏蔽")
+        node = self.core.mem.detach(ref)  # 失败时抛 VMMemoryError，不改账本
+        self._memory[ref] = node
+        return {"masked": ref, "kind": type(node).__name__}
+
+    def unmask_memory(self, ref: str) -> dict:
+        if ref not in self._memory:
+            raise KeyError(f"{ref} 没有被屏蔽")
+        self.core.mem.attach(ref, self._memory[ref])  # 冲突时抛 VMMemoryError，账本保持不变
+        del self._memory[ref]
+        return {"unmasked": ref}
+
+    def mask_device(self, mount: str) -> dict:
+        if mount in self._devices:
+            raise ValueError(f"设备 {mount} 已经被屏蔽")
+        devices = self.core.mem.mounted_devices()
+        if mount not in devices:
+            raise KeyError(f"路径 {mount} 没有挂载设备")
+        device = devices[mount]
+        self.core.mem.unmount(mount)
+        self._devices[mount] = device
+        return {"masked": mount, "type": type(device).__name__}
+
+    def unmask_device(self, mount: str) -> dict:
+        if mount not in self._devices:
+            raise KeyError(f"设备 {mount} 没有被屏蔽")
+        self.core.mem.mount(mount, self._devices[mount])
+        del self._devices[mount]
+        return {"unmasked": mount}
+
+
+class MemorySnapshots:
+    """内存快照：把当前 $MEM 摊平成 {地址: 值} 存一份，用来做前后比对。
+
+    只读内核、不改任何东西。构造时先取一份——相当于"刚装载完的初始态"，
+    所以第一个编号 0 总是可用的。
+    """
+
+    def __init__(self, core):
+        self.core = core
+        self._frames: List[Dict[str, Any]] = [self._current()]
+
+    def _current(self) -> Dict[str, Any]:
+        return _walk(self.core.unwrap("$MEM", for_llm=False))
+
+    def count(self) -> int:
+        return len(self._frames)
+
+    def take(self) -> int:
+        """存一份当前状态，返回它的编号。"""
+        self._frames.append(self._current())
+        return len(self._frames) - 1
+
+    def diff(self, frm: int, to: Optional[int] = None) -> dict:
+        """两个快照之间新增/删除/改动过的地址；to 缺省表示"现在"。"""
+        if frm < 0 or frm >= len(self._frames):
+            raise KeyError(f"快照 {frm} 不存在（现有 0..{len(self._frames) - 1}）")
+        before = self._frames[frm]
+        after = self._frames[to] if to is not None else self._current()
+        return {
+            "from": frm,
+            "to": to,
+            "added": sorted(set(after) - set(before)),
+            "removed": sorted(set(before) - set(after)),
+            "changed": sorted(
+                p for p in set(before) & set(after) if before[p] != after[p]
+            ),
+        }
+
+
+class ConsoleView:
+    """控制台的只读投影：把内核状态整理成面板要看的形状。
+
+    这一层只读——它不调用任何写接口，也不改任何状态；"改世界"的动作全在
+    Console 的介入方法里。单独成类就是为了让这条界限看得出来。
+    """
+
+    def __init__(self, core, panel, action_log: List[dict]):
+        self.core = core
+        self.panel = panel
+        self._action_log = action_log  # 与 Console 共用同一个列表，这里只读切片
 
     def schedule(self) -> dict:
         core = self.core
+        sched = core.schedule_state()
         return {
-            "active_cid": core._active_cid,
-            "ready": list(core._ready_cids),
-            "dormant": list(core._dormant_cids),
-            "finished": sorted(core._finished),
-            "instruction_budget": core._instruction_budget,
-            "activation_instructions": core._activation_instructions,
+            "active_cid": sched["active"],
+            "ready": sched["ready"],
+            "dormant": sched["dormant"],
+            "finished": core.finished_ids(),
+            "instruction_budget": core.instruction_budget,
+            "activation_instructions": core.activation_instructions,
             "panel_cid": self.panel.cid,
         }
 
-    def state(self) -> dict:
+    def brief(self, cid: int, conv) -> dict:
+        """列表用的对话摘要：身份 + 状态 + 能力摘要。"""
         core = self.core
-        return {
-            "running": self.running,
-            "schedule": self.schedule(),
-            "conversations": [
-                self._conversation_brief(cid, conv)
-                for cid, conv in sorted(core._conv_by_cid.items())
-            ],
-            "panel": {
-                "cid": self.panel.cid,
-                "active": core._active_cid == self.panel.cid,
-                "messages": len(self.panel.messages),
-                "channel": self.channel.status(),
-            },
-            "interrupts": {
-                "vectors": core.interrupts.vectors,
-                "pending": core.interrupts.pending_types(),
-                "last_dispatch": core.interrupts.last_dispatch,
-            },
-            "mask": {
-                "memory": sorted(self._memory_mask),
-                "devices": sorted(self._device_mask),
-            },
-            "snapshots": len(self._snapshots),
-            # 操作面板首屏：生命周期、本次恢复摘要、IO 两条流的 seq 与丢弃计数
-            "lifecycle": self.lifecycle,
-            # API 暂停是内核状态（core.paused），生命周期是宿主视角，两者一起给面板。
-            "paused": bool(getattr(core, "paused", False)),
-            "pause_reason": getattr(core, "pause_reason", None),
-            "pause_category": getattr(core, "pause_category", None),
-            "recovery": getattr(core, "recovery", {}),
-            "io": self.io_bus.status(),
-            "force_stop_after": self.force_stop_delay,
-            "force_stop_remaining": self.force_stop_remaining(),
-            "client": self.client_status(),
-        }
-
-    def force_stop_remaining(self) -> float:
-        """还要等几秒才允许强制退出；尚未请求关机时给满额，已停止时给 0。"""
-        with self._client_lock:
-            since = self.stopping_since
-            lifecycle = self.lifecycle
-        if lifecycle == "stopped":
-            return 0.0
-        if since is None:
-            return self.force_stop_delay
-        return max(0.0, self.force_stop_delay - (time.time() - since))
-
-    def _conversation_brief(self, cid: int, conv) -> dict:
-        core = self.core
-        if cid in core._finished:
+        if core.is_finished(cid):
             status = "finished"
-        elif core._active_cid == cid:
+        elif core.active_conversation_id() == cid:
             status = "active"
-        elif cid in core._ready_cids:
+        elif core.is_ready(cid):
             status = "ready"
-        elif cid in core._dormant_cids:
+        elif core.is_dormant(cid):
             status = "dormant"
         else:
             status = "unknown"
@@ -493,10 +468,11 @@ class Console:
         }
 
     def conversation(self, cid: int) -> dict:
-        conv = self.core._conv_by_cid.get(cid)
+        """单个对话的完整视图：摘要 + 历史 + 待发批次 + 元信息。"""
+        conv = self.core.get_conversation(cid)
         if conv is None:
             raise KeyError(f"对话 {cid} 不存在")
-        brief = self._conversation_brief(cid, conv)
+        brief = self.brief(cid, conv)
         brief["history"] = [
             {
                 "role": m.role,
@@ -561,137 +537,62 @@ class Console:
             })
         return {"devices": out, "action_log": list(self._action_log[-50:])}
 
-    # -- 快照与 diff ---------------------------------------------------
 
-    def snapshot(self) -> int:
-        self._snapshots.append(_walk(self.core.unwrap("$MEM", for_llm=False)))
-        return len(self._snapshots) - 1
+class DeviceActions:
+    """设备调试动作：调用设备自己声明的动作，并记一条调用记录。
 
-    def diff(self, frm: int, to: Optional[int] = None) -> dict:
-        if frm < 0 or frm >= len(self._snapshots):
-            raise KeyError(f"快照 {frm} 不存在（现有 0..{len(self._snapshots) - 1}）")
-        before = self._snapshots[frm]
-        after = self._snapshots[to] if to is not None else _walk(
-            self.core.unwrap("$MEM", for_llm=False))
-        return {
-            "from": frm,
-            "to": to,
-            "added": sorted(set(after) - set(before)),
-            "removed": sorted(set(before) - set(after)),
-            "changed": sorted(
-                p for p in set(before) & set(after) if before[p] != after[p]
-            ),
-        }
+    不入内核、不产生事件——这是宿主侧的调试通道，动作写什么、返回什么都由设备决定。
+    记录里保留异常（不往外抛）：面板要能看到"这一次失败了"而不是整个请求挂掉。
+    """
 
-    # -- 介入：中断与动作 ----------------------------------------------
+    def __init__(self, core):
+        self.core = core
+        self.log: List[dict] = []   # 调用记录（面板只展示最近 50 条）
 
-    def request_pause(self) -> dict:
-        """请求暂停。中断在下一个安全点生效；系统空转结束时不会生效。
-
-        中断会向面板对话投一条 payload 为「已暂停」的消息，操作员在对话流里看得到。
-        """
-        self.core.interrupts.raise_("operator", payload="已暂停")
-        return {
-            "requested": True,
-            "pending": self.core.interrupts.pending_types(),
-            "panel_cid": self.panel.cid,
-            "already_active": self.core._active_cid == self.panel.cid,
-        }
-
-    def submit_action(self, tool: str, arguments: Optional[dict] = None) -> dict:
-        """提交一次操作员动作。未暂停时先自动中断。"""
-        if not isinstance(tool, str) or not tool:
-            raise ValueError("tool 必须是非空字符串")
-        if arguments is None:
-            arguments = {}
-        if not isinstance(arguments, dict):
-            raise ValueError("arguments 必须是对象")
-        paused = self._enqueue_actions([{"tool": tool, "arguments": arguments}])
-        known = set(_instruction_registry())
-        return {
-            "submitted": True,
-            "tool": tool,
-            "auto_paused": not paused,
-            "known_tool": tool in known,
-            "warning": None if tool in known else (
-                f"未知工具 {tool!r}：Core 会在 stderr 报错，且不回工具响应"
-            ),
-        }
-
-    def _enqueue_actions(self, actions: List[dict],
-                         interrupt_payload: Optional[str] = "已暂停") -> bool:
-        """投一批动作；返回提交前面板是否已经持有执行权。
-
-        动作批一次入队（`OperatorChannel.submit_actions`），避免其它端点的
-        `end` 动作插到批中间。未暂停时先请求中断，和单动作提交同一语义。
-        """
-        paused = self.core._active_cid == self.panel.cid
-        if not paused:
-            self.core.interrupts.raise_("operator", payload=interrupt_payload)
-        self.channel.submit_actions(actions)
-        return paused
-
-    def resume(self) -> dict:
-        """让面板结束本轮交互，把执行权让回就绪队列。"""
-        self.channel.submit_action({"end": True})
-        return {"submitted": True}
-
-    # -- API 暂停与恢复 ------------------------------------------------
-
-    def resume_api_pause(self) -> dict:
-        """清除内核的 API 暂停，并唤醒等待恢复的主线程。
-
-        只有真正处于暂停时才接受：没有暂停时调它说明操作员按错了，回 409 比假装
-        成功更诚实。清除暂停后主线程重新进入 core.run()。
-        """
-        core = self.core
-        with self._client_lock:
-            if not getattr(core, "paused", False):
-                raise ConsoleConflict("系统没有处于 API 暂停")
-            core.clear_api_pause()
-            self.lifecycle = "running"
-            self._api_resume_event.set()
-        return {"status": "resumed", "paused": False}
-
-    def wait_for_api_resume(self) -> None:
-        """主线程在 API 暂停后等待操作员恢复；关机请求也会置位（见 request_shutdown）。"""
-        self._api_resume_event.wait()
-        self._api_resume_event.clear()
-
-    def invoke_device_action(self, mount: str, index: Optional[int] = None,
-                             arguments: Optional[dict] = None,
-                             name: Optional[str] = None) -> dict:
-        """调用设备自己声明的调试动作。不入核心、不产生事件。
-
-        优先按动作名 `name` 查找（动态动作表的稳定性由名字保证）；没给名字时沿用
-        index。名字在该设备的动作清单里必须唯一。
-        """
+    def invoke(self, mount: str, index: Optional[int] = None,
+               arguments: Optional[dict] = None,
+               name: Optional[str] = None) -> dict:
+        """优先按动作名查找（动态动作表的稳定性由名字保证）；没给名字时按 index。"""
         device = self.core.mem.mounted_devices().get(mount)
         if device is None:
             raise KeyError(f"设备 {mount} 未挂载（可能被屏蔽了）")
         actions = device.debug_actions() or []
         if name is not None:
-            if not isinstance(name, str) or not name:
-                raise ValueError("动作 name 必须是非空字符串")
-            matches = [
-                (i, action) for i, action in enumerate(actions)
-                if isinstance(action, dict) and action.get("name") == name
-                and callable(action.get("run"))
-            ]
-            if not matches:
-                raise KeyError(f"设备 {mount} 没有名为 {name!r} 的可调用调试动作")
-            if len(matches) > 1:
-                raise ValueError(
-                    f"设备 {mount} 有多个名为 {name!r} 的调试动作；请用 index 指定")
-            resolved_index, action = matches[0]
+            resolved_index, action = self._pick_by_name(mount, name, actions)
         else:
-            if isinstance(index, bool) or not isinstance(index, int):
-                raise ValueError("调用设备动作需要 name 或整数 index")
-            if index < 0 or index >= len(actions):
-                raise KeyError(f"设备 {mount} 没有编号 {index} 的调试动作")
-            resolved_index, action = index, actions[index]
+            resolved_index, action = self._pick_by_index(mount, index, actions)
         if not isinstance(action, dict) or not callable(action.get("run")):
             raise ValueError(f"设备 {mount} 的调试动作 {resolved_index} 没有可调用的 run")
+        return self._run(mount, resolved_index, action, arguments)
+
+    @staticmethod
+    def _pick_by_name(mount: str, name: str, actions: list) -> tuple:
+        """按名字找唯一一个可调用动作；没有、或有多个同名都报错。"""
+        if not isinstance(name, str) or not name:
+            raise ValueError("动作 name 必须是非空字符串")
+        matches = [
+            (i, action) for i, action in enumerate(actions)
+            if isinstance(action, dict) and action.get("name") == name
+            and callable(action.get("run"))
+        ]
+        if not matches:
+            raise KeyError(f"设备 {mount} 没有名为 {name!r} 的可调用调试动作")
+        if len(matches) > 1:
+            raise ValueError(
+                f"设备 {mount} 有多个名为 {name!r} 的调试动作；请用 index 指定")
+        return matches[0]
+
+    @staticmethod
+    def _pick_by_index(mount: str, index, actions: list) -> tuple:
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise ValueError("调用设备动作需要 name 或整数 index")
+        if index < 0 or index >= len(actions):
+            raise KeyError(f"设备 {mount} 没有编号 {index} 的调试动作")
+        return index, actions[index]
+
+    def _run(self, mount: str, resolved_index: int, action: dict,
+             arguments: Optional[dict]) -> dict:
+        """执行一次并记账。动作自己抛的异常记进记录，不往外传。"""
         args = arguments if isinstance(arguments, dict) else {}
         started = time.time()
         try:
@@ -708,8 +609,431 @@ class Console:
             "error": error,
             "time": started,
         }
-        self._action_log.append(record)
+        self.log.append(record)
         return record
+
+
+class OperatorActions:
+    """操作员动作：暂停 / 提交一次工具调用 / 让出执行权。
+
+    动作本身不进内核——它们只是往操作员通道里投递给面板对话，由面板在自己的
+    回合里执行。未暂停时先挂 operator 中断，让面板拿到执行权再说。
+    """
+
+    def __init__(self, core, panel, channel):
+        self.core = core
+        self.panel = panel
+        self.channel = channel
+
+    def request_pause(self) -> dict:
+        """请求暂停。中断在下一个安全点生效；系统空转结束时不会生效。
+
+        中断会向面板对话投一条 payload 为「已暂停」的消息，操作员在对话流里看得到。
+        """
+        self.core.interrupts.raise_("operator", payload="已暂停")
+        return {
+            "requested": True,
+            "pending": self.core.interrupts.pending_types(),
+            "panel_cid": self.panel.cid,
+            "already_active": self.core.active_conversation_id() == self.panel.cid,
+        }
+
+    def submit_action(self, tool: str, arguments: Optional[dict] = None) -> dict:
+        """提交一次操作员动作。未暂停时先自动中断。"""
+        if not isinstance(tool, str) or not tool:
+            raise ValueError("tool 必须是非空字符串")
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            raise ValueError("arguments 必须是对象")
+        paused = self.enqueue([{"tool": tool, "arguments": arguments}])
+        known = set(_instruction_registry())
+        return {
+            "submitted": True,
+            "tool": tool,
+            "auto_paused": not paused,
+            "known_tool": tool in known,
+            "warning": None if tool in known else (
+                f"未知工具 {tool!r}：Core 会在 stderr 报错，且不回工具响应"
+            ),
+        }
+
+    def enqueue(self, actions: List[dict],
+                interrupt_payload: Optional[str] = "已暂停") -> bool:
+        """投一批动作；返回提交前面板是否已经持有执行权。
+
+        动作批一次入队（`OperatorChannel.submit_actions`），避免其它端点的
+        `end` 动作插到批中间。未暂停时先请求中断，和单动作提交同一语义。
+        """
+        paused = self.core.active_conversation_id() == self.panel.cid
+        if not paused:
+            self.core.interrupts.raise_("operator", payload=interrupt_payload)
+        self.channel.submit_actions(actions)
+        return paused
+
+    def resume(self) -> dict:
+        """让面板结束本轮交互，把执行权让回就绪队列。"""
+        self.channel.submit_action({"end": True})
+        return {"submitted": True}
+
+
+class Lifecycle:
+    """控制台生命周期：running / paused / stopping / stopped，以及关机流程。
+
+    状态机、唤醒信号、强制退出闸门放在同一个对象里，因为它们互相牵制：关机要
+    唤醒正停在暂停里的主线程，强制退出要等满 force_stop_delay 才放行。分散在
+    Console 里就变成"三处各自盯着两个字段"。
+
+    自带的锁只保护这三个字段（与 ClientLease 的锁互不嵌套）。外部直接改状态
+    （`console.lifecycle = "paused"`）走的是单字段赋值，和以前一样不加锁。
+    """
+
+    RUNNING, PAUSED, STOPPING, STOPPED = "running", "paused", "stopping", "stopped"
+
+    def __init__(self, core, panel, channel, force_stop_hook=None,
+                 force_stop_delay: float = 10.0):
+        self.core = core
+        self.panel = panel
+        self.channel = channel
+        self.state = self.RUNNING
+        self.stopping_since: Optional[float] = None
+        self.force_stop_hook = force_stop_hook
+        self.force_stop_delay = float(force_stop_delay)
+        self.api_resume_event = threading.Event()
+        self._lock = threading.Lock()
+
+    def remaining(self) -> float:
+        """还要等几秒才允许强制退出；尚未请求关机时给满额，已停止时给 0。"""
+        with self._lock:
+            since = self.stopping_since
+            state = self.state
+        if state == self.STOPPED:
+            return 0.0
+        if since is None:
+            return self.force_stop_delay
+        return max(0.0, self.force_stop_delay - (time.time() - since))
+
+    def resume_api_pause(self) -> dict:
+        """清除内核的 API 暂停，并唤醒等待恢复的主线程。
+
+        只有真正处于暂停时才接受：没有暂停时调它说明操作员按错了，回 409 比假装
+        成功更诚实。清除暂停后主线程重新进入 core.run()。
+        """
+        core = self.core
+        with self._lock:
+            if not getattr(core, "paused", False):
+                raise ConsoleConflict("系统没有处于 API 暂停")
+            core.clear_api_pause()
+            self.state = self.RUNNING
+            self.api_resume_event.set()
+        return {"status": "resumed", "paused": False}
+
+    def wait_for_api_resume(self) -> None:
+        """主线程在 API 暂停后等待操作员恢复；关机请求也会置位（见 request_shutdown）。"""
+        self.api_resume_event.wait()
+        self.api_resume_event.clear()
+
+    def request_shutdown(self) -> dict:
+        """挂 `shutdown` 中断通知系统关机（中断是 VM 通知软件的通道）。
+
+        镜像声明了 `meta.guest_programs.shutdown` 时，把该角色程序的入口正文作为
+        payload 挂中断：Core 在下一个安全点把执行权交给监督程序，由它收尾并写
+        `$MEM.sys.power.state = "off"`；宿主在安全点看到 off 才写快照/persist 并退出。
+        没有声明 shutdown 角色时中断没有接收方：只返回 warning 并保持 stopping，
+        不自行断电，操作员可在 force_stop_delay 之后强制退出。
+
+        面板对话空闲时正阻塞在自己的推理里等操作员动作，中断要等它回到安全点才能
+        派发；所以面板关机按钮在挂中断的同时向操作员通道提交一次 `{"end": True}`，
+        让阻塞的面板回合回到安全点（作者 2026-11-11 定）。面板没有占执行权时中断
+        在下一个安全点自然派发，不提交动作，避免在通道里留下一枚过早的 end。
+        这不是"经保留对话写世界"：只是让阻塞的面板让出执行权。新输入从这一刻起被拦住。
+
+        API 暂停中也可以请求关机：关机优先于暂停，先清暂停并唤醒主线程，让 shutdown
+        中断在下一个安全点能够派发；否则主线程停在暂停等待里，中断永远到不了接收方。
+        没有 shutdown 处理程序时回到正常运行（warning 不变），force-stop 仍按秒数放行。
+        """
+        with self._lock:
+            if self.state not in (self.RUNNING, self.PAUSED):
+                raise ConsoleConflict(f"面板处于 {self.state} 状态，不再接收关机请求")
+            was_paused = self.state == self.PAUSED
+            self.state = self.STOPPING
+            self.stopping_since = time.time()
+        info = self.core.guest_roles.get("shutdown")
+        warning = None
+        if info is None:
+            warning = (
+                "镜像没有声明 shutdown 处理程序（meta.guest_programs.shutdown）："
+                "关机中断没有接收方，系统不会自行断电；等待 force_stop_after 秒后"
+                "可走 force-stop 强制退出"
+            )
+        else:
+            self.core.interrupts.raise_("shutdown", payload=info.get("entry"))
+            if self.core.active_conversation_id() == self.panel.cid:
+                # 面板关机按钮同时向操作员通道提交一次：结束面板这一轮，Core 回到
+                # 安全点才能派发 shutdown 中断（作者 2026-11-11 定）。
+                self.channel.submit_action({"end": True})
+        if was_paused:
+            # 中断已挂起；清暂停让主线程重新进入 run()，在安全点派发它。
+            self.core.clear_api_pause()
+            self.api_resume_event.set()
+        return {
+            "status": "stopping",
+            "request": "shutdown",
+            "interrupt": "shutdown" if info is not None else None,
+            "payload": info.get("entry") if info is not None else None,
+            "force_stop_after": self.force_stop_delay,
+            "warning": warning,
+        }
+
+    def force_stop(self) -> dict:
+        """强制退出：不写快照。只有注入了回调的真实宿主才真的结束进程。
+
+        只在「已请求关机且等满 force_stop_delay 秒」之后放行，防止顺手把还在
+        正常收尾的宿主杀掉；回调由 main() 注入，单测与 mock 不结束进程。
+        """
+        remaining = self.remaining()
+        if remaining > 0:
+            raise ConsoleConflict(
+                f"关机还在收尾：{remaining:.0f} 秒后才可强制退出（不写快照）"
+            )
+        with self._lock:
+            self.state = self.STOPPED
+        hook = self.force_stop_hook
+        if callable(hook):
+            threading.Thread(target=hook, daemon=True).start()
+        return {"status": "force-stopped", "snapshot_written": False}
+
+
+class Console:
+    """调试控制台：面板对话 + 观测 + 介入 + 屏蔽账本。"""
+
+    def __init__(self, core, web_root: Optional[str] = None,
+                 auth_token: Optional[str] = None, force_stop_hook=None,
+                 single_client: bool = False, client_lease_seconds: float = 15.0,
+                 force_stop_delay: float = 10.0, mount_io_devices: bool = True):
+        self.core = core
+        # 前端构建产物目录（web/dist）。传 None 用仓库默认位置；测试传临时目录。
+        self.web_root = web_root if web_root is not None else _WEB_DIST
+
+        # 操作面板：宿主侧 IO 总线与生命周期。auth_token 为 None 时不启用认证
+        # （单测与 e2e mock 走这条路），真实宿主由 main() 生成 token 后启用。
+        if getattr(core, "io_bus", None) is None:
+            core.io_bus = IOBus()
+        self.io_bus = core.io_bus
+        # 把镜像声明的 inputs / outputs 换成只认总线的两台 IO 设备。标准设备留在
+        # avm/memory_device.py 供终端宿主使用，本宿主不碰终端、不打印。
+        self.io_input_devices: List[IOInputDevice] = []
+        self.io_output_devices: List[IOOutputDevice] = []
+        if mount_io_devices:
+            self._install_io_devices()
+
+        self.channel = OperatorChannel()
+        # 保留对话（cid -1）在装载时/重放时已经存在；这里只把操作员通道绑上去。
+        # 没有（例如测试直接构造 Core）时 bind 会创建一条。
+        self.panel = core.bind_console_conversation(self.channel)
+        core.interrupts.register("operator", self.panel.cid)
+        # 空闲态就是面板：系统没有可运行的对话时，Core 把执行权交给 `idle` 向量，
+        # 面板在自己的推理里阻塞等操作员动作。镜像声明的 guest idle 程序在
+        # console 宿主下被这个向量覆盖（面板即 OS 空闲处理程序）。
+        core.interrupts.register("idle", self.panel.cid)
+        # 操作员动作（暂停 / 提交工具调用 / 让出执行权）走通道，不进内核
+        self.actions = OperatorActions(core, self.panel, self.channel)
+
+        self.auth_token = auth_token
+        # 生命周期（running / paused / stopping / stopped）、关机闸门与唤醒信号整块
+        # 交给 Lifecycle；对外仍按 `console.lifecycle` 这个老名字读写，见下面的属性。
+        self.lifecycle_state = Lifecycle(core, self.panel, self.channel,
+                                         force_stop_hook=force_stop_hook,
+                                         force_stop_delay=force_stop_delay)
+        # 单客户端准入（宿主策略）单独一个对象管，见 ClientLease。
+        self.clients = ClientLease(single_client=single_client,
+                                   lease_seconds=client_lease_seconds)
+
+        self.running = False                       # Core.run 是否在跑，由 runner 设置
+        self.masks = MaskLedger(core)              # 屏蔽账本（摘下来的节点/设备）
+        self.snapshots = MemorySnapshots(core)     # 内存快照（diff 用）
+        self.device_actions = DeviceActions(core)   # 设备调试动作 + 调用记录
+        # 只读投影（对话/内存/监听器/设备的展示形状），与动作记录共用同一个列表
+        self.view = ConsoleView(core, self.panel, self.device_actions.log)
+        core.events.add_observer(self._on_event)
+
+    # -- 生命周期 ------------------------------------------------------
+    #
+    # 状态与关机流程都在 Lifecycle 里；Console 只留 `lifecycle` 这一个老名字。
+
+    @property
+    def lifecycle(self) -> str:
+        """宿主视角的生命周期：running / paused / stopping / stopped。
+
+        状态住在 Lifecycle 里，这里只是保住 Console 上的旧名字——面板端点、关机
+        流程和测试都按 `console.lifecycle` 读写，换名字会把调用点全扯进来。
+        """
+        return self.lifecycle_state.state
+
+    @lifecycle.setter
+    def lifecycle(self, value: str) -> None:
+        self.lifecycle_state.state = value
+
+    # -- 操作面板 IO 设备挂载 ------------------------------------------
+
+    def _install_io_devices(self) -> None:
+        """在 `inputs` / `outputs` 上换成总线前端；镜像没声明的路径不新增。
+
+        数据和元数据从镜像装出来的标准设备原样搬过去（快照恢复后的历史不能丢），
+        设备标识符与挂载键也照抄。已经挂了 IO 设备的宿主（e2e mock）只登记引用。
+        """
+        core = self.core
+        for mount, cls, bucket in (
+            ("inputs", IOInputDevice, self.io_input_devices),
+            ("outputs", IOOutputDevice, self.io_output_devices),
+        ):
+            old = core.mem.mounted_devices().get(mount)
+            if old is None:
+                continue
+            if isinstance(old, cls):
+                dev = old
+            elif isinstance(old, MetaListDevice):
+                dev = cls(data=list(old._data),
+                          metadata=old.get_metadata())
+                dev.device_id = getattr(old, "device_id", None)
+                core.mem.unmount(mount)
+                core.mem.mount(mount, dev)
+            else:
+                # 镜像在 inputs / outputs 上挂了别的设备：不猜它的语义，保持原样
+                continue
+            dev.mount_path = mount
+            dev.attach_core(core)
+            bucket.append(dev)
+
+    # -- 单客户端准入 --------------------------------------------------
+    #
+    # 规则全在 ClientLease 里，这里只保留对外的方法名（HTTP 层与测试都用这几个）。
+
+    @property
+    def single_client(self) -> bool:
+        return self.clients.single_client
+
+    @property
+    def client_lease_seconds(self) -> float:
+        return self.clients.lease_seconds
+
+    def client_status(self) -> dict:
+        return self.clients.status()
+
+    def acquire_client(self, client_id: Optional[str]) -> dict:
+        """占住唯一席位；已声明身份的其它客户端在租约有效期内一律被挡。"""
+        return self.clients.acquire(client_id)
+
+    def release_client(self, client_id: Optional[str]) -> dict:
+        return self.clients.release(client_id)
+
+    def check_client(self, client_id: Optional[str]) -> bool:
+        """普通 API 请求：带身份的必须就是席位持有者；不带身份的按宿主本地调用放行。"""
+        return self.clients.check(client_id)
+
+    # -- 事件观察 ------------------------------------------------------
+
+    def _on_event(self, event: dict) -> None:
+        self.channel.publish("event", _jsonable(event))
+
+    # -- 观测 ----------------------------------------------------------
+
+    def schedule(self) -> dict:
+        """就绪 / 休眠 / 已结束队列与步数账本；实现在 ConsoleView。"""
+        return self.view.schedule()
+
+    def state(self) -> dict:
+        core = self.core
+        return {
+            "running": self.running,
+            "schedule": self.schedule(),
+            "conversations": [
+                self.view.brief(cid, conv)
+                for cid, conv in sorted(core.conversations.items())
+            ],
+            "panel": {
+                "cid": self.panel.cid,
+                "active": core.active_conversation_id() == self.panel.cid,
+                "messages": len(self.panel.messages),
+                "channel": self.channel.status(),
+            },
+            "interrupts": {
+                "vectors": core.interrupts.vectors,
+                "pending": core.interrupts.pending_types(),
+                "last_dispatch": core.interrupts.last_dispatch,
+            },
+            "mask": self.masks.masked(),
+            "snapshots": self.snapshots.count(),
+            # 操作面板首屏：生命周期、本次恢复摘要、IO 两条流的 seq 与丢弃计数
+            "lifecycle": self.lifecycle,
+            # API 暂停是内核状态（core.paused），生命周期是宿主视角，两者一起给面板。
+            "paused": bool(getattr(core, "paused", False)),
+            "pause_reason": getattr(core, "pause_reason", None),
+            "pause_category": getattr(core, "pause_category", None),
+            "recovery": getattr(core, "recovery", {}),
+            "io": self.io_bus.status(),
+            "force_stop_after": self.lifecycle_state.force_stop_delay,
+            "force_stop_remaining": self.force_stop_remaining(),
+            "client": self.client_status(),
+        }
+
+    def force_stop_remaining(self) -> float:
+        """还要等几秒才允许强制退出；尚未请求关机时给满额，已停止时给 0。"""
+        return self.lifecycle_state.remaining()
+
+    def conversation(self, cid: int) -> dict:
+        return self.view.conversation(cid)
+
+    def memory(self, ref: Optional[str] = None) -> dict:
+        return self.view.memory(ref)
+
+    def listeners(self) -> dict:
+        return self.view.listeners()
+
+    def devices(self) -> dict:
+        return self.view.devices()
+
+    # -- 快照与 diff ---------------------------------------------------
+    #
+    # 帧的存法与比对在 MemorySnapshots 里，这里只保留对外方法名。
+
+    def snapshot(self) -> int:
+        return self.snapshots.take()
+
+    def diff(self, frm: int, to: Optional[int] = None) -> dict:
+        return self.snapshots.diff(frm, to)
+
+    # -- 介入：中断与动作 ----------------------------------------------
+    #
+    # 三个动作的实际实现在 OperatorActions 里，这里只保留对外方法名。
+
+    def request_pause(self) -> dict:
+        return self.actions.request_pause()
+
+    def submit_action(self, tool: str, arguments: Optional[dict] = None) -> dict:
+        return self.actions.submit_action(tool, arguments)
+
+    def resume(self) -> dict:
+        return self.actions.resume()
+
+    # -- API 暂停与恢复 ------------------------------------------------
+    #
+    # 暂停位是内核状态，生命周期与唤醒信号在 Lifecycle 里，这里只保留对外方法名。
+
+    def resume_api_pause(self) -> dict:
+        """清除内核的 API 暂停，并唤醒等待恢复的主线程（实现见 Lifecycle）。"""
+        return self.lifecycle_state.resume_api_pause()
+
+    def wait_for_api_resume(self) -> None:
+        """主线程在 API 暂停后等待操作员恢复；关机请求也会置位。"""
+        self.lifecycle_state.wait_for_api_resume()
+
+    def invoke_device_action(self, mount: str, index: Optional[int] = None,
+                             arguments: Optional[dict] = None,
+                             name: Optional[str] = None) -> dict:
+        """调用设备自己声明的调试动作（实现见 DeviceActions）。"""
+        return self.device_actions.invoke(mount, index=index,
+                                         arguments=arguments, name=name)
 
     # -- 操作面板：IO 与生命周期 ---------------------------------------
 
@@ -731,112 +1055,28 @@ class Console:
                 "target": entry["target"], "text": entry["text"]}
 
     def request_shutdown(self) -> dict:
-        """挂 `shutdown` 中断通知系统关机（中断是 VM 通知软件的通道）。
-
-        镜像声明了 `meta.guest_programs.shutdown` 时，把该角色程序的入口正文作为
-        payload 挂中断：Core 在下一个安全点把执行权交给监督程序，由它收尾并写
-        `$MEM.sys.power.state = "off"`；宿主在安全点看到 off 才写快照/persist 并退出。
-        没有声明 shutdown 角色时中断没有接收方：只返回 warning 并保持 stopping，
-        不自行断电，操作员可在 force_stop_delay 之后强制退出。
-
-        面板对话空闲时正阻塞在自己的推理里等操作员动作，中断要等它回到安全点才能
-        派发；所以面板关机按钮在挂中断的同时向操作员通道提交一次 `{"end": True}`，
-        让阻塞的面板回合回到安全点（作者 2026-11-11 定）。面板没有占执行权时中断
-        在下一个安全点自然派发，不提交动作，避免在通道里留下一枚过早的 end。
-        这不是"经保留对话写世界"：只是让阻塞的面板让出执行权。新输入从这一刻起被拦住。
-
-        API 暂停中也可以请求关机：关机优先于暂停，先清暂停并唤醒主线程，让 shutdown
-        中断在下一个安全点能够派发；否则主线程停在暂停等待里，中断永远到不了接收方。
-        没有 shutdown 处理程序时回到正常运行（warning 不变），force-stop 仍按秒数放行。
-        """
-        with self._client_lock:
-            if self.lifecycle not in ("running", "paused"):
-                raise ConsoleConflict(f"面板处于 {self.lifecycle} 状态，不再接收关机请求")
-            was_paused = self.lifecycle == "paused"
-            self.lifecycle = "stopping"
-            self.stopping_since = time.time()
-        info = self.core.guest_roles.get("shutdown")
-        warning = None
-        if info is None:
-            warning = (
-                "镜像没有声明 shutdown 处理程序（meta.guest_programs.shutdown）："
-                "关机中断没有接收方，系统不会自行断电；等待 force_stop_after 秒后"
-                "可走 force-stop 强制退出"
-            )
-        else:
-            self.core.interrupts.raise_("shutdown", payload=info.get("entry"))
-            if self.core._active_cid == self.panel.cid:
-                # 面板关机按钮同时向操作员通道提交一次：结束面板这一轮，Core 回到
-                # 安全点才能派发 shutdown 中断（作者 2026-11-11 定）。
-                self.channel.submit_action({"end": True})
-        if was_paused:
-            # 中断已挂起；清暂停让主线程重新进入 run()，在安全点派发它。
-            self.core.clear_api_pause()
-            self._api_resume_event.set()
-        return {
-            "status": "stopping",
-            "request": "shutdown",
-            "interrupt": "shutdown" if info is not None else None,
-            "payload": info.get("entry") if info is not None else None,
-            "force_stop_after": self.force_stop_delay,
-            "warning": warning,
-        }
+        """挂 `shutdown` 中断通知系统关机（实现与设计说明见 Lifecycle.request_shutdown）。"""
+        return self.lifecycle_state.request_shutdown()
 
     def force_stop(self) -> dict:
-        """强制退出：不写快照。只有注入了回调的真实宿主才真的结束进程。
-
-        只在「已请求关机且等满 force_stop_delay 秒」之后放行，防止顺手把还在
-        正常收尾的宿主杀掉；回调由 main() 注入，单测与 mock 不结束进程。
-        """
-        remaining = self.force_stop_remaining()
-        if remaining > 0:
-            raise ConsoleConflict(
-                f"关机还在收尾：{remaining:.0f} 秒后才可强制退出（不写快照）"
-            )
-        with self._client_lock:
-            self.lifecycle = "stopped"
-        hook = self.force_stop_hook
-        if callable(hook):
-            threading.Thread(target=hook, daemon=True).start()
-        return {"status": "force-stopped", "snapshot_written": False}
+        """强制退出，不写快照（实现与放行条件见 Lifecycle.force_stop）。"""
+        return self.lifecycle_state.force_stop()
 
     # -- 屏蔽与还原 ----------------------------------------------------
+    #
+    # 账本逻辑在 MaskLedger 里，这里只保留对外方法名（HTTP 层与测试用这几个）。
 
     def mask_memory(self, ref: str) -> dict:
-        if ref in self._memory_mask:
-            raise ValueError(f"{ref} 已经被屏蔽")
-        node = self.core.mem.detach(ref)  # 失败时抛 VMMemoryError，不改账本
-        self._memory_mask[ref] = node
-        return {"masked": ref, "kind": type(node).__name__}
+        return self.masks.mask_memory(ref)
 
     def unmask_memory(self, ref: str) -> dict:
-        if ref not in self._memory_mask:
-            raise KeyError(f"{ref} 没有被屏蔽")
-        node = self._memory_mask[ref]
-        try:
-            self.core.mem.attach(ref, node)  # 冲突时抛 VMMemoryError，账本保持不变
-        except Exception:
-            raise
-        del self._memory_mask[ref]
-        return {"unmasked": ref}
+        return self.masks.unmask_memory(ref)
 
     def mask_device(self, mount: str) -> dict:
-        if mount in self._device_mask:
-            raise ValueError(f"设备 {mount} 已经被屏蔽")
-        devices = self.core.mem.mounted_devices()
-        if mount not in devices:
-            raise KeyError(f"路径 {mount} 没有挂载设备")
-        device = devices[mount]
-        self.core.mem.unmount(mount)
-        self._device_mask[mount] = device
-        return {"masked": mount, "type": type(device).__name__}
+        return self.masks.mask_device(mount)
 
     def unmask_device(self, mount: str) -> dict:
-        if mount not in self._device_mask:
-            raise KeyError(f"设备 {mount} 没有被屏蔽")
-        self.core.mem.mount(mount, self._device_mask[mount])
-        del self._device_mask[mount]
-        return {"unmasked": mount}
+        return self.masks.unmask_device(mount)
 
     # -- 监听器管线 ----------------------------------------------------
 
@@ -1062,7 +1302,6 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        query = self._query()
         console = self.console
         if self._guard(path):
             return
@@ -1226,7 +1465,8 @@ def serve(console: Console, host: str = "127.0.0.1", port: int = 8700) -> Thread
 # 入口
 # ----------------------------------------------------------------------
 
-def main(argv=None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
+    """控制台的命令行参数：端口、绑定地址、面板准入、启动模式。"""
     parser = argparse.ArgumentParser(description="AVM 调试控制台后端")
     parser.add_argument("image", nargs="?", help="系统镜像 JSON 文件路径")
     parser.add_argument("--port", type=int, default=8700, help="监听端口（默认 8700）")
@@ -1238,46 +1478,57 @@ def main(argv=None) -> int:
     from .boot import add_core_dump_args, add_mode_arg
     add_core_dump_args(parser)
     add_mode_arg(parser)
-    args = parser.parse_args(argv)
+    return parser
 
-    if not args.image:
-        print("[console] 需要一个镜像路径", file=sys.stderr)
-        return 1
 
-    from .boot import boot, dump_on_death, write_snapshot
+def _boot_core(args):
+    """按启动模式装载并启动内核；镜像类错误只报到 stderr 并返回 None。
+
+    返回 None 而不是抛：镜像错误是运行者的输入问题，控制台该给一行提示、
+    退出码 1，不给 traceback。
+    """
+    from .boot import boot
     from .services import services_from_env
     from .exceptions import VMMemoryError
     from .image import ImageError
 
     try:
-        core = boot(args.image, mode=args.mode,
+        return boot(args.image, mode=args.mode,
                     checkpoint_in=args.checkpoint_in,
                     host_flags={"console": True},
                     services=services_from_env())
     except (ImageError, VMMemoryError, OSError, ValueError) as e:
         print(f"[console] 镜像错误: {e}", file=sys.stderr)
-        return 1
+        return None
 
-    # 紧耦合登录：一次性 token 只在本次进程有效，登录本身即凭证。
-    # 单测与 e2e mock 直接构造 Console（auth_token=None），不启用这一层。
-    token = secrets.token_urlsafe(24)
 
+def _start_panel(core, token: str, args):
+    """绑定面板对话并起 HTTP 服务；返回 (console, server)。"""
     def force_exit():
         time.sleep(0.3)  # 让 202 响应先写回浏览器
         os._exit(1)
 
     console = Console(core, auth_token=token, force_stop_hook=force_exit,
                       single_client=not args.allow_multiple_clients)
-    server = serve(console, args.host, args.port)
+    return console, serve(console, args.host, args.port)
+
+
+def _announce(console, server, token: str, host: str) -> None:
+    """把连上之前必须知道的东西打到 stderr：面板 cid、准入开关、地址、凭证。"""
     print(f"[console] 面板对话 cid={console.panel.cid}，"
           f"中断向量 operator → {console.panel.cid}", file=sys.stderr)
     print(f"[console] 单客户端准入：{'开启' if console.single_client else '关闭（--allow-multiple-clients）'}",
           file=sys.stderr)
-    print(f"[console] http://{args.host}:{server.server_port}/", file=sys.stderr)
+    print(f"[console] http://{host}:{server.server_port}/", file=sys.stderr)
     print(f"[console] 面板凭证：{token}", file=sys.stderr)
-    token_path = os.path.join(
-        os.path.dirname(os.path.abspath(args.image)), "out", "console.token"
-    )
+
+
+def _write_token_file(image_path: str, token: str) -> None:
+    """把一次性凭证写到镜像目录 out/console.token（权限 0o600）。
+
+    写不成不拦启动：凭证同时打在终端上，运行者照着输就行。
+    """
+    token_path = os.path.join(os.path.dirname(os.path.abspath(image_path)), "out", "console.token")
     try:
         os.makedirs(os.path.dirname(token_path) or ".", exist_ok=True)
         with open(token_path, "w", encoding="utf-8") as f:
@@ -1289,9 +1540,101 @@ def main(argv=None) -> int:
         print(f"[console] 凭证已写入 {token_path}", file=sys.stderr)
     except OSError as e:
         print(f"[console] 凭证文件写入失败（以终端显示为准）：{e}", file=sys.stderr)
+
+
+def _warn_if_web_unbuilt(console) -> None:
+    """前端没构建过时说清怎么补，而不是让 / 变成 404。"""
     if not os.path.isfile(os.path.join(console.web_root, "index.html")):
         print(f"[console] 前端未构建（{console.web_root} 里没有 index.html）："
               f"cd web && npm install && npm run build；/ 会给出同样的提示", file=sys.stderr)
+
+
+def _wait_while_paused(core, console) -> None:
+    """API 暂停：HTTP 服务保持存活，等面板发 resume（关机请求会置位后继续）。
+
+    暂停不写快照、不关对话，主线程就停在这里。
+    """
+    # 已请求关机时保留 stopping，避免暂停覆盖掉宿主生命周期。
+    if console.lifecycle != "stopping":
+        console.lifecycle = "paused"
+    print(
+        f"[console] API 暂停（{core.pause_category}）：{core.pause_reason}",
+        file=sys.stderr,
+    )
+    print(
+        "[console] 等待 POST /api/system/resume 恢复；force-stop 仍可用",
+        file=sys.stderr,
+    )
+    console.wait_for_api_resume()
+    if console.lifecycle == "paused":
+        console.lifecycle = "running"
+
+
+def _serve_until_stop(core, console) -> int:
+    """把内核跑到停下：正常停下返回 0，操作员中断返回 130。
+
+    内核异常死亡不在这里处理——那是 main 的活（先落现场快照再原样上抛），
+    所以只捕获"停止"这一类，其余 BaseException 让它穿过去。
+    """
+    try:
+        while True:
+            core.run()
+            if not core.paused:
+                # 恢复/关机端点可能抢在主线程读到暂停之前清掉 core.paused 并置位
+                # 事件；事件已置位说明这是暂停后的继续，不是正常退出。
+                resume_event = console.lifecycle_state.api_resume_event
+                if resume_event.is_set():
+                    resume_event.clear()
+                    continue
+                break
+            _wait_while_paused(core, console)
+    except RunnerStop as e:
+        print(f"[console] {e}", file=sys.stderr)
+    except KeyboardInterrupt:
+        print("[console] 收到中断，写回后退出", file=sys.stderr)
+        return 130
+    return 0
+
+
+def _shutdown(core, console, server, clean_exit: bool) -> None:
+    """收尾：摘状态、写重启快照、写回内存、关服务。
+
+    正常退出（含 OS 写 power.state=off 后的安全点返回、运行者停止）才写重启快照；
+    异常死亡与强制退出不拍——半截回合/未收尾的世界不能当恢复输入。
+    """
+    console.running = False
+    console.lifecycle = "stopped"
+    if clean_exit:
+        from .boot import write_snapshot
+        write_snapshot(core)
+    persist_to = getattr(core, "persist_to", None)
+    if persist_to:
+        try:
+            os.makedirs(os.path.dirname(persist_to) or ".", exist_ok=True)
+            core.mem.save(persist_to)
+            print(f"[console] 内存已写回 {persist_to}", file=sys.stderr)
+        except OSError as e:
+            print(f"[console] 写回失败: {e}", file=sys.stderr)
+    server.shutdown()
+
+
+def main(argv=None) -> int:
+    args = _build_parser().parse_args(argv)
+    if not args.image:
+        print("[console] 需要一个镜像路径", file=sys.stderr)
+        return 1
+
+    core = _boot_core(args)
+    if core is None:
+        return 1
+
+    # 紧耦合登录：一次性 token 只在本次进程有效，登录本身即凭证。
+    # 单测与 e2e mock 直接构造 Console（auth_token=None），不启用这一层。
+    token = secrets.token_urlsafe(24)
+    console, server = _start_panel(core, token, args)
+    _announce(console, server, token, args.host)
+    _write_token_file(args.image, token)
+    _warn_if_web_unbuilt(console)
 
     console.running = True
     if args.no_core_dump:
@@ -1299,58 +1642,17 @@ def main(argv=None) -> int:
     status = 0
     clean_exit = True
     try:
-        while True:
-            core.run()
-            if not core.paused:
-                # 恢复/关机端点可能抢在主线程读到暂停之前清掉 core.paused 并置位
-                # 事件；事件已置位说明这是暂停后的继续，不是正常退出。
-                if console._api_resume_event.is_set():
-                    console._api_resume_event.clear()
-                    continue
-                break
-            # API 暂停：HTTP 服务保持存活，操作员可从面板恢复；暂停不写快照、
-            # 不关对话，主线程停在这里等 resume（或关机请求置位后继续处理中断）。
-            # 已请求关机时保留 stopping，避免暂停覆盖掉宿主生命周期。
-            if console.lifecycle != "stopping":
-                console.lifecycle = "paused"
-            print(
-                f"[console] API 暂停（{core.pause_category}）：{core.pause_reason}",
-                file=sys.stderr,
-            )
-            print(
-                "[console] 等待 POST /api/system/resume 恢复；force-stop 仍可用",
-                file=sys.stderr,
-            )
-            console.wait_for_api_resume()
-            if console.lifecycle == "paused":
-                console.lifecycle = "running"
-    except RunnerStop as e:
-        print(f"[console] {e}", file=sys.stderr)
-    except KeyboardInterrupt:
-        print("[console] 收到中断，写回后退出", file=sys.stderr)
-        status = 130
+        status = _serve_until_stop(core, console)
     except BaseException as e:
         # 内核死亡：先落现场快照，再保留原始 traceback 往上抛
         clean_exit = False
+        from .boot import dump_on_death
         dump_on_death(core, e, args.core_dump)
         raise
     finally:
-        console.running = False
-        console.lifecycle = "stopped"
-        # 正常退出（含 OS 写 power.state=off 后的安全点返回、运行者停止）写重启快照；
-        # 异常死亡与强制退出不拍，半截回合/未收尾的世界不能当恢复输入。
-        if clean_exit:
-            write_snapshot(core)
-        persist_to = getattr(core, "persist_to", None)
-        if persist_to:
-            try:
-                os.makedirs(os.path.dirname(persist_to) or ".", exist_ok=True)
-                core.mem.save(persist_to)
-                print(f"[console] 内存已写回 {persist_to}", file=sys.stderr)
-            except OSError as e:
-                print(f"[console] 写回失败: {e}", file=sys.stderr)
-        server.shutdown()
+        _shutdown(core, console, server, clean_exit)
     return status
+
 
 
 if __name__ == "__main__":

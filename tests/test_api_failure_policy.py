@@ -315,7 +315,8 @@ class TestConsolePause:
             assert response["status"] == "stopping"
             assert core.paused is False
             assert console.lifecycle == "stopping"
-            assert console._api_resume_event.is_set()
+            # 唤醒信号住在 Lifecycle 里：关机要从暂停里把主线程拽出来。
+            assert console.lifecycle_state.api_resume_event.is_set()
         finally:
             server.shutdown()
             server.server_close()

@@ -1,5 +1,7 @@
 import dataclasses
 import traceback
+from contextlib import contextmanager
+from types import MappingProxyType
 from typing import Optional, List, Dict, Type, Any
 
 import json
@@ -7,28 +9,35 @@ import os
 import sys
 import time
 
-from .types import MetaList, MetaDict
+from .types import MetaList, MetaDict, PANEL_CID
 from .capabilities import (
     CONTROL_DEVICE_ROOTS, MEM_ROOT_NAME, MODE_KERNEL, MODE_USER, Capability, caps_to_dict,
-    check_root_name, default_kernel_caps, grant_target_segments, path_is_prefix,
-    targets_prefix_free,
+    check_root_name, default_kernel_caps, path_is_prefix, targets_prefix_free,
 )
-from .exceptions import IllegalOperationError, VMSyntaxError, VMMemoryError, APIError, RunnerStop, KernelPanic
-from .api_errors import CONTEXT_LIMIT, INSUFFICIENT_BALANCE, CATEGORIES, classify_api_error
-from .types import SystemMessage, UserMessage, Conversation, UserMessageBatch, message_to_api_dict, LinkNode
-from .types import message_to_dict, batch_to_dict
-from .memory import Memory, check_new_key
-from .memory_device import MemoryDevice
+from .exceptions import IllegalOperationError, VMMemoryError, APIError, RunnerStop, KernelPanic
+from .api_errors import (
+    CONTEXT_LIMIT,
+    INSUFFICIENT_BALANCE,
+    category_and_detail,
+    classify_api_error,
+    remember_failure,
+    resolve_action,
+    retry_limit,
+)
+from .types import SystemMessage, UserMessage, Conversation, LinkNode
+from .types import message_to_dict, batch_to_dict, tool_exchange
+from .memory import Memory
+from .memory_nodes import check_new_key
 from .monitor import Monitor
 from .modules import (
-    BASE_MODULES, MODULE_CATALOG, ModuleCatalogDevice, ModuleLoaderDevice,
+    BASE_MODULES, ModuleCatalogDevice, ModuleLoaderDevice,
     grantable_module_names, module_descriptor, register_module_from_source,
-    register_module as register_catalog_module, registered_module_descriptors,
+    register_module as register_catalog_module,
 )
 from .events import EventSystem, build_event, EVENT_TYPES
 from .journal import (
     JOURNAL_RECORD_VERSION, Journal, JournalError, apply as apply_journal_record,
-    conversation_create_payload, scheduler_to_snapshot,
+    conversation_create_payload, scheduler_delta,
 )
 from .info_devices import (
     CapsDevice, ConversationsDevice, RootsDevice, SchedulerDevice,
@@ -51,10 +60,6 @@ from .instructions import (
     _INSTRUCTION_ERRORS, _UNEXECUTED_TOOL_RESPONSE,
     instruction_registry, build_tools, build_imports,
 )
-
-
-
-
 
 
 # 操作员对话的系统消息：说明这条对话的执行器是操作员而不是模型。
@@ -82,7 +87,9 @@ _OPERATOR_SYSTEM_PROMPT = (
 # 里，也不可用 send_instruction / close_conversation 或 $conv.<cid> / $batch.<cid>
 # 寻址。隐藏只是显示/寻址策略：对话本身随快照/日志正常恢复，日志里它的回合按普通
 # 回合重放。
-PANEL_CID = -1
+#
+# 定义与语义说明在 avm.types.PANEL_CID（上面已 import），此处只是重新导出，
+# 保持 `from avm.core import PANEL_CID` 的既有用法。
 
 
 # 启动自带的内存节点：模型目录。普通内存节点，不是设备——不产生事件、不参与调度。
@@ -115,7 +122,7 @@ def _publish_memory_after(
         )
         return
     _, mount_key, remainder = follow
-    device = core.mem._devices[mount_key]
+    device = core.mem.devices[mount_key]
     extra = device.after_event(event_type, remainder, result or {})
     if extra is None:
         return
@@ -183,7 +190,7 @@ def _check_model_namespace(core: 'Core', program_type: str, para: MetaDict, para
     python 程序 → model 必须是 PLM 注册名；settingup 程序 → model 必须是上游 LLM 模型名。
     上游清单没取到时只警告不拦：`/models` 只是参考，取不到不该让镜像起不来（讨论案第五节）。
     """
-    catalog = core.mem._data.get(MODEL_CATALOG_KEY)
+    catalog = core.mem.get(MODEL_CATALOG_KEY)
     if not isinstance(catalog, MetaDict):
         return
     model = para.get("model")
@@ -293,20 +300,32 @@ def _program_caps_spec(node) -> dict:
 
 def _derive_child_caps(core: 'Core', parent: Optional[Conversation], node, is_sub: bool,
                        is_init: bool = False) -> Capability:
-    """按程序 ctrl.caps 与父能力计算子对话能力。
+    """按程序节点的 caps 声明，结合父对话能力算出子对话的能力。全部规则在此，缺省继承。
 
-    规则（批次一）：
     - 模式：缺省继承；用户态不能创建内核态；亚对话不能跨模式；init 强制内核态。
     - 工具集：缺省继承；显式声明时必须 ⊆ 父工具集。
     - 组：缺省继承；用户态父对话只能给子对话父已有的组（内核态父可指定）。
     - 根：内核态子对话固定 `{MEM: ()}`；用户态子对话的授予根来自 caps.roots 的
       `根名 -> $MEM 路径`（同域创建时只能沿用父根，不能新增）。用户态对话的工作
       目录不再由内核分配：目录由软件建，根由 `$MEM.conversations.<cid>.roots` 动态授予。
+
+    每一类各有一个 _derive_xxx：规则彼此独立，混在一个函数里会看不出"哪条规则拒了它"。
     """
     spec = _program_caps_spec(node)
     parent_caps = parent.caps if parent is not None else default_kernel_caps()
-    parent_mode = parent_caps.mode
+    # 按原来的校验顺序逐项求值（mode → tools → imports → groups → roots）：
+    # 同时有多处非法时，报哪一条也属于行为，写进 Capability(...) 实参会打乱顺序。
+    mode = _derive_mode(spec, parent_caps.mode, parent, is_sub, is_init)
+    tools = _derive_tools(spec, parent_caps)
+    imports = _derive_imports(spec, parent_caps)
+    groups = _derive_groups(spec, parent_caps, parent)
+    roots = _derive_roots(core, spec, mode, parent_caps, parent, is_sub)
+    return Capability(mode=mode, groups=groups, roots=roots, tools=tools, imports=imports)
 
+
+def _derive_mode(spec: dict, parent_mode: str, parent: Optional[Conversation],
+                 is_sub: bool, is_init: bool) -> str:
+    """模式：缺省继承；不能提权；亚对话不能跨模式；init 强制内核态。"""
     mode = spec.get("mode", parent_mode)
     if mode not in (MODE_KERNEL, MODE_USER):
         raise IllegalOperationError(f"程序 caps.mode 必须是 kernel/user，得到 {mode!r}")
@@ -317,79 +336,90 @@ def _derive_child_caps(core: 'Core', parent: Optional[Conversation], node, is_su
             raise VMMemoryError("模式不可提权：用户态对话只能创建用户态对话")
         if is_sub and mode != parent_mode:
             raise VMMemoryError("亚对话不能跨模式创建")
+    return mode
 
+
+def _derive_tools(spec: dict, parent_caps) -> frozenset:
+    """工具集：缺省继承；显式声明时必须 ⊆ 父工具集（不允许凭空多出工具）。"""
     tools_spec = spec.get("tools")
     if tools_spec is None:
-        tools = parent_caps.tools
-    else:
-        if not isinstance(tools_spec, list) or not all(isinstance(x, str) for x in tools_spec):
-            raise IllegalOperationError("程序 caps.tools 必须是字符串列表")
-        tools = frozenset(tools_spec)
-        extra = tools - parent_caps.tools
-        if extra:
-            raise VMMemoryError(f"工具集不可超出父对话：{sorted(extra)}")
+        return parent_caps.tools
+    if not isinstance(tools_spec, list) or not all(isinstance(x, str) for x in tools_spec):
+        raise IllegalOperationError("程序 caps.tools 必须是字符串列表")
+    tools = frozenset(tools_spec)
+    extra = tools - parent_caps.tools
+    if extra:
+        raise VMMemoryError(f"工具集不可超出父对话：{sorted(extra)}")
+    return tools
 
+
+def _derive_imports(spec: dict, parent_caps) -> frozenset:
+    """模块导入：缺省继承；不能声明基线模块、不能超出宿主目录、不能超出父对话。"""
     imports_spec = spec.get("imports")
     if imports_spec is None:
-        imports = parent_caps.imports
-    else:
-        if not isinstance(imports_spec, list) or not all(isinstance(x, str) for x in imports_spec):
-            raise IllegalOperationError("程序 caps.imports 必须是字符串列表")
-        imports = frozenset(imports_spec)
-        declared_base = sorted(imports & set(BASE_MODULES))
-        if declared_base:
-            raise IllegalOperationError(
-                f"程序 caps.imports 不能声明基线模块：{declared_base}"
-                f"（基线 {list(BASE_MODULES)} 不可裁剪，也不需要声明）"
-            )
-        unknown = imports - grantable_module_names()
-        if unknown:
-            raise VMMemoryError(
-                f"程序 caps.imports 引用了宿主模块目录之外的模块：{sorted(unknown)}"
-                f"（可授予：{sorted(grantable_module_names())}）"
-            )
-        extra = imports - parent_caps.imports
-        if extra:
-            raise VMMemoryError(f"模块导入不可超出父对话：{sorted(extra)}")
+        return parent_caps.imports
+    if not isinstance(imports_spec, list) or not all(isinstance(x, str) for x in imports_spec):
+        raise IllegalOperationError("程序 caps.imports 必须是字符串列表")
+    imports = frozenset(imports_spec)
+    declared_base = sorted(imports & set(BASE_MODULES))
+    if declared_base:
+        raise IllegalOperationError(
+            f"程序 caps.imports 不能声明基线模块：{declared_base}"
+            f"（基线 {list(BASE_MODULES)} 不可裁剪，也不需要声明）"
+        )
+    unknown = imports - grantable_module_names()
+    if unknown:
+        raise VMMemoryError(
+            f"程序 caps.imports 引用了宿主模块目录之外的模块：{sorted(unknown)}"
+            f"（可授予：{sorted(grantable_module_names())}）"
+        )
+    extra = imports - parent_caps.imports
+    if extra:
+        raise VMMemoryError(f"模块导入不可超出父对话：{sorted(extra)}")
+    return imports
 
+
+def _derive_groups(spec: dict, parent_caps, parent: Optional[Conversation]) -> tuple:
+    """组：缺省继承；显式声明时去重保序；用户态父对话不能给子对话父没有的组。"""
     groups_spec = spec.get("groups")
     if groups_spec is None:
-        groups = parent_caps.groups
-    else:
-        if not isinstance(groups_spec, list) or not all(isinstance(x, str) and x for x in groups_spec):
-            raise IllegalOperationError("程序 caps.groups 必须是非空字符串列表")
-        groups = tuple(dict.fromkeys(groups_spec))
-        if parent is not None and parent_mode == MODE_USER and not set(groups) <= set(parent_caps.groups):
-            raise VMMemoryError("组不可提权：用户态对话只能创建同组或更少组的子对话")
+        return parent_caps.groups
+    if not isinstance(groups_spec, list) or not all(isinstance(x, str) and x for x in groups_spec):
+        raise IllegalOperationError("程序 caps.groups 必须是非空字符串列表")
+    groups = tuple(dict.fromkeys(groups_spec))
+    if parent is not None and parent_caps.mode == MODE_USER and not set(groups) <= set(parent_caps.groups):
+        raise VMMemoryError("组不可提权：用户态对话只能创建同组或更少组的子对话")
+    return groups
 
+
+def _derive_roots(core: 'Core', spec: dict, mode: str, parent_caps,
+                  parent: Optional[Conversation], is_sub: bool) -> dict:
+    """根：内核态固定 `{MEM: ()}`；用户态按声明从根注册表取，同域创建只能沿用父根。"""
     if mode == MODE_KERNEL:
-        roots = {MEM_ROOT_NAME: ()}
-    else:
-        grants = {}
-        roots_spec = spec.get("roots") or []
-        if not isinstance(roots_spec, list) or not all(isinstance(x, str) for x in roots_spec):
-            raise IllegalOperationError(
-                "程序 caps.roots 必须是根名列表（名字来自镜像 security.roots 注册表）"
-            )
-        for name in roots_spec:
-            check_root_name(name)
-            if name == MEM_ROOT_NAME:
-                raise IllegalOperationError("程序 caps.roots 不能声明 MEM 根")
-            target = core.root_registry.get(name)
-            if target is None:
-                raise VMMemoryError(f"程序 caps.roots 引用了未注册的根：{name!r}")
-            grants[name] = tuple(target)
-        same_domain = is_sub or (parent is not None and parent_mode == MODE_USER)
-        if same_domain:
-            inherited = {n: t for n, t in parent_caps.roots.items() if n != MEM_ROOT_NAME}
-            for name, target in grants.items():
-                if inherited.get(name) != target:
-                    raise VMMemoryError(f"不能向子对话授予父对话没有的根：{name!r}")
-            roots = inherited
-        else:
-            roots = grants
+        return {MEM_ROOT_NAME: ()}
+    grants = {}
+    roots_spec = spec.get("roots") or []
+    if not isinstance(roots_spec, list) or not all(isinstance(x, str) for x in roots_spec):
+        raise IllegalOperationError(
+            "程序 caps.roots 必须是根名列表（名字来自镜像 security.roots 注册表）"
+        )
+    for name in roots_spec:
+        check_root_name(name)
+        if name == MEM_ROOT_NAME:
+            raise IllegalOperationError("程序 caps.roots 不能声明 MEM 根")
+        target = core.root_registry.get(name)
+        if target is None:
+            raise VMMemoryError(f"程序 caps.roots 引用了未注册的根：{name!r}")
+        grants[name] = tuple(target)
+    same_domain = is_sub or (parent is not None and parent_caps.mode == MODE_USER)
+    if not same_domain:
+        return grants
+    inherited = {n: t for n, t in parent_caps.roots.items() if n != MEM_ROOT_NAME}
+    for name, target in grants.items():
+        if inherited.get(name) != target:
+            raise VMMemoryError(f"不能向子对话授予父对话没有的根：{name!r}")
+    return inherited
 
-    return Capability(mode=mode, groups=groups, roots=roots, tools=tools, imports=imports)
 
 
 def _build_conversation(core: 'Core', system_ref: str, para_ref: str, parent: Conversation, is_sub: bool,
@@ -427,7 +457,7 @@ def _build_conversation(core: 'Core', system_ref: str, para_ref: str, parent: Co
         is_root=False,
         caps=caps,
     )
-    core._register(conv)
+    core.register(conv)
     if conv.caps.mode == MODE_USER:
         # 能力自述：保留根 caps 绑定到 $MEM.caps.<cid>，由 Core 拥有，不参与授予
         roots = dict(conv.caps.roots)
@@ -507,6 +537,15 @@ class Core:
         self.events: EventSystem = EventSystem(self)
         self.interrupts: InterruptTable = InterruptTable(self)  # 中断向量表：外部（控制台）发起的控制权转移
         self._turn_events: List[dict] = []
+        self._init_persistence()
+
+    def _init_persistence(self) -> None:
+        """持久运行的状态：日志、快照、重放/记录标记，以及末尾的两步安装。
+
+        单独成法只为让 __init__ 读得下去：这些字段都属于「这台内核怎么活过下一次
+        重启」，与上面的执行状体不混在一起。宿主设备与模型目录放在最后装，因为它们
+        要枚举前面那些字段（设备来源表、镜像声明的 PLM 等）。
+        """
         # 持久运行：回合级效果日志（journal）与重启快照（snapshot）。
         # journal 为 None 时所有记录点是空操作——无日志镜像行为不变。
         self.journal: Optional[Journal] = None
@@ -562,7 +601,7 @@ class Core:
             "module_loader": lambda: ModuleLoaderDevice(self),
         }
         for mount, factory in factories.items():
-            if mount in self.mem._devices:
+            if mount in self.mem.devices:
                 continue
             device = factory()
             self.mem.mount(mount, device)
@@ -673,7 +712,7 @@ class Core:
         checked = self._validate_root_specs(roots_spec, check_live=True)
         self.root_registry = checked
 
-    def _core_roots(self, conv) -> dict:
+    def core_roots(self, conv) -> dict:
         """Core 拥有的根（目前只有能力自述根 caps）：控制面不可覆盖、重放时保留。"""
         target = conv.caps.roots.get("caps")
         return {"caps": tuple(target)} if target is not None else {}
@@ -690,7 +729,7 @@ class Core:
                 raise IllegalOperationError(
                     f"根 {name!r} 的目标落在内核控制面设备路径 $MEM.{target[0]}"
                 )
-            for mount in self.mem._devices:
+            for mount in self.mem.devices:
                 mount_segments = tuple(mount.split("."))
                 if target == mount_segments:
                     continue  # 显式授予设备本身是允许的
@@ -744,7 +783,7 @@ class Core:
             )
         if not isinstance(roots_map, dict):
             raise IllegalOperationError("roots 必须是映射（根名 -> 目标段序列）")
-        core_roots = self._core_roots(conv)
+        core_roots = self.core_roots(conv)
         grants: Dict[str, tuple] = {}
         for name, segments in roots_map.items():
             if not isinstance(name, str) or not name:
@@ -771,7 +810,7 @@ class Core:
         )
         conv.caps = conv.caps.copy(roots=new_roots)
 
-    def _register(self, conv: Conversation, cid: Optional[int] = None) -> Conversation:
+    def register(self, conv: Conversation, cid: Optional[int] = None) -> Conversation:
         conv.cid = self._next_cid if cid is None else cid
         assert conv.cid not in self._conv_by_cid, f"cid {conv.cid} 已存在"
         self._conv_by_cid[conv.cid] = conv
@@ -781,6 +820,204 @@ class Core:
 
     def get_conversation(self, cid: int) -> Optional[Conversation]:
         return self._conv_by_cid.get(cid)
+
+    @property
+    def conversations(self):
+        """对话表的只读视图（cid → Conversation）。
+
+        持久化、事件、设备、宿主都只需要查表，不该直接摸 _conv_by_cid。收口到这里之后，
+        表结构变化只需要改本类，外部模块跟着接口走。返回只读代理，写操作仍走本类的
+        register / remove / clear。
+        """
+        return MappingProxyType(self._conv_by_cid)
+
+    def remove_conversation(self, cid: int) -> Optional[Conversation]:
+        """从对话表移除并返回该对话（日志重放撤销用）。不存在时返回 None。"""
+        return self._conv_by_cid.pop(cid, None)
+
+    def clear_conversations(self) -> None:
+        """清空对话表（快照恢复重建时用）。原地清空，保留字典对象本身。"""
+        self._conv_by_cid.clear()
+
+    # ------------------------------------------------------------------
+    # 调度状态：就绪队列 / 休眠集合 / 活跃对话
+    #
+    # 这三样原先被 9 个模块直接读写私有字段（events / interrupts / journal /
+    # info_devices / console / monitor / image / snapshot / io_devices）。
+    # 队列的插入顺序本身就是语义（谁先跑），所以外部不该自己 append/remove。
+    # 下面这组方法是唯一的操作入口；本类内部仍直接操作字段。
+    # ------------------------------------------------------------------
+
+    def schedule_state(self) -> dict:
+        """调度状态快照：{active, ready, dormant}。两个队列是副本，改了不影响内核。"""
+        return {
+            "active": self._active_cid,
+            "ready": list(self._ready_cids),
+            "dormant": list(self._dormant_cids),
+        }
+
+    def active_conversation_id(self) -> Optional[int]:
+        """当前活跃对话 cid；没有则为 None。"""
+        return self._active_cid
+
+    def is_ready(self, cid) -> bool:
+        return cid in self._ready_cids
+
+    def is_dormant(self, cid) -> bool:
+        return cid in self._dormant_cids
+
+    def ready_ids(self) -> List[int]:
+        """就绪队列的副本（按执行顺序）。"""
+        return list(self._ready_cids)
+
+    def dormant_ids(self) -> List[int]:
+        """休眠集合的副本。"""
+        return list(self._dormant_cids)
+
+    def wake(self, cid) -> None:
+        """唤醒：从休眠/就绪中摘掉后，排到就绪队列末尾（排队执行）。"""
+        if cid in self._dormant_cids:
+            self._dormant_cids.remove(cid)
+        if cid in self._ready_cids:
+            self._ready_cids.remove(cid)
+        self._ready_cids.append(cid)
+
+    def prioritize(self, cid) -> None:
+        """插队：从休眠摘掉后放到就绪队列最前（亚对话结束唤醒父对话、中断抢占）。"""
+        if cid in self._dormant_cids:
+            self._dormant_cids.remove(cid)
+        if cid not in self._ready_cids:
+            self._ready_cids.insert(0, cid)
+
+    def sleep(self, cid) -> None:
+        """置为休眠：不再参与就绪排队。"""
+        if cid not in self._dormant_cids:
+            self._dormant_cids.append(cid)
+
+    def add_ready(self, cid) -> None:
+        """只往就绪队列末尾补一个（不动休眠集合）。日志重放按增量追加时用。"""
+        if cid not in self._ready_cids:
+            self._ready_cids.append(cid)
+
+    def remove_ready(self, cid) -> None:
+        """只从就绪队列摘掉（不动休眠集合）。日志重放按增量撤销时用。"""
+        if cid in self._ready_cids:
+            self._ready_cids.remove(cid)
+
+    def add_dormant(self, cid) -> None:
+        """只往休眠集合补一个（不动就绪队列）。"""
+        if cid not in self._dormant_cids:
+            self._dormant_cids.append(cid)
+
+    def remove_dormant(self, cid) -> None:
+        """只从休眠集合摘掉（不动就绪队列）。"""
+        if cid in self._dormant_cids:
+            self._dormant_cids.remove(cid)
+
+    def drop_from_schedule(self, cid) -> None:
+        """从两个队列里彻底摘掉（对话关闭/删除时）。不改活跃位。"""
+        for queue in (self._ready_cids, self._dormant_cids):
+            while cid in queue:
+                queue.remove(cid)
+
+    def set_active(self, cid) -> None:
+        """指定活跃对话；None 表示无活跃。"""
+        self._active_cid = cid
+
+    def restore_schedule(self, active, ready, dormant) -> None:
+        """整体恢复调度状态（日志重放 / 快照恢复用）。三个参数都是完整状态。"""
+        self._active_cid = active
+        self._ready_cids = list(ready)
+        self._dormant_cids = list(dormant)
+
+    # 已终结对话：终端提示、事件投递、中断、日志重放都要问"这个 cid 还能不能跑"。
+    # 归属是内核的记账，外部只该问和标记，不该自己 add/discard 一个 set。
+
+    def is_finished(self, cid) -> bool:
+        """该对话是否已终结（关闭/结束，不再参与调度与投递）。"""
+        return cid in self._finished
+
+    def finished_ids(self) -> List[int]:
+        """已终结 cid 的升序副本（观测输出用）。"""
+        return sorted(self._finished)
+
+    def add_finished(self, cid) -> None:
+        """标记为已终结（关闭对话、日志重放补记）。"""
+        self._finished.add(cid)
+
+    def remove_finished(self, cid) -> None:
+        """撤销终结标记（日志重放撤销）。"""
+        self._finished.discard(cid)
+
+    def restore_finished(self, cids) -> None:
+        """整体恢复终结集合（日志重放 / 快照恢复用）。"""
+        self._finished = set(cids)
+
+    # ------------------------------------------------------------------
+    # 记账数字：cid 分配器 / 日志位置 / 指令预算
+    #
+    # 这几个都是内核自己维护的计数器，外部（boot / snapshot / journal /
+    # monitor / console / interrupts / info_devices）以前直接读写字段。
+    # 它们的不变量只在写入点成立：cid 只能增、"已提交位置"只能由提交推进、
+    # 预算只能由本链消费。所以读取用属性，写入各给一个具名方法。
+    # ------------------------------------------------------------------
+
+    @property
+    def next_cid(self) -> int:
+        """下一个可分配的对话 cid。"""
+        return self._next_cid
+
+    def restore_next_cid(self, cid: int) -> None:
+        """恢复 cid 分配器（快照 / 日志重放用），保证重启后继续增长、不撞号。"""
+        self._next_cid = int(cid)
+
+    @property
+    def journal_seq(self) -> int:
+        """已提交的日志位置（不是文件长度：文件里可能有尚未重放的尾巴）。"""
+        return self._journal_seq
+
+    def restore_journal_seq(self, seq) -> None:
+        """把已提交位置恢复到 seq，并把"上次快照位置"对齐到同一点。
+
+        恢复基线就是"快照 + 日志尾部"：两者必须重合，否则增量会重复应用。
+        """
+        self._journal_seq = int(seq or 0)
+        self._last_snapshot_seq = self._journal_seq
+
+    def mark_snapshot_taken(self) -> None:
+        """记录"快照已覆盖到当前已提交位置"（写快照后、建立恢复基线时）。"""
+        self._last_snapshot_seq = self._journal_seq
+
+    def reset_journal_seq(self) -> None:
+        """新代际：已提交位置与上次快照位置一起归零。"""
+        self._journal_seq = 0
+        self._last_snapshot_seq = 0
+
+    @property
+    def instruction_budget(self) -> int:
+        """单条调用链的指令预算上限。"""
+        return self._instruction_budget
+
+    def set_instruction_budget(self, budget: int) -> None:
+        """设定预算上限（镜像声明 / 恢复）。"""
+        self._instruction_budget = int(budget)
+
+    @property
+    def activation_instructions(self) -> int:
+        """当前调用链已消耗的指令数。"""
+        return self._activation_instructions
+
+    def set_activation_instructions(self, count: int) -> None:
+        """设定链内计数：断链时归零（重新给满预算），重放时按记录恢复。"""
+        self._activation_instructions = int(count)
+
+    def stash_image_init(self, init) -> None:
+        """暂存镜像 init 段：恢复路径不建对话，留给冷启动模式补跑（见 avm.image.start_cold）。"""
+        self._image_init = init
+
+    def stashed_image_init(self):
+        """取出暂存的 init 段；没暂存过（非恢复路径）为 None。"""
+        return self._image_init
 
     def checkpoint_path(self, cid: int) -> str:
         """调试用：单对话检查点的默认路径（镜像目录/out/<镜像名>.conv.json；无镜像上下文时用 checkpoints/conv-<cid>.json）"""
@@ -821,7 +1058,7 @@ class Core:
         conv = Conversation.from_checkpoint(cp)
         if conv.is_python:
             raise ValueError("v1 检查点不支持 Python 对话")
-        self._register(conv)
+        self.register(conv)
         if schedule == "ready":
             self._ready_cids.append(conv.cid)
         else:
@@ -838,14 +1075,14 @@ class Core:
         self.journal = Journal(path)
         # 调度增量的基线：从装载后的状态开始记，第一条记录覆盖 run 前的选择与回合内迁移。
         self._scheduler_committed = self._scheduler_state()
-        self._refresh_journal_batch()
+        self.refresh_journal_batch()
         return self.journal
 
     def detach_journal(self) -> None:
         """摘掉日志（之后的回合不再记录；已提交的记录留在文件里）。"""
         self.journal = None
 
-    def _journaling(self) -> bool:
+    def is_journaling(self) -> bool:
         """当前是否正在为回合日志记录（无日志/重放/非回合执行期都是假）。
 
         记录点先问这一句再构造载荷：无日志镜像不该为日志做序列化工作。
@@ -854,15 +1091,44 @@ class Core:
 
     def note_effect(self, kind: str, **payload) -> None:
         """记一条语义效果：无日志、重放期间、非回合执行期都是空操作。"""
-        if not self._journaling():
+        if not self.is_journaling():
             return
         self._turn_effects.append({"kind": kind, **payload})
 
     def note_effects(self, effects: List[dict]) -> None:
         """批量记效果（一步产生多条状态变化的操作用）。"""
-        if not self._journaling():
+        if not self.is_journaling():
             return
         self._turn_effects.extend(effects)
+
+    @contextmanager
+    def replaying(self):
+        """进入"按日志重放"态，退出时恢复原值（重放里可能嵌套调用）。
+
+        重放期间 is_journaling 为假：应用历史变化不该再产生新日志。
+        """
+        was = self._replaying
+        self._replaying = True
+        try:
+            yield
+        finally:
+            self._replaying = was
+
+    def mark_warmup_needed(self, cid) -> None:
+        """标记该对话的 Python 执行器需要预热（日志/快照恢复出来的对话）。"""
+        self._warmup_needed.add(cid)
+
+    def drop_executor(self, cid) -> None:
+        """丢掉该对话的执行器（对话关闭/删除时释放 PLM 状态）。"""
+        self._executors.pop(cid, None)
+
+    def clear_executors(self) -> None:
+        """清空全部执行器（快照重建时）。"""
+        self._executors = {}
+
+    def note_turn_event(self, summary: dict) -> None:
+        """记一条本回合的事件摘要（监测帧用）。事件系统每派发完一条就调一次。"""
+        self._turn_events.append(summary)
 
     def _scheduler_state(self) -> dict:
         """当前调度状态的只读快照（回合开始/提交时各取一次，做增量用）。"""
@@ -875,38 +1141,7 @@ class Core:
             "next_cid": int(self._next_cid),
         }
 
-    @staticmethod
-    def _scheduler_delta(before: dict, after: dict):
-        """把回合前后的调度状态压成一条增量变化；没有变化返回 None。"""
-        delta = {}
-        if before["active"] != after["active"]:
-            delta["active"] = after["active"]
-        for key in ("ready", "dormant"):
-            before_list = before[key]
-            after_list = after[key]
-            before_set = set(before_list)
-            after_set = set(after_list)
-            added = [cid for cid in after_list if cid not in before_set]
-            removed = [cid for cid in before_list if cid not in after_set]
-            if added:
-                delta[key + "_add"] = added
-            if removed:
-                delta[key + "_remove"] = removed
-        added_finished = sorted(after["finished"] - before["finished"])
-        removed_finished = sorted(before["finished"] - after["finished"])
-        if added_finished:
-            delta["finished_add"] = added_finished
-        if removed_finished:
-            delta["finished_remove"] = removed_finished
-        if before["activation_instructions"] != after["activation_instructions"]:
-            delta["activation_instructions"] = after["activation_instructions"]
-        if before["next_cid"] != after["next_cid"]:
-            delta["next_cid"] = after["next_cid"]
-        if not delta:
-            return None
-        return {"kind": "scheduler", **delta}
-
-    def _refresh_journal_batch(self) -> None:
+    def refresh_journal_batch(self) -> None:
         """重放/恢复完成后，把"上次提交的批次"对齐到当前对话状态。"""
         self._journal_batch = {
             cid: batch_to_dict(conv.user_batch) for cid, conv in self._conv_by_cid.items()
@@ -946,7 +1181,7 @@ class Core:
         scheduler_before = self._scheduler_committed
         if scheduler_before is None:
             scheduler_before = self._scheduler_state()
-        delta = self._scheduler_delta(scheduler_before, self._scheduler_state())
+        delta = scheduler_delta(scheduler_before, self._scheduler_state())
         if delta is not None:
             changes.append(delta)
         self._scheduler_committed = self._scheduler_state()
@@ -987,7 +1222,7 @@ class Core:
             self._journal_seq = seq
             applied += 1
         if applied:
-            self._refresh_journal_batch()
+            self.refresh_journal_batch()
             self._refresh_journal_scheduler()
         return applied
 
@@ -1073,35 +1308,33 @@ class Core:
             instr = instr_cls(call_id, conv.cid, args)
             instr.execute(self, conv)
 
-    def _on_conversation_finished(self, conv: Conversation, result: str):
-        if conv.is_sub:
-            parent = conv.parent
-            if parent is not None and parent.cid not in self._finished:
-                if conv.metadata.get("returned"):
-                    _report_tool_error(conv, "亚对话已完成过一次，本次完成不再写回父对话")
-                else:
-                    # 亚对话紧耦合：完成即自动写回并唤醒父
-                    call_id = conv.metadata.get("call_id", "direct_output")
-                    parent.user_batch.add_tool_response(result, call_id)
-                    self.note_effect(
-                        "delivery", to_cid=parent.cid,
-                        tool_responses=[{"content": result, "tool_call_id": call_id}],
-                    )
-                    conv.metadata["returned"] = True
-                # 用完即删：返回通道只用一次，个体不再保留
-                self._delete_conversation(conv.cid)
-                if not self._is_waiting_for_return(parent):
-                    # 同一轮可能声明多个 create_sub：全部返回后才唤醒父
-                    self._resume(parent.cid)
-                else:
-                    # 父还在等别的亚对话：让出活跃权，继续调度（活跃指针不能留在已删个体上）
-                    self._active_cid = None
-                    self._pick_next_active()
-                return
-            # 父已关闭或不存在：没有返回通道，亚对话用完即删
-            self._delete_conversation(conv.cid)
+    def _after_tool_returns(self, conv: Conversation, return_calls) -> None:
+        """工具调用已返回、响应已进批次之后：记账，再定这个对话接下来算活跃还是让出。
+
+        三条去向互斥，顺序不能换：先看个体还在不在（工具可能顺手把它关了或删了），
+        再看它是不是自己让出的（等亚对话返回），最后才轮到指令预算用尽——预算用尽
+        是"打断"，前两条是"结束/暂停"，判反了会把一条已经消失的对话放进就绪队列。
+        """
+        self._process_return_calls(return_calls, conv)
+        self._activation_instructions += len(return_calls)
+        if conv.cid in self._finished or conv.cid not in self._conv_by_cid:
+            # 内核级关闭或亚对话用完即删：本轮结束后选择下一个活跃对话
             self._active_cid = None
             self._pick_next_active()
+        elif conv.cid in self._dormant_cids:
+            # 对话自己让出（等待返回/子完成）
+            self._pick_next_active()
+        elif self._activation_instructions >= self._instruction_budget:
+            # 核心中断：工具返回已加入 batch、状态完整；让出执行权，进就绪队列末尾
+            self._activation_instructions = 0  # 链被中断，重新计数
+            if conv.cid not in self._ready_cids:
+                self._ready_cids.append(conv.cid)
+            self._pick_next_active()
+
+    def _on_conversation_finished(self, conv: Conversation, result: str):
+        """一轮交互结束：亚对话写完返回就消失，交互对话退回休眠等事件。"""
+        if conv.is_sub:
+            self._finish_sub_conversation(conv, result)
             return
         # 交互结束：对话进入休眠（个体保留，等待事件/再次被调用）。
         # "finished" 是概念态（被内核级关闭指令关闭的对话），Core 调度状态只有活跃/休眠/就绪。
@@ -1109,6 +1342,40 @@ class Core:
             self._dormant_cids.append(conv.cid)
         self._active_cid = None
         self._pick_next_active()
+
+    def _finish_sub_conversation(self, conv: Conversation, result: str) -> None:
+        """亚对话完成：有活着的父就写回并唤醒它，没有返回通道就直接删。
+
+        亚对话紧耦合——返回通道只用一次，个体不保留。唤醒父之前要看它还等不等别的
+        亚对话：同一轮可能声明了多个 create_sub，只有最后一个返回才该唤醒它。
+        """
+        parent = conv.parent
+        if parent is None or parent.cid in self._finished:
+            # 父已关闭或不存在：没有返回通道，亚对话用完即删
+            self._delete_conversation(conv.cid)
+            self._active_cid = None
+            self._pick_next_active()
+            return
+        if conv.metadata.get("returned"):
+            _report_tool_error(conv, "亚对话已完成过一次，本次完成不再写回父对话")
+        else:
+            # 亚对话紧耦合：完成即自动写回并唤醒父
+            call_id = conv.metadata.get("call_id", "direct_output")
+            parent.user_batch.add_tool_response(result, call_id)
+            self.note_effect(
+                "delivery", to_cid=parent.cid,
+                tool_responses=[{"content": result, "tool_call_id": call_id}],
+            )
+            conv.metadata["returned"] = True
+        # 用完即删：返回通道只用一次，个体不再保留
+        self._delete_conversation(conv.cid)
+        if not self.is_waiting_for_return(parent):
+            # 同一轮可能声明多个 create_sub：全部返回后才唤醒父
+            self._resume(parent.cid)
+        else:
+            # 父还在等别的亚对话：让出活跃权，继续调度（活跃指针不能留在已删个体上）
+            self._active_cid = None
+            self._pick_next_active()
 
     def _resume(self, cid: int):
         """将等待中的对话唤醒为活跃对话（亚对话完成唤醒父：同一调用链，延续预算不重置）。"""
@@ -1189,7 +1456,7 @@ class Core:
         )
         sub.metadata["returned"] = True
         # 同一轮多个 create_sub：父还有别的待答调用时只补响应，等全部返回后再唤醒
-        if parent.cid != self._active_cid and not self._is_waiting_for_return(parent):
+        if parent.cid != self._active_cid and not self.is_waiting_for_return(parent):
             if parent.cid in self._dormant_cids:
                 self._dormant_cids.remove(parent.cid)
             if parent.cid not in self._ready_cids:
@@ -1200,7 +1467,7 @@ class Core:
         while self._ready_cids:
             picked = self._ready_cids.pop(0)
             conv = self._conv_by_cid.get(picked)
-            if conv is not None and self._is_waiting_for_return(conv):
+            if conv is not None and self.is_waiting_for_return(conv):
                 # 等亚对话返回的对话不能先跑：退回休眠，响应到了再由 _resume 唤醒。
                 # 它批次里的内容保留，等被唤醒时一起处理。
                 if picked not in self._dormant_cids:
@@ -1208,13 +1475,13 @@ class Core:
                 continue
             if picked in self._dormant_cids:
                 self._dormant_cids.remove(picked)
-            if not self._same_chain(self._active_cid, picked):
+            if not self.same_chain(self._active_cid, picked):
                 self._activation_instructions = 0  # 调用链断开：新链重新给满预算
             self._active_cid = picked
             return
         self._active_cid = None
 
-    def _same_chain(self, prev_cid, new_cid) -> bool:
+    def same_chain(self, prev_cid, new_cid) -> bool:
         """亚对话与父对话是同一调用链（预算共享）：
         亚对话激活时续用父的剩余预算；亚对话完成、父恢复时也续用。
         create_cmd 子对话（is_sub=False）独立预算，不在此列。"""
@@ -1256,21 +1523,7 @@ class Core:
                 self._recording = True
                 try:
                     if return_calls:
-                        self._process_return_calls(return_calls, conv)
-                        self._activation_instructions += len(return_calls)
-                        if conv.cid in self._finished or conv.cid not in self._conv_by_cid:
-                            # 内核级关闭或亚对话用完即删：本轮结束后选择下一个活跃对话
-                            self._active_cid = None
-                            self._pick_next_active()
-                        elif conv.cid in self._dormant_cids:
-                            # 对话自己让出（等待返回/子完成）
-                            self._pick_next_active()
-                        elif self._activation_instructions >= self._instruction_budget:
-                            # 核心中断：工具返回已加入 batch、状态完整；让出执行权，进就绪队列末尾
-                            self._activation_instructions = 0  # 链被中断，重新计数
-                            if conv.cid not in self._ready_cids:
-                                self._ready_cids.append(conv.cid)
-                            self._pick_next_active()
+                        self._after_tool_returns(conv, return_calls)
                     else:
                         self._on_conversation_finished(conv, result)
                 finally:
@@ -1280,11 +1533,12 @@ class Core:
                 # 同一轮是干净的。宿主装了 api_error_policy 时走宿主策略（旧语义）；
                 # 没装时走内置策略：余额不足暂停、上下文超限跳过对话、其余重试。
                 attempt += 1
-                category, detail = self._classify_api_error(e)
-                self._remember_api_error(conv, detail)
+                category, detail = category_and_detail(e)
+                remember_failure(conv, detail)
                 self.monitor.record(self, error=e, last_call=self._last_call_for(executor))
                 if self.api_error_policy is not None:
-                    if self._resolve_api_error(e, conv, attempt, executor) == "exit":
+                    # 宿主装了覆盖策略：走向由它定，内核只负责把失败记帧（上面两行）。
+                    if resolve_action(self.api_error_policy, e, attempt, executor) == "exit":
                         raise RunnerStop(f"API 调用失败，运行者选择退出：{e}") from e
                     continue
                 if category == INSUFFICIENT_BALANCE:
@@ -1324,76 +1578,17 @@ class Core:
             last_call = {**last_call, "events": list(self._turn_events)}
         return last_call
 
-    def _resolve_api_error(self, error: APIError, conv: Conversation, attempt: int, executor) -> str:
-        """问运行者 API 失败怎么办，返回 retry / reload / exit。
-
-        没装回调、回调自己出错、返回未知动作，一律按退出处理：停下等一个不会来的
-        选择比退出更糟。策略的落点是宿主（终端提示见 avm/runner_prompt.py）。
-        """
-        policy = self.api_error_policy
-        if policy is None:
-            print(f"[AVM] API 调用失败且没有安装 api_error_policy，按退出处理：{error}", file=sys.stderr)
-            return "exit"
-        try:
-            action = policy(error, attempt)
-        except Exception as e:
-            print(
-                f"[AVM] api_error_policy 自身异常（{type(e).__name__}: {e}），按退出处理",
-                file=sys.stderr,
-            )
-            return "exit"
-        if action not in ("retry", "reload", "exit"):
-            print(f"[AVM] api_error_policy 返回未知动作 {action!r}，按退出处理", file=sys.stderr)
-            return "exit"
-        if action == "reload":
-            reset = getattr(executor, "reset_client", None)
-            if callable(reset):
-                reset()
-        return action
-
     # ------------------------------------------------------------------
     # 内置 API 失败策略
+    #
+    # 分类、处置、失败记录与重试上限都在 api_errors 里（见那边的"处置"一节）；
+    # 这里只剩"配置从哪儿读"：Core.api_error_max_retries 是宿主可改的字段，缺省
+    # 与合法性判断跟着字段走，所以留在本类。
     # ------------------------------------------------------------------
-
-    def _classify_api_error(self, error: APIError):
-        """取 (category, detail)：外部执行器已经分类的直接用，否则在这里补分类。
-
-        LMU 在抛错前把分类放进 APIError；其它执行器（镜像自定义 PLM、测试替身）
-        可能只抛一个普通 APIError，这里按同样的纯函数再判一次。
-        """
-        category = getattr(error, "category", None)
-        detail = getattr(error, "detail", None)
-        if category in CATEGORIES:
-            detail = dict(detail or {})
-            detail.setdefault("category", category)
-            detail.setdefault("message", str(error))
-            detail.setdefault("status_code", getattr(error, "status_code", None))
-            detail.setdefault("context_limit", None)
-            return category, detail
-        return classify_api_error(
-            error, status_code=getattr(error, "status_code", None)
-        )
-
-    def _remember_api_error(self, conv: Conversation, detail: dict) -> None:
-        """把分类信息挂到对话运行态（不写内存树）；成功一轮后由调用方清掉。
-
-        只保留设备契约里的五个字段：外部执行器给的 detail 可能带额外键，设备面
-        不因此漂移。
-        """
-        conv.last_api_error = {
-            "category": detail.get("category"),
-            "message": detail.get("message", ""),
-            "status_code": detail.get("status_code"),
-            "context_limit": detail.get("context_limit"),
-            "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        }
 
     def _api_error_retry_limit(self) -> int:
         """连续失败达到这个次数就暂停；运行期改 Core.api_error_max_retries 立即生效。"""
-        limit = getattr(self, "api_error_max_retries", 5)
-        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
-            return 5
-        return limit
+        return retry_limit(getattr(self, "api_error_max_retries", 5))
 
     def _pause_for_api_error(self, category: str, reason: str,
                              cid: Optional[int] = None) -> None:
@@ -1529,7 +1724,7 @@ class Core:
             parent=None,
             is_root=True,
         )
-        self._register(conv)
+        self.register(conv)
         conv.para_ref = para_ref
         self._ready_cids.append(conv.cid)
         return conv
@@ -1557,7 +1752,7 @@ class Core:
             # 宿主标记：控制台持有的保留对话对普通对话隐藏。判定只读 attrs。
             attrs={"host": "console", "hidden": "1"},
         )
-        self._register(conv, cid=PANEL_CID)
+        self.register(conv, cid=PANEL_CID)
         conv.para_ref = para_ref or self.para_ref
         conv.is_python = True
         self._dormant_cids.append(conv.cid)
@@ -1578,10 +1773,12 @@ class Core:
     # 安全点自检（六条具名不变量）
     # ------------------------------------------------------------------
 
-    def _check_invariants(self) -> None:
+    def check_invariants(self) -> None:
         """六条具名不变量的结构自检。违反即 KernelPanic：出现说明某条边界少了一条判定。
 
-        只在安全点调用（run 的每轮推理之前）。成本是常数级遍历，加上活跃对话的一小段历史。
+        只在安全点调用：run 的每轮推理之前，以及装载/快照恢复把内核重建完之后
+        （那时外部刚批量改过对话表、调度与设备表，最需要自检）。
+        成本是常数级遍历，加上活跃对话的一小段历史。
         """
         # 1 调度互斥：就绪与休眠不相交，就绪队列无重复
         both = set(self._ready_cids) & set(self._dormant_cids)
@@ -1611,24 +1808,13 @@ class Core:
 
         目前只有 `create_sub` 会留下待答调用：父对话在等亚对话返回。
         """
-        messages = conv.messages
-        last = None
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].role == "assistant" and getattr(messages[i], "tool_calls", None):
-                last = i
-                break
-        if last is None:
+        wanted, got = tool_exchange(conv)
+        if not wanted:
             return []
-        wanted = []
-        for tc in messages[last].tool_calls or []:
-            call_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
-            if isinstance(call_id, str) and call_id:
-                wanted.append(call_id)
-        got = {m.tool_call_id for m in messages[last + 1:] if m.role == "tool"}
-        got |= {r.tool_call_id for r in conv.user_batch.tool_responses}
-        return [call_id for call_id in wanted if call_id not in got]
+        answered = set(got)
+        return [call_id for call_id in wanted if call_id not in answered]
 
-    def _is_waiting_for_return(self, conv: Conversation) -> bool:
+    def is_waiting_for_return(self, conv: Conversation) -> bool:
         """对话是否在等工具返回（亚对话）。等返回的对话不能被外部消息唤醒运行。"""
         return bool(self._pending_call_ids(conv))
 
@@ -1637,25 +1823,12 @@ class Core:
         """调用 API 前，带 tool_calls 的 assistant 消息要与 tool 消息一一配对。
 
         待发批次（user_batch）也算数：工具响应先入批次，下一轮推理才写进历史。
-        没有 id 的工具调用两边都配不上，不在这里判定。
+        没有 id 的工具调用两边都配不上，不在这里判定。排序后再比：同一 id 收到两次
+        响应会让两边长度不等，照样判错。
         """
-        messages = conv.messages
-        last = None
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].role == "assistant" and getattr(messages[i], "tool_calls", None):
-                last = i
-                break
-        if last is None:
-            return
-        wanted = []
-        for tc in messages[last].tool_calls or []:
-            call_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
-            if isinstance(call_id, str) and call_id:
-                wanted.append(call_id)
+        wanted, got = tool_exchange(conv)
         if not wanted:
             return
-        got = [m.tool_call_id for m in messages[last + 1:] if m.role == "tool"]
-        got += [r.tool_call_id for r in conv.user_batch.tool_responses]
         if sorted(wanted) != sorted(got):
             raise KernelPanic(
                 f"对话 {conv.cid} 的历史配对被破坏：assistant 声明 {sorted(wanted)}，"
@@ -1684,21 +1857,24 @@ class Core:
     def _check_device_table(self) -> None:
         """设备表与挂载点一致：每个挂载地址有链接节点；每个标识符至少有一个挂载地址。"""
         mounted_ids = set()
-        for address, device in list(self.mem._devices.items()):
+        for address, device in list(self.mem.devices.items()):
             mounted_ids.add(getattr(device, "device_id", None) or address)
-            node = self.mem._data
+            node = self.mem.root
             for seg in address.split("."):
                 node = node.get(seg) if isinstance(node, (dict, MetaDict)) else None
                 if node is None:
                     break
             if not isinstance(node, LinkNode):
                 raise KernelPanic(f"设备表不一致：{address} 没有挂载点链接节点")
-        for device_id in list(self.mem._device_ids):
+        for device_id in self.mem.device_ids():
             if device_id not in mounted_ids:
                 raise KernelPanic(f"设备表不一致：标识符 {device_id!r} 没有挂载地址")
 
     # ------------------------------------------------------------------
     # 模型目录（$MEM.model_catalog）
+    #
+    # 安装、刷新与"默认 para 用了清单外模型"的提醒都在本类里：目录只是普通内存
+    # 节点，但它的字段由适配器清单（services.llm.interfaces）决定，跟着启动流程走。
     # ------------------------------------------------------------------
 
     def install_model_catalog(self) -> None:
@@ -1933,7 +2109,7 @@ class Core:
             "listeners": listeners,
             "devices": [
                 {"mount": mount, "type": type(dev).__name__, "id": getattr(dev, "device_id", None)}
-                for mount, dev in list(self.mem._devices.items())
+                for mount, dev in list(self.mem.devices.items())
             ],
             "interrupts": {"last_dispatch": list(self.interrupts.last_dispatch)},
             "frames": frames,
@@ -2117,7 +2293,7 @@ class Core:
             # 日志与内存的提交位置必须追平（恢复路径由 boot 保证）。
             self._check_journal_seq()
             try:
-                self._check_invariants()
+                self.check_invariants()
             except KernelPanic as e:
                 self.monitor.record(self, error=e)
                 raise
@@ -2243,7 +2419,7 @@ class Core:
         只支持 memory_write before 事件；target 必须位于该设备路径下。
         走正常 before 管道，并返回处理后的 event，设备据此决定是否执行自改。
         """
-        if device_path not in self.mem._devices:
+        if device_path not in self.mem.devices:
             raise VMMemoryError(f"设备 {device_path} 未挂载")
         split = self.mem.split_path(target)
         if len(split) != 3 or split[0] != "device" or split[1] != device_path:
