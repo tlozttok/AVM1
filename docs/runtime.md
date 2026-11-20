@@ -759,7 +759,7 @@ LLM 响应中的 `reasoning_content`（思维链）被完整存入对话历史�
 - **内核恐慌**：六条具名不变量（调度互斥、活跃有来源、历史配对、值域、设备表一致、预算计数）在每轮安全点自检，违反即 `KernelPanic` 并留监测帧。可判定的输入不该走到这里——出现说明某条边界少了一条判定。
 - **内核缺陷**：约定错误类之外的异常不再被读路径吞掉；记录监测帧后向上抛，进程退出。
 
-API 调用失败（缺 key、断网、超时、限流、余额不足、上下文超限）按原因分类处置（`avm/api_errors.py` 是纯分类函数）：
+API 调用失败（缺 key、断网、超时、限流、余额不足、上下文超限）按原因分类处置（`avm/api_errors.py` 收分类与处置：`classify_api_error` / `category_and_detail` 是纯分类，`resolve_action` / `remember_failure` / `retry_limit` 是策略动作）：
 
 - **余额不足**（HTTP 402，或消息含 `insufficient_quota` / `insufficient balance` / `余额` / `billing` / `payment` / `credit`）：暂停执行，不重试、不关闭对话。429 的普通限流不含这些标记，归入“其它”。
 - **上下文超限**（HTTP 400/413/422 且消息含 `context_length_exceeded` / `maximum context length` / `context window` / `too many tokens` / `exceeds the maximum` / `上下文` / `token limit`）：跳过该对话——不关闭、不重试、不消费待发输入；普通对话回休眠等待再次被唤醒（亚对话不能留在等待链外，给父补一条 `Error:` 后按用完即删删除个体），分类信息记在对话运行态的 `last_api_error` 上，随后继续调度其他对话。回收/总结由软件任务负责：读 `$MEM.conversations.<cid>.context` 与 `.messages` 后决定裁剪、总结或显式关闭。能解析出上限时一并记录（如 `maximum context length is 128000 tokens` → 128000）。
