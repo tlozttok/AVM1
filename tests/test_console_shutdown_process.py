@@ -168,9 +168,10 @@ def _spawn(driver_path, image_path, cwd):
             lines.put(line)
 
     threading.Thread(target=reader, daemon=True).start()
-    deadline = time.time() + 25
+    # 单调钟：墙钟会被系统校时前后跳，用它算 deadline 会提前放弃等待。
+    deadline = time.monotonic() + 25
     port = None
-    while time.time() < deadline and port is None:
+    while time.monotonic() < deadline and port is None:
         try:
             line = lines.get(timeout=0.2)
         except queue.Empty:
@@ -190,8 +191,9 @@ def _spawn(driver_path, image_path, cwd):
 
 def _token(tmp_path):
     path = tmp_path / "out" / "console.token"
-    deadline = time.time() + 10
-    while time.time() < deadline:
+    # 单调钟（同上）。
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
         if path.is_file():
             return path.read_text(encoding="utf-8").strip()
         time.sleep(0.05)
@@ -199,8 +201,9 @@ def _token(tmp_path):
 
 
 def _wait_for(predicate, timeout=10, message="条件没有满足"):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    # 单调钟（同上）。
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         if predicate():
             return True
         time.sleep(0.05)
@@ -208,8 +211,9 @@ def _wait_for(predicate, timeout=10, message="条件没有满足"):
 
 
 def _wait_exit(proc, timeout=20):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    # 单调钟（同上）。
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         if proc.poll() is not None:
             assert proc.returncode == 0, f"宿主退出码 {proc.returncode}"
             return

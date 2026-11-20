@@ -121,8 +121,9 @@ def start_run(core):
 
 
 def wait_for(predicate, timeout=15, message="条件没有满足"):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    # 单调钟：墙钟会被系统校时前后跳，用它算 deadline 会提前放弃等待。
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         if predicate():
             return
         time.sleep(0.01)
